@@ -1,5 +1,6 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use topodb::*;
 
 /// Generate a small random-but-valid op sequence: create nodes, then a mix
@@ -144,6 +145,33 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) {
     }
 }
 
+/// Projects a `Snapshot`'s `nodes` map into a `BTreeMap` for order-independent
+/// comparison (`im::HashMap` iteration order isn't guaranteed to match
+/// between an incrementally-`apply`'d snapshot and a from-scratch
+/// `Snapshot::from_storage` rebuild, even when the contents are identical).
+fn nodes_map(snap: &Snapshot) -> BTreeMap<NodeId, NodeRecord> {
+    snap.nodes.iter().map(|(k, v)| (*k, v.clone())).collect()
+}
+
+/// Same idea for the full-record `edges` map.
+fn edges_map(snap: &Snapshot) -> BTreeMap<EdgeId, EdgeRecord> {
+    snap.edges.iter().map(|(k, v)| (*k, v.clone())).collect()
+}
+
+/// Same idea for `out`/`inn` adjacency: per-key entry order in the `im`
+/// vectors also isn't guaranteed to match, so each key's entries are sorted
+/// by edge id before comparison (same technique as the `graph` module's own
+/// `incremental_snapshot_equals_rebuild` test).
+fn adj_map(m: &im::HashMap<NodeId, im::Vector<AdjEntry>>) -> BTreeMap<NodeId, Vec<AdjEntry>> {
+    m.iter()
+        .map(|(k, v)| {
+            let mut entries: Vec<AdjEntry> = v.iter().cloned().collect();
+            entries.sort_by_key(|e| e.edge);
+            (*k, entries)
+        })
+        .collect()
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
@@ -155,10 +183,33 @@ proptest! {
 
         let live_nodes = db.debug_dump_nodes();
         let live_edges = db.debug_dump_edges();
+        // Captured through the *reader* path (`Db::snapshot`, the
+        // arc-swapped in-memory snapshot readers actually see) — not
+        // storage directly — so this guards the `Db::rebuild_state_from_ops`
+        // snapshot swap specifically, not just `Storage`'s rebuild.
+        let snap_before = db.snapshot();
 
         db.rebuild_state_from_ops().unwrap();
 
         prop_assert_eq!(live_nodes, db.debug_dump_nodes());
         prop_assert_eq!(live_edges, db.debug_dump_edges());
+
+        let snap_after = db.snapshot();
+        // `Db::rebuild_state_from_ops` must actually swap in a *new*
+        // `Arc<Snapshot>` — not just leave the old one in place. Checking
+        // pointer identity (rather than only content) is what catches a
+        // dropped/forgotten `snap.store(...)` call: since a correct rebuild
+        // reproduces identical content, a content-only comparison would
+        // still pass even if the swap never happened (the stale Arc already
+        // held the same values). This is the reader-facing guard the
+        // reviewer asked for.
+        prop_assert!(
+            !Arc::ptr_eq(&snap_before, &snap_after),
+            "rebuild_state_from_ops must store a fresh Snapshot Arc, not leave the old one in place"
+        );
+        prop_assert_eq!(nodes_map(&snap_before), nodes_map(&snap_after));
+        prop_assert_eq!(edges_map(&snap_before), edges_map(&snap_after));
+        prop_assert_eq!(adj_map(&snap_before.out), adj_map(&snap_after.out));
+        prop_assert_eq!(adj_map(&snap_before.inn), adj_map(&snap_after.inn));
     }
 }
