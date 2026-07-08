@@ -1,5 +1,5 @@
 /target
-Cargo.lock
 *.redb
 .claude-checkpoint.md
 Claude Docs/
+.superpowers/

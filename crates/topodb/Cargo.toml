@@ -2,8 +2,13 @@
 name = "topodb"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 description = "Embedded, local-first memory engine for AI agents: temporal property graph + scoped recall."
+repository = "https://github.com/TopoDB/topodb"
+readme = "README.md"
+keywords = ["graph", "embedded", "database", "temporal", "agent"]
+categories = ["database-implementations", "data-structures"]
 
 [dependencies]
 redb = "2"

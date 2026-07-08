@@ -7,7 +7,10 @@ pure Rust: a property graph with temporal facts (facts supersede, never
 overwrite), scope-aware recall, graph-scoped vector search, and a change feed
 for external consolidation — running in-process, no server.
 
-Status: **design phase**. See
+Status: **early development (0.0.x)** — the engine core works (op-log write
+path, single-applier concurrency, scoped k-hop temporal traversal,
+replay-determinism property tests); the recall layer (vector search,
+full-text, change feed) is next. API not yet stable. Design spec:
 [docs/superpowers/specs/2026-07-08-topodb-design.md](docs/superpowers/specs/2026-07-08-topodb-design.md).
 
 First consumer: Atlas (agentic OS desktop app).
