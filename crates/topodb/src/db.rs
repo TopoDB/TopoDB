@@ -133,11 +133,9 @@ impl Db {
 
     /// Test/inspection helper: every edge `(from, to)` currently in the
     /// adjacency snapshot, open or closed. `#[doc(hidden)]` — callers should
-    /// prefer the query layer once it exists. Note: `AdjEntry` doesn't carry
-    /// edge props, so the returned `EdgeRecord`s always have empty `props`
-    /// (fine for the current id/valid_to-focused callers; don't rely on
-    /// `props` here — use `Db`'s (future) query layer or `Storage::load_edge`
-    /// for that).
+    /// prefer the query layer once it exists. Full `EdgeRecord`s (props
+    /// included), read from the snapshot's `edges` map — the source of
+    /// truth, not reconstructed from the lean `AdjEntry`s in `out`/`inn`.
     #[doc(hidden)]
     pub fn all_edges_between(&self, from: NodeId, to: NodeId) -> Vec<crate::state::EdgeRecord> {
         let snap = self.snapshot();
@@ -146,16 +144,7 @@ impl Db {
             .into_iter()
             .flat_map(|entries| entries.iter())
             .filter(|e| e.other == to)
-            .map(|e| crate::state::EdgeRecord {
-                id: e.edge,
-                scope: e.scope,
-                ty: e.ty.clone(),
-                from,
-                to,
-                props: Default::default(),
-                valid_from: e.valid_from,
-                valid_to: e.valid_to,
-            })
+            .filter_map(|e| snap.edges.get(&e.edge).cloned())
             .collect()
     }
 

@@ -32,6 +32,11 @@ pub struct Snapshot {
     pub nodes: im::HashMap<NodeId, NodeRecord>,
     pub out: im::HashMap<NodeId, im::Vector<AdjEntry>>,
     pub inn: im::HashMap<NodeId, im::Vector<AdjEntry>>,
+    /// Full edge records, keyed by id. `AdjEntry`s (in `out`/`inn`) are kept
+    /// lean (no `props`) for cheap traversal; this map is the source of
+    /// truth for anything that needs a complete `EdgeRecord` (props
+    /// included). Kept in step with `out`/`inn` by every arm below.
+    pub edges: im::HashMap<EdgeId, EdgeRecord>,
 }
 
 impl Snapshot {
@@ -46,6 +51,7 @@ impl Snapshot {
 
         let mut out: im::HashMap<NodeId, im::Vector<AdjEntry>> = im::HashMap::new();
         let mut inn: im::HashMap<NodeId, im::Vector<AdjEntry>> = im::HashMap::new();
+        let mut edges: im::HashMap<EdgeId, EdgeRecord> = im::HashMap::new();
         for e in storage.all_edges()? {
             out.entry(e.from).or_default().push_back(AdjEntry {
                 edge: e.id,
@@ -57,15 +63,16 @@ impl Snapshot {
             });
             inn.entry(e.to).or_default().push_back(AdjEntry {
                 edge: e.id,
-                ty: e.ty,
+                ty: e.ty.clone(),
                 other: e.from,
                 scope: e.scope,
                 valid_from: e.valid_from,
                 valid_to: e.valid_to,
             });
+            edges.insert(e.id, e);
         }
 
-        Ok(Snapshot { nodes, out, inn })
+        Ok(Snapshot { nodes, out, inn, edges })
     }
 
     /// Applies a batch of already-resolved ops (as produced by
@@ -90,6 +97,7 @@ impl Snapshot {
         let mut nodes = self.nodes.clone();
         let mut out = self.out.clone();
         let mut inn = self.inn.clone();
+        let mut edges = self.edges.clone();
 
         for op in resolved_ops {
             match op {
@@ -133,9 +141,12 @@ impl Snapshot {
                     // incrementally-emptied vector's key must also be
                     // removed here — otherwise `out`/`inn` diverge from a
                     // from-scratch rebuild (stale empty-vector keys) and
-                    // grow unboundedly under churn.
+                    // grow unboundedly under churn. The full-record `edges`
+                    // map must also lose every incident edge, mirroring
+                    // storage's `RemoveNode` handling.
                     if let Some(entries) = out.remove(id) {
                         for e in entries.iter() {
+                            edges.remove(&e.edge);
                             if let Some(v) = inn.get_mut(&e.other) {
                                 v.retain(|x| x.edge != e.edge);
                                 if v.is_empty() {
@@ -146,6 +157,7 @@ impl Snapshot {
                     }
                     if let Some(entries) = inn.remove(id) {
                         for e in entries.iter() {
+                            edges.remove(&e.edge);
                             if let Some(v) = out.get_mut(&e.other) {
                                 v.retain(|x| x.edge != e.edge);
                                 if v.is_empty() {
@@ -155,7 +167,7 @@ impl Snapshot {
                         }
                     }
                 }
-                Op::CreateEdge { id, scope, ty, from, to, props: _, valid_from } => {
+                Op::CreateEdge { id, scope, ty, from, to, props, valid_from } => {
                     let vf = valid_from
                         .expect("Snapshot::apply only runs on resolved ops (valid_from filled)");
                     out.entry(*from).or_default().push_back(AdjEntry {
@@ -174,6 +186,19 @@ impl Snapshot {
                         valid_from: vf,
                         valid_to: None,
                     });
+                    edges.insert(
+                        *id,
+                        EdgeRecord {
+                            id: *id,
+                            scope: *scope,
+                            ty: ty.clone(),
+                            from: *from,
+                            to: *to,
+                            props: props.clone(),
+                            valid_from: vf,
+                            valid_to: None,
+                        },
+                    );
                 }
                 Op::CloseEdge { id, valid_to } => {
                     if let Some(rec) = edge_lookup(*id) {
@@ -191,12 +216,15 @@ impl Snapshot {
                                 }
                             }
                         }
+                        if let Some(e) = edges.get_mut(id) {
+                            e.valid_to = *valid_to;
+                        }
                     }
                 }
             }
         }
 
-        Snapshot { nodes, out, inn }
+        Snapshot { nodes, out, inn, edges }
     }
 }
 
