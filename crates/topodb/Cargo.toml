@@ -24,3 +24,7 @@ arc-swap = "1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+[lints.clippy]
+# TopoError and redb::Error are large enum variants; Plan 4 may box
+result_large_err = "allow"
