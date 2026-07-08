@@ -66,3 +66,40 @@ fn stats_respect_scope_and_reads_of_stats_do_not_bump() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(db.access_stats(&scopes, id).unwrap(), Some(AccessStats::default()));
 }
+
+#[test]
+fn nodes_by_prop_bumps_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![PropIndex { label: "M".into(), prop: "k".into() }],
+        text: vec![],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let id = NodeId::new();
+    let mut props = Props::new();
+    props.insert("k".into(), PropValue::Str("x".into()));
+    db.submit(vec![Op::CreateNode { id, scope: Scope::Id(s), label: "M".into(), props }]).unwrap();
+
+    let hits = db.nodes_by_prop(&scopes, "M", "k", &PropValue::Str("x".into())).unwrap();
+    assert_eq!(hits.len(), 1);
+    let stats = wait_for_count(&db, &scopes, id, 1);
+    assert!(stats.access_count >= 1);
+}
+
+#[test]
+fn float_range_scan_does_not_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let id = NodeId::new();
+    let mut props = Props::new();
+    props.insert("importance".into(), PropValue::Float(0.5));
+    db.submit(vec![Op::CreateNode { id, scope: Scope::Id(s), label: "M".into(), props }]).unwrap();
+
+    assert_eq!(db.nodes_by_float_range(&scopes, "importance", 0.0, 1.0).len(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(300)); // > one bumper flush interval
+    assert_eq!(db.access_stats(&scopes, id).unwrap(), Some(AccessStats::default()));
+}

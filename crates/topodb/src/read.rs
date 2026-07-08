@@ -82,7 +82,8 @@ impl Db {
         hits
     }
 
-    /// Equality lookup against the declared `(label, prop)` index:
+    /// Equality lookup against the declared `(label, prop)` index: counts as a
+    /// recall access and bumps the access counters of all returned hits.
     /// `Rejected` if `(label, prop)` isn't declared in `spec.equality`, or if
     /// `value` is a `Float` (not equality-indexable — Floats never enter the
     /// index in the first place). Otherwise an index lookup followed by a
@@ -103,7 +104,7 @@ impl Db {
         let Some(iv) = crate::index::IndexValue::of(value) else {
             return Err(TopoError::Rejected("Float values are not equality-indexable".into()));
         };
-        Ok(snap
+        let hits: Vec<NodeRecord> = snap
             .prop_index
             .get(&(SmolStr::new(label), prop.to_string(), iv))
             .into_iter()
@@ -111,13 +112,18 @@ impl Db {
             .filter_map(|id| snap.nodes.get(id))
             .filter(|n| scopes.contains(n.scope))
             .cloned()
-            .collect())
+            .collect();
+        self.bump(hits.iter().map(|n| n.id));
+        Ok(hits)
     }
 
     /// Unindexed scoped snapshot scan for `min <= props[prop] <= max` over
     /// `PropValue::Float` values. O(scope size) — the decay-sweep primitive;
     /// there is no float range index (equality indexing explicitly excludes
     /// `Float`, see `IndexValue`).
+    /// Does NOT bump access counters, by design: this is the decay-sweep
+    /// primitive. A sweep that bumped everything it scanned would overwrite the
+    /// very recency signal (`last_accessed_at`) it exists to read.
     #[must_use]
     pub fn nodes_by_float_range(
         &self,
