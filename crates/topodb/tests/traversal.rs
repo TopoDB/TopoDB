@@ -64,3 +64,85 @@ fn hop_cap_enforced() {
                              edge_types: None, direction: Direction::Out, as_of: None };
     assert!(matches!(f.db.traverse(&q), Err(TopoError::Rejected(_))));
 }
+
+#[test]
+fn max_hops_zero_is_rejected() {
+    let f = fixture();
+    let q = TraversalQuery { scopes: ScopeSet::of(&[f.s1]), seeds: vec![f.a], max_hops: 0,
+                             edge_types: None, direction: Direction::Out, as_of: None };
+    assert!(matches!(f.db.traverse(&q), Err(TopoError::Rejected(_))));
+}
+
+/// Walk the fixture *backwards* from `c`: `In` must follow `inn`, reaching
+/// b (via e2) and then a (via e1). Read `as_of` 150 so the since-closed e2 is
+/// still open.
+#[test]
+fn direction_in_traverses_backwards() {
+    let f = fixture();
+    let scopes = ScopeSet::of(&[f.s1]).with_shared();
+    let sub = f.db.traverse(&TraversalQuery {
+        scopes, seeds: vec![f.c], max_hops: 2,
+        edge_types: None, direction: Direction::In, as_of: Some(150),
+    }).unwrap();
+    let ids: Vec<_> = sub.nodes.iter().map(|n| n.id).collect();
+    assert!(ids.contains(&f.c) && ids.contains(&f.b) && ids.contains(&f.a),
+            "In-traversal from c must reach b and a, got {ids:?}");
+}
+
+/// `Both` from b reaches a (via `inn`/e1) and c (via `out`/e2). e2 is
+/// encountered from both b->c and c->b; the `visited`/`result_edges` sets must
+/// dedup it so every node and edge appears exactly once in the Subgraph.
+#[test]
+fn direction_both_dedups_nodes_and_edges() {
+    let f = fixture();
+    let scopes = ScopeSet::of(&[f.s1]).with_shared();
+    let sub = f.db.traverse(&TraversalQuery {
+        scopes, seeds: vec![f.b], max_hops: 2,
+        edge_types: None, direction: Direction::Both, as_of: Some(150),
+    }).unwrap();
+    assert_eq!(sub.nodes.len(), 3, "a, b, c each exactly once");
+    assert_eq!(sub.edges.len(), 2, "e1, e2 each exactly once (e2 not double-counted)");
+    let mut node_ids: Vec<_> = sub.nodes.iter().map(|n| n.id).collect();
+    node_ids.sort(); node_ids.dedup();
+    assert_eq!(node_ids.len(), 3, "node set must be duplicate-free");
+    let mut edge_ids: Vec<_> = sub.edges.iter().map(|e| e.id).collect();
+    edge_ids.sort(); edge_ids.dedup();
+    assert_eq!(edge_ids.len(), 2, "edge set must be duplicate-free");
+}
+
+/// `edge_types: Some(["ABOUT"])` must exclude the RELATES_TO edge b->c, so the
+/// traversal stops at b and never reaches c.
+#[test]
+fn edge_types_filter_excludes_other_types() {
+    let f = fixture();
+    let scopes = ScopeSet::of(&[f.s1]).with_shared();
+    let sub = f.db.traverse(&TraversalQuery {
+        scopes, seeds: vec![f.a], max_hops: 3,
+        edge_types: Some(vec!["ABOUT".into()]), direction: Direction::Out, as_of: Some(150),
+    }).unwrap();
+    let ids: Vec<_> = sub.nodes.iter().map(|n| n.id).collect();
+    assert!(ids.contains(&f.b), "ABOUT edge a->b must be traversed");
+    assert!(!ids.contains(&f.c), "RELATES_TO edge b->c must be excluded by edge_types filter");
+    assert!(sub.edges.iter().all(|e| e.ty == "ABOUT"), "only ABOUT edges may appear");
+}
+
+/// Temporal window boundaries are half-open `[valid_from, valid_to)`: e2 has
+/// valid_from=100, valid_to=200. At t == valid_from the edge IS traversable
+/// (inclusive lower bound); at t == valid_to it is NOT (exclusive upper bound).
+#[test]
+fn temporal_boundaries_inclusive_from_exclusive_to() {
+    let f = fixture();
+    let scopes = ScopeSet::of(&[f.s1]).with_shared();
+    let at_from = f.db.traverse(&TraversalQuery {
+        scopes: scopes.clone(), seeds: vec![f.b], max_hops: 1,
+        edge_types: None, direction: Direction::Out, as_of: Some(100),
+    }).unwrap();
+    assert!(at_from.nodes.iter().any(|n| n.id == f.c),
+            "at t == valid_from (100) the edge must be traversable");
+    let at_to = f.db.traverse(&TraversalQuery {
+        scopes, seeds: vec![f.b], max_hops: 1,
+        edge_types: None, direction: Direction::Out, as_of: Some(200),
+    }).unwrap();
+    assert!(!at_to.nodes.iter().any(|n| n.id == f.c),
+            "at t == valid_to (200) the edge must not be traversable");
+}

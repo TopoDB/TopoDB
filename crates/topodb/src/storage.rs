@@ -451,6 +451,61 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_unsupported_format_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        // A freshly-created db opens fine and stamps FORMAT_VERSION.
+        drop(Storage::create(&path).unwrap());
+
+        // Corrupt the stored version to an unsupported value via a raw redb
+        // write (bypassing `Storage`, which is the whole point).
+        {
+            let db = Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert("format_version", 2u32.to_le_bytes().as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Reopening must now be rejected rather than silently accepted.
+        // `.err()` drops the (non-`Debug`) `Storage` from the `Ok` arm.
+        let err = Storage::create(&path).err().expect("reopen must be rejected");
+        assert!(matches!(err, TopoError::Encoding(_)), "expected Encoding error, got {err:?}");
+    }
+
+    #[test]
+    fn set_embedding_lands_in_record_and_rejects_missing_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::create(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let id = NodeId::new();
+        s.apply_batch(
+            vec![Op::CreateNode { id, scope, label: "M".into(), props: Default::default() }],
+            0,
+        )
+        .unwrap();
+        s.apply_batch(
+            vec![Op::SetEmbedding { id, model: "m".into(), vector: vec![1.0, 2.0, 3.0] }],
+            0,
+        )
+        .unwrap();
+
+        let rec = s.load_node(id).unwrap().unwrap();
+        assert_eq!(rec.embedding, Some(("m".to_string(), vec![1.0, 2.0, 3.0])));
+
+        // Embedding a node that doesn't exist rejects the whole batch.
+        let err = s
+            .apply_batch(
+                vec![Op::SetEmbedding { id: NodeId::new(), model: "m".into(), vector: vec![0.0] }],
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)));
+    }
+
+    #[test]
     fn append_ops_rejects_empty_batch() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::create(dir.path().join("t.redb")).unwrap();

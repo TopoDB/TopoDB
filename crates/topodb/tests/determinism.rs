@@ -13,6 +13,7 @@ enum Intent {
     Edge { from_ix: usize, to_ix: usize },
     Close { edge_ix: usize },
     SetProp { node_ix: usize, val: i64 },
+    Embed { node_ix: usize },
     Remove { node_ix: usize },
 }
 
@@ -21,6 +22,7 @@ fn scripts() -> impl Strategy<Value = (usize, usize, Vec<Intent>)> {
         (any::<usize>(), any::<usize>()).prop_map(|(f, t)| Intent::Edge { from_ix: f, to_ix: t }),
         any::<usize>().prop_map(|i| Intent::Close { edge_ix: i }),
         (any::<usize>(), any::<i64>()).prop_map(|(i, v)| Intent::SetProp { node_ix: i, val: v }),
+        any::<usize>().prop_map(|i| Intent::Embed { node_ix: i }),
         any::<usize>().prop_map(|i| Intent::Remove { node_ix: i }),
     ];
     (3usize..10, 0usize..4, proptest::collection::vec(intent, 0..20))
@@ -131,6 +133,24 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) {
                 let mut props: BTreeMap<String, Option<PropValue>> = BTreeMap::new();
                 props.insert("v".to_string(), Some(PropValue::Int(val)));
                 db.submit_at(vec![Op::SetNodeProps { id, props }], t).unwrap();
+            }
+            Intent::Embed { node_ix } => {
+                if nodes.is_empty() {
+                    continue;
+                }
+                let (id, _) = nodes[node_ix % nodes.len()];
+                // Deterministic payload derived from the index so replay
+                // reproduces the same embedding; exercises the `SetEmbedding`
+                // arm of both `apply_op` and `Snapshot::apply` under replay.
+                db.submit_at(
+                    vec![Op::SetEmbedding {
+                        id,
+                        model: "m".into(),
+                        vector: vec![node_ix as f32],
+                    }],
+                    t,
+                )
+                .unwrap();
             }
             Intent::Remove { node_ix } => {
                 if nodes.len() <= 1 {
