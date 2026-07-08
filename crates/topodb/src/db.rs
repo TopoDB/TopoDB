@@ -139,7 +139,17 @@ impl Db {
     /// clone via `ArcSwap::load_full` — never blocks on the applier thread
     /// or on other readers.
     #[must_use]
-    pub fn snapshot(&self) -> Arc<Snapshot> {
+    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
+        self.inner.snap.load_full()
+    }
+
+    /// Test/inspection seam: the raw (unscoped) snapshot. `#[doc(hidden)]`
+    /// because it bypasses scoping — the supported read APIs are the scoped
+    /// ones (`node`, `nodes_by_label`, `traverse`, ...). Same class as
+    /// `debug_dump_nodes`/`debug_dump_edges`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_snapshot(&self) -> Arc<Snapshot> {
         self.inner.snap.load_full()
     }
 

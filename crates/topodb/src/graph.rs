@@ -29,14 +29,14 @@ pub struct AdjEntry {
 /// underlying `im` structures are shared between old and new versions.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    pub nodes: im::HashMap<NodeId, NodeRecord>,
-    pub out: im::HashMap<NodeId, im::Vector<AdjEntry>>,
-    pub inn: im::HashMap<NodeId, im::Vector<AdjEntry>>,
+    pub(crate) nodes: im::HashMap<NodeId, NodeRecord>,
+    pub(crate) out: im::HashMap<NodeId, im::Vector<AdjEntry>>,
+    pub(crate) inn: im::HashMap<NodeId, im::Vector<AdjEntry>>,
     /// Full edge records, keyed by id. `AdjEntry`s (in `out`/`inn`) are kept
     /// lean (no `props`) for cheap traversal; this map is the source of
     /// truth for anything that needs a complete `EdgeRecord` (props
     /// included). Kept in step with `out`/`inn` by every arm below.
-    pub edges: im::HashMap<EdgeId, EdgeRecord>,
+    pub(crate) edges: im::HashMap<EdgeId, EdgeRecord>,
 }
 
 impl Snapshot {
@@ -221,11 +221,17 @@ impl Snapshot {
 
         Snapshot { nodes, out, inn, edges }
     }
+
+    #[doc(hidden)] pub fn debug_nodes(&self) -> &im::HashMap<NodeId, NodeRecord> { &self.nodes }
+    #[doc(hidden)] pub fn debug_out(&self) -> &im::HashMap<NodeId, im::Vector<AdjEntry>> { &self.out }
+    #[doc(hidden)] pub fn debug_inn(&self) -> &im::HashMap<NodeId, im::Vector<AdjEntry>> { &self.inn }
+    #[doc(hidden)] pub fn debug_edges(&self) -> &im::HashMap<EdgeId, EdgeRecord> { &self.edges }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{AdjEntry, Db, EdgeId, NodeId, Op, Scope, ScopeId};
+    use crate::graph::AdjEntry;
+    use crate::{Db, EdgeId, NodeId, Op, Scope, ScopeId};
 
     #[test]
     fn incremental_snapshot_equals_rebuild() {

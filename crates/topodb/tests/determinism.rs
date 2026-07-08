@@ -2,6 +2,7 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use topodb::*;
+use topodb::graph::AdjEntry;
 
 /// Generate a small random-but-valid op sequence: create nodes, then a mix
 /// of edges/prop-sets/closes/removes referencing only created ids.
@@ -170,12 +171,12 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) {
 /// between an incrementally-`apply`'d snapshot and a from-scratch
 /// `Snapshot::from_storage` rebuild, even when the contents are identical).
 fn nodes_map(snap: &Snapshot) -> BTreeMap<NodeId, NodeRecord> {
-    snap.nodes.iter().map(|(k, v)| (*k, v.clone())).collect()
+    snap.debug_nodes().iter().map(|(k, v)| (*k, v.clone())).collect()
 }
 
 /// Same idea for the full-record `edges` map.
 fn edges_map(snap: &Snapshot) -> BTreeMap<EdgeId, EdgeRecord> {
-    snap.edges.iter().map(|(k, v)| (*k, v.clone())).collect()
+    snap.debug_edges().iter().map(|(k, v)| (*k, v.clone())).collect()
 }
 
 /// Same idea for `out`/`inn` adjacency: per-key entry order in the `im`
@@ -203,18 +204,18 @@ proptest! {
 
         let live_nodes = db.debug_dump_nodes();
         let live_edges = db.debug_dump_edges();
-        // Captured through the *reader* path (`Db::snapshot`, the
+        // Captured through the *reader* path (`Db::debug_snapshot`, the
         // arc-swapped in-memory snapshot readers actually see) — not
         // storage directly — so this guards the `Db::rebuild_state_from_ops`
         // snapshot swap specifically, not just `Storage`'s rebuild.
-        let snap_before = db.snapshot();
+        let snap_before = db.debug_snapshot();
 
         db.rebuild_state_from_ops().unwrap();
 
         prop_assert_eq!(live_nodes, db.debug_dump_nodes());
         prop_assert_eq!(live_edges, db.debug_dump_edges());
 
-        let snap_after = db.snapshot();
+        let snap_after = db.debug_snapshot();
         // `Db::rebuild_state_from_ops` must actually swap in a *new*
         // `Arc<Snapshot>` — not just leave the old one in place. Checking
         // pointer identity (rather than only content) is what catches a
@@ -229,7 +230,7 @@ proptest! {
         );
         prop_assert_eq!(nodes_map(&snap_before), nodes_map(&snap_after));
         prop_assert_eq!(edges_map(&snap_before), edges_map(&snap_after));
-        prop_assert_eq!(adj_map(&snap_before.out), adj_map(&snap_after.out));
-        prop_assert_eq!(adj_map(&snap_before.inn), adj_map(&snap_after.inn));
+        prop_assert_eq!(adj_map(snap_before.debug_out()), adj_map(snap_after.debug_out()));
+        prop_assert_eq!(adj_map(snap_before.debug_inn()), adj_map(snap_after.debug_inn()));
     }
 }

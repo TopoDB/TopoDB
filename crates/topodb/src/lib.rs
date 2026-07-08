@@ -10,7 +10,7 @@ pub mod storage;
 
 pub use db::Db;
 pub use error::TopoError;
-pub use graph::{AdjEntry, Snapshot};
+pub use graph::Snapshot;
 pub use ids::{EdgeId, NodeId, Scope, ScopeId, ScopeSet};
 pub use op::Op;
 pub use props::{PropValue, Props};
