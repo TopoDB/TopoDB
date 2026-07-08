@@ -365,7 +365,10 @@ impl Db {
             .as_millis() as i64;
         // Clone the sender out from under the mutex so we never hold the lock
         // across `try_send`. `None` once `Drop` has taken it — nothing to bump.
-        let tx = self.inner.bump_tx.lock().unwrap().as_ref().cloned();
+        // A poisoned mutex (applier panicked; poisoned-lock policy) also yields
+        // `None`: bumps are auxiliary telemetry, so we silently drop them rather
+        // than propagate the panic into a read path.
+        let tx = self.inner.bump_tx.lock().ok().and_then(|g| g.as_ref().cloned());
         if let Some(tx) = tx {
             for id in ids {
                 // Full (bumper backed up) or Disconnected (shutdown) → drop.
@@ -436,7 +439,18 @@ impl Db {
     pub fn subscribe(&self, capacity: usize) -> Receiver<ChangeEvent> {
         let capacity = capacity.max(1);
         let (tx, rx) = bounded::<ChangeEvent>(capacity);
-        self.inner.subs.lock().unwrap().push(tx);
+        // Poisoned subs registry ⇒ the applier panicked and the engine is dead
+        // (poisoned-lock policy, see vector.rs). Hand back an already-disconnected
+        // Receiver rather than propagating the panic: it reports `Disconnected`
+        // immediately, the same terminal signal a subscriber sees after shutdown.
+        match self.inner.subs.lock() {
+            Ok(mut subs) => subs.push(tx),
+            Err(_) => {
+                let (tx, rx) = bounded(1);
+                drop(tx);
+                return rx;
+            }
+        }
         rx
     }
 
@@ -463,7 +477,10 @@ impl Db {
     /// the bounded channel would needlessly serialize all submitters against
     /// each other on the mutex rather than on the channel.
     fn sender(&self) -> Option<Sender<Job>> {
-        self.inner.tx.lock().unwrap().as_ref().cloned()
+        // A poisoned mutex (applier panicked; poisoned-lock policy) maps to
+        // `None`, which `submit_inner`/`rebuild_state_from_ops` already turn into
+        // `TopoError::Closed` — the same result as a shut-down engine.
+        self.inner.tx.lock().ok().and_then(|g| g.as_ref().cloned())
     }
 
     fn submit_inner(&self, ops: Vec<Op>, at: Option<i64>) -> Result<AppliedBatch, TopoError> {
@@ -567,12 +584,18 @@ impl Drop for Inner {
         // Reorder these and you either deadlock (drop `tx` while the bumper's
         // clone keeps the applier channel open → applier join hangs) or lose
         // the final flush (join applier before the bumper has enqueued it).
-        self.bump_tx.lock().unwrap().take();
-        if let Some(h) = self.bumper.lock().unwrap().take() {
+        // Shutdown must proceed even if a mutex was poisoned by an applier panic
+        // (poisoned-lock policy, see vector.rs) — otherwise the host leaks the
+        // applier/bumper threads on drop. Recover the guard via `into_inner`.
+        self.bump_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(h) = self.bumper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        {
             let _ = h.join();
         }
-        self.tx.lock().unwrap().take();
-        if let Some(h) = self.applier.lock().unwrap().take() {
+        self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(h) =
+            self.applier.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        {
             let _ = h.join();
         }
     }

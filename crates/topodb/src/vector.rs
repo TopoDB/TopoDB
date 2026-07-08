@@ -12,6 +12,17 @@
 //! guarantee covers snapshot/adjacency reads, while slab write locks are held
 //! only for O(dim) per op on the applier, and slab read locks only for the
 //! duration of a single `top_k` scan.
+//!
+//! **Poisoned-lock policy.** Std `RwLock`/`Mutex` poisoning can only originate
+//! from a panic on the applier thread — the sole writer of the slabs map, the
+//! per-slab write locks, and the subs registry. After such a panic the engine
+//! is dead: `submit` already returns [`TopoError::Closed`] (its channel is
+//! gone). This module makes the READ paths agree rather than propagating the
+//! panic into the host: search-path lock acquisitions go through
+//! [`read_or_closed`], which maps a poisoned lock to `Err(Closed)`. Applier-side
+//! lock acquisitions keep `unwrap()` (a poison there means THIS thread already
+//! panicked — unreachable). Shutdown (`Drop for Inner` in `db.rs`) recovers
+//! poisoned mutexes via `into_inner` so threads are still joined.
 
 use crate::db::Db;
 use crate::error::TopoError;
@@ -21,6 +32,18 @@ use crate::op::Op;
 use crate::state::NodeRecord;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+
+/// Acquire a read lock, mapping a poisoned lock to [`TopoError::Closed`].
+///
+/// Poisoning is only reachable if the applier thread panicked while holding the
+/// write lock — at which point the engine is already dead — so on the read path
+/// the correct answer is `Closed`, not a propagated panic. See the module-level
+/// poisoned-lock policy.
+pub(crate) fn read_or_closed<T>(
+    l: &std::sync::RwLock<T>,
+) -> Result<std::sync::RwLockReadGuard<'_, T>, TopoError> {
+    l.read().map_err(|_| TopoError::Closed)
+}
 
 /// A vector-search request: cosine-rank the embeddings under `model` within
 /// `scopes` against `vector`, returning the top `k`.
@@ -190,8 +213,10 @@ impl VectorIndex {
     /// rows — an empty or fully-tombstoned slab imposes no dim constraint (its
     /// `dim` is re-settable via the next `upsert`), so this reports `None`.
     pub(crate) fn dim_of(&self, model: &str, scope: Scope) -> Option<usize> {
+        // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         let slabs = self.slabs.read().unwrap();
         let arc = slabs.get(&(model.to_string(), scope))?;
+        // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         let slab = arc.read().unwrap();
         let live = slab.ids.len() - slab.dead;
         (live > 0).then_some(slab.dim)
@@ -204,12 +229,14 @@ impl VectorIndex {
         // Fast path: slab already exists — take only a read lock on the outer
         // map, then a write lock on the one slab.
         let arc = {
+            // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
             let slabs = self.slabs.read().unwrap();
             slabs.get(&key).cloned()
         };
         let arc = match arc {
             Some(a) => a,
             None => {
+                // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
                 let mut slabs = self.slabs.write().unwrap();
                 slabs
                     .entry(key)
@@ -217,16 +244,19 @@ impl VectorIndex {
                     .clone()
             }
         };
+        // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         arc.write().unwrap().upsert(id, v);
     }
 
     /// Tombstone `id` in `(model, scope)` (no-op if the slab or row is absent).
     pub(crate) fn tombstone(&self, model: &str, scope: Scope, id: NodeId) {
         let arc = {
+            // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
             let slabs = self.slabs.read().unwrap();
             slabs.get(&(model.to_string(), scope)).cloned()
         };
         if let Some(arc) = arc {
+            // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
             arc.write().unwrap().tombstone(id);
         }
     }
@@ -234,10 +264,12 @@ impl VectorIndex {
     /// Compaction hook for a single touched slab (see `Slab::maybe_compact`).
     pub(crate) fn maybe_compact(&self, model: &str, scope: Scope) {
         let arc = {
+            // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
             let slabs = self.slabs.read().unwrap();
             slabs.get(&(model.to_string(), scope)).cloned()
         };
         if let Some(arc) = arc {
+            // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
             arc.write().unwrap().maybe_compact();
         }
     }
@@ -366,7 +398,9 @@ impl VectorIndex {
     /// arm after storing the fresh snapshot.
     pub(crate) fn rebuild_from(&self, snap: &Snapshot) {
         let fresh = VectorIndex::from_snapshot(snap);
+        // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         let new_map = fresh.slabs.into_inner().unwrap();
+        // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         *self.slabs.write().unwrap() = new_map;
     }
 }
@@ -383,6 +417,10 @@ impl Db {
     /// no longer carries (the slab can be momentarily ahead of/behind the
     /// snapshot between locks) is dropped — harmless. Result nodes are bumped
     /// (access counters, Task 4).
+    ///
+    /// Returns [`TopoError::Closed`] if a slab lock is poisoned — reachable only
+    /// after the applier thread has panicked (the engine is already dead); see
+    /// the module-level poisoned-lock policy.
     pub fn search_vector(&self, q: &VectorQuery) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if q.k == 0 || q.vector.is_empty() {
             return Err(TopoError::Rejected(
@@ -395,12 +433,12 @@ impl Db {
         let vectors = self.vectors();
         let mut merged: Vec<(NodeId, f32)> = Vec::new();
         {
-            let slabs = vectors.slabs.read().unwrap();
+            let slabs = read_or_closed(&vectors.slabs)?;
             for ((model, scope), arc) in slabs.iter() {
                 if model != &q.model || !q.scopes.contains(*scope) {
                     continue;
                 }
-                let slab = arc.read().unwrap();
+                let slab = read_or_closed(arc)?;
                 if slab.dim != q.vector.len() {
                     continue;
                 }
@@ -423,5 +461,27 @@ impl Db {
         }
         self.bump(out.iter().map(|(n, _)| n.id));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_outer_lock_maps_to_closed_not_panic() {
+        let idx = VectorIndex::new();
+        // Poison the outer map lock from a scratch thread.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = idx.slabs.write().unwrap();
+            panic!("poison it");
+        }));
+        assert!(r.is_err());
+        // Semicolon so the match's temporary `Result` (which may hold a guard
+        // borrowing `idx.slabs`) is dropped before `idx` at end of scope.
+        match read_or_closed(&idx.slabs) {
+            Err(TopoError::Closed) => {}
+            other => panic!("expected Closed, got {:?}", other.map(|_| ())),
+        };
     }
 }
