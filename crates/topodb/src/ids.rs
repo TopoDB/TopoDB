@@ -8,6 +8,14 @@ macro_rules! id_type {
         pub struct $name(pub Ulid);
         impl $name {
             pub fn new() -> Self { Self(Ulid::new()) }
+
+            /// Deterministic constructor for tests/fixtures (e.g. the committed
+            /// FORMAT.md fixture, `tests/format_fixture.rs`) that need a stable,
+            /// reproducible id rather than `Ulid::new()`'s wall-clock-derived
+            /// randomness. Same debug-seam class as `Db::debug_snapshot` — not
+            /// part of the supported public surface, hence `#[doc(hidden)]`.
+            #[doc(hidden)]
+            pub fn from_u128(v: u128) -> Self { Self(Ulid(v)) }
         }
         impl Default for $name {
             fn default() -> Self { Self::new() }
