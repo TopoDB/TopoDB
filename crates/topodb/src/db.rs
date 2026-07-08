@@ -313,6 +313,14 @@ impl Db {
         self.inner.vectors.clone()
     }
 
+    /// The underlying storage. Used by `search_text` (in `fts.rs`) to open a
+    /// read transaction over the POSTINGS/FTS_DOCS/META tables from an
+    /// `impl Db` block in a sibling module that can't touch `self.inner`.
+    #[must_use]
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.inner.storage
+    }
+
     /// Test/inspection seam: the raw (unscoped) snapshot. `#[doc(hidden)]`
     /// because it bypasses scoping — the supported read APIs are the scoped
     /// ones (`node`, `nodes_by_label`, `traverse`, ...). Same class as

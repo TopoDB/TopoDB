@@ -2,6 +2,7 @@ pub mod counters;
 pub mod db;
 pub mod error;
 pub mod feed;
+pub mod fts;
 pub mod graph;
 pub mod ids;
 pub mod index;

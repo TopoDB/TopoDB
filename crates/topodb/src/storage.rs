@@ -1,5 +1,6 @@
 use crate::counters::AccessStats;
 use crate::error::TopoError;
+use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::index::IndexSpec;
 use crate::op::Op;
@@ -12,6 +13,14 @@ pub const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
 pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 pub const NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
 pub const EDGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edges");
+/// Inverted index: UTF-8 term bytes → postcard `Vec<(NodeId, u32)>` (doc, term
+/// frequency), maintained transactionally by `fts_update`. Opened in
+/// `create_with`.
+pub(crate) const POSTINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("postings");
+/// Per-document token length: node key → postcard `u32`. Opened in
+/// `create_with`. Corpus totals (`fts_doc_count` / `fts_total_len`, `u64` LE)
+/// live in META.
+pub(crate) const FTS_DOCS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fts_docs");
 /// Auxiliary per-node access statistics, keyed by the same 16-byte node key as
 /// NODES. Deliberately *outside* the op log: never appended to OPS, never
 /// broadcast to the change feed, and never touched by `rebuild_state_from_ops`.
@@ -50,6 +59,8 @@ impl Storage {
             tx.open_table(NODES).map_err(redb::Error::from)?;
             tx.open_table(EDGES).map_err(redb::Error::from)?;
             tx.open_table(COUNTERS).map_err(redb::Error::from)?;
+            tx.open_table(POSTINGS).map_err(redb::Error::from)?;
+            tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
             let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
             // Read the stored version into an owned value first so the read
             // guard's borrow of `meta` ends before we (maybe) insert into it.
@@ -77,7 +88,55 @@ impl Storage {
             }
         }
         tx.commit().map_err(redb::Error::from)?;
+        // Reconcile the stored text-index spec with the one we were opened
+        // with; a change triggers a full reindex (committed here, before any
+        // reader/`Db` observes the tables).
+        s.ensure_fts_spec()?;
         Ok(s)
+    }
+
+    /// Compares the incoming `spec.text` against the value stored under META
+    /// `"fts_spec"` (absent = default empty spec, covering Plan-1 files). On a
+    /// mismatch: drain POSTINGS/FTS_DOCS, zero the corpus counters, and rebuild
+    /// the whole index by scanning NODES through `fts_update` — all in one
+    /// write transaction — then persist the new spec. A match is a no-op.
+    fn ensure_fts_spec(&self) -> Result<(), TopoError> {
+        let incoming = postcard::to_allocvec(&self.spec.text)
+            .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let needs_reindex = {
+            let meta = tx.open_table(META).map_err(redb::Error::from)?;
+            let stored = meta.get("fts_spec").map_err(redb::Error::from)?;
+            match stored {
+                Some(v) => v.value() != incoming.as_slice(),
+                None => !self.spec.text.is_empty(),
+            }
+        };
+        if needs_reindex {
+            {
+                let mut postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
+                let mut docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
+                let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
+                postings.retain(|_, _| false).map_err(redb::Error::from)?;
+                docs.retain(|_, _| false).map_err(redb::Error::from)?;
+                meta.insert("fts_doc_count", 0u64.to_le_bytes().as_slice())
+                    .map_err(redb::Error::from)?;
+                meta.insert("fts_total_len", 0u64.to_le_bytes().as_slice())
+                    .map_err(redb::Error::from)?;
+
+                let nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
+                for entry in nodes.iter().map_err(redb::Error::from)? {
+                    let (_, v) = entry.map_err(redb::Error::from)?;
+                    let rec: NodeRecord = postcard::from_bytes(v.value())
+                        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                    let new_text = doc_text(&self.spec, &rec);
+                    fts_update(&mut postings, &mut docs, &mut meta, rec.id, None, new_text.as_deref())?;
+                }
+                meta.insert("fts_spec", incoming.as_slice()).map_err(redb::Error::from)?;
+            }
+        }
+        tx.commit().map_err(redb::Error::from)?;
+        Ok(())
     }
 
     pub fn format_version(&self) -> Result<u32, TopoError> {
@@ -148,11 +207,47 @@ impl Storage {
         let resolved: Vec<Op> = ops.into_iter().map(|op| resolve_op(op, now_ms)).collect();
 
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        // Text-index edits collected during the op loop and applied AFTER every
+        // op has succeeded — still inside this transaction, so the postings
+        // ride the batch's atomicity (a later failing op aborts the whole txn,
+        // leaving the index untouched). `old_text` is captured BEFORE `apply_op`
+        // mutates the record.
+        let mut fts_edits: Vec<(NodeId, Option<String>, Option<String>)> = Vec::new();
         {
             let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
             let mut edges = tx.open_table(EDGES).map_err(redb::Error::from)?;
             for op in &resolved {
+                let pre: Option<(NodeId, Option<String>)> = match op {
+                    Op::CreateNode { id, .. } => Some((*id, None)),
+                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
+                        Some((*id, read_node(&nodes, *id)?.and_then(|rec| doc_text(&self.spec, &rec))))
+                    }
+                    // SetEmbedding never changes text; edge ops carry none.
+                    _ => None,
+                };
                 apply_op(&mut nodes, &mut edges, op)?;
+                if let Some((id, old_text)) = pre {
+                    let new_text = match op {
+                        Op::RemoveNode { .. } => None,
+                        _ => read_node(&nodes, id)?.and_then(|rec| doc_text(&self.spec, &rec)),
+                    };
+                    fts_edits.push((id, old_text, new_text));
+                }
+            }
+        }
+        {
+            let mut postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
+            let mut docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
+            let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
+            for (id, old_text, new_text) in &fts_edits {
+                fts_update(
+                    &mut postings,
+                    &mut docs,
+                    &mut meta,
+                    *id,
+                    old_text.as_deref(),
+                    new_text.as_deref(),
+                )?;
             }
         }
 
@@ -296,15 +391,50 @@ impl Storage {
         {
             let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
             let mut edges = tx.open_table(EDGES).map_err(redb::Error::from)?;
+            // The text index is derived from state, so it is drained and rebuilt
+            // alongside NODES/EDGES through the very same `fts_update` used on the
+            // write path — no parallel maintenance logic.
+            let mut postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
+            let mut docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
+            let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
             nodes.retain(|_, _| false).map_err(redb::Error::from)?;
             edges.retain(|_, _| false).map_err(redb::Error::from)?;
+            postings.retain(|_, _| false).map_err(redb::Error::from)?;
+            docs.retain(|_, _| false).map_err(redb::Error::from)?;
+            meta.insert("fts_doc_count", 0u64.to_le_bytes().as_slice())
+                .map_err(redb::Error::from)?;
+            meta.insert("fts_total_len", 0u64.to_le_bytes().as_slice())
+                .map_err(redb::Error::from)?;
 
             let ops_table = tx.open_table(OPS).map_err(redb::Error::from)?;
             for entry in ops_table.iter().map_err(redb::Error::from)? {
                 let (_, v) = entry.map_err(redb::Error::from)?;
                 let op: Op = postcard::from_bytes(v.value())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                // Same (id, old_text, new_text) derivation as `apply_batch`:
+                // old_text read BEFORE `apply_op` mutates the record.
+                let pre: Option<(NodeId, Option<String>)> = match &op {
+                    Op::CreateNode { id, .. } => Some((*id, None)),
+                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
+                        Some((*id, read_node(&nodes, *id)?.and_then(|rec| doc_text(&self.spec, &rec))))
+                    }
+                    _ => None,
+                };
                 apply_op(&mut nodes, &mut edges, &op)?;
+                if let Some((id, old_text)) = pre {
+                    let new_text = match &op {
+                        Op::RemoveNode { .. } => None,
+                        _ => read_node(&nodes, id)?.and_then(|rec| doc_text(&self.spec, &rec)),
+                    };
+                    fts_update(
+                        &mut postings,
+                        &mut docs,
+                        &mut meta,
+                        id,
+                        old_text.as_deref(),
+                        new_text.as_deref(),
+                    )?;
+                }
             }
         }
         tx.commit().map_err(redb::Error::from)?;
@@ -340,7 +470,7 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
     }
 }
 
-fn node_key(id: NodeId) -> [u8; 16] {
+pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
     id.0 .0.to_be_bytes()
 }
 
