@@ -21,11 +21,10 @@ pub struct Db {
 }
 
 struct Inner {
-    // Not read directly by `Db`'s own methods right now (they go through
-    // `snap`) — kept alive here so the underlying `redb::Database`'s file
-    // handle stays open for the lifetime of the `Db`, and for the (future)
-    // query layer that will read through it directly.
-    #[allow(dead_code)]
+    // Read directly by `rebuild_state_from_ops`/`debug_dump_*`, and kept
+    // alive here so the underlying `redb::Database`'s file handle stays open
+    // for the lifetime of the `Db`, and for the (future) query layer that
+    // will read through it directly.
     storage: Arc<Storage>,
     // In-memory adjacency snapshot. The applier thread is the *only* writer
     // (see `open`'s loop below); readers `load_full()` and never block on
@@ -161,6 +160,38 @@ impl Db {
             .filter(|e| e.other == to && e.valid_to.is_none())
             .map(|e| e.edge)
             .collect()
+    }
+
+    /// Rebuilds NODES/EDGES from the OPS log (see
+    /// `Storage::rebuild_state_from_ops`) and swaps in a fresh
+    /// `Snapshot::from_storage` so readers observe the rebuilt state — the
+    /// existing snapshot is derived incrementally and would otherwise go
+    /// stale relative to storage the moment the tables are drained.
+    pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
+        self.inner.storage.rebuild_state_from_ops()?;
+        let fresh = Snapshot::from_storage(&self.inner.storage)?;
+        self.inner.snap.store(Arc::new(fresh));
+        Ok(())
+    }
+
+    /// Test/inspection helper: every node currently in storage, sorted by
+    /// id for deterministic comparison. `#[doc(hidden)]` — see
+    /// `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_dump_nodes(&self) -> Vec<crate::state::NodeRecord> {
+        let mut out = self.inner.storage.all_nodes().expect("debug dump: storage read failed");
+        out.sort_by_key(|n| n.id);
+        out
+    }
+
+    /// Test/inspection helper: every edge currently in storage, sorted by
+    /// id for deterministic comparison. `#[doc(hidden)]` — see
+    /// `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_dump_edges(&self) -> Vec<crate::state::EdgeRecord> {
+        let mut out = self.inner.storage.all_edges().expect("debug dump: storage read failed");
+        out.sort_by_key(|e| e.id);
+        out
     }
 }
 

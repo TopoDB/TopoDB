@@ -141,7 +141,6 @@ impl Storage {
 
     /// Crate-internal full scan — used to rebuild in-memory adjacency. Not
     /// public API: callers should go through the (future) query layer.
-    #[allow(dead_code)]
     pub(crate) fn all_nodes(&self) -> Result<Vec<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(NODES).map_err(redb::Error::from)?;
@@ -155,7 +154,6 @@ impl Storage {
         Ok(out)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn all_edges(&self) -> Result<Vec<EdgeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(EDGES).map_err(redb::Error::from)?;
@@ -167,6 +165,40 @@ impl Storage {
             out.push(rec);
         }
         Ok(out)
+    }
+
+    /// Rebuilds NODES/EDGES from scratch by replaying the OPS log in seq
+    /// order through the same `apply_op` used by `apply_batch` — no parallel
+    /// mutation logic. One write transaction: the state tables are drained
+    /// and repopulated atomically, so a reader (or a crash) never observes a
+    /// partially-rebuilt graph.
+    ///
+    /// Validation (endpoint existence, cross-scope rule, missing/duplicate
+    /// close, ...) is *not* re-run here: every op in the log already passed
+    /// it at append time, and `apply_batch` only ever appends ops it also
+    /// applied successfully in the same transaction. `apply_op` still
+    /// enforces its own invariants (e.g. `RemoveNode` on a target that
+    /// doesn't exist), but replaying a valid log in order cannot hit those
+    /// paths; if it does, the log itself is corrupt and surfacing
+    /// `TopoError::Rejected` here is the correct, honest outcome.
+    pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
+        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        {
+            let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
+            let mut edges = tx.open_table(EDGES).map_err(redb::Error::from)?;
+            nodes.retain(|_, _| false).map_err(redb::Error::from)?;
+            edges.retain(|_, _| false).map_err(redb::Error::from)?;
+
+            let ops_table = tx.open_table(OPS).map_err(redb::Error::from)?;
+            for entry in ops_table.iter().map_err(redb::Error::from)? {
+                let (_, v) = entry.map_err(redb::Error::from)?;
+                let op: Op = postcard::from_bytes(v.value())
+                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                apply_op(&mut nodes, &mut edges, &op)?;
+            }
+        }
+        tx.commit().map_err(redb::Error::from)?;
+        Ok(())
     }
 }
 
