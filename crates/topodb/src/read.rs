@@ -60,7 +60,11 @@ impl Db {
     #[must_use]
     pub fn node(&self, scopes: &ScopeSet, id: NodeId) -> Option<NodeRecord> {
         let snap = self.snapshot();
-        snap.nodes.get(&id).filter(|n| scopes.contains(n.scope)).cloned()
+        let hit = snap.nodes.get(&id).filter(|n| scopes.contains(n.scope)).cloned();
+        if hit.is_some() {
+            self.bump([id]);
+        }
+        hit
     }
 
     /// All nodes with the given `label`, restricted to `scopes`. Order is
@@ -68,11 +72,14 @@ impl Db {
     #[must_use]
     pub fn nodes_by_label(&self, scopes: &ScopeSet, label: &str) -> Vec<NodeRecord> {
         let snap = self.snapshot();
-        snap.nodes
+        let hits: Vec<NodeRecord> = snap
+            .nodes
             .values()
             .filter(|n| n.label == label && scopes.contains(n.scope))
             .cloned()
-            .collect()
+            .collect();
+        self.bump(hits.iter().map(|n| n.id));
+        hits
     }
 
     /// Equality lookup against the declared `(label, prop)` index:
@@ -181,7 +188,9 @@ impl Db {
             .filter_map(|id| snap.edges.get(id).cloned())
             .collect();
 
-        Ok(Subgraph { nodes, edges })
+        let sg = Subgraph { nodes, edges };
+        self.bump(sg.nodes.iter().map(|n| n.id));
+        Ok(sg)
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::counters::AccessStats;
 use crate::error::TopoError;
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::index::IndexSpec;
@@ -11,6 +12,10 @@ pub const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
 pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 pub const NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
 pub const EDGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edges");
+/// Auxiliary per-node access statistics, keyed by the same 16-byte node key as
+/// NODES. Deliberately *outside* the op log: never appended to OPS, never
+/// broadcast to the change feed, and never touched by `rebuild_state_from_ops`.
+pub(crate) const COUNTERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("counters");
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -44,6 +49,7 @@ impl Storage {
             tx.open_table(OPS).map_err(redb::Error::from)?;
             tx.open_table(NODES).map_err(redb::Error::from)?;
             tx.open_table(EDGES).map_err(redb::Error::from)?;
+            tx.open_table(COUNTERS).map_err(redb::Error::from)?;
             let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
             // Read the stored version into an owned value first so the read
             // guard's borrow of `meta` ends before we (maybe) insert into it.
@@ -213,6 +219,60 @@ impl Storage {
         Ok(out)
     }
 
+    /// Folds a batch of access-counter bumps into the COUNTERS table in ONE
+    /// write transaction. Each `(id, n, ts)` is applied read-modify-write:
+    /// `access_count += n`, `last_accessed_at = max(existing, ts)`. This is the
+    /// only writer of COUNTERS and is driven exclusively by the applier thread
+    /// via `Job::BumpCounters`, so bumps serialize with (but are recorded
+    /// separately from) graph writes. Nothing here appends to OPS or broadcasts
+    /// to the change feed — counters live outside the durable log by design.
+    pub(crate) fn merge_counter_bumps(
+        &self,
+        bumps: &[(NodeId, u64, i64)],
+    ) -> Result<(), TopoError> {
+        if bumps.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        {
+            let mut table = tx.open_table(COUNTERS).map_err(redb::Error::from)?;
+            for (id, n, ts) in bumps {
+                let key = node_key(*id);
+                let existing = match table.get(key.as_slice()).map_err(redb::Error::from)? {
+                    Some(v) => postcard::from_bytes::<AccessStats>(v.value())
+                        .map_err(|e| TopoError::Encoding(e.to_string()))?,
+                    None => AccessStats::default(),
+                };
+                let merged = AccessStats {
+                    access_count: existing.access_count + n,
+                    last_accessed_at: existing.last_accessed_at.max(*ts),
+                };
+                let bytes = postcard::to_allocvec(&merged)
+                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                table.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+            }
+        }
+        tx.commit().map_err(redb::Error::from)?;
+        Ok(())
+    }
+
+    /// Reads the raw counter row for `id`, or `None` if the node has never been
+    /// counted. Scope gating is the caller's responsibility (`Db::access_stats`
+    /// checks node existence/scope first); this is a pure COUNTERS lookup.
+    pub(crate) fn read_counter(&self, id: NodeId) -> Result<Option<AccessStats>, TopoError> {
+        let tx = self.db.begin_read().map_err(redb::Error::from)?;
+        let table = tx.open_table(COUNTERS).map_err(redb::Error::from)?;
+        let key = node_key(id);
+        match table.get(key.as_slice()).map_err(redb::Error::from)? {
+            None => Ok(None),
+            Some(v) => {
+                let stats: AccessStats = postcard::from_bytes(v.value())
+                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                Ok(Some(stats))
+            }
+        }
+    }
+
     /// Rebuilds NODES/EDGES from scratch by replaying the OPS log in seq
     /// order through the same `apply_op` used by `apply_batch` — no parallel
     /// mutation logic. One write transaction: the state tables are drained
@@ -227,6 +287,10 @@ impl Storage {
     /// doesn't exist), but replaying a valid log in order cannot hit those
     /// paths; if it does, the log itself is corrupt and surfacing
     /// `TopoError::Rejected` here is the correct, honest outcome.
+    ///
+    /// The COUNTERS table is intentionally *not* opened or drained here: access
+    /// counters are auxiliary telemetry outside the op log, so a state rebuild
+    /// must preserve them rather than reset them to zero.
     pub(crate) fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
         {

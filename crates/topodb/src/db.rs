@@ -1,7 +1,8 @@
+use crate::counters::AccessStats;
 use crate::error::TopoError;
 use crate::feed::ChangeEvent;
 use crate::graph::Snapshot;
-use crate::ids::{EdgeId, NodeId};
+use crate::ids::{EdgeId, NodeId, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
@@ -23,6 +24,13 @@ enum Job {
     },
     Rebuild {
         reply: Sender<Result<(), TopoError>>,
+    },
+    /// Fire-and-forget batch of access-counter bumps folded into COUNTERS by
+    /// the applier. No reply channel: bumps are auxiliary telemetry, so the
+    /// applier logs nothing, broadcasts nothing to the change feed, and never
+    /// acknowledges. Enqueued only by the bumper thread (see `open_with`).
+    BumpCounters {
+        bumps: Vec<(NodeId, u64, i64)>,
     },
 }
 
@@ -56,6 +64,14 @@ struct Inner {
     // close and `join()` would hang forever.
     tx: Mutex<Option<Sender<Job>>>,
     applier: Mutex<Option<std::thread::JoinHandle<()>>>,
+    // `Sender` half of the bump channel feeding the bumper thread. Reads
+    // `try_send` `(NodeId, ts)` pairs here; the bumper accumulates and flushes
+    // them as batched `Job::BumpCounters`. Wrapped in `Option` so `Drop` can
+    // take+drop it *first* (before joining the bumper) — closing this channel
+    // is what makes the bumper's `recv_timeout` loop see `Disconnected`, do its
+    // final flush, and exit. See `Drop for Inner` for the full ordering.
+    bump_tx: Mutex<Option<Sender<(NodeId, i64)>>>,
+    bumper: Mutex<Option<std::thread::JoinHandle<()>>>,
     // Change-feed subscriber registry: the bounded `Sender` half of every
     // live `subscribe` channel. The applier clones this `Arc` at spawn and is
     // the *only* broadcaster; `subscribe` pushes a new sender under the mutex.
@@ -179,6 +195,54 @@ impl Db {
                         };
                         let _ = reply.send(result);
                     }
+                    Job::BumpCounters { bumps } => {
+                        // Auxiliary telemetry: fold into COUNTERS and move on.
+                        // Deliberately NO op-log append and NO change-feed
+                        // broadcast (the feed's broadcast lives only in the
+                        // `Job::Apply` success arm above and stays there) — and
+                        // no reply, since bumps are fire-and-forget. A failed
+                        // write is swallowed: losing best-effort counters must
+                        // never take down the applier.
+                        let _ = storage_for_applier.merge_counter_bumps(&bumps);
+                    }
+                }
+            }
+        });
+
+        // Bumper thread: owns batching of access-counter bumps so reads never
+        // pay a per-hit write. It holds a *clone* of the applier `Sender` and
+        // forwards accumulated bumps as `Job::BumpCounters`. Because of that
+        // clone, `Drop for Inner` MUST join this thread *before* dropping the
+        // applier `tx` — otherwise the applier channel never closes and the
+        // applier join hangs (see `Drop for Inner`).
+        let (bump_tx, bump_rx) = bounded::<(NodeId, i64)>(4096);
+        let applier_tx_for_bumper = tx.clone();
+        let bumper = std::thread::spawn(move || {
+            let mut pending: std::collections::HashMap<NodeId, (u64, i64)> = Default::default();
+            let flush = |pending: &mut std::collections::HashMap<NodeId, (u64, i64)>| {
+                if pending.is_empty() {
+                    return;
+                }
+                let bumps: Vec<(NodeId, u64, i64)> =
+                    pending.drain().map(|(id, (n, ts))| (id, n, ts)).collect();
+                // Applier gone (shutdown race) → drop silently; aux data.
+                let _ = applier_tx_for_bumper.send(Job::BumpCounters { bumps });
+            };
+            loop {
+                match bump_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok((id, ts)) => {
+                        let e = pending.entry(id).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 = e.1.max(ts);
+                        if pending.len() >= 256 {
+                            flush(&mut pending);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => flush(&mut pending),
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        flush(&mut pending);
+                        break;
+                    }
                 }
             }
         });
@@ -190,6 +254,8 @@ impl Db {
                 tx: Mutex::new(Some(tx)),
                 applier: Mutex::new(Some(applier)),
                 subs,
+                bump_tx: Mutex::new(Some(bump_tx)),
+                bumper: Mutex::new(Some(bumper)),
             }),
         })
     }
@@ -210,6 +276,51 @@ impl Db {
     #[must_use]
     pub fn debug_snapshot(&self) -> Arc<Snapshot> {
         self.inner.snap.load_full()
+    }
+
+    /// Records an access bump for each id in `ids`, timestamped with a single
+    /// wall-clock read taken once per call. Fire-and-forget: each `(id, now)`
+    /// is `try_send`'d to the bumper thread, and on a full or closed channel it
+    /// is *silently dropped*. Counters are auxiliary telemetry — a read must
+    /// never block, retry, or fail because the counter pipeline is saturated or
+    /// shutting down. Called from the scoped read paths (`node`,
+    /// `nodes_by_label`, `traverse`) with exactly the nodes they returned.
+    pub(crate) fn bump(&self, ids: impl IntoIterator<Item = NodeId>) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_millis() as i64;
+        // Clone the sender out from under the mutex so we never hold the lock
+        // across `try_send`. `None` once `Drop` has taken it — nothing to bump.
+        let tx = self.inner.bump_tx.lock().unwrap().as_ref().cloned();
+        if let Some(tx) = tx {
+            for id in ids {
+                // Full (bumper backed up) or Disconnected (shutdown) → drop.
+                let _ = tx.try_send((id, now));
+            }
+        }
+    }
+
+    /// Auxiliary access statistics for `id`, scoped exactly like [`Db::node`]:
+    /// `None` if the node is absent OR out of `scopes` (the two are
+    /// indistinguishable by design); `Some(AccessStats::default())` if the node
+    /// exists in scope but has never been counted. **Reading stats never
+    /// bumps** — this is a pure read of the COUNTERS table gated on node
+    /// existence, so callers can inspect recency without perturbing it.
+    pub fn access_stats(
+        &self,
+        scopes: &ScopeSet,
+        id: NodeId,
+    ) -> Result<Option<AccessStats>, TopoError> {
+        // Gate on scoped existence *without* going through `node()` — reading
+        // stats must never bump, and `node()` bumps. We replicate its scope
+        // filter directly against the snapshot: `None` if absent OR out of
+        // scope (indistinguishable, mirroring `node()`).
+        let snap = self.snapshot();
+        if !snap.nodes.get(&id).is_some_and(|n| scopes.contains(n.scope)) {
+            return Ok(None);
+        }
+        Ok(Some(self.inner.storage.read_counter(id)?.unwrap_or_default()))
     }
 
     /// Submits a batch of ops for application, blocking until the applier
@@ -362,10 +473,27 @@ impl Db {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Drop the sender first so the applier's `rx.recv()` loop observes a
-        // closed channel and exits, then join it. Without this, `tx` would
-        // stay alive as a field on `Inner` until after we tried to join,
-        // and the applier would block forever.
+        // Shutdown order is load-bearing because the bumper thread holds a
+        // *clone* of the applier `tx`. It must be, in exactly this sequence:
+        //
+        //   1. take+drop `bump_tx` — closes the bump channel so the bumper's
+        //      `recv_timeout` loop sees `Disconnected`, does its FINAL flush
+        //      (enqueuing one last `Job::BumpCounters` into the applier
+        //      channel), and returns.
+        //   2. join the bumper — waits for that final flush to be enqueued and
+        //      for the bumper's clone of the applier `tx` to be dropped.
+        //   3. take+drop `tx` — only now, with the bumper's clone gone, does
+        //      the applier channel actually close.
+        //   4. join the applier — its `rx.recv()` loop finally sees the closed
+        //      channel (after draining the final flush) and exits.
+        //
+        // Reorder these and you either deadlock (drop `tx` while the bumper's
+        // clone keeps the applier channel open → applier join hangs) or lose
+        // the final flush (join applier before the bumper has enqueued it).
+        self.bump_tx.lock().unwrap().take();
+        if let Some(h) = self.bumper.lock().unwrap().take() {
+            let _ = h.join();
+        }
         self.tx.lock().unwrap().take();
         if let Some(h) = self.applier.lock().unwrap().take() {
             let _ = h.join();

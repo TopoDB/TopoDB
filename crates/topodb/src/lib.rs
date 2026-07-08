@@ -1,3 +1,4 @@
+pub mod counters;
 pub mod db;
 pub mod error;
 pub mod feed;
@@ -10,6 +11,7 @@ pub mod read;
 pub mod state;
 pub mod storage;
 
+pub use counters::AccessStats;
 pub use db::Db;
 pub use error::TopoError;
 pub use feed::ChangeEvent;
