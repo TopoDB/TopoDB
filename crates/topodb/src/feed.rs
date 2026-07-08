@@ -24,5 +24,5 @@ use crate::op::Op;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeEvent {
     pub seq: u64,
-    pub op: Op,
+    pub op: std::sync::Arc<Op>,
 }

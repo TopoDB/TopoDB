@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TopoError {
     #[error("storage error: {0}")]
     Storage(#[from] redb::Error),
@@ -12,4 +13,6 @@ pub enum TopoError {
     Compacted { oldest: u64 },
     #[error("database closed")]
     Closed,
+    #[error("unsupported format version {found} (this build supports up to {supported})")]
+    UnsupportedFormat { found: u32, supported: u32 },
 }

@@ -2,7 +2,7 @@ use proptest::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use topodb::*;
-use topodb::graph::AdjEntry;
+use topodb::AdjEntry;
 
 /// Fixed, distinct vocabulary for `Intent::SetText` — deterministic (no
 /// random strings), so BM25 postings are reproducible across replay.

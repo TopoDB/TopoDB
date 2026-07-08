@@ -32,7 +32,7 @@ mod tests {
 
     fn db() -> (tempfile::TempDir, Storage) {
         let dir = tempfile::tempdir().unwrap();
-        let s = Storage::create(dir.path().join("t.redb")).unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
         (dir, s)
     }
 

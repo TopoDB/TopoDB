@@ -1,17 +1,17 @@
-pub mod counters;
-pub mod db;
-pub mod error;
-pub mod feed;
-pub mod fts;
-pub mod graph;
-pub mod ids;
-pub mod index;
-pub mod props;
-pub mod op;
-pub mod read;
-pub mod state;
-pub mod storage;
-pub mod vector;
+mod counters;
+mod db;
+mod error;
+mod feed;
+mod fts;
+mod graph;
+mod ids;
+mod index;
+mod props;
+mod op;
+mod read;
+mod state;
+mod storage;
+mod vector;
 
 pub use counters::AccessStats;
 pub use db::Db;
@@ -25,3 +25,5 @@ pub use props::{PropValue, Props};
 pub use read::{Direction, Subgraph, TraversalQuery};
 pub use state::{EdgeRecord, NodeRecord};
 pub use vector::VectorQuery;
+#[doc(hidden)]
+pub use graph::AdjEntry;

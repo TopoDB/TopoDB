@@ -9,16 +9,16 @@ use redb::{Database, ReadableTable, Table, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 
-pub const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
-pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
-pub const NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
-pub const EDGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edges");
+pub(crate) const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
+pub(crate) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+pub(crate) const NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
+pub(crate) const EDGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edges");
 /// Inverted index: UTF-8 term bytes → postcard `Vec<(NodeId, u32)>` (doc, term
 /// frequency), maintained transactionally by `fts_update`. Opened in
-/// `create_with`.
+/// `open_with`.
 pub(crate) const POSTINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("postings");
 /// Per-document token length: node key → postcard `u32`. Opened in
-/// `create_with`. Corpus totals (`fts_doc_count` / `fts_total_len`, `u64` LE)
+/// `open_with`. Corpus totals (`fts_doc_count` / `fts_total_len`, `u64` LE)
 /// live in META.
 pub(crate) const FTS_DOCS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fts_docs");
 /// Auxiliary per-node access statistics, keyed by the same 16-byte node key as
@@ -30,26 +30,26 @@ pub const FORMAT_VERSION: u32 = 1;
 
 pub struct Storage {
     pub(crate) db: Database,
-    /// The index configuration this storage was opened with. Not yet read
-    /// anywhere in this crate — Task 6's FTS indexing is the first consumer,
-    /// reading `spec.text` from storage-level write paths. Held here (not
-    /// just threaded through `Snapshot`) precisely so that write-path access
-    /// is possible without going through the in-memory snapshot.
-    #[allow(dead_code)]
+    /// The index configuration this storage was opened with. Read by
+    /// `apply_batch`/`rebuild_state_from_ops`/`ensure_fts_spec` (via
+    /// `doc_text(&self.spec, ...)`) on every write-path mutation and full
+    /// rebuild. Held here (not just threaded through `Snapshot`) precisely so
+    /// that write-path access is possible without going through the
+    /// in-memory snapshot.
     pub(crate) spec: Arc<IndexSpec>,
 }
 
 impl Storage {
-    /// Delegates to `create_with` with a default (empty) `IndexSpec` — no
-    /// declared indexes. `Db::open`/`open_with` call `create_with` directly;
+    /// Delegates to `open_with` with a default (empty) `IndexSpec` — no
+    /// declared indexes. `Db::open`/`open_with` call `open_with` directly;
     /// this delegate is currently exercised only by unit tests that don't
     /// need a custom spec, hence `#[allow(dead_code)]` in non-test builds.
     #[allow(dead_code)]
-    pub(crate) fn create(path: impl AsRef<Path>) -> Result<Self, TopoError> {
-        Self::create_with(path, Arc::new(IndexSpec::default()))
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, TopoError> {
+        Self::open_with(path, Arc::new(IndexSpec::default()))
     }
 
-    pub(crate) fn create_with(path: impl AsRef<Path>, spec: Arc<IndexSpec>) -> Result<Self, TopoError> {
+    pub(crate) fn open_with(path: impl AsRef<Path>, spec: Arc<IndexSpec>) -> Result<Self, TopoError> {
         let db = Database::create(path).map_err(redb::Error::from)?;
         let s = Self { db, spec };
         // Ensure tables + format version exist.
@@ -78,6 +78,9 @@ impl Storage {
                 None => {
                     meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                         .map_err(redb::Error::from)?;
+                }
+                Some(found) if found > FORMAT_VERSION => {
+                    return Err(TopoError::UnsupportedFormat { found, supported: FORMAT_VERSION });
                 }
                 Some(found) if found != FORMAT_VERSION => {
                     return Err(TopoError::Encoding(format!(
@@ -139,6 +142,12 @@ impl Storage {
         Ok(())
     }
 
+    /// Reads back the stored `format_version`. `Storage` itself is not part
+    /// of the crate's public API (never re-exported from `lib.rs`), so this
+    /// `pub` is inert outside the crate; it is exercised only by unit tests
+    /// today, hence `#[allow(dead_code)]` in non-test builds — same class as
+    /// `append_ops`/`open` above.
+    #[allow(dead_code)]
     pub fn format_version(&self) -> Result<u32, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let meta = tx.open_table(META).map_err(redb::Error::from)?;
@@ -274,12 +283,18 @@ impl Storage {
         Ok(AppliedBatch { first_seq, last_seq, resolved })
     }
 
+    /// Same rationale/`#[allow(dead_code)]` as `format_version` above:
+    /// crate-internal only (`Storage` isn't re-exported), exercised only by
+    /// unit tests today.
+    #[allow(dead_code)]
     pub fn load_node(&self, id: NodeId) -> Result<Option<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(NODES).map_err(redb::Error::from)?;
         read_node(&table, id)
     }
 
+    /// See `load_node`.
+    #[allow(dead_code)]
     pub fn load_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(EDGES).map_err(redb::Error::from)?;
@@ -647,7 +662,7 @@ mod tests {
     #[test]
     fn append_assigns_monotonic_seq_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Storage::create(dir.path().join("t.redb")).unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
         let scope = Scope::Id(ScopeId::new());
         let ops = vec![
             Op::CreateNode { id: NodeId::new(), scope, label: "Memory".into(), props: Default::default() },
@@ -666,7 +681,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         // A freshly-created db opens fine and stamps FORMAT_VERSION.
-        drop(Storage::create(&path).unwrap());
+        drop(Storage::open(&path).unwrap());
 
         // Corrupt the stored version to an unsupported value via a raw redb
         // write (bypassing `Storage`, which is the whole point).
@@ -682,14 +697,17 @@ mod tests {
 
         // Reopening must now be rejected rather than silently accepted.
         // `.err()` drops the (non-`Debug`) `Storage` from the `Ok` arm.
-        let err = Storage::create(&path).err().expect("reopen must be rejected");
-        assert!(matches!(err, TopoError::Encoding(_)), "expected Encoding error, got {err:?}");
+        let err = Storage::open(&path).err().expect("reopen must be rejected");
+        match err {
+            TopoError::UnsupportedFormat { found: 2, supported: 1 } => {}
+            other => panic!("expected UnsupportedFormat {{ found: 2, supported: 1 }}, got {other:?}"),
+        }
     }
 
     #[test]
     fn set_embedding_lands_in_record_and_rejects_missing_node() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Storage::create(dir.path().join("t.redb")).unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
         let scope = Scope::Id(ScopeId::new());
         let id = NodeId::new();
         s.apply_batch(
@@ -719,7 +737,7 @@ mod tests {
     #[test]
     fn append_ops_rejects_empty_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Storage::create(dir.path().join("t.redb")).unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
 
         let err = s.append_ops(&[]).unwrap_err();
         assert!(matches!(err, TopoError::Rejected(_)));

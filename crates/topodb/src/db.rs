@@ -44,6 +44,17 @@ pub struct Db {
     inner: Arc<Inner>,
 }
 
+// Manual (not derived) so this doesn't force `Debug` on every field of
+// `Inner` (several of which — `Storage`, `ArcSwap<Snapshot>` — don't derive
+// it and aren't otherwise worth adding it to). `Db` itself carries no useful
+// state to print; this exists so `Result<Db, TopoError>` — e.g. in a test's
+// `panic!("{other:?}")` fallback arm — is formattable.
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db").finish_non_exhaustive()
+    }
+}
+
 struct Inner {
     // Read directly by `rebuild_state_from_ops`/`debug_dump_*`, and kept
     // alive here so the underlying `redb::Database`'s file handle stays open
@@ -107,7 +118,7 @@ impl Db {
     pub fn open_with(path: impl AsRef<Path>, spec: IndexSpec) -> Result<Self, TopoError> {
         spec.validate()?;
         let spec = Arc::new(spec);
-        let storage = Arc::new(Storage::create_with(path, spec.clone())?);
+        let storage = Arc::new(Storage::open_with(path, spec.clone())?);
         let initial_snapshot = Snapshot::from_storage(&storage, spec.clone())?;
         // Build the vector index from the same initial snapshot before it is
         // moved into the `ArcSwap`. The applier captures a clone below.
@@ -173,12 +184,21 @@ impl Db {
                                 // subscriber. Only successful `Job::Apply`
                                 // batches broadcast — rejects and rebuilds
                                 // emit nothing.
+                                // Wrap each op in an `Arc` ONCE per op for the
+                                // whole batch (not once per op per
+                                // subscriber) — every subscriber below then
+                                // only pays for a cheap `Arc::clone`.
+                                let ev_ops: Vec<Arc<Op>> = batch
+                                    .resolved
+                                    .iter()
+                                    .map(|op| Arc::new(op.clone()))
+                                    .collect();
                                 let mut subs = subs_for_applier.lock().unwrap();
                                 subs.retain(|s| {
-                                    for (i, op) in batch.resolved.iter().enumerate() {
+                                    for (i, ev_op) in ev_ops.iter().enumerate() {
                                         let ev = ChangeEvent {
                                             seq: batch.first_seq + i as u64,
-                                            op: op.clone(),
+                                            op: ev_op.clone(),
                                         };
                                         match s.try_send(ev) {
                                             Ok(()) => {}
@@ -409,8 +429,12 @@ impl Db {
     /// been dropped is pruned from the registry on the next broadcast.
     /// Rejected batches, counter flushes, and rebuilds broadcast nothing;
     /// reads never produce events.
+    ///
+    /// A `capacity` of 0 is clamped to 1 — crossbeam's zero-capacity channels
+    /// are rendezvous channels, which would silently drop nearly every event.
     #[must_use]
     pub fn subscribe(&self, capacity: usize) -> Receiver<ChangeEvent> {
+        let capacity = capacity.max(1);
         let (tx, rx) = bounded::<ChangeEvent>(capacity);
         self.inner.subs.lock().unwrap().push(tx);
         rx
@@ -430,7 +454,7 @@ impl Db {
     /// retained, so any `since_seq` succeeds.
     pub fn ops_since(&self, since_seq: u64) -> Result<Vec<ChangeEvent>, TopoError> {
         let ops = self.inner.storage.read_ops(since_seq)?;
-        Ok(ops.into_iter().map(|(seq, op)| ChangeEvent { seq, op }).collect())
+        Ok(ops.into_iter().map(|(seq, op)| ChangeEvent { seq, op: Arc::new(op) }).collect())
     }
 
     /// Clones the job `Sender` out of the mutex and releases the guard before
