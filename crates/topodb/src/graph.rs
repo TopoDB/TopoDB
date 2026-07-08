@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 /// One directed adjacency edge, as seen from either endpoint. `other` is the
 /// node at the far end (i.e. under `out[from]`, `other == to`; under
 /// `inn[to]`, `other == from`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdjEntry {
     pub edge: EdgeId,
     pub ty: SmolStr,
@@ -128,11 +128,19 @@ impl Snapshot {
                     nodes.remove(id);
                     // Drop this node's own adjacency lists, and purge the
                     // matching reverse entries recorded under the *other*
-                    // endpoint's key in the opposite map.
+                    // endpoint's key in the opposite map. `from_storage`
+                    // never creates a key for a node with zero edges, so an
+                    // incrementally-emptied vector's key must also be
+                    // removed here — otherwise `out`/`inn` diverge from a
+                    // from-scratch rebuild (stale empty-vector keys) and
+                    // grow unboundedly under churn.
                     if let Some(entries) = out.remove(id) {
                         for e in entries.iter() {
                             if let Some(v) = inn.get_mut(&e.other) {
                                 v.retain(|x| x.edge != e.edge);
+                                if v.is_empty() {
+                                    inn.remove(&e.other);
+                                }
                             }
                         }
                     }
@@ -140,6 +148,9 @@ impl Snapshot {
                         for e in entries.iter() {
                             if let Some(v) = out.get_mut(&e.other) {
                                 v.retain(|x| x.edge != e.edge);
+                                if v.is_empty() {
+                                    out.remove(&e.other);
+                                }
                             }
                         }
                     }
@@ -191,7 +202,7 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Db, EdgeId, NodeId, Op, Scope, ScopeId};
+    use crate::{AdjEntry, Db, EdgeId, NodeId, Op, Scope, ScopeId};
 
     #[test]
     fn incremental_snapshot_equals_rebuild() {
@@ -208,9 +219,12 @@ mod tests {
             }])
             .unwrap();
         }
+        let mut edge_ids: Vec<EdgeId> = Vec::new();
         for w in ids.windows(2) {
+            let e = EdgeId::new();
+            edge_ids.push(e);
             db.submit(vec![Op::CreateEdge {
-                id: EdgeId::new(),
+                id: e,
                 scope,
                 ty: "NEXT".into(),
                 from: w[0],
@@ -220,6 +234,13 @@ mod tests {
             }])
             .unwrap();
         }
+
+        // Close one edge (well clear of the node we're about to remove) —
+        // exercises CloseEdge's endpoint lookup and per-entry valid_to
+        // update on both `out` and `inn`.
+        let closed_edge = edge_ids[10]; // edge ids[10] -> ids[11]
+        db.submit(vec![Op::CloseEdge { id: closed_edge, valid_to: None }]).unwrap();
+
         db.submit(vec![Op::RemoveNode { id: ids[25] }]).unwrap();
 
         let live = db.snapshot();
@@ -229,10 +250,54 @@ mod tests {
         let rebuilt = db2.snapshot();
 
         assert_eq!(live.nodes.len(), rebuilt.nodes.len());
-        for (id, entries) in live.out.iter() {
-            let r = rebuilt.out.get(id).cloned().unwrap_or_default();
-            assert_eq!(entries.len(), r.len(), "out-degree mismatch at {id:?}");
-        }
         assert!(rebuilt.nodes.get(&ids[25]).is_none());
+
+        // Full key-set equality — not per-key degree via
+        // `unwrap_or_default()`, which can't distinguish "empty vector left
+        // behind under this key" from "no entry for this key at all" (the
+        // latter is what `from_storage` always produces for degree-0 nodes).
+        let live_out_keys: std::collections::BTreeSet<NodeId> = live.out.keys().copied().collect();
+        let rebuilt_out_keys: std::collections::BTreeSet<NodeId> =
+            rebuilt.out.keys().copied().collect();
+        assert_eq!(live_out_keys, rebuilt_out_keys, "out key-set mismatch");
+
+        let live_inn_keys: std::collections::BTreeSet<NodeId> = live.inn.keys().copied().collect();
+        let rebuilt_inn_keys: std::collections::BTreeSet<NodeId> =
+            rebuilt.inn.keys().copied().collect();
+        assert_eq!(live_inn_keys, rebuilt_inn_keys, "inn key-set mismatch");
+
+        // Entry-for-entry equality (sorted by EdgeId), not just counts.
+        fn sorted(v: &im::Vector<AdjEntry>) -> Vec<AdjEntry> {
+            let mut v: Vec<AdjEntry> = v.iter().cloned().collect();
+            v.sort_by_key(|e| e.edge);
+            v
+        }
+        for key in &live_out_keys {
+            let l = sorted(live.out.get(key).unwrap());
+            let r = sorted(rebuilt.out.get(key).unwrap());
+            assert_eq!(l, r, "out entries mismatch at {key:?}");
+        }
+        for key in &live_inn_keys {
+            let l = sorted(live.inn.get(key).unwrap());
+            let r = sorted(rebuilt.inn.get(key).unwrap());
+            assert_eq!(l, r, "inn entries mismatch at {key:?}");
+        }
+
+        // The closed edge's `valid_to` must agree, live vs. rebuilt, at both
+        // endpoints (out[from] and inn[to]).
+        let (from, to) = (ids[10], ids[11]);
+        let live_out_entry =
+            live.out.get(&from).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
+        let rebuilt_out_entry =
+            rebuilt.out.get(&from).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
+        assert!(live_out_entry.valid_to.is_some());
+        assert_eq!(live_out_entry.valid_to, rebuilt_out_entry.valid_to);
+
+        let live_inn_entry =
+            live.inn.get(&to).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
+        let rebuilt_inn_entry =
+            rebuilt.inn.get(&to).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
+        assert!(live_inn_entry.valid_to.is_some());
+        assert_eq!(live_inn_entry.valid_to, rebuilt_inn_entry.valid_to);
     }
 }
