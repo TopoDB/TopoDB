@@ -107,6 +107,27 @@ fn compaction_enforces_ops_since_contract() {
 }
 
 #[test]
+fn append_after_empty_compaction_resumes_at_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let scope = Scope::Id(ScopeId::new());
+    for _ in 0..5 {
+        db.submit(vec![Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() }]).unwrap();
+    }
+    db.compact_ops(6).unwrap(); // empty the log; floor = 6
+
+    // The next append must land AT the floor, not restart at seq 1 — a
+    // sub-floor seq would be committed yet permanently unreadable via
+    // ops_since, and would break the seq monotonicity the subscribe/dedup
+    // recipe depends on.
+    db.submit(vec![Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() }]).unwrap();
+    assert_eq!(db.current_seq().unwrap(), 6);
+    let replay = db.ops_since(6).unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].seq, 6);
+}
+
+#[test]
 fn unsupported_format_version_errors_at_open() {
     use redb::{Database, TableDefinition};
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");

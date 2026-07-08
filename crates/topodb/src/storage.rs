@@ -227,9 +227,18 @@ impl Storage {
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
         let (first, last);
         {
+            // Floor read inside the SAME write txn as the append: after an
+            // empty-log compaction only META `"oldest_seq"` carries the seq
+            // high-water mark (`retain_in` leaves no sentinel key), so the
+            // next seq is one past the last OPS key, clamped up to the floor.
+            let floor = {
+                let meta = tx.open_table(META).map_err(redb::Error::from)?;
+                read_oldest_seq(&meta)?
+            };
             let mut table = tx.open_table(OPS).map_err(redb::Error::from)?;
             let next = table.last().map_err(redb::Error::from)?
-                .map(|(k, _)| k.value() + 1).unwrap_or(1);
+                .map(|(k, _)| k.value() + 1).unwrap_or(1)
+                .max(floor);
             first = next;
             last = next + ops.len() as u64 - 1;
             for (i, op) in ops.iter().enumerate() {
@@ -257,6 +266,12 @@ impl Storage {
     /// the log is empty. A plain storage read — no applier round-trip — so it
     /// is safe to call from any thread as the anchor for a live tail
     /// (`current_seq` then `subscribe` then `ops_since(seq + 1)`).
+    ///
+    /// On an empty-but-compacted log this returns 0 even though the next
+    /// assigned seq will be `oldest_seq` (the append paths clamp to the
+    /// floor); callers anchoring with `ops_since(current_seq() + 1)` may
+    /// therefore get `Compacted` and must re-anchor from materialized state —
+    /// the designed recovery.
     pub(crate) fn current_seq(&self) -> Result<u64, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(OPS).map_err(redb::Error::from)?;
@@ -270,8 +285,12 @@ impl Storage {
     ///   txn is aborted, not committed).
     /// - `keep_from > current_seq + 1`: would advance the floor past the log's
     ///   end (skipping never-written seqs) — `TopoError::Rejected`.
-    /// - `keep_from == current_seq + 1`: legal; retains an empty tail so the
-    ///   next append still lands at `current_seq + 1`.
+    /// - `keep_from == current_seq + 1`: legal; empties the log entirely.
+    ///   `retain_in` leaves no sentinel key behind, so after an empty-log
+    ///   compaction the seq high-water mark survives ONLY in META
+    ///   `"oldest_seq"` — the append paths (`apply_batch`/`append_ops`)
+    ///   consult that floor at append time and clamp the next seq up to it,
+    ///   which is what keeps seqs monotonic across an emptying compaction.
     ///
     /// Only ever called on the applier thread (the sole redb writer), so the
     /// `oldest_seq`/`current_seq` reads and the delete-and-stamp write are
@@ -397,12 +416,23 @@ impl Storage {
 
         let (first_seq, last_seq);
         {
+            // Same floor clamp as `append_ops`, same rationale: after an
+            // empty-log compaction the seq high-water mark lives only in META
+            // `"oldest_seq"` — deriving `next` from `OPS.last()` alone would
+            // restart at 1, committing ops BELOW the floor (permanently
+            // unreadable via `read_ops` and breaking seq monotonicity). Read
+            // inside this write txn so the clamp is atomic with the append.
+            let floor = {
+                let meta = tx.open_table(META).map_err(redb::Error::from)?;
+                read_oldest_seq(&meta)?
+            };
             let mut table = tx.open_table(OPS).map_err(redb::Error::from)?;
             let next = table
                 .last()
                 .map_err(redb::Error::from)?
                 .map(|(k, _)| k.value() + 1)
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .max(floor);
             first_seq = next;
             last_seq = next + resolved.len() as u64 - 1;
             for (i, op) in resolved.iter().enumerate() {

@@ -505,6 +505,12 @@ impl Db {
     /// call from any thread. Its purpose is to anchor a gap-free live tail:
     /// take it *before* [`subscribe`](Db::subscribe), then backfill with
     /// `ops_since(seq + 1)` (see `subscribe`'s anchoring recipe).
+    ///
+    /// One compaction edge case: on an empty-but-compacted log this returns 0,
+    /// while the next assigned seq will be the compaction floor (`oldest_seq`)
+    /// rather than 1. The anchoring recipe's `ops_since(current_seq() + 1)` can
+    /// then return [`TopoError::Compacted`] — that is not a fault, it is the
+    /// signal to re-anchor from materialized state (the designed recovery).
     #[must_use = "the seq anchors ops_since"]
     pub fn current_seq(&self) -> Result<u64, TopoError> {
         self.inner.storage.current_seq()
