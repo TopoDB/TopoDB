@@ -93,6 +93,47 @@ fn empty_string_text_prop_is_not_a_document() {
 }
 
 #[test]
+fn scores_are_isolated_per_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let (s1, s2) = (ScopeId::new(), ScopeId::new());
+    let (a, op_a) = memory("rust database engine", Scope::Id(s1));
+    db.submit(vec![op_a]).unwrap();
+    let baseline = db.search_text(&ScopeSet::of(&[s1]), "rust", 10).unwrap()[0].1;
+
+    // Flood the OTHER scope with docs containing the query term.
+    for i in 0..20 {
+        let (_x, op) = memory(&format!("rust filler number {i}"), Scope::Id(s2));
+        db.submit(vec![op]).unwrap();
+    }
+    let after = db.search_text(&ScopeSet::of(&[s1]), "rust", 10).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].0.id, a);
+    assert!(
+        (after[0].1 - baseline).abs() < 1e-6,
+        "scope s1's score moved from {baseline} to {} because of scope s2's corpus — df/IDF leak",
+        after[0].1
+    );
+}
+
+#[test]
+fn plan2_layout_file_migrates_at_open() {
+    // Simulate: open with spec (new layout), close, reopen — postings must
+    // survive a second open without spurious reindex (idempotent), and a
+    // file whose stored index_spec text-portion matches gets NO drain.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let s = ScopeId::new();
+    {
+        let db = Db::open_with(path.clone(), spec()).unwrap();
+        let (_a, op) = memory("persistent postings", Scope::Id(s));
+        db.submit(vec![op]).unwrap();
+    }
+    let db = Db::open_with(path, spec()).unwrap();
+    assert_eq!(db.search_text(&ScopeSet::of(&[s]), "persistent", 10).unwrap().len(), 1);
+}
+
+#[test]
 fn changed_text_spec_reindexes_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.redb");

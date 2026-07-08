@@ -45,6 +45,19 @@ impl ScopeSet {
             Scope::Id(id) => self.ids.contains(&id),
         }
     }
+
+    /// Every concrete scope this set admits: `Scope::Shared` (only if the set
+    /// includes shared) followed by each member `ScopeId` as `Scope::Id`.
+    /// Backs per-scope BM25 scoring in `search_text`, which reads one corpus
+    /// stat + postings row per scope and merges. The `ScopeSet` representation
+    /// (a `bool` + `BTreeSet<ScopeId>`) is directly enumerable, so this is an
+    /// exact enumeration, not an approximation.
+    pub(crate) fn iter_scopes(&self) -> impl Iterator<Item = Scope> + '_ {
+        self.include_shared
+            .then_some(Scope::Shared)
+            .into_iter()
+            .chain(self.ids.iter().map(|id| Scope::Id(*id)))
+    }
 }
 
 #[cfg(test)]

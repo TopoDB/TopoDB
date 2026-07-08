@@ -1,23 +1,26 @@
 //! Full-text search: tokenization, per-node declared text extraction,
-//! transactional postings maintenance, and scoped BM25 ranking.
+//! transactional per-scope postings maintenance, and scoped BM25 ranking.
 //!
-//! The postings/doc-length tables and the two corpus-stat META counters are
-//! maintained *inside the same redb write transaction* as the graph state, via
-//! [`fts_update`] — so a batch is atomic across NODES/EDGES **and** the text
-//! index, and a rejected batch leaves the index untouched. `apply_batch`
-//! collects `(id, old_text, new_text)` during its op loop and drives
-//! `fts_update` after every op succeeds; `rebuild_state_from_ops` reuses the
-//! very same function during replay (after draining the tables and zeroing the
-//! counters). `search_text` reads the committed tables through a fresh read
-//! transaction and scores BM25, then scope-filters through one snapshot.
+//! The postings/doc-length/per-scope-corpus tables are maintained *inside the
+//! same redb write transaction* as the graph state, via [`fts_update`] — so a
+//! batch is atomic across NODES/EDGES **and** the text index, and a rejected
+//! batch leaves the index untouched. `apply_batch` collects
+//! `(scope, id, old_text, new_text)` during its op loop and drives `fts_update`
+//! after every op succeeds; `rebuild_state_from_ops` reuses the very same
+//! function during replay (after draining POSTINGS/FTS_DOCS/FTS_STATS).
+//! Postings are keyed by `scope_key(scope) ++ term` and corpus stats live in
+//! FTS_STATS keyed by scope, so a document in one scope never shifts another
+//! scope's df/avgdl. `search_text` reads the committed tables through a fresh
+//! read transaction, scores BM25 within each requested scope's own corpus, and
+//! merges (a node lives in exactly one scope — no cross-scope key collision).
 
 use crate::db::Db;
 use crate::error::TopoError;
-use crate::ids::{NodeId, ScopeSet};
+use crate::ids::{NodeId, Scope, ScopeSet};
 use crate::index::IndexSpec;
 use crate::props::PropValue;
 use crate::state::NodeRecord;
-use crate::storage::{node_key, FTS_DOCS, META, POSTINGS};
+use crate::storage::{node_key, scope_key, FTS_DOCS, FTS_STATS, POSTINGS};
 use redb::{ReadableTable, Table};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -114,30 +117,49 @@ fn set_posting(
     Ok(())
 }
 
-/// Reads a `u64` LE corpus counter from META (`0` if absent).
-fn read_u64(
-    meta: &impl ReadableTable<&'static str, &'static [u8]>,
-    key: &str,
-) -> Result<u64, TopoError> {
-    match meta.get(key).map_err(redb::Error::from)? {
-        Some(v) => {
-            let bytes: [u8; 8] = v
-                .value()
-                .try_into()
-                .map_err(|_| TopoError::Encoding(format!("bad {key} counter")))?;
-            Ok(u64::from_le_bytes(bytes))
-        }
-        None => Ok(0),
+/// Postings key for `term` in `scope`: `scope_key(scope) ++ term-UTF-8`. The
+/// scope prefix is fixed-width (17 bytes), so no separator is needed and no
+/// term can collide across scopes (one scope's key is never a prefix of
+/// another's).
+fn posting_key(scope: Scope, term: &str) -> Vec<u8> {
+    let prefix = scope_key(scope);
+    let mut key = Vec::with_capacity(prefix.len() + term.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(term.as_bytes());
+    key
+}
+
+/// Reads a scope's `(doc_count, total_len)` corpus stats from FTS_STATS
+/// (`(0, 0)` if absent).
+fn read_stats(
+    stats: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+) -> Result<(u64, u64), TopoError> {
+    let key = scope_key(scope);
+    match stats.get(key.as_slice()).map_err(redb::Error::from)? {
+        Some(v) => postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string())),
+        None => Ok((0, 0)),
     }
 }
 
-/// Writes a `u64` LE corpus counter to META.
-fn write_u64(
-    meta: &mut Table<'_, &'static str, &'static [u8]>,
-    key: &'static str,
-    val: u64,
+/// Writes a scope's `(doc_count, total_len)` corpus stats to FTS_STATS. When
+/// the scope's last document is removed (`doc_count == 0`) the row is dropped
+/// entirely, so an emptied scope leaves no stale row claiming documents (same
+/// empty-key doctrine as the postings and prop index).
+fn write_stats(
+    stats: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scope: Scope,
+    doc_count: u64,
+    total_len: u64,
 ) -> Result<(), TopoError> {
-    meta.insert(key, val.to_le_bytes().as_slice()).map_err(redb::Error::from)?;
+    let key = scope_key(scope);
+    if doc_count == 0 {
+        stats.remove(key.as_slice()).map_err(redb::Error::from)?;
+    } else {
+        let bytes = postcard::to_allocvec(&(doc_count, total_len))
+            .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        stats.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+    }
     Ok(())
 }
 
@@ -158,22 +180,29 @@ fn read_doc_len(
 /// Transition node `id`'s indexed text from `old_text` to `new_text`, entirely
 /// within the caller's write transaction. Removes the node from every term it
 /// no longer contains, re-sets its term frequency for every term it now
-/// contains, rewrites its FTS_DOCS length, and folds the corpus counters
-/// (`fts_doc_count` / `fts_total_len`). A no-op when `old_text == new_text`.
+/// contains, rewrites its FTS_DOCS length, and folds `scope`'s corpus stats in
+/// FTS_STATS. A no-op when `old_text == new_text`.
 ///
-/// The counters move by *state transition*, not by naive addition:
+/// Postings are keyed per scope (`posting_key(scope, term)`) and corpus stats
+/// are keyed per scope (`scope_key(scope)`), so this node's edits touch only
+/// its own scope's df/doc-count/total-length — never any other scope's. A
+/// node's scope is immutable, so `scope` is the same across an update.
+///
+/// The stats move by *state transition*, not by naive addition:
 /// - `None -> Some`: a new document (`doc_count += 1`, `total_len += new_len`).
 /// - `Some -> Some`: an update in place (`doc_count` unchanged, `total_len`
 ///   adjusted by the length delta — this is where doc-count-vs-length drift
 ///   would creep in if handled carelessly).
 /// - `Some -> None`: a removed document (`doc_count -= 1`, `total_len -=
-///   old_len`).
+///   old_len`, both saturating so stats can never go negative; a scope whose
+///   last doc is removed drops its FTS_STATS row).
 ///
 /// Factored so `rebuild_state_from_ops` reuses it verbatim during replay.
 pub(crate) fn fts_update(
     postings: &mut Table<'_, &'static [u8], &'static [u8]>,
     docs: &mut Table<'_, &'static [u8], &'static [u8]>,
-    meta: &mut Table<'_, &'static str, &'static [u8]>,
+    stats: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scope: Scope,
     id: NodeId,
     old_text: Option<&str>,
     new_text: Option<&str>,
@@ -202,14 +231,13 @@ pub(crate) fn fts_update(
     terms.extend(new_tf.keys().copied());
     for term in terms {
         let count = new_tf.get(term).copied().unwrap_or(0);
-        set_posting(postings, term.as_bytes(), id, count)?;
+        set_posting(postings, posting_key(scope, term).as_slice(), id, count)?;
     }
 
     let key = node_key(id);
     let old_len = old_tokens.len() as u64;
     let new_len = new_tokens.len() as u64;
-    let mut doc_count = read_u64(meta, "fts_doc_count")?;
-    let mut total_len = read_u64(meta, "fts_total_len")?;
+    let (mut doc_count, mut total_len) = read_stats(stats, scope)?;
     match (old_text.is_some(), new_text.is_some()) {
         (false, true) => {
             doc_count += 1;
@@ -233,20 +261,27 @@ pub(crate) fn fts_update(
     } else {
         docs.remove(key.as_slice()).map_err(redb::Error::from)?;
     }
-    write_u64(meta, "fts_doc_count", doc_count)?;
-    write_u64(meta, "fts_total_len", total_len)?;
+    write_stats(stats, scope, doc_count, total_len)?;
     Ok(())
 }
 
 impl Db {
     /// Scoped BM25 full-text search over the declared text index.
     ///
-    /// `Rejected` if `k == 0` or the query tokenizes to nothing. For each
-    /// distinct query term, reads its postings and accumulates the BM25
-    /// contribution per document; `avgdl = total_len / n_docs` (empty result
-    /// when the corpus is empty). Hits are scope-filtered through a single
-    /// snapshot, sorted by descending score (id as a deterministic tie-break),
-    /// truncated to `k`, and bumped (access counters, Task 4).
+    /// Scores are computed within each scope's own corpus: df, doc count, and
+    /// average document length are all per-scope, read from that scope's
+    /// FTS_STATS row and scope-prefixed postings. Adding documents to scope B
+    /// never changes scope A's scores. Each requested scope is scored
+    /// independently and the results are merged (a node lives in exactly one
+    /// scope, so the score maps never collide across scopes).
+    ///
+    /// `Rejected` if `k == 0` or the query tokenizes to nothing. For each scope
+    /// in `scopes` and each distinct query term, reads that scope's postings
+    /// and accumulates the BM25 contribution per document; `avgdl = total_len /
+    /// n_docs` per scope (a scope with no corpus row is skipped). Hits are
+    /// mapped through a single snapshot, sorted by descending score (id as a
+    /// deterministic tie-break), truncated to `k`, and bumped (access counters,
+    /// Task 4).
     pub fn search_text(
         &self,
         scopes: &ScopeSet,
@@ -266,30 +301,33 @@ impl Db {
 
         let storage = self.storage();
         let tx = storage.db.begin_read().map_err(redb::Error::from)?;
-        let meta = tx.open_table(META).map_err(redb::Error::from)?;
-        let n_docs = read_u64(&meta, "fts_doc_count")?;
-        if n_docs == 0 {
-            return Ok(Vec::new());
-        }
-        let total_len = read_u64(&meta, "fts_total_len")?;
-        let avgdl = total_len as f32 / n_docs as f32;
-
         let postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
         let docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
+        let stats = tx.open_table(FTS_STATS).map_err(redb::Error::from)?;
 
+        // Score each requested scope against its own corpus, then merge. A node
+        // lives in exactly one scope, so its entry is only ever written under
+        // that scope's pass — no cross-scope key collision in `scores`.
         let mut scores: HashMap<NodeId, f32> = HashMap::new();
-        for term in &distinct {
-            let list = read_posting(&postings, term.as_bytes())?;
-            let df = list.len() as f32;
-            if df == 0.0 {
+        for scope in scopes.iter_scopes() {
+            let (n_docs, total_len) = read_stats(&stats, scope)?;
+            if n_docs == 0 {
                 continue;
             }
-            let idf = ((n_docs as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
-            for (id, tf) in list {
-                let len = read_doc_len(&docs, id)? as f32;
-                let tf = tf as f32;
-                let denom = tf + K1 * (1.0 - B + B * len / avgdl);
-                *scores.entry(id).or_insert(0.0) += idf * tf * (K1 + 1.0) / denom;
+            let avgdl = total_len as f32 / n_docs as f32;
+            for term in &distinct {
+                let list = read_posting(&postings, posting_key(scope, term).as_slice())?;
+                let df = list.len() as f32;
+                if df == 0.0 {
+                    continue;
+                }
+                let idf = ((n_docs as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
+                for (id, tf) in list {
+                    let len = read_doc_len(&docs, id)? as f32;
+                    let tf = tf as f32;
+                    let denom = tf + K1 * (1.0 - B + B * len / avgdl);
+                    *scores.entry(id).or_insert(0.0) += idf * tf * (K1 + 1.0) / denom;
+                }
             }
         }
 
