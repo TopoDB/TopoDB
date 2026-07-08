@@ -45,6 +45,9 @@ impl Storage {
     }
 
     pub fn append_ops(&self, ops: &[Op]) -> Result<(u64, u64), TopoError> {
+        if ops.is_empty() {
+            return Err(TopoError::Rejected("empty op batch".into()));
+        }
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
         let (first, last);
         {
@@ -99,5 +102,27 @@ mod tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].1, ops[0]);
         assert_eq!(s.format_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn append_ops_rejects_empty_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::create(dir.path().join("t.redb")).unwrap();
+
+        let err = s.append_ops(&[]).unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)));
+
+        // Nothing was appended.
+        assert!(s.read_ops(1).unwrap().is_empty());
+
+        // A subsequent real append still starts at seq 1.
+        let ops = vec![Op::CreateNode {
+            id: NodeId::new(),
+            scope: Scope::Id(ScopeId::new()),
+            label: "Memory".into(),
+            props: Default::default(),
+        }];
+        let (first, last) = s.append_ops(&ops).unwrap();
+        assert_eq!((first, last), (1, 1));
     }
 }
