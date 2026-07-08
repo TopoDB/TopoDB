@@ -6,6 +6,7 @@ use crate::ids::{EdgeId, NodeId, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
+use crate::vector::VectorIndex;
 use arc_swap::ArcSwap;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::Path;
@@ -81,6 +82,12 @@ struct Inner {
     // (not captured via `Inner`) for the same reason as `snap`: the applier
     // must never hold a strong ref back to `Inner`, or `Drop` would deadlock.
     subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
+    // Per-(model, scope) f32 embedding slabs. Held behind its own `Arc`
+    // (never captured via `Inner`, same rationale as `snap`/`subs`): the
+    // applier holds a clone and is the sole mutator of the outer slab map
+    // (slab creation, and the wholesale swap on rebuild); searches take short
+    // read locks. See `vector.rs` for the locking contract.
+    vectors: Arc<VectorIndex>,
 }
 
 impl Db {
@@ -102,6 +109,9 @@ impl Db {
         let spec = Arc::new(spec);
         let storage = Arc::new(Storage::create_with(path, spec.clone())?);
         let initial_snapshot = Snapshot::from_storage(&storage, spec.clone())?;
+        // Build the vector index from the same initial snapshot before it is
+        // moved into the `ArcSwap`. The applier captures a clone below.
+        let vectors = Arc::new(VectorIndex::from_snapshot(&initial_snapshot));
         let snap = Arc::new(ArcSwap::new(Arc::new(initial_snapshot)));
         let (tx, rx) = bounded::<Job>(256);
 
@@ -113,6 +123,7 @@ impl Db {
         let spec_for_applier = spec.clone();
         let subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>> = Arc::new(Mutex::new(Vec::new()));
         let subs_for_applier = subs.clone();
+        let vectors_for_applier = vectors.clone();
         let applier = std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 match job {
@@ -123,13 +134,31 @@ impl Db {
                                 .expect("system clock before UNIX epoch")
                                 .as_millis() as i64
                         });
+                        // Load the pre-batch snapshot ONCE. It anchors three
+                        // things: dim pre-validation (below), slab maintenance
+                        // (old embedding/scope lookups), and the incremental
+                        // `apply` fold. The applier is the sole `ArcSwap`
+                        // writer, so nothing mutates it between here and the
+                        // store.
+                        let cur = snap_for_applier.load_full();
+                        // Dim pre-validation runs BEFORE `apply_batch` so a
+                        // violation leaves storage untouched — atomic with the
+                        // rest of the batch.
+                        if let Err(e) = vectors_for_applier.prevalidate_dims(&cur, &ops) {
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
                         match storage_for_applier.apply_batch(ops, now) {
                             Ok(batch) => {
+                                // Slab maintenance runs after `apply_batch`
+                                // succeeds and BEFORE the snapshot store, using
+                                // `cur` (pre-batch) for old embedding/scope
+                                // state.
+                                vectors_for_applier.maintain(&cur, &batch.resolved);
                                 // Fold the resolved ops into a new snapshot and
                                 // store it *before* replying, so the submitter is
                                 // guaranteed to observe its own write via
                                 // `Db::snapshot`/the traversal helpers.
-                                let cur = snap_for_applier.load_full();
                                 let next = cur.apply(&batch.resolved);
                                 snap_for_applier.store(Arc::new(next));
                                 // Broadcast the committed ops to live
@@ -186,6 +215,13 @@ impl Db {
                                 spec_for_applier.clone(),
                             ) {
                                 Ok(fresh) => {
+                                    // Rebuild the vector index from the fresh
+                                    // snapshot and swap the inner slab map in
+                                    // place (under the outer write lock) — the
+                                    // applier's `Arc<VectorIndex>` is shared
+                                    // with `Db`, so only its contents may be
+                                    // replaced, not the `Arc`.
+                                    vectors_for_applier.rebuild_from(&fresh);
                                     snap_for_applier.store(Arc::new(fresh));
                                     Ok(())
                                 }
@@ -256,6 +292,7 @@ impl Db {
                 subs,
                 bump_tx: Mutex::new(Some(bump_tx)),
                 bumper: Mutex::new(Some(bumper)),
+                vectors,
             }),
         })
     }
@@ -266,6 +303,14 @@ impl Db {
     #[must_use]
     pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
         self.inner.snap.load_full()
+    }
+
+    /// The shared vector index. Cheap `Arc` clone; used by `search_vector`
+    /// (in `vector.rs`) to reach the slab map from an `impl Db` block in a
+    /// sibling module that can't touch `self.inner` directly.
+    #[must_use]
+    pub(crate) fn vectors(&self) -> Arc<VectorIndex> {
+        self.inner.vectors.clone()
     }
 
     /// Test/inspection seam: the raw (unscoped) snapshot. `#[doc(hidden)]`

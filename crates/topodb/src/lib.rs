@@ -10,6 +10,7 @@ pub mod op;
 pub mod read;
 pub mod state;
 pub mod storage;
+pub mod vector;
 
 pub use counters::AccessStats;
 pub use db::Db;
@@ -22,3 +23,4 @@ pub use op::Op;
 pub use props::{PropValue, Props};
 pub use read::{Direction, Subgraph, TraversalQuery};
 pub use state::{EdgeRecord, NodeRecord};
+pub use vector::VectorQuery;
