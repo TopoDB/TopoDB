@@ -41,9 +41,11 @@ pub struct Storage {
 
 impl Storage {
     /// Delegates to `open_with` with a default (empty) `IndexSpec` — no
-    /// declared indexes. `Db::open`/`open_with` call `open_with` directly;
-    /// this delegate is currently exercised only by unit tests that don't
-    /// need a custom spec, hence `#[allow(dead_code)]` in non-test builds.
+    /// declared indexes. Kept as the parameterless twin of `open_with`
+    /// (mirroring `Db::open`/`Db::open_with` one layer up), but it has no
+    /// non-test callers: `Db::open` delegates via `Db::open_with`, which
+    /// calls `Storage::open_with` directly. Only unit tests call this, hence
+    /// the `#[allow(dead_code)]` in non-test builds.
     #[allow(dead_code)]
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, TopoError> {
         Self::open_with(path, Arc::new(IndexSpec::default()))
@@ -82,6 +84,10 @@ impl Storage {
                 Some(found) if found > FORMAT_VERSION => {
                     return Err(TopoError::UnsupportedFormat { found, supported: FORMAT_VERSION });
                 }
+                // Reachable only for `found < FORMAT_VERSION` (the `>` arm
+                // above catches the rest) — i.e. a pre-1 file, which no
+                // released build ever writes. Kept as a guard against
+                // corrupt/hand-rolled files rather than dead logic.
                 Some(found) if found != FORMAT_VERSION => {
                     return Err(TopoError::Encoding(format!(
                         "unsupported format version {found}, this build supports {FORMAT_VERSION}"
