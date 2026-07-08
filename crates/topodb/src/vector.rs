@@ -134,7 +134,11 @@ impl Slab {
                 hits.push((*id, score));
             }
         }
-        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         hits.truncate(k);
         hits
     }
@@ -403,7 +407,11 @@ impl Db {
                 merged.extend(slab.top_k(&q.vector, q.k, filter.as_ref()));
             }
         }
-        merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         merged.truncate(q.k);
 
         let snap = self.snapshot();
