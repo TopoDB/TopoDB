@@ -27,9 +27,29 @@ impl Storage {
             tx.open_table(NODES).map_err(redb::Error::from)?;
             tx.open_table(EDGES).map_err(redb::Error::from)?;
             let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
-            if meta.get("format_version").map_err(redb::Error::from)?.is_none() {
-                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
-                    .map_err(redb::Error::from)?;
+            // Read the stored version into an owned value first so the read
+            // guard's borrow of `meta` ends before we (maybe) insert into it.
+            let existing: Option<u32> = match meta.get("format_version").map_err(redb::Error::from)? {
+                Some(v) => {
+                    let bytes: [u8; 4] = v
+                        .value()
+                        .try_into()
+                        .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
+                    Some(u32::from_le_bytes(bytes))
+                }
+                None => None,
+            };
+            match existing {
+                None => {
+                    meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                        .map_err(redb::Error::from)?;
+                }
+                Some(found) if found != FORMAT_VERSION => {
+                    return Err(TopoError::Encoding(format!(
+                        "unsupported format version {found}, this build supports {FORMAT_VERSION}"
+                    )));
+                }
+                Some(_) => {}
             }
         }
         tx.commit().map_err(redb::Error::from)?;

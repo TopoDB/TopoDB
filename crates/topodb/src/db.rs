@@ -9,7 +9,20 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type Job = (Vec<Op>, Option<i64>, Sender<Result<AppliedBatch, TopoError>>);
+/// A unit of work for the single applier thread. Both variants carry a reply
+/// channel so the submitting thread blocks until the applier has finished —
+/// and, crucially, so the *applier* remains the sole writer of the
+/// `ArcSwap<Snapshot>` for both incremental batches and full rebuilds.
+enum Job {
+    Apply {
+        ops: Vec<Op>,
+        at: Option<i64>,
+        reply: Sender<Result<AppliedBatch, TopoError>>,
+    },
+    Rebuild {
+        reply: Sender<Result<(), TopoError>>,
+    },
+}
 
 /// A handle to an open database. Cloning shares the same underlying storage
 /// and applier thread — `Db` is `Send + Sync + Clone`. All writes funnel
@@ -60,30 +73,53 @@ impl Db {
         let storage_for_applier = storage.clone();
         let snap_for_applier = snap.clone();
         let applier = std::thread::spawn(move || {
-            while let Ok((ops, at, reply)) = rx.recv() {
-                let now = at.unwrap_or_else(|| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("system clock before UNIX epoch")
-                        .as_millis() as i64
-                });
-                match storage_for_applier.apply_batch(ops, now) {
-                    Ok(batch) => {
-                        // Fold the resolved ops into a new snapshot and
-                        // store it *before* replying, so the submitter is
-                        // guaranteed to observe its own write via
-                        // `Db::snapshot`/the traversal helpers.
-                        let cur = snap_for_applier.load_full();
-                        let next = cur.apply(&batch.resolved, &|id| {
-                            storage_for_applier.load_edge(id).ok().flatten()
+            while let Ok(job) = rx.recv() {
+                match job {
+                    Job::Apply { ops, at, reply } => {
+                        let now = at.unwrap_or_else(|| {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("system clock before UNIX epoch")
+                                .as_millis() as i64
                         });
-                        snap_for_applier.store(Arc::new(next));
-                        // If the caller already dropped its reply receiver,
-                        // there's nothing to do with the result — move on.
-                        let _ = reply.send(Ok(batch));
+                        match storage_for_applier.apply_batch(ops, now) {
+                            Ok(batch) => {
+                                // Fold the resolved ops into a new snapshot and
+                                // store it *before* replying, so the submitter is
+                                // guaranteed to observe its own write via
+                                // `Db::snapshot`/the traversal helpers.
+                                let cur = snap_for_applier.load_full();
+                                let next = cur.apply(&batch.resolved);
+                                snap_for_applier.store(Arc::new(next));
+                                // If the caller already dropped its reply
+                                // receiver, there's nothing to do with the
+                                // result — move on.
+                                let _ = reply.send(Ok(batch));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
+                    Job::Rebuild { reply } => {
+                        // Rebuild runs on the applier thread — the sole
+                        // ArcSwap writer — so it serializes with in-flight
+                        // batch application. Routing it through the channel
+                        // (rather than storing from the caller thread) closes
+                        // the fold-twice race where a caller's fresh snapshot
+                        // and the applier's incremental `apply` could both
+                        // fold the same committed batch.
+                        let result = match storage_for_applier.rebuild_state_from_ops() {
+                            Ok(()) => match Snapshot::from_storage(&storage_for_applier) {
+                                Ok(fresh) => {
+                                    snap_for_applier.store(Arc::new(fresh));
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
                     }
                 }
             }
@@ -121,12 +157,19 @@ impl Db {
         self.submit_inner(ops, Some(now_ms))
     }
 
+    /// Clones the job `Sender` out of the mutex and releases the guard before
+    /// the caller does anything blocking with it. `None` once `Drop` has taken
+    /// the sender. Holding the guard across a (potentially blocking) `send` on
+    /// the bounded channel would needlessly serialize all submitters against
+    /// each other on the mutex rather than on the channel.
+    fn sender(&self) -> Option<Sender<Job>> {
+        self.inner.tx.lock().unwrap().as_ref().cloned()
+    }
+
     fn submit_inner(&self, ops: Vec<Op>, at: Option<i64>) -> Result<AppliedBatch, TopoError> {
         let (reply_tx, reply_rx) = bounded(1);
-        let tx_guard = self.inner.tx.lock().unwrap();
-        let tx = tx_guard.as_ref().ok_or(TopoError::Closed)?;
-        tx.send((ops, at, reply_tx)).map_err(|_| TopoError::Closed)?;
-        drop(tx_guard);
+        let tx = self.sender().ok_or(TopoError::Closed)?;
+        tx.send(Job::Apply { ops, at, reply: reply_tx }).map_err(|_| TopoError::Closed)?;
         reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
@@ -167,12 +210,21 @@ impl Db {
     /// `Snapshot::from_storage` so readers observe the rebuilt state — the
     /// existing snapshot is derived incrementally and would otherwise go
     /// stale relative to storage the moment the tables are drained.
+    ///
+    /// The rebuild is performed *on the applier thread* (via a `Job::Rebuild`
+    /// routed through the same channel as `submit`), not on the caller
+    /// thread. The applier is the single designated writer of the
+    /// `ArcSwap<Snapshot>`; doing the rebuild-and-store there serializes it
+    /// with batch application and structurally rules out the race where a
+    /// caller-thread store and an in-flight incremental `apply` both fold the
+    /// same committed batch. Blocks until the applier replies; `Closed` after
+    /// shutdown, same contract as `submit`.
     #[doc(hidden)]
     pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
-        self.inner.storage.rebuild_state_from_ops()?;
-        let fresh = Snapshot::from_storage(&self.inner.storage)?;
-        self.inner.snap.store(Arc::new(fresh));
-        Ok(())
+        let (reply_tx, reply_rx) = bounded(1);
+        let tx = self.sender().ok_or(TopoError::Closed)?;
+        tx.send(Job::Rebuild { reply: reply_tx }).map_err(|_| TopoError::Closed)?;
+        reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
     /// Test/inspection helper: every node currently in storage, sorted by

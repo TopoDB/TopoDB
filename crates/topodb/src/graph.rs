@@ -82,18 +82,13 @@ impl Snapshot {
     /// (`insert`/`remove`/`push_back`/...) returns new structure that shares
     /// untouched nodes with `self` — there is no full-map rebuild here.
     ///
-    /// `edge_lookup` resolves an `EdgeId` to its current `EdgeRecord`. It's
-    /// needed for `CloseEdge`: the op only carries `id` and the new
-    /// `valid_to`, not the edge's `from`/`to` endpoints, so we can't find the
-    /// matching `AdjEntry` in `out`/`inn` without looking the edge back up.
-    /// The applier passes a closure over `Storage::load_edge`, since by the
-    /// time `apply` runs the batch is already committed there.
+    /// `CloseEdge` carries only `id` and the new `valid_to`, not the edge's
+    /// `from`/`to` endpoints. We resolve them from `self.edges` — the
+    /// full-`EdgeRecord` map maintained in this same pass, so a same-batch
+    /// `CreateEdge` → `CloseEdge` resolves correctly against the just-inserted
+    /// record. No storage read is involved, so there is no error to swallow.
     #[must_use]
-    pub(crate) fn apply(
-        &self,
-        resolved_ops: &[Op],
-        edge_lookup: &impl Fn(EdgeId) -> Option<EdgeRecord>,
-    ) -> Snapshot {
+    pub(crate) fn apply(&self, resolved_ops: &[Op]) -> Snapshot {
         let mut nodes = self.nodes.clone();
         let mut out = self.out.clone();
         let mut inn = self.inn.clone();
@@ -201,15 +196,15 @@ impl Snapshot {
                     );
                 }
                 Op::CloseEdge { id, valid_to } => {
-                    if let Some(rec) = edge_lookup(*id) {
-                        if let Some(v) = out.get_mut(&rec.from) {
+                    if let Some((from, to)) = edges.get(id).map(|e| (e.from, e.to)) {
+                        if let Some(v) = out.get_mut(&from) {
                             for entry in v.iter_mut() {
                                 if entry.edge == *id {
                                     entry.valid_to = *valid_to;
                                 }
                             }
                         }
-                        if let Some(v) = inn.get_mut(&rec.to) {
+                        if let Some(v) = inn.get_mut(&to) {
                             for entry in v.iter_mut() {
                                 if entry.edge == *id {
                                     entry.valid_to = *valid_to;
