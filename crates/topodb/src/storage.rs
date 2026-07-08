@@ -112,10 +112,9 @@ impl Storage {
         Ok((first, last))
     }
 
-    /// Sequential op-log read from `since`. Crate-internal seam for the
-    /// future compaction/replication layer; currently exercised only by unit
-    /// tests, hence `#[allow(dead_code)]`.
-    #[allow(dead_code)]
+    /// Sequential op-log read from `since` (INCLUSIVE). Backs
+    /// `Db::ops_since` — the pull side of the change feed — and remains the
+    /// seam the future compaction/replication layer will read through.
     pub(crate) fn read_ops(&self, since: u64) -> Result<Vec<(u64, Op)>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(OPS).map_err(redb::Error::from)?;

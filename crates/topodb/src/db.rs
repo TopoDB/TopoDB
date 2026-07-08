@@ -1,11 +1,12 @@
 use crate::error::TopoError;
+use crate::feed::ChangeEvent;
 use crate::graph::Snapshot;
 use crate::ids::{EdgeId, NodeId};
 use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
 use arc_swap::ArcSwap;
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,6 +56,15 @@ struct Inner {
     // close and `join()` would hang forever.
     tx: Mutex<Option<Sender<Job>>>,
     applier: Mutex<Option<std::thread::JoinHandle<()>>>,
+    // Change-feed subscriber registry: the bounded `Sender` half of every
+    // live `subscribe` channel. The applier clones this `Arc` at spawn and is
+    // the *only* broadcaster; `subscribe` pushes a new sender under the mutex.
+    // Both hold the lock only briefly (a push, or one non-blocking drain per
+    // batch), and nothing else locks it — so it introduces no lock-ordering
+    // hazard against the `tx`/`applier` mutexes. Held behind its own `Arc`
+    // (not captured via `Inner`) for the same reason as `snap`: the applier
+    // must never hold a strong ref back to `Inner`, or `Drop` would deadlock.
+    subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
 }
 
 impl Db {
@@ -85,6 +95,8 @@ impl Db {
         let storage_for_applier = storage.clone();
         let snap_for_applier = snap.clone();
         let spec_for_applier = spec.clone();
+        let subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>> = Arc::new(Mutex::new(Vec::new()));
+        let subs_for_applier = subs.clone();
         let applier = std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 match job {
@@ -104,6 +116,36 @@ impl Db {
                                 let cur = snap_for_applier.load_full();
                                 let next = cur.apply(&batch.resolved);
                                 snap_for_applier.store(Arc::new(next));
+                                // Broadcast the committed ops to live
+                                // subscribers *after* the snapshot store (so a
+                                // subscriber that reacts by reading sees its
+                                // own event's effect) and *before* replying.
+                                // Best-effort, non-blocking: a full subscriber
+                                // buffer drops the event (the subscriber
+                                // detects the `seq` gap and recovers via
+                                // `ops_since`); a disconnected receiver is
+                                // pruned. The applier NEVER blocks on a slow
+                                // subscriber. Only successful `Job::Apply`
+                                // batches broadcast — rejects and rebuilds
+                                // emit nothing.
+                                let mut subs = subs_for_applier.lock().unwrap();
+                                subs.retain(|s| {
+                                    for (i, op) in batch.resolved.iter().enumerate() {
+                                        let ev = ChangeEvent {
+                                            seq: batch.first_seq + i as u64,
+                                            op: op.clone(),
+                                        };
+                                        match s.try_send(ev) {
+                                            Ok(()) => {}
+                                            Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                                            Err(crossbeam_channel::TrySendError::Disconnected(
+                                                _,
+                                            )) => return false,
+                                        }
+                                    }
+                                    true
+                                });
+                                drop(subs);
                                 // If the caller already dropped its reply
                                 // receiver, there's nothing to do with the
                                 // result — move on.
@@ -147,6 +189,7 @@ impl Db {
                 snap,
                 tx: Mutex::new(Some(tx)),
                 applier: Mutex::new(Some(applier)),
+                subs,
             }),
         })
     }
@@ -181,6 +224,49 @@ impl Db {
     /// the wall clock. Intended for tests and backdating.
     pub fn submit_at(&self, ops: Vec<Op>, now_ms: i64) -> Result<AppliedBatch, TopoError> {
         self.submit_inner(ops, Some(now_ms))
+    }
+
+    /// Subscribes to the change feed, returning the `Receiver` half of a fresh
+    /// bounded channel (`capacity` slots) registered with the applier. Every
+    /// op the applier commits after this call is pushed as a [`ChangeEvent`]
+    /// carrying a monotonic op-log `seq`.
+    ///
+    /// **Unscoped, by spec design.** The change feed is a *host-level*
+    /// primitive that powers external consolidation/decay — it must observe
+    /// every committed write regardless of scope. Unlike the scoped read APIs
+    /// (`node`, `nodes_by_label`, `traverse`), it is not gated by a
+    /// `ScopeSet`.
+    ///
+    /// **Delivery contract (best-effort, never blocks the applier):** if this
+    /// subscriber's buffer is full when the applier broadcasts, the event is
+    /// **DROPPED** for this subscriber — the applier never blocks on a slow
+    /// consumer. The subscriber detects the resulting gap in `seq` and
+    /// recovers the missing ops with [`Db::ops_since`]. A receiver that has
+    /// been dropped is pruned from the registry on the next broadcast.
+    /// Rejected batches, counter flushes, and rebuilds broadcast nothing;
+    /// reads never produce events.
+    #[must_use]
+    pub fn subscribe(&self, capacity: usize) -> Receiver<ChangeEvent> {
+        let (tx, rx) = bounded::<ChangeEvent>(capacity);
+        self.inner.subs.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// Replays the durable op log from `since_seq` (**INCLUSIVE**), returning
+    /// one [`ChangeEvent`] per op in ascending `seq` order. This is the pull
+    /// side of the change feed: subscribers that dropped events (buffer full)
+    /// call it to recover the gap after noticing a jump in `seq`.
+    ///
+    /// **Unscoped, by spec design** — same rationale as [`Db::subscribe`]: the
+    /// change feed is a host-level primitive that must see every write. This
+    /// is a read: it produces no events of its own.
+    ///
+    /// Once compaction exists (deferred), reading below the oldest retained
+    /// seq will return [`TopoError::Compacted`]; today the full log is always
+    /// retained, so any `since_seq` succeeds.
+    pub fn ops_since(&self, since_seq: u64) -> Result<Vec<ChangeEvent>, TopoError> {
+        let ops = self.inner.storage.read_ops(since_seq)?;
+        Ok(ops.into_iter().map(|(seq, op)| ChangeEvent { seq, op }).collect())
     }
 
     /// Clones the job `Sender` out of the mutex and releases the guard before

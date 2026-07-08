@@ -1,5 +1,6 @@
 pub mod db;
 pub mod error;
+pub mod feed;
 pub mod graph;
 pub mod ids;
 pub mod index;
@@ -11,6 +12,7 @@ pub mod storage;
 
 pub use db::Db;
 pub use error::TopoError;
+pub use feed::ChangeEvent;
 pub use graph::Snapshot;
 pub use ids::{EdgeId, NodeId, Scope, ScopeId, ScopeSet};
 pub use index::{IndexSpec, PropIndex};
