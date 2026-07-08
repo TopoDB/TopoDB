@@ -77,6 +77,36 @@ fn rebuild_broadcasts_nothing() {
 }
 
 #[test]
+fn compaction_enforces_ops_since_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let scope = Scope::Id(ScopeId::new());
+    for _ in 0..5 {
+        db.submit(vec![Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() }]).unwrap();
+    }
+    assert_eq!(db.current_seq().unwrap(), 5);
+
+    db.compact_ops(4).unwrap(); // retain seqs 4..=5
+    assert_eq!(db.ops_since(4).unwrap().len(), 2);
+    match db.ops_since(2) {
+        Err(TopoError::Compacted { oldest: 4 }) => {}
+        other => panic!("expected Compacted{{oldest:4}}, got {other:?}"),
+    }
+    // Rebuild is impossible from a partial log:
+    match db.rebuild_state_from_ops() {
+        Err(TopoError::Compacted { oldest: 4 }) => {}
+        other => panic!("expected Compacted, got {other:?}"),
+    }
+    // State untouched by compaction:
+    assert_eq!(db.current_seq().unwrap(), 5);
+    // No-op and over-limit edges:
+    db.compact_ops(2).unwrap();                       // <= oldest: no-op
+    assert!(db.compact_ops(7).is_err());              // > current+1: Rejected
+    db.compact_ops(6).unwrap();                       // == current+1: empty log is legal
+    assert!(db.ops_since(6).unwrap().is_empty());
+}
+
+#[test]
 fn unsupported_format_version_errors_at_open() {
     use redb::{Database, TableDefinition};
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");

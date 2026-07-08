@@ -33,6 +33,14 @@ enum Job {
     BumpCounters {
         bumps: Vec<(NodeId, u64, i64)>,
     },
+    /// Compacts the op log through `keep_from` on the applier thread (the sole
+    /// redb writer). Broadcasts nothing — compaction touches no NODES/EDGES
+    /// state and emits no change events — and replies the storage result so the
+    /// caller blocks until the trim has committed.
+    Compact {
+        keep_from: u64,
+        reply: Sender<Result<(), TopoError>>,
+    },
 }
 
 /// A handle to an open database. Cloning shares the same underlying storage
@@ -261,6 +269,15 @@ impl Db {
                         // never take down the applier.
                         let _ = storage_for_applier.merge_counter_bumps(&bumps);
                     }
+                    Job::Compact { keep_from, reply } => {
+                        // Runs on the applier (sole redb writer), so it
+                        // serializes with batch application: no append can
+                        // interleave between the delete and the `oldest_seq`
+                        // stamp. Compaction touches only the OPS/META tables —
+                        // never NODES/EDGES or the snapshot — so there is
+                        // nothing to fold and nothing to broadcast.
+                        let _ = reply.send(storage_for_applier.compact_ops_through(keep_from));
+                    }
                 }
             }
         });
@@ -435,6 +452,14 @@ impl Db {
     ///
     /// A `capacity` of 0 is clamped to 1 — crossbeam's zero-capacity channels
     /// are rendezvous channels, which would silently drop nearly every event.
+    ///
+    /// **Anchoring a gap-free live tail:** capture the log position *before*
+    /// subscribing, then backfill the window between them once:
+    /// `let seq = db.current_seq()?; let rx = db.subscribe(cap);` then replay
+    /// `ops_since(seq + 1)` once and dedup by `seq` against the channel. Any op
+    /// committed between the two calls appears in both the replay and the live
+    /// channel; deduping by `seq` collapses the overlap, and nothing in the gap
+    /// is missed.
     #[must_use]
     pub fn subscribe(&self, capacity: usize) -> Receiver<ChangeEvent> {
         let capacity = capacity.max(1);
@@ -463,12 +488,46 @@ impl Db {
     /// change feed is a host-level primitive that must see every write. This
     /// is a read: it produces no events of its own.
     ///
-    /// Once compaction exists (deferred), reading below the oldest retained
-    /// seq will return [`TopoError::Compacted`]; today the full log is always
-    /// retained, so any `since_seq` succeeds.
+    /// Reading below the oldest retained seq returns
+    /// [`TopoError::Compacted { oldest }`](TopoError::Compacted): the requested
+    /// range dips beneath the compaction floor, so a partial replay would
+    /// silently drop history. The caller re-anchors from materialized state
+    /// (the NODES/EDGES tables, which stay the source of truth after
+    /// compaction) rather than trusting a truncated tail. An uncompacted log
+    /// has a floor of 1, so any `since_seq` succeeds.
     pub fn ops_since(&self, since_seq: u64) -> Result<Vec<ChangeEvent>, TopoError> {
         let ops = self.inner.storage.read_ops(since_seq)?;
         Ok(ops.into_iter().map(|(seq, op)| ChangeEvent { seq, op: Arc::new(op) }).collect())
+    }
+
+    /// The highest op-log seq committed so far (0 when the log is empty). A
+    /// plain storage read — no applier round-trip — so it is cheap and safe to
+    /// call from any thread. Its purpose is to anchor a gap-free live tail:
+    /// take it *before* [`subscribe`](Db::subscribe), then backfill with
+    /// `ops_since(seq + 1)` (see `subscribe`'s anchoring recipe).
+    #[must_use = "the seq anchors ops_since"]
+    pub fn current_seq(&self) -> Result<u64, TopoError> {
+        self.inner.storage.current_seq()
+    }
+
+    /// Compacts the durable op log, dropping every entry with seq `< keep_from`
+    /// and advancing the retained floor to `keep_from`. After this,
+    /// [`ops_since`](Db::ops_since) below `keep_from` returns
+    /// [`TopoError::Compacted`] and [`rebuild_state_from_ops`](Db::rebuild_state_from_ops)
+    /// refuses (a compacted log is no longer a full history — NODES/EDGES stay
+    /// the materialized source of truth).
+    ///
+    /// **Host-level primitive** (unscoped, like the change feed it serves).
+    /// Edge behaviour mirrors `Storage::compact_ops_through`:
+    /// `keep_from <= oldest` is a no-op, `keep_from > current_seq + 1` is
+    /// rejected, and `keep_from == current_seq + 1` legally empties the log.
+    /// Runs on the applier thread and blocks until it commits; `Closed` after
+    /// shutdown, same contract as [`submit`](Db::submit).
+    pub fn compact_ops(&self, keep_from: u64) -> Result<(), TopoError> {
+        let (reply_tx, reply_rx) = bounded(1);
+        let tx = self.sender().ok_or(TopoError::Closed)?;
+        tx.send(Job::Compact { keep_from, reply: reply_tx }).map_err(|_| TopoError::Closed)?;
+        reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
     /// Clones the job `Sender` out of the mutex and releases the guard before

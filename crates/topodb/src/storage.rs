@@ -243,11 +243,80 @@ impl Storage {
         Ok((first, last))
     }
 
+    /// The oldest op seq still retained in the log. Sourced from META
+    /// `"oldest_seq"` (u64 LE), written only by `compact_ops_through`. An
+    /// ABSENT key means the log has never been compacted, so the oldest
+    /// retained seq is 1 (the genesis seq).
+    pub(crate) fn oldest_seq(&self) -> Result<u64, TopoError> {
+        let tx = self.db.begin_read().map_err(redb::Error::from)?;
+        let meta = tx.open_table(META).map_err(redb::Error::from)?;
+        read_oldest_seq(&meta)
+    }
+
+    /// The highest op seq currently in the log (its last OPS key), or 0 when
+    /// the log is empty. A plain storage read — no applier round-trip — so it
+    /// is safe to call from any thread as the anchor for a live tail
+    /// (`current_seq` then `subscribe` then `ops_since(seq + 1)`).
+    pub(crate) fn current_seq(&self) -> Result<u64, TopoError> {
+        let tx = self.db.begin_read().map_err(redb::Error::from)?;
+        let table = tx.open_table(OPS).map_err(redb::Error::from)?;
+        let last = table.last().map_err(redb::Error::from)?.map(|(k, _)| k.value()).unwrap_or(0);
+        Ok(last)
+    }
+
+    /// Drops op-log entries with seq `< keep_from` in one write transaction and
+    /// records the new floor under META `"oldest_seq"`. Edge behaviour:
+    /// - `keep_from <= oldest_seq`: nothing to trim — no-op `Ok(())` (the write
+    ///   txn is aborted, not committed).
+    /// - `keep_from > current_seq + 1`: would advance the floor past the log's
+    ///   end (skipping never-written seqs) — `TopoError::Rejected`.
+    /// - `keep_from == current_seq + 1`: legal; retains an empty tail so the
+    ///   next append still lands at `current_seq + 1`.
+    ///
+    /// Only ever called on the applier thread (the sole redb writer), so the
+    /// `oldest_seq`/`current_seq` reads and the delete-and-stamp write are
+    /// effectively atomic against other writes.
+    pub(crate) fn compact_ops_through(&self, keep_from: u64) -> Result<(), TopoError> {
+        let oldest = self.oldest_seq()?;
+        if keep_from <= oldest {
+            return Ok(());
+        }
+        let current = self.current_seq()?;
+        if keep_from > current + 1 {
+            return Err(TopoError::Rejected(format!(
+                "compact: keep_from {keep_from} exceeds current_seq {current} + 1"
+            )));
+        }
+        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        {
+            let mut ops = tx.open_table(OPS).map_err(redb::Error::from)?;
+            ops.retain_in(..keep_from, |_, _| false).map_err(redb::Error::from)?;
+            let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
+            meta.insert("oldest_seq", keep_from.to_le_bytes().as_slice())
+                .map_err(redb::Error::from)?;
+        }
+        tx.commit().map_err(redb::Error::from)?;
+        Ok(())
+    }
+
     /// Sequential op-log read from `since` (INCLUSIVE). Backs
-    /// `Db::ops_since` — the pull side of the change feed — and remains the
-    /// seam the future compaction/replication layer will read through.
+    /// `Db::ops_since` — the pull side of the change feed — and is the seam
+    /// the compaction layer reads through.
+    ///
+    /// Returns `TopoError::Compacted { oldest }` when `since < oldest_seq`: the
+    /// requested range dips below the retained floor, so the caller must
+    /// re-anchor from materialized state rather than receive a silently partial
+    /// replay. The `oldest_seq` check and the range read share ONE
+    /// `begin_read` transaction, so the returned ops are always consistent with
+    /// the floor they were validated against — a concurrent compaction commits
+    /// atomically and is either fully visible or not visible to this snapshot.
     pub(crate) fn read_ops(&self, since: u64) -> Result<Vec<(u64, Op)>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
+        let meta = tx.open_table(META).map_err(redb::Error::from)?;
+        let oldest = read_oldest_seq(&meta)?;
+        if since < oldest {
+            return Err(TopoError::Compacted { oldest });
+        }
         let table = tx.open_table(OPS).map_err(redb::Error::from)?;
         let mut out = Vec::new();
         for entry in table.range(since..).map_err(redb::Error::from)? {
@@ -467,7 +536,17 @@ impl Storage {
     /// The COUNTERS table is intentionally *not* opened or drained here: access
     /// counters are auxiliary telemetry outside the op log, so a state rebuild
     /// must preserve them rather than reset them to zero.
+    ///
+    /// Refuses with `TopoError::Compacted { oldest }` once `oldest_seq > 1`:
+    /// after compaction the log is no longer a full history, so replay from
+    /// genesis is impossible by definition. NODES/EDGES remain the materialized
+    /// source of truth for a compacted database — there is no full-history
+    /// rebuild to fall back on, and none is needed.
     pub(crate) fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
+        let oldest = self.oldest_seq()?;
+        if oldest > 1 {
+            return Err(TopoError::Compacted { oldest });
+        }
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
         {
             let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
@@ -555,6 +634,25 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
 
 pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
     id.0 .0.to_be_bytes()
+}
+
+/// Reads META `"oldest_seq"` (u64 LE) from an already-open META table; an
+/// ABSENT key means the log was never compacted, so the floor is 1. Factored
+/// out so `oldest_seq` (own read txn) and `read_ops` (shares the read txn with
+/// its range scan for a consistent view) derive the floor identically.
+fn read_oldest_seq(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<u64, TopoError> {
+    match meta.get("oldest_seq").map_err(redb::Error::from)? {
+        Some(v) => {
+            let bytes: [u8; 8] = v
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad oldest_seq".into()))?;
+            Ok(u64::from_le_bytes(bytes))
+        }
+        None => Ok(1),
+    }
 }
 
 /// A copy of `spec` with both index lists sorted by `(label, prop)`, so the
