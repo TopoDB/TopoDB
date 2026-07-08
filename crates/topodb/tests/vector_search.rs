@@ -71,6 +71,37 @@ fn dim_mismatch_rejects_whole_batch_atomically() {
 }
 
 #[test]
+fn cross_model_switch_tombstones_old_slab() {
+    let s = ScopeId::new();
+    let a = NodeId::new();
+    let (_d, db) = db_with(&[(a, Scope::Id(s), &[1.0, 0.0])]); // model m1
+    db.submit(vec![Op::SetEmbedding { id: a, model: "m2".into(), vector: vec![1.0, 0.0] }]).unwrap();
+    let q = |model: &str| VectorQuery {
+        scopes: ScopeSet::of(&[s]), model: model.into(),
+        vector: vec![1.0, 0.0], k: 10, candidates: None,
+    };
+    assert!(db.search_vector(&q("m1")).unwrap().is_empty(), "old model slab must be tombstoned");
+    assert_eq!(db.search_vector(&q("m2")).unwrap().len(), 1);
+}
+
+#[test]
+fn fully_tombstoned_slab_accepts_new_dimension() {
+    let s = ScopeId::new();
+    let a = NodeId::new();
+    let (_d, db) = db_with(&[(a, Scope::Id(s), &[1.0, 0.0])]); // m1, dim 2
+    db.submit(vec![Op::RemoveNode { id: a }]).unwrap();        // slab now has no live rows
+    let b = NodeId::new();
+    db.submit(vec![Op::CreateNode { id: b, scope: Scope::Id(s), label: "M".into(), props: Default::default() }]).unwrap();
+    db.submit(vec![Op::SetEmbedding { id: b, model: "m1".into(), vector: vec![1.0, 0.0, 0.0] }]).unwrap(); // dim 3
+    let hits = db.search_vector(&VectorQuery {
+        scopes: ScopeSet::of(&[s]), model: "m1".into(),
+        vector: vec![1.0, 0.0, 0.0], k: 10, candidates: None,
+    }).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.id, b);
+}
+
+#[test]
 fn slabs_survive_rebuild_and_reopen() {
     let s = ScopeId::new();
     let a = NodeId::new();

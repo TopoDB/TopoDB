@@ -178,6 +178,13 @@ pub(crate) fn fts_update(
     old_text: Option<&str>,
     new_text: Option<&str>,
 ) -> Result<(), TopoError> {
+    // A "document" is text with >= 1 token. A declared prop holding "" (or
+    // pure punctuation) must not inflate n_docs / deflate avgdl for everyone
+    // else's scores. Normalizing HERE makes all four call paths (apply,
+    // replay, reindex, and Task 5's per-scope rework) agree by construction.
+    let old_text = old_text.filter(|t| !tokenize(t).is_empty());
+    let new_text = new_text.filter(|t| !tokenize(t).is_empty());
+
     if old_text == new_text {
         return Ok(());
     }

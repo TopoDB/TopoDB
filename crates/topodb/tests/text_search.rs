@@ -74,6 +74,25 @@ fn rejected_batch_leaves_postings_untouched_and_rebuild_restores_them() {
 }
 
 #[test]
+fn empty_string_text_prop_is_not_a_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (_e, op_e) = memory("", Scope::Id(s));            // empty content
+    let (a, op_a) = memory("solitary real document", Scope::Id(s));
+    db.submit(vec![op_e, op_a]).unwrap();
+    // If "" counted as a doc, n_docs=2 halves this idf; with normalization
+    // n_docs=1 and df=1: idf = ln((1-1+0.5)/(1+0.5)+1) = ln(4/3).
+    let hits = db.search_text(&scopes, "solitary", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.id, a);
+    let expected = ((1.0f32 - 1.0 + 0.5) / (1.0 + 0.5) + 1.0).ln()
+        * (1.0 * (1.2f32 + 1.0)) / (1.0 + 1.2f32 * (1.0 - 0.75f32 + 0.75f32 * 3.0 / 3.0));
+    assert!((hits[0].1 - expected).abs() < 1e-5, "n_docs must be 1, got score {}", hits[0].1);
+}
+
+#[test]
 fn changed_text_spec_reindexes_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.redb");

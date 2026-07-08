@@ -89,6 +89,20 @@ fn nodes_by_prop_bumps_results() {
 }
 
 #[test]
+fn removed_node_stats_are_none_despite_orphan_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let id = NodeId::new();
+    db.submit(vec![Op::CreateNode { id, scope: Scope::Id(s), label: "M".into(), props: Default::default() }]).unwrap();
+    let _ = db.node(&scopes, id);
+    let _ = wait_for_count(&db, &scopes, id, 1); // orphan row now exists in COUNTERS
+    db.submit(vec![Op::RemoveNode { id }]).unwrap();
+    assert_eq!(db.access_stats(&scopes, id).unwrap(), None, "gate on node existence, not row existence");
+}
+
+#[test]
 fn float_range_scan_does_not_bump() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();

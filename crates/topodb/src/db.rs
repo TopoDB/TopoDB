@@ -600,3 +600,21 @@ impl Drop for Inner {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_receiver_is_pruned_on_next_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.redb")).unwrap();
+        let rx = db.subscribe(4);
+        drop(rx);
+        db.submit(vec![crate::Op::CreateNode {
+            id: crate::NodeId::new(), scope: crate::Scope::Id(crate::ScopeId::new()),
+            label: "M".into(), props: Default::default(),
+        }]).unwrap();
+        assert_eq!(db.inner.subs.lock().unwrap().len(), 0, "disconnected sender must be pruned");
+    }
+}

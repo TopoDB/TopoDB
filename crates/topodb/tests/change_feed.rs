@@ -63,6 +63,20 @@ fn subscribe_zero_capacity_still_delivers() {
 }
 
 #[test]
+fn rebuild_broadcasts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let rx = db.subscribe(16);
+    db.submit(vec![Op::CreateNode {
+        id: NodeId::new(), scope: Scope::Id(ScopeId::new()),
+        label: "M".into(), props: Default::default(),
+    }]).unwrap();
+    let _ = rx.recv().unwrap();
+    db.rebuild_state_from_ops().unwrap();
+    assert!(rx.try_recv().is_err(), "rebuild must not broadcast");
+}
+
+#[test]
 fn unsupported_format_version_errors_at_open() {
     use redb::{Database, TableDefinition};
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
