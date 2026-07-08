@@ -18,6 +18,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo bench --no-run
+        if: matrix.os == 'ubuntu-latest'
   msrv:
     runs-on: ubuntu-latest
     steps:
