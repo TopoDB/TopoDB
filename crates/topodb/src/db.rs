@@ -1,0 +1,128 @@
+use crate::error::TopoError;
+use crate::ids::{EdgeId, NodeId};
+use crate::op::Op;
+use crate::storage::{AppliedBatch, Storage};
+use crossbeam_channel::{bounded, Sender};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+type Job = (Vec<Op>, Option<i64>, Sender<Result<AppliedBatch, TopoError>>);
+
+/// A handle to an open database. Cloning shares the same underlying storage
+/// and applier thread — `Db` is `Send + Sync + Clone`. All writes funnel
+/// through a single applier thread (via `submit`/`submit_at`), so batches
+/// serialize deterministically even under concurrent callers.
+#[derive(Clone)]
+pub struct Db {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    storage: Arc<Storage>,
+    // `Sender` half of the job channel. Wrapped in `Option` so `Drop` can
+    // `take()` it and actually drop it *before* joining the applier thread —
+    // otherwise the applier's `rx.recv()` loop would never see the channel
+    // close and `join()` would hang forever.
+    tx: Mutex<Option<Sender<Job>>>,
+    applier: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Db {
+    /// Opens (creating if necessary) the database at `path` and starts its
+    /// single applier thread. `submit`/`submit_at` route through this thread;
+    /// it is the only place wall-clock time is read (`submit` uses
+    /// `SystemTime::now`; `submit_at` is the deterministic test/backdate
+    /// seam).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, TopoError> {
+        let storage = Arc::new(Storage::create(path)?);
+        let (tx, rx) = bounded::<Job>(256);
+        let s2 = storage.clone();
+        let applier = std::thread::spawn(move || {
+            while let Ok((ops, at, reply)) = rx.recv() {
+                let now = at.unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("system clock before UNIX epoch")
+                        .as_millis() as i64
+                });
+                // If the caller already dropped its reply receiver, there's
+                // nothing to do with the result — just move on.
+                let _ = reply.send(s2.apply_batch(ops, now));
+            }
+        });
+        Ok(Self {
+            inner: Arc::new(Inner {
+                storage,
+                tx: Mutex::new(Some(tx)),
+                applier: Mutex::new(Some(applier)),
+            }),
+        })
+    }
+
+    /// Submits a batch of ops for application, blocking until the applier
+    /// thread has processed it. Safe to call from any thread; batches from
+    /// concurrent callers serialize through the single applier. Uses the
+    /// wall clock (`SystemTime::now`) to resolve any unset timestamps.
+    pub fn submit(&self, ops: Vec<Op>) -> Result<AppliedBatch, TopoError> {
+        self.submit_inner(ops, None)
+    }
+
+    /// Like `submit`, but resolves unset timestamps to `now_ms` instead of
+    /// the wall clock. Intended for tests and backdating.
+    pub fn submit_at(&self, ops: Vec<Op>, now_ms: i64) -> Result<AppliedBatch, TopoError> {
+        self.submit_inner(ops, Some(now_ms))
+    }
+
+    fn submit_inner(&self, ops: Vec<Op>, at: Option<i64>) -> Result<AppliedBatch, TopoError> {
+        let (reply_tx, reply_rx) = bounded(1);
+        let tx_guard = self.inner.tx.lock().unwrap();
+        let tx = tx_guard.as_ref().ok_or(TopoError::Closed)?;
+        tx.send((ops, at, reply_tx)).map_err(|_| TopoError::Closed)?;
+        drop(tx_guard);
+        reply_rx.recv().map_err(|_| TopoError::Closed)?
+    }
+
+    /// Test/inspection helper: every edge `(from, to)` currently in storage,
+    /// open or closed. `#[doc(hidden)]` — Task 5's traversal replaces the
+    /// internals with the adjacency snapshot; callers should prefer the
+    /// query layer once it exists.
+    #[doc(hidden)]
+    pub fn all_edges_between(&self, from: NodeId, to: NodeId) -> Vec<crate::state::EdgeRecord> {
+        self.inner
+            .storage
+            .all_edges()
+            .expect("all_edges_between: storage scan failed")
+            .into_iter()
+            .filter(|e| e.from == from && e.to == to)
+            .collect()
+    }
+
+    /// Test/inspection helper: the ids of currently-open edges `(from, to)`
+    /// (i.e. `valid_to.is_none()`). `#[doc(hidden)]` — see
+    /// `all_edges_between`.
+    #[doc(hidden)]
+    pub fn open_edges_between(&self, from: NodeId, to: NodeId) -> Vec<EdgeId> {
+        self.inner
+            .storage
+            .all_edges()
+            .expect("open_edges_between: storage scan failed")
+            .into_iter()
+            .filter(|e| e.from == from && e.to == to && e.valid_to.is_none())
+            .map(|e| e.id)
+            .collect()
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Drop the sender first so the applier's `rx.recv()` loop observes a
+        // closed channel and exits, then join it. Without this, `tx` would
+        // stay alive as a field on `Inner` until after we tried to join,
+        // and the applier would block forever.
+        self.tx.lock().unwrap().take();
+        if let Some(h) = self.applier.lock().unwrap().take() {
+            let _ = h.join();
+        }
+    }
+}
