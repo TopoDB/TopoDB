@@ -302,7 +302,10 @@ fn apply_op(
         }
         Op::RemoveNode { id } => {
             let key = node_key(*id);
-            nodes.remove(key.as_slice()).map_err(redb::Error::from)?;
+            let removed = nodes.remove(key.as_slice()).map_err(redb::Error::from)?;
+            if removed.is_none() {
+                return Err(TopoError::Rejected(format!("RemoveNode: node {id:?} not found")));
+            }
 
             // Remove incident edges, both directions. v0.1: linear scan is
             // acceptable; adjacency-assisted delete arrives with Task 5.

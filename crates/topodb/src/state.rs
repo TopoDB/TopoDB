@@ -26,7 +26,6 @@ pub struct EdgeRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::ids::*;
     use crate::op::Op;
     use crate::storage::Storage;
@@ -142,5 +141,108 @@ mod tests {
         s.apply_batch(vec![Op::RemoveNode { id: a }], 1).unwrap();
         assert!(s.load_node(a).unwrap().is_none());
         assert!(s.load_edge(e).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_node_missing_is_rejected() {
+        let (_d, s) = db();
+        let err = s.apply_batch(vec![Op::RemoveNode { id: NodeId::new() }], 0).unwrap_err();
+        assert!(matches!(err, crate::TopoError::Rejected(_)));
+    }
+
+    #[test]
+    fn remove_node_removes_incident_edge_in_to_direction() {
+        let (_d, s) = db();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b, e) = (NodeId::new(), NodeId::new(), EdgeId::new());
+        s.apply_batch(
+            vec![
+                Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
+                Op::CreateNode { id: b, scope, label: "M".into(), props: Default::default() },
+                Op::CreateEdge {
+                    id: e,
+                    scope,
+                    ty: "RELATES_TO".into(),
+                    from: a,
+                    to: b,
+                    props: Default::default(),
+                    valid_from: None,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        // Remove b, the edge's `to` endpoint — must also delete the edge.
+        s.apply_batch(vec![Op::RemoveNode { id: b }], 1).unwrap();
+        assert!(s.load_node(b).unwrap().is_none());
+        assert!(s.load_edge(e).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_edge_missing_endpoint_is_rejected() {
+        let (_d, s) = db();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b) = (NodeId::new(), NodeId::new());
+        // Only `a` is created; `b` never exists.
+        let err = s
+            .apply_batch(
+                vec![
+                    Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
+                    Op::CreateEdge {
+                        id: EdgeId::new(),
+                        scope,
+                        ty: "ABOUT".into(),
+                        from: a,
+                        to: b,
+                        props: Default::default(),
+                        valid_from: None,
+                    },
+                ],
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(err, crate::TopoError::Rejected(_)));
+        // Whole batch rejected — nothing committed, not even the CreateNode:
+        assert!(s.load_node(a).unwrap().is_none());
+        assert!(s.read_ops(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_edge_missing_is_rejected() {
+        let (_d, s) = db();
+        let err = s
+            .apply_batch(vec![Op::CloseEdge { id: EdgeId::new(), valid_to: None }], 0)
+            .unwrap_err();
+        assert!(matches!(err, crate::TopoError::Rejected(_)));
+    }
+
+    #[test]
+    fn close_edge_already_closed_is_rejected() {
+        let (_d, s) = db();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b, e) = (NodeId::new(), NodeId::new(), EdgeId::new());
+        s.apply_batch(
+            vec![
+                Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
+                Op::CreateNode { id: b, scope, label: "M".into(), props: Default::default() },
+                Op::CreateEdge {
+                    id: e,
+                    scope,
+                    ty: "ABOUT".into(),
+                    from: a,
+                    to: b,
+                    props: Default::default(),
+                    valid_from: None,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        s.apply_batch(vec![Op::CloseEdge { id: e, valid_to: None }], 1).unwrap();
+        let err = s.apply_batch(vec![Op::CloseEdge { id: e, valid_to: None }], 2).unwrap_err();
+        assert!(matches!(err, crate::TopoError::Rejected(_)));
+        // The first close still stands — the second (rejected) batch never committed.
+        let edge = s.load_edge(e).unwrap().unwrap();
+        assert_eq!(edge.valid_to, Some(1));
     }
 }
