@@ -167,6 +167,7 @@ impl Db {
     /// `Snapshot::from_storage` so readers observe the rebuilt state — the
     /// existing snapshot is derived incrementally and would otherwise go
     /// stale relative to storage the moment the tables are drained.
+    #[doc(hidden)]
     pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
         self.inner.storage.rebuild_state_from_ops()?;
         let fresh = Snapshot::from_storage(&self.inner.storage)?;

@@ -43,7 +43,7 @@ impl Snapshot {
     /// Rebuilds a snapshot from scratch by scanning storage. Used at `Db`
     /// open time (and by tests to check incremental application against a
     /// from-scratch rebuild).
-    pub fn from_storage(storage: &Storage) -> Result<Snapshot, TopoError> {
+    pub(crate) fn from_storage(storage: &Storage) -> Result<Snapshot, TopoError> {
         let mut nodes = im::HashMap::new();
         for n in storage.all_nodes()? {
             nodes.insert(n.id, n);
@@ -89,7 +89,7 @@ impl Snapshot {
     /// The applier passes a closure over `Storage::load_edge`, since by the
     /// time `apply` runs the batch is already committed there.
     #[must_use]
-    pub fn apply(
+    pub(crate) fn apply(
         &self,
         resolved_ops: &[Op],
         edge_lookup: &impl Fn(EdgeId) -> Option<EdgeRecord>,

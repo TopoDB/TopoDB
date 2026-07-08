@@ -17,7 +17,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn create(path: impl AsRef<Path>) -> Result<Self, TopoError> {
+    pub(crate) fn create(path: impl AsRef<Path>) -> Result<Self, TopoError> {
         let db = Database::create(path).map_err(redb::Error::from)?;
         let s = Self { db };
         // Ensure tables + format version exist.
@@ -46,7 +46,12 @@ impl Storage {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    pub fn append_ops(&self, ops: &[Op]) -> Result<(u64, u64), TopoError> {
+    /// Raw op-log append — bypasses resolution/validation, so it is *not*
+    /// part of the write path (`apply_batch` is). Kept `pub(crate)` and
+    /// exercised only by unit tests: a low-level seam reserved for the future
+    /// compaction/replication layer, never exposed to external consumers.
+    #[allow(dead_code)]
+    pub(crate) fn append_ops(&self, ops: &[Op]) -> Result<(u64, u64), TopoError> {
         if ops.is_empty() {
             return Err(TopoError::Rejected("empty op batch".into()));
         }
@@ -69,7 +74,11 @@ impl Storage {
         Ok((first, last))
     }
 
-    pub fn read_ops(&self, since: u64) -> Result<Vec<(u64, Op)>, TopoError> {
+    /// Sequential op-log read from `since`. Crate-internal seam for the
+    /// future compaction/replication layer; currently exercised only by unit
+    /// tests, hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
+    pub(crate) fn read_ops(&self, since: u64) -> Result<Vec<(u64, Op)>, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(OPS).map_err(redb::Error::from)?;
         let mut out = Vec::new();
@@ -86,7 +95,7 @@ impl Storage {
     /// NODES/EDGES state tables in one redb write transaction. On any
     /// validation failure nothing is committed and `TopoError::Rejected` is
     /// returned.
-    pub fn apply_batch(&self, ops: Vec<Op>, now_ms: i64) -> Result<AppliedBatch, TopoError> {
+    pub(crate) fn apply_batch(&self, ops: Vec<Op>, now_ms: i64) -> Result<AppliedBatch, TopoError> {
         if ops.is_empty() {
             return Err(TopoError::Rejected("empty op batch".into()));
         }
@@ -181,7 +190,7 @@ impl Storage {
     /// doesn't exist), but replaying a valid log in order cannot hit those
     /// paths; if it does, the log itself is corrupt and surfacing
     /// `TopoError::Rejected` here is the correct, honest outcome.
-    pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
+    pub(crate) fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
         {
             let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
