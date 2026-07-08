@@ -1,7 +1,9 @@
 use crate::error::TopoError;
+use crate::graph::Snapshot;
 use crate::ids::{EdgeId, NodeId};
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
+use arc_swap::ArcSwap;
 use crossbeam_channel::{bounded, Sender};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -19,7 +21,21 @@ pub struct Db {
 }
 
 struct Inner {
+    // Not read directly by `Db`'s own methods right now (they go through
+    // `snap`) — kept alive here so the underlying `redb::Database`'s file
+    // handle stays open for the lifetime of the `Db`, and for the (future)
+    // query layer that will read through it directly.
+    #[allow(dead_code)]
     storage: Arc<Storage>,
+    // In-memory adjacency snapshot. The applier thread is the *only* writer
+    // (see `open`'s loop below); readers `load_full()` and never block on
+    // it, and never on each other or on writers. Held behind its own `Arc`
+    // (rather than the thread capturing an `Arc<Inner>`) so the applier
+    // thread never holds a strong reference back to `Inner` itself — that
+    // would create a cycle where `Inner`'s `Drop` (which must run to close
+    // the channel so the thread can exit) never fires because the thread's
+    // own clone keeps the refcount above zero.
+    snap: Arc<ArcSwap<Snapshot>>,
     // `Sender` half of the job channel. Wrapped in `Option` so `Drop` can
     // `take()` it and actually drop it *before* joining the applier thread —
     // otherwise the applier's `rx.recv()` loop would never see the channel
@@ -36,8 +52,14 @@ impl Db {
     /// seam).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TopoError> {
         let storage = Arc::new(Storage::create(path)?);
+        let initial_snapshot = Snapshot::from_storage(&storage)?;
+        let snap = Arc::new(ArcSwap::new(Arc::new(initial_snapshot)));
         let (tx, rx) = bounded::<Job>(256);
-        let s2 = storage.clone();
+
+        // The thread captures its own clones of `storage`/`snap` — never a
+        // clone of `Inner` itself (see the comment on `Inner::snap` for why).
+        let storage_for_applier = storage.clone();
+        let snap_for_applier = snap.clone();
         let applier = std::thread::spawn(move || {
             while let Ok((ops, at, reply)) = rx.recv() {
                 let now = at.unwrap_or_else(|| {
@@ -46,18 +68,44 @@ impl Db {
                         .expect("system clock before UNIX epoch")
                         .as_millis() as i64
                 });
-                // If the caller already dropped its reply receiver, there's
-                // nothing to do with the result — just move on.
-                let _ = reply.send(s2.apply_batch(ops, now));
+                match storage_for_applier.apply_batch(ops, now) {
+                    Ok(batch) => {
+                        // Fold the resolved ops into a new snapshot and
+                        // store it *before* replying, so the submitter is
+                        // guaranteed to observe its own write via
+                        // `Db::snapshot`/the traversal helpers.
+                        let cur = snap_for_applier.load_full();
+                        let next = cur.apply(&batch.resolved, &|id| {
+                            storage_for_applier.load_edge(id).ok().flatten()
+                        });
+                        snap_for_applier.store(Arc::new(next));
+                        // If the caller already dropped its reply receiver,
+                        // there's nothing to do with the result — move on.
+                        let _ = reply.send(Ok(batch));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
         });
+
         Ok(Self {
             inner: Arc::new(Inner {
                 storage,
+                snap,
                 tx: Mutex::new(Some(tx)),
                 applier: Mutex::new(Some(applier)),
             }),
         })
+    }
+
+    /// Returns the current in-memory adjacency snapshot. Cheap: an `Arc`
+    /// clone via `ArcSwap::load_full` — never blocks on the applier thread
+    /// or on other readers.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.inner.snap.load_full()
     }
 
     /// Submits a batch of ops for application, blocking until the applier
@@ -83,18 +131,31 @@ impl Db {
         reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
-    /// Test/inspection helper: every edge `(from, to)` currently in storage,
-    /// open or closed. `#[doc(hidden)]` — Task 5's traversal replaces the
-    /// internals with the adjacency snapshot; callers should prefer the
-    /// query layer once it exists.
+    /// Test/inspection helper: every edge `(from, to)` currently in the
+    /// adjacency snapshot, open or closed. `#[doc(hidden)]` — callers should
+    /// prefer the query layer once it exists. Note: `AdjEntry` doesn't carry
+    /// edge props, so the returned `EdgeRecord`s always have empty `props`
+    /// (fine for the current id/valid_to-focused callers; don't rely on
+    /// `props` here — use `Db`'s (future) query layer or `Storage::load_edge`
+    /// for that).
     #[doc(hidden)]
     pub fn all_edges_between(&self, from: NodeId, to: NodeId) -> Vec<crate::state::EdgeRecord> {
-        self.inner
-            .storage
-            .all_edges()
-            .expect("all_edges_between: storage scan failed")
+        let snap = self.snapshot();
+        snap.out
+            .get(&from)
             .into_iter()
-            .filter(|e| e.from == from && e.to == to)
+            .flat_map(|entries| entries.iter())
+            .filter(|e| e.other == to)
+            .map(|e| crate::state::EdgeRecord {
+                id: e.edge,
+                scope: e.scope,
+                ty: e.ty.clone(),
+                from,
+                to,
+                props: Default::default(),
+                valid_from: e.valid_from,
+                valid_to: e.valid_to,
+            })
             .collect()
     }
 
@@ -103,13 +164,13 @@ impl Db {
     /// `all_edges_between`.
     #[doc(hidden)]
     pub fn open_edges_between(&self, from: NodeId, to: NodeId) -> Vec<EdgeId> {
-        self.inner
-            .storage
-            .all_edges()
-            .expect("open_edges_between: storage scan failed")
+        let snap = self.snapshot();
+        snap.out
+            .get(&from)
             .into_iter()
-            .filter(|e| e.from == from && e.to == to && e.valid_to.is_none())
-            .map(|e| e.id)
+            .flat_map(|entries| entries.iter())
+            .filter(|e| e.other == to && e.valid_to.is_none())
+            .map(|e| e.edge)
             .collect()
     }
 }
