@@ -10,8 +10,7 @@ for external consolidation — running in-process, no server.
 Status: **early development (0.0.x)** — the engine core works (op-log write
 path, single-applier concurrency, scoped k-hop temporal traversal,
 replay-determinism property tests); the recall layer (vector search,
-full-text, change feed) is next. API not yet stable. Design spec:
-[docs/superpowers/specs/2026-07-08-topodb-design.md](docs/superpowers/specs/2026-07-08-topodb-design.md).
+full-text, change feed) is next. API not yet stable.
 
 First consumer: Atlas (agentic OS desktop app).
 
