@@ -21,7 +21,10 @@ fn wait_for_count(db: &Db, scopes: &ScopeSet, id: NodeId, want_at_least: u64) ->
                 return stats;
             }
         }
-        assert!(Instant::now() < deadline, "counter never reached {want_at_least}");
+        assert!(
+            Instant::now() < deadline,
+            "counter never reached {want_at_least}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -41,7 +44,9 @@ fn rrf_merge(text_ranked: &[NodeId], vector_ranked: &[NodeId]) -> Vec<(NodeId, f
     }
     let mut merged: Vec<(NodeId, f64)> = scores.into_iter().collect();
     merged.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     merged
 }
@@ -73,7 +78,10 @@ fn build_fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let spec = IndexSpec {
         equality: vec![],
-        text: vec![PropIndex { label: "Memory".into(), prop: "content".into() }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
     };
     let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
     let s = ScopeId::new();
@@ -85,10 +93,10 @@ fn build_fixture() -> Fixture {
     let best = ids[1];
 
     let contents: [&str; 20] = [
-        "hub anchor node placeholder text",  // 0: hub (seed)
-        "rust embedded database engine",     // 1: BEST — all 4 query terms
-        "rust programming language basics",  // 2: partial text overlap (rust only)
-        "gardening tips for spring bloom",   // 3: vector-only rival, no text overlap
+        "hub anchor node placeholder text", // 0: hub (seed)
+        "rust embedded database engine",    // 1: BEST — all 4 query terms
+        "rust programming language basics", // 2: partial text overlap (rust only)
+        "gardening tips for spring bloom",  // 3: vector-only rival, no text overlap
         "javascript frontend framework tutorial",
         "cooking recipes for weeknight dinners",
         "hiking trails in the pacific northwest",
@@ -113,7 +121,7 @@ fn build_fixture() -> Fixture {
     // cosine-similarity maximum against the query (which equals vectors[1]
     // exactly).
     let vectors: [[f32; 4]; 20] = [
-        [0.1, 0.1, 0.1, 0.1],   // 0 hub
+        [0.1, 0.1, 0.1, 0.1],    // 0 hub
         [1.0, 0.5, 0.25, 0.125], // 1 BEST
         [0.0, 1.0, 0.0, 0.0],
         [0.8, 0.6, 0.0, 0.0],
@@ -139,7 +147,12 @@ fn build_fixture() -> Fixture {
     for i in 0..20 {
         let mut props = Props::new();
         props.insert("content".into(), PropValue::Str(contents[i].into()));
-        create_ops.push(Op::CreateNode { id: ids[i], scope, label: "Memory".into(), props });
+        create_ops.push(Op::CreateNode {
+            id: ids[i],
+            scope,
+            label: "Memory".into(),
+            props,
+        });
     }
     db.submit(create_ops).unwrap();
 
@@ -169,7 +182,15 @@ fn build_fixture() -> Fixture {
     }
     db.submit(edge_ops).unwrap();
 
-    Fixture { _dir: dir, db, scope, scopes, hub, best, query_vector: vectors[1].to_vec() }
+    Fixture {
+        _dir: dir,
+        db,
+        scope,
+        scopes,
+        hub,
+        best,
+        query_vector: vectors[1].to_vec(),
+    }
 }
 
 #[test]
@@ -177,9 +198,8 @@ fn traverse_then_vector_and_text_recall_fuse_with_best_match_first() {
     let f = build_fixture();
 
     // Host step 1: traverse from the seed to get a candidate neighborhood.
-    let sub = f
-        .db
-        .traverse(&TraversalQuery {
+    let sub =
+        f.db.traverse(&TraversalQuery {
             scopes: f.scopes.clone(),
             seeds: vec![f.hub],
             max_hops: 1,
@@ -193,9 +213,8 @@ fn traverse_then_vector_and_text_recall_fuse_with_best_match_first() {
     assert!(candidate_ids.contains(&f.best));
 
     // Host step 2: vector search restricted to the traversal candidates.
-    let vec_hits = f
-        .db
-        .search_vector(&VectorQuery {
+    let vec_hits =
+        f.db.search_vector(&VectorQuery {
             scopes: f.scopes.clone(),
             model: "m1".into(),
             vector: f.query_vector.clone(),
@@ -204,7 +223,11 @@ fn traverse_then_vector_and_text_recall_fuse_with_best_match_first() {
         })
         .unwrap();
     let vector_ranked: Vec<NodeId> = vec_hits.iter().map(|(n, _)| n.id).collect();
-    assert_eq!(vector_ranked.first(), Some(&f.best), "exact embedding match must rank first");
+    assert_eq!(
+        vector_ranked.first(),
+        Some(&f.best),
+        "exact embedding match must rank first"
+    );
 
     // Host step 3: text search over the whole scope (not candidate-restricted
     // — `search_text` has no `candidates` parameter, matching the real API).
@@ -228,7 +251,10 @@ fn traverse_then_vector_and_text_recall_fuse_with_best_match_first() {
     // Every node either search path returned must actually be in the queried
     // scope — a regression here would mean a scope filter got bypassed.
     for (rec, _) in vec_hits.iter().chain(text_hits.iter()) {
-        assert_eq!(rec.scope, f.scope, "every returned node must be in the queried scope");
+        assert_eq!(
+            rec.scope, f.scope,
+            "every returned node must be in the queried scope"
+        );
     }
 
     // The three reads above (traverse, search_vector, search_text) each

@@ -8,9 +8,20 @@ fn subscriber_receives_applied_ops_with_monotonic_seq() {
     let scope = Scope::Id(ScopeId::new());
     let (a, b) = (NodeId::new(), NodeId::new());
     db.submit(vec![
-        Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
-        Op::CreateNode { id: b, scope, label: "M".into(), props: Default::default() },
-    ]).unwrap();
+        Op::CreateNode {
+            id: a,
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: b,
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        },
+    ])
+    .unwrap();
 
     let e1 = rx.recv().unwrap();
     let e2 = rx.recv().unwrap();
@@ -24,10 +35,18 @@ fn rejected_batches_and_reads_produce_no_events() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let rx = db.subscribe(16);
     // Rejected batch: close a nonexistent edge.
-    assert!(db.submit(vec![Op::CloseEdge { id: EdgeId::new(), valid_to: None }]).is_err());
+    assert!(db
+        .submit(vec![Op::CloseEdge {
+            id: EdgeId::new(),
+            valid_to: None
+        }])
+        .is_err());
     // A read:
     let _ = db.nodes_by_label(&ScopeSet::of(&[ScopeId::new()]), "M");
-    assert!(rx.try_recv().is_err(), "no events for rejected batches or reads");
+    assert!(
+        rx.try_recv().is_err(),
+        "no events for rejected batches or reads"
+    );
 }
 
 #[test]
@@ -37,10 +56,26 @@ fn ops_since_replays_the_log_and_covers_dropped_events() {
     let rx = db.subscribe(1); // tiny buffer — the second event will be dropped
     let scope = Scope::Id(ScopeId::new());
     db.submit(vec![
-        Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() },
-        Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() },
-        Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() },
-    ]).unwrap();
+        Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        },
+    ])
+    .unwrap();
 
     let first = rx.recv().unwrap();
     assert_eq!(first.seq, 1);
@@ -56,9 +91,12 @@ fn subscribe_zero_capacity_still_delivers() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let rx = db.subscribe(0); // clamped to 1 — must not become a rendezvous channel
     db.submit(vec![Op::CreateNode {
-        id: NodeId::new(), scope: Scope::Id(ScopeId::new()),
-        label: "M".into(), props: Default::default(),
-    }]).unwrap();
+        id: NodeId::new(),
+        scope: Scope::Id(ScopeId::new()),
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
     assert_eq!(rx.recv().unwrap().seq, 1);
 }
 
@@ -68,9 +106,12 @@ fn rebuild_broadcasts_nothing() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let rx = db.subscribe(16);
     db.submit(vec![Op::CreateNode {
-        id: NodeId::new(), scope: Scope::Id(ScopeId::new()),
-        label: "M".into(), props: Default::default(),
-    }]).unwrap();
+        id: NodeId::new(),
+        scope: Scope::Id(ScopeId::new()),
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
     let _ = rx.recv().unwrap();
     db.rebuild_state_from_ops().unwrap();
     assert!(rx.try_recv().is_err(), "rebuild must not broadcast");
@@ -82,7 +123,13 @@ fn compaction_enforces_ops_since_contract() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let scope = Scope::Id(ScopeId::new());
     for _ in 0..5 {
-        db.submit(vec![Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() }]).unwrap();
+        db.submit(vec![Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
     }
     assert_eq!(db.current_seq().unwrap(), 5);
 
@@ -100,9 +147,9 @@ fn compaction_enforces_ops_since_contract() {
     // State untouched by compaction:
     assert_eq!(db.current_seq().unwrap(), 5);
     // No-op and over-limit edges:
-    db.compact_ops(2).unwrap();                       // <= oldest: no-op
-    assert!(db.compact_ops(7).is_err());              // > current+1: Rejected
-    db.compact_ops(6).unwrap();                       // == current+1: empty log is legal
+    db.compact_ops(2).unwrap(); // <= oldest: no-op
+    assert!(db.compact_ops(7).is_err()); // > current+1: Rejected
+    db.compact_ops(6).unwrap(); // == current+1: empty log is legal
     assert!(db.ops_since(6).unwrap().is_empty());
 }
 
@@ -112,7 +159,13 @@ fn append_after_empty_compaction_resumes_at_the_floor() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let scope = Scope::Id(ScopeId::new());
     for _ in 0..5 {
-        db.submit(vec![Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() }]).unwrap();
+        db.submit(vec![Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
     }
     db.compact_ops(6).unwrap(); // empty the log; floor = 6
 
@@ -120,7 +173,13 @@ fn append_after_empty_compaction_resumes_at_the_floor() {
     // sub-floor seq would be committed yet permanently unreadable via
     // ops_since, and would break the seq monotonicity the subscribe/dedup
     // recipe depends on.
-    db.submit(vec![Op::CreateNode { id: NodeId::new(), scope, label: "M".into(), props: Default::default() }]).unwrap();
+    db.submit(vec![Op::CreateNode {
+        id: NodeId::new(),
+        scope,
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
     assert_eq!(db.current_seq().unwrap(), 6);
     let replay = db.ops_since(6).unwrap();
     assert_eq!(replay.len(), 1);
@@ -133,16 +192,25 @@ fn unsupported_format_version_errors_at_open() {
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.redb");
-    { let _ = Db::open(path.clone()).unwrap(); } // create a valid v1 file
-    { // sabotage the version from outside
+    {
+        let _ = Db::open(path.clone()).unwrap();
+    } // create a valid v1 file
+    {
+        // sabotage the version from outside
         let raw = Database::open(&path).unwrap();
         let tx = raw.begin_write().unwrap();
-        { let mut t = tx.open_table(META).unwrap();
-          t.insert("format_version", 999u32.to_le_bytes().as_slice()).unwrap(); }
+        {
+            let mut t = tx.open_table(META).unwrap();
+            t.insert("format_version", 999u32.to_le_bytes().as_slice())
+                .unwrap();
+        }
         tx.commit().unwrap();
     }
     match Db::open(path) {
-        Err(TopoError::UnsupportedFormat { found: 999, supported: 1 }) => {}
+        Err(TopoError::UnsupportedFormat {
+            found: 999,
+            supported: 1,
+        }) => {}
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
 }

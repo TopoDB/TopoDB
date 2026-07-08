@@ -69,7 +69,13 @@ pub(crate) struct Slab {
 
 impl Slab {
     pub(crate) fn new(dim: usize) -> Slab {
-        Slab { dim, ids: Vec::new(), data: Vec::new(), row_of: HashMap::new(), dead: 0 }
+        Slab {
+            dim,
+            ids: Vec::new(),
+            data: Vec::new(),
+            row_of: HashMap::new(),
+            dead: 0,
+        }
     }
 
     /// Tombstone any existing row for `id`, then append `v` as a fresh row.
@@ -89,7 +95,11 @@ impl Slab {
             self.dead = 0;
             self.dim = v.len();
         }
-        debug_assert_eq!(v.len(), self.dim, "upsert vector length must match slab dim");
+        debug_assert_eq!(
+            v.len(),
+            self.dim,
+            "upsert vector length must match slab dim"
+        );
         // Tombstone the prior row (if any) before appending the new one.
         self.tombstone(id);
         let row = self.ids.len();
@@ -195,7 +205,9 @@ pub(crate) struct VectorIndex {
 
 impl VectorIndex {
     pub(crate) fn new() -> VectorIndex {
-        VectorIndex { slabs: RwLock::new(HashMap::new()) }
+        VectorIndex {
+            slabs: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Fold every node with an embedding into a fresh index.

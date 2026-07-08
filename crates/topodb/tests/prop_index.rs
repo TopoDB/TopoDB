@@ -2,7 +2,10 @@ use topodb::*;
 
 fn spec() -> IndexSpec {
     IndexSpec {
-        equality: vec![PropIndex { label: "Entity".into(), prop: "name".into() }],
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
         text: vec![],
     }
 }
@@ -11,7 +14,15 @@ fn entity(name: &str, scope: Scope) -> (NodeId, Op) {
     let id = NodeId::new();
     let mut props = Props::new();
     props.insert("name".into(), PropValue::Str(name.into()));
-    (id, Op::CreateNode { id, scope, label: "Entity".into(), props })
+    (
+        id,
+        Op::CreateNode {
+            id,
+            scope,
+            label: "Entity".into(),
+            props,
+        },
+    )
 }
 
 #[test]
@@ -24,7 +35,12 @@ fn equality_lookup_finds_only_declared_and_scoped() {
     db.submit(vec![op_a, op_b]).unwrap();
 
     let hits = db
-        .nodes_by_prop(&ScopeSet::of(&[s1]), "Entity", "name", &PropValue::Str("ada".into()))
+        .nodes_by_prop(
+            &ScopeSet::of(&[s1]),
+            "Entity",
+            "name",
+            &PropValue::Str("ada".into()),
+        )
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, a);
@@ -37,7 +53,12 @@ fn equality_lookup_finds_only_declared_and_scoped() {
 
     // Float query value is rejected too, even for a declared key:
     let err = db
-        .nodes_by_prop(&ScopeSet::of(&[s1]), "Entity", "name", &PropValue::Float(1.0))
+        .nodes_by_prop(
+            &ScopeSet::of(&[s1]),
+            "Entity",
+            "name",
+            &PropValue::Float(1.0),
+        )
         .unwrap_err();
     assert!(matches!(err, TopoError::Rejected(_)));
 }
@@ -55,29 +76,54 @@ fn index_follows_set_and_remove() {
     db.submit(vec![Op::SetNodeProps {
         id: a,
         props: [("name".to_string(), Some(PropValue::Str("grace".into())))].into(),
-    }]).unwrap();
-    assert!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into())).unwrap().is_empty());
-    assert_eq!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().len(), 1);
+    }])
+    .unwrap();
+    assert!(db
+        .nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into()))
+            .unwrap()
+            .len(),
+        1
+    );
 
     // None-removal: clearing the declared prop deletes the index entry while
     // the node itself survives.
     db.submit(vec![Op::SetNodeProps {
         id: a,
         props: [("name".to_string(), None)].into(),
-    }]).unwrap();
-    assert!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().is_empty());
-    assert!(db.node(&scopes, a).is_some(), "node must survive a prop clear");
+    }])
+    .unwrap();
+    assert!(db
+        .nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into()))
+        .unwrap()
+        .is_empty());
+    assert!(
+        db.node(&scopes, a).is_some(),
+        "node must survive a prop clear"
+    );
 
     // Re-set so the remove below exercises removal of an indexed node.
     db.submit(vec![Op::SetNodeProps {
         id: a,
         props: [("name".to_string(), Some(PropValue::Str("grace".into())))].into(),
-    }]).unwrap();
-    assert_eq!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().len(), 1);
+    }])
+    .unwrap();
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into()))
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Remove: gone from the index.
     db.submit(vec![Op::RemoveNode { id: a }]).unwrap();
-    assert!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().is_empty());
+    assert!(db
+        .nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into()))
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -89,12 +135,20 @@ fn float_range_scan_is_scoped() {
         let id = NodeId::new();
         let mut props = Props::new();
         props.insert("importance".into(), PropValue::Float(imp));
-        db.submit(vec![Op::CreateNode { id, scope: Scope::Id(s), label: "Memory".into(), props }]).unwrap();
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }])
+        .unwrap();
     }
     let hits = db.nodes_by_float_range(&ScopeSet::of(&[s]), "importance", 0.0, 0.4);
     assert_eq!(hits.len(), 1);
     // Nothing without the scope:
-    assert!(db.nodes_by_float_range(&ScopeSet::of(&[ScopeId::new()]), "importance", 0.0, 1.0).is_empty());
+    assert!(db
+        .nodes_by_float_range(&ScopeSet::of(&[ScopeId::new()]), "importance", 0.0, 1.0)
+        .is_empty());
 }
 
 #[test]
@@ -102,10 +156,19 @@ fn open_with_rejects_float_equality_declaration_and_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let bad = IndexSpec {
         equality: vec![
-            PropIndex { label: "M".into(), prop: "x".into() },
-            PropIndex { label: "M".into(), prop: "x".into() },
+            PropIndex {
+                label: "M".into(),
+                prop: "x".into(),
+            },
+            PropIndex {
+                label: "M".into(),
+                prop: "x".into(),
+            },
         ],
         text: vec![],
     };
-    assert!(matches!(Db::open_with(dir.path().join("t.redb"), bad), Err(TopoError::Rejected(_))));
+    assert!(matches!(
+        Db::open_with(dir.path().join("t.redb"), bad),
+        Err(TopoError::Rejected(_))
+    ));
 }

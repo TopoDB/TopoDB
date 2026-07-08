@@ -4,10 +4,14 @@ use ulid::Ulid;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
         pub struct $name(pub Ulid);
         impl $name {
-            pub fn new() -> Self { Self(Ulid::new()) }
+            pub fn new() -> Self {
+                Self(Ulid::new())
+            }
 
             /// Deterministic constructor for tests/fixtures (e.g. the committed
             /// FORMAT.md fixture, `tests/format_fixture.rs`) that need a stable,
@@ -15,10 +19,14 @@ macro_rules! id_type {
             /// randomness. Same debug-seam class as `Db::debug_snapshot` — not
             /// part of the supported public surface, hence `#[doc(hidden)]`.
             #[doc(hidden)]
-            pub fn from_u128(v: u128) -> Self { Self(Ulid(v)) }
+            pub fn from_u128(v: u128) -> Self {
+                Self(Ulid(v))
+            }
         }
         impl Default for $name {
-            fn default() -> Self { Self::new() }
+            fn default() -> Self {
+                Self::new()
+            }
         }
     };
 }
@@ -41,7 +49,10 @@ pub struct ScopeSet {
 
 impl ScopeSet {
     pub fn of(ids: &[ScopeId]) -> Self {
-        Self { include_shared: false, ids: ids.iter().copied().collect() }
+        Self {
+            include_shared: false,
+            ids: ids.iter().copied().collect(),
+        }
     }
     pub fn with_shared(mut self) -> Self {
         self.include_shared = true;

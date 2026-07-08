@@ -1,12 +1,14 @@
 use proptest::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use topodb::*;
 use topodb::AdjEntry;
+use topodb::*;
 
 /// Fixed, distinct vocabulary for `Intent::SetText` — deterministic (no
 /// random strings), so BM25 postings are reproducible across replay.
-const WORDS: [&str; 8] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+const WORDS: [&str; 8] = [
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+];
 
 /// Generate a small random-but-valid op sequence: create nodes, then a mix
 /// of edges/prop-sets/closes/removes/text-sets referencing only created ids.
@@ -15,27 +17,52 @@ const WORDS: [&str; 8] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot
 /// generated script is valid by construction.
 #[derive(Debug, Clone)]
 enum Intent {
-    Edge { from_ix: usize, to_ix: usize },
-    Close { edge_ix: usize },
-    SetProp { node_ix: usize, val: i64 },
+    Edge {
+        from_ix: usize,
+        to_ix: usize,
+    },
+    Close {
+        edge_ix: usize,
+    },
+    SetProp {
+        node_ix: usize,
+        val: i64,
+    },
     /// Sets the declared text prop (`"text"`) to a fixed word from `WORDS`
     /// (chosen via `word_ix % WORDS.len()`), exercising the FTS postings
     /// maintenance path under replay.
-    SetText { node_ix: usize, word_ix: usize },
-    Embed { node_ix: usize },
-    Remove { node_ix: usize },
+    SetText {
+        node_ix: usize,
+        word_ix: usize,
+    },
+    Embed {
+        node_ix: usize,
+    },
+    Remove {
+        node_ix: usize,
+    },
 }
 
 fn scripts() -> impl Strategy<Value = (usize, usize, Vec<Intent>)> {
     let intent = prop_oneof![
-        (any::<usize>(), any::<usize>()).prop_map(|(f, t)| Intent::Edge { from_ix: f, to_ix: t }),
+        (any::<usize>(), any::<usize>()).prop_map(|(f, t)| Intent::Edge {
+            from_ix: f,
+            to_ix: t
+        }),
         any::<usize>().prop_map(|i| Intent::Close { edge_ix: i }),
         (any::<usize>(), any::<i64>()).prop_map(|(i, v)| Intent::SetProp { node_ix: i, val: v }),
-        (any::<usize>(), any::<usize>()).prop_map(|(i, w)| Intent::SetText { node_ix: i, word_ix: w }),
+        (any::<usize>(), any::<usize>()).prop_map(|(i, w)| Intent::SetText {
+            node_ix: i,
+            word_ix: w
+        }),
         any::<usize>().prop_map(|i| Intent::Embed { node_ix: i }),
         any::<usize>().prop_map(|i| Intent::Remove { node_ix: i }),
     ];
-    (3usize..10, 0usize..4, proptest::collection::vec(intent, 0..20))
+    (
+        3usize..10,
+        0usize..4,
+        proptest::collection::vec(intent, 0..20),
+    )
 }
 
 /// Lowers the abstract script into concrete `submit_at` calls against `db`.
@@ -146,7 +173,8 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) -> 
                 let (id, _) = nodes[node_ix % nodes.len()];
                 let mut props: BTreeMap<String, Option<PropValue>> = BTreeMap::new();
                 props.insert("v".to_string(), Some(PropValue::Int(val)));
-                db.submit_at(vec![Op::SetNodeProps { id, props }], t).unwrap();
+                db.submit_at(vec![Op::SetNodeProps { id, props }], t)
+                    .unwrap();
             }
             Intent::SetText { node_ix, word_ix } => {
                 if nodes.is_empty() {
@@ -158,7 +186,8 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) -> 
                     "text".to_string(),
                     Some(PropValue::Str(WORDS[word_ix % WORDS.len()].into())),
                 );
-                db.submit_at(vec![Op::SetNodeProps { id, props }], t).unwrap();
+                db.submit_at(vec![Op::SetNodeProps { id, props }], t)
+                    .unwrap();
             }
             Intent::Embed { node_ix } => {
                 if nodes.is_empty() {
@@ -197,12 +226,18 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) -> 
 /// between an incrementally-`apply`'d snapshot and a from-scratch
 /// `Snapshot::from_storage` rebuild, even when the contents are identical).
 fn nodes_map(snap: &Snapshot) -> BTreeMap<NodeId, NodeRecord> {
-    snap.debug_nodes().iter().map(|(k, v)| (*k, v.clone())).collect()
+    snap.debug_nodes()
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect()
 }
 
 /// Same idea for the full-record `edges` map.
 fn edges_map(snap: &Snapshot) -> BTreeMap<EdgeId, EdgeRecord> {
-    snap.debug_edges().iter().map(|(k, v)| (*k, v.clone())).collect()
+    snap.debug_edges()
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect()
 }
 
 /// Same idea for `out`/`inn` adjacency: per-key entry order in the `im`
@@ -226,8 +261,14 @@ fn adj_map(m: &im::HashMap<NodeId, im::Vector<AdjEntry>>) -> BTreeMap<NodeId, Ve
 /// needs no spec declaration).
 fn spec() -> IndexSpec {
     IndexSpec {
-        equality: vec![PropIndex { label: "M".into(), prop: "v".into() }],
-        text: vec![PropIndex { label: "M".into(), prop: "text".into() }],
+        equality: vec![PropIndex {
+            label: "M".into(),
+            prop: "v".into(),
+        }],
+        text: vec![PropIndex {
+            label: "M".into(),
+            prop: "text".into(),
+        }],
     }
 }
 
@@ -249,7 +290,9 @@ fn assert_equality_and_vector_parity(db: &Db, scopes: &ScopeSet) {
     for n in &dump {
         if let Some(PropValue::Int(v)) = n.props.get("v") {
             present_v.insert(*v);
-            let hits = db.nodes_by_prop(scopes, "M", "v", &PropValue::Int(*v)).unwrap();
+            let hits = db
+                .nodes_by_prop(scopes, "M", "v", &PropValue::Int(*v))
+                .unwrap();
             assert!(
                 hits.iter().any(|h| h.id == n.id),
                 "nodes_by_prop(\"M\",\"v\",{v}) must find node {:?}",
@@ -264,8 +307,13 @@ fn assert_equality_and_vector_parity(db: &Db, scopes: &ScopeSet) {
     while present_v.contains(&absent) {
         absent = absent.wrapping_add(1);
     }
-    let empty_hits = db.nodes_by_prop(scopes, "M", "v", &PropValue::Int(absent)).unwrap();
-    assert!(empty_hits.is_empty(), "nodes_by_prop must find nothing for unused value {absent}");
+    let empty_hits = db
+        .nodes_by_prop(scopes, "M", "v", &PropValue::Int(absent))
+        .unwrap();
+    assert!(
+        empty_hits.is_empty(),
+        "nodes_by_prop must find nothing for unused value {absent}"
+    );
 
     // --- Vector parity: every embedded node's own vector must retrieve it. ---
     // k = live node count is an upper bound on any tie group (see below), so
@@ -305,8 +353,12 @@ fn assert_equality_and_vector_parity(db: &Db, scopes: &ScopeSet) {
 /// FTS parity before vs. after rebuild (postings must reindex to the exact
 /// same set, not merely a non-empty one).
 fn fts_hit_ids(db: &Db, scopes: &ScopeSet, word: &str, k: usize) -> Vec<NodeId> {
-    let mut ids: Vec<NodeId> =
-        db.search_text(scopes, word, k).unwrap().into_iter().map(|(n, _)| n.id).collect();
+    let mut ids: Vec<NodeId> = db
+        .search_text(scopes, word, k)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
     ids.sort();
     ids
 }

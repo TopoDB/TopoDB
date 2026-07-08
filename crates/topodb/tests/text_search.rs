@@ -3,7 +3,10 @@ use topodb::*;
 fn spec() -> IndexSpec {
     IndexSpec {
         equality: vec![],
-        text: vec![PropIndex { label: "Memory".into(), prop: "content".into() }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
     }
 }
 
@@ -11,7 +14,15 @@ fn memory(content: &str, scope: Scope) -> (NodeId, Op) {
     let id = NodeId::new();
     let mut props = Props::new();
     props.insert("content".into(), PropValue::Str(content.into()));
-    (id, Op::CreateNode { id, scope, label: "Memory".into(), props })
+    (
+        id,
+        Op::CreateNode {
+            id,
+            scope,
+            label: "Memory".into(),
+            props,
+        },
+    )
 }
 
 #[test]
@@ -24,7 +35,9 @@ fn bm25_ranks_matches_and_respects_scope() {
     let (_c, op_c) = memory("rust embedded database engine", Scope::Id(s2)); // wrong scope
     db.submit(vec![op_a, op_b, op_c]).unwrap();
 
-    let hits = db.search_text(&ScopeSet::of(&[s1]), "embedded rust", 10).unwrap();
+    let hits = db
+        .search_text(&ScopeSet::of(&[s1]), "embedded rust", 10)
+        .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0.id, a);
     assert!(hits[0].1 > 0.0);
@@ -42,8 +55,13 @@ fn index_follows_prop_updates_and_removal() {
 
     db.submit(vec![Op::SetNodeProps {
         id: a,
-        props: [("content".to_string(), Some(PropValue::Str("vector recall pipelines".into())))].into(),
-    }]).unwrap();
+        props: [(
+            "content".to_string(),
+            Some(PropValue::Str("vector recall pipelines".into())),
+        )]
+        .into(),
+    }])
+    .unwrap();
     assert!(db.search_text(&scopes, "topology", 10).unwrap().is_empty());
     assert_eq!(db.search_text(&scopes, "recall", 10).unwrap().len(), 1);
 
@@ -61,10 +79,22 @@ fn rejected_batch_leaves_postings_untouched_and_rebuild_restores_them() {
     db.submit(vec![op_a]).unwrap();
 
     // Batch = text update + invalid op → whole batch rejected, postings unchanged.
-    let err = db.submit(vec![
-        Op::SetNodeProps { id: a, props: [("content".to_string(), Some(PropValue::Str("changed".into())))].into() },
-        Op::CloseEdge { id: EdgeId::new(), valid_to: None },
-    ]).unwrap_err();
+    let err = db
+        .submit(vec![
+            Op::SetNodeProps {
+                id: a,
+                props: [(
+                    "content".to_string(),
+                    Some(PropValue::Str("changed".into())),
+                )]
+                .into(),
+            },
+            Op::CloseEdge {
+                id: EdgeId::new(),
+                valid_to: None,
+            },
+        ])
+        .unwrap_err();
     assert!(matches!(err, TopoError::Rejected(_)));
     assert_eq!(db.search_text(&scopes, "atomic", 10).unwrap().len(), 1);
     assert!(db.search_text(&scopes, "changed", 10).unwrap().is_empty());
@@ -79,7 +109,7 @@ fn empty_string_text_prop_is_not_a_document() {
     let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
     let s = ScopeId::new();
     let scopes = ScopeSet::of(&[s]);
-    let (_e, op_e) = memory("", Scope::Id(s));            // empty content
+    let (_e, op_e) = memory("", Scope::Id(s)); // empty content
     let (a, op_a) = memory("solitary real document", Scope::Id(s));
     db.submit(vec![op_e, op_a]).unwrap();
     // If "" counted as a doc, n_docs=2 halves this idf; with normalization
@@ -87,9 +117,13 @@ fn empty_string_text_prop_is_not_a_document() {
     let hits = db.search_text(&scopes, "solitary", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0.id, a);
-    let expected = ((1.0f32 - 1.0 + 0.5) / (1.0 + 0.5) + 1.0).ln()
-        * (1.0 * (1.2f32 + 1.0)) / (1.0 + 1.2f32 * (1.0 - 0.75f32 + 0.75f32 * 3.0 / 3.0));
-    assert!((hits[0].1 - expected).abs() < 1e-5, "n_docs must be 1, got score {}", hits[0].1);
+    let expected = ((1.0f32 - 1.0 + 0.5) / (1.0 + 0.5) + 1.0).ln() * (1.0 * (1.2f32 + 1.0))
+        / (1.0 + 1.2f32 * (1.0 - 0.75f32 + 0.75f32 * 3.0 / 3.0));
+    assert!(
+        (hits[0].1 - expected).abs() < 1e-5,
+        "n_docs must be 1, got score {}",
+        hits[0].1
+    );
 }
 
 #[test]
@@ -130,7 +164,12 @@ fn plan2_layout_file_migrates_at_open() {
         db.submit(vec![op]).unwrap();
     }
     let db = Db::open_with(path, spec()).unwrap();
-    assert_eq!(db.search_text(&ScopeSet::of(&[s]), "persistent", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_text(&ScopeSet::of(&[s]), "persistent", 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -142,8 +181,16 @@ fn changed_text_spec_reindexes_at_open() {
     {
         let db = Db::open(path.clone()).unwrap(); // no text spec — nothing indexed
         db.submit(vec![op_a]).unwrap();
-        assert!(db.search_text(&ScopeSet::of(&[s]), "reindex", 10).unwrap().is_empty());
+        assert!(db
+            .search_text(&ScopeSet::of(&[s]), "reindex", 10)
+            .unwrap()
+            .is_empty());
     }
     let db = Db::open_with(path, spec()).unwrap(); // spec changed → full reindex
-    assert_eq!(db.search_text(&ScopeSet::of(&[s]), "reindex", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_text(&ScopeSet::of(&[s]), "reindex", 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }

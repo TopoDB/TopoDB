@@ -56,7 +56,10 @@ impl Storage {
         Self::open_with(path, Arc::new(IndexSpec::default()))
     }
 
-    pub(crate) fn open_with(path: impl AsRef<Path>, spec: Arc<IndexSpec>) -> Result<Self, TopoError> {
+    pub(crate) fn open_with(
+        path: impl AsRef<Path>,
+        spec: Arc<IndexSpec>,
+    ) -> Result<Self, TopoError> {
         let db = Database::create(path).map_err(redb::Error::from)?;
         let s = Self { db, spec };
         // Ensure tables + format version exist.
@@ -72,23 +75,27 @@ impl Storage {
             let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
             // Read the stored version into an owned value first so the read
             // guard's borrow of `meta` ends before we (maybe) insert into it.
-            let existing: Option<u32> = match meta.get("format_version").map_err(redb::Error::from)? {
-                Some(v) => {
-                    let bytes: [u8; 4] = v
-                        .value()
-                        .try_into()
-                        .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
-                    Some(u32::from_le_bytes(bytes))
-                }
-                None => None,
-            };
+            let existing: Option<u32> =
+                match meta.get("format_version").map_err(redb::Error::from)? {
+                    Some(v) => {
+                        let bytes: [u8; 4] = v
+                            .value()
+                            .try_into()
+                            .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
+                        Some(u32::from_le_bytes(bytes))
+                    }
+                    None => None,
+                };
             match existing {
                 None => {
                     meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                         .map_err(redb::Error::from)?;
                 }
                 Some(found) if found > FORMAT_VERSION => {
-                    return Err(TopoError::UnsupportedFormat { found, supported: FORMAT_VERSION });
+                    return Err(TopoError::UnsupportedFormat {
+                        found,
+                        supported: FORMAT_VERSION,
+                    });
                 }
                 // Reachable only for `found < FORMAT_VERSION` (the `>` arm
                 // above catches the rest) — i.e. a pre-1 file, which no
@@ -193,7 +200,8 @@ impl Storage {
             // spec always reflects the current open (a byte-identical rewrite
             // is a harmless no-op). Introspection sees equality changes even
             // when they trigger no reindex.
-            meta.insert("index_spec", incoming_bytes.as_slice()).map_err(redb::Error::from)?;
+            meta.insert("index_spec", incoming_bytes.as_slice())
+                .map_err(redb::Error::from)?;
         }
         tx.commit().map_err(redb::Error::from)?;
         Ok(())
@@ -208,9 +216,13 @@ impl Storage {
     pub fn format_version(&self) -> Result<u32, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let meta = tx.open_table(META).map_err(redb::Error::from)?;
-        let v = meta.get("format_version").map_err(redb::Error::from)?
+        let v = meta
+            .get("format_version")
+            .map_err(redb::Error::from)?
             .ok_or_else(|| TopoError::Encoding("missing format_version".into()))?;
-        let bytes: [u8; 4] = v.value().try_into()
+        let bytes: [u8; 4] = v
+            .value()
+            .try_into()
             .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
         Ok(u32::from_le_bytes(bytes))
     }
@@ -236,15 +248,19 @@ impl Storage {
                 read_oldest_seq(&meta)?
             };
             let mut table = tx.open_table(OPS).map_err(redb::Error::from)?;
-            let next = table.last().map_err(redb::Error::from)?
-                .map(|(k, _)| k.value() + 1).unwrap_or(1)
+            let next = table
+                .last()
+                .map_err(redb::Error::from)?
+                .map(|(k, _)| k.value() + 1)
+                .unwrap_or(1)
                 .max(floor);
             first = next;
             last = next + ops.len() as u64 - 1;
             for (i, op) in ops.iter().enumerate() {
-                let bytes = postcard::to_allocvec(op)
-                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                table.insert(next + i as u64, bytes.as_slice())
+                let bytes =
+                    postcard::to_allocvec(op).map_err(|e| TopoError::Encoding(e.to_string()))?;
+                table
+                    .insert(next + i as u64, bytes.as_slice())
                     .map_err(redb::Error::from)?;
             }
         }
@@ -275,7 +291,11 @@ impl Storage {
     pub(crate) fn current_seq(&self) -> Result<u64, TopoError> {
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let table = tx.open_table(OPS).map_err(redb::Error::from)?;
-        let last = table.last().map_err(redb::Error::from)?.map(|(k, _)| k.value()).unwrap_or(0);
+        let last = table
+            .last()
+            .map_err(redb::Error::from)?
+            .map(|(k, _)| k.value())
+            .unwrap_or(0);
         Ok(last)
     }
 
@@ -309,7 +329,8 @@ impl Storage {
         let tx = self.db.begin_write().map_err(redb::Error::from)?;
         {
             let mut ops = tx.open_table(OPS).map_err(redb::Error::from)?;
-            ops.retain_in(..keep_from, |_, _| false).map_err(redb::Error::from)?;
+            ops.retain_in(..keep_from, |_, _| false)
+                .map_err(redb::Error::from)?;
             let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
             meta.insert("oldest_seq", keep_from.to_le_bytes().as_slice())
                 .map_err(redb::Error::from)?;
@@ -340,8 +361,8 @@ impl Storage {
         let mut out = Vec::new();
         for entry in table.range(since..).map_err(redb::Error::from)? {
             let (k, v) = entry.map_err(redb::Error::from)?;
-            let op: Op = postcard::from_bytes(v.value())
-                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let op: Op =
+                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
             out.push((k.value(), op));
         }
         Ok(out)
@@ -445,7 +466,11 @@ impl Storage {
         }
 
         tx.commit().map_err(redb::Error::from)?;
-        Ok(AppliedBatch { first_seq, last_seq, resolved })
+        Ok(AppliedBatch {
+            first_seq,
+            last_seq,
+            resolved,
+        })
     }
 
     /// Same rationale/`#[allow(dead_code)]` as `format_version` above:
@@ -524,7 +549,9 @@ impl Storage {
                 };
                 let bytes = postcard::to_allocvec(&merged)
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                table.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+                table
+                    .insert(key.as_slice(), bytes.as_slice())
+                    .map_err(redb::Error::from)?;
             }
         }
         tx.commit().map_err(redb::Error::from)?;
@@ -646,7 +673,15 @@ pub struct AppliedBatch {
 /// unchanged. Idempotent: an already-resolved op (`Some(_)`) is left as-is.
 fn resolve_op(op: Op, now_ms: i64) -> Op {
     match op {
-        Op::CreateEdge { id, scope, ty, from, to, props, valid_from } => Op::CreateEdge {
+        Op::CreateEdge {
+            id,
+            scope,
+            ty,
+            from,
+            to,
+            props,
+            valid_from,
+        } => Op::CreateEdge {
             id,
             scope,
             ty,
@@ -655,9 +690,10 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
             props,
             valid_from: Some(valid_from.unwrap_or(now_ms)),
         },
-        Op::CloseEdge { id, valid_to } => {
-            Op::CloseEdge { id, valid_to: Some(valid_to.unwrap_or(now_ms)) }
-        }
+        Op::CloseEdge { id, valid_to } => Op::CloseEdge {
+            id,
+            valid_to: Some(valid_to.unwrap_or(now_ms)),
+        },
         other => other,
     }
 }
@@ -757,7 +793,9 @@ fn put_node(
 ) -> Result<(), TopoError> {
     let key = node_key(rec.id);
     let bytes = postcard::to_allocvec(rec).map_err(|e| TopoError::Encoding(e.to_string()))?;
-    table.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+    table
+        .insert(key.as_slice(), bytes.as_slice())
+        .map_err(redb::Error::from)?;
     Ok(())
 }
 
@@ -767,7 +805,9 @@ fn put_edge(
 ) -> Result<(), TopoError> {
     let key = edge_key(rec.id);
     let bytes = postcard::to_allocvec(rec).map_err(|e| TopoError::Encoding(e.to_string()))?;
-    table.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+    table
+        .insert(key.as_slice(), bytes.as_slice())
+        .map_err(redb::Error::from)?;
     Ok(())
 }
 
@@ -782,7 +822,12 @@ fn apply_op(
     op: &Op,
 ) -> Result<(), TopoError> {
     match op {
-        Op::CreateNode { id, scope, label, props } => {
+        Op::CreateNode {
+            id,
+            scope,
+            label,
+            props,
+        } => {
             let rec = NodeRecord {
                 id: *id,
                 scope: *scope,
@@ -819,7 +864,9 @@ fn apply_op(
             let key = node_key(*id);
             let removed = nodes.remove(key.as_slice()).map_err(redb::Error::from)?;
             if removed.is_none() {
-                return Err(TopoError::Rejected(format!("RemoveNode: node {id:?} not found")));
+                return Err(TopoError::Rejected(format!(
+                    "RemoveNode: node {id:?} not found"
+                )));
             }
 
             // Remove incident edges, both directions. v0.1: linear scan is
@@ -838,7 +885,15 @@ fn apply_op(
             }
             Ok(())
         }
-        Op::CreateEdge { id, scope, ty, from, to, props, valid_from } => {
+        Op::CreateEdge {
+            id,
+            scope,
+            ty,
+            from,
+            to,
+            props,
+            valid_from,
+        } => {
             let from_rec = read_node(nodes, *from)?.ok_or_else(|| {
                 TopoError::Rejected(format!("CreateEdge {id:?}: from node {from:?} not found"))
             })?;
@@ -870,7 +925,9 @@ fn apply_op(
             let mut rec = read_edge(edges, *id)?
                 .ok_or_else(|| TopoError::Rejected(format!("CloseEdge: edge {id:?} not found")))?;
             if rec.valid_to.is_some() {
-                return Err(TopoError::Rejected(format!("CloseEdge: edge {id:?} already closed")));
+                return Err(TopoError::Rejected(format!(
+                    "CloseEdge: edge {id:?} already closed"
+                )));
             }
             rec.valid_to = Some(
                 valid_to
@@ -893,8 +950,18 @@ mod tests {
         let s = Storage::open(dir.path().join("t.redb")).unwrap();
         let scope = Scope::Id(ScopeId::new());
         let ops = vec![
-            Op::CreateNode { id: NodeId::new(), scope, label: "Memory".into(), props: Default::default() },
-            Op::CreateNode { id: NodeId::new(), scope, label: "Entity".into(), props: Default::default() },
+            Op::CreateNode {
+                id: NodeId::new(),
+                scope,
+                label: "Memory".into(),
+                props: Default::default(),
+            },
+            Op::CreateNode {
+                id: NodeId::new(),
+                scope,
+                label: "Entity".into(),
+                props: Default::default(),
+            },
         ];
         let (first, last) = s.append_ops(&ops).unwrap();
         assert_eq!((first, last), (1, 2));
@@ -918,7 +985,8 @@ mod tests {
             let tx = db.begin_write().unwrap();
             {
                 let mut meta = tx.open_table(META).unwrap();
-                meta.insert("format_version", 2u32.to_le_bytes().as_slice()).unwrap();
+                meta.insert("format_version", 2u32.to_le_bytes().as_slice())
+                    .unwrap();
             }
             tx.commit().unwrap();
         }
@@ -927,8 +995,13 @@ mod tests {
         // `.err()` drops the (non-`Debug`) `Storage` from the `Ok` arm.
         let err = Storage::open(&path).err().expect("reopen must be rejected");
         match err {
-            TopoError::UnsupportedFormat { found: 2, supported: 1 } => {}
-            other => panic!("expected UnsupportedFormat {{ found: 2, supported: 1 }}, got {other:?}"),
+            TopoError::UnsupportedFormat {
+                found: 2,
+                supported: 1,
+            } => {}
+            other => {
+                panic!("expected UnsupportedFormat {{ found: 2, supported: 1 }}, got {other:?}")
+            }
         }
     }
 
@@ -939,12 +1012,21 @@ mod tests {
         let scope = Scope::Id(ScopeId::new());
         let id = NodeId::new();
         s.apply_batch(
-            vec![Op::CreateNode { id, scope, label: "M".into(), props: Default::default() }],
+            vec![Op::CreateNode {
+                id,
+                scope,
+                label: "M".into(),
+                props: Default::default(),
+            }],
             0,
         )
         .unwrap();
         s.apply_batch(
-            vec![Op::SetEmbedding { id, model: "m".into(), vector: vec![1.0, 2.0, 3.0] }],
+            vec![Op::SetEmbedding {
+                id,
+                model: "m".into(),
+                vector: vec![1.0, 2.0, 3.0],
+            }],
             0,
         )
         .unwrap();
@@ -955,7 +1037,11 @@ mod tests {
         // Embedding a node that doesn't exist rejects the whole batch.
         let err = s
             .apply_batch(
-                vec![Op::SetEmbedding { id: NodeId::new(), model: "m".into(), vector: vec![0.0] }],
+                vec![Op::SetEmbedding {
+                    id: NodeId::new(),
+                    model: "m".into(),
+                    vector: vec![0.0],
+                }],
                 0,
             )
             .unwrap_err();

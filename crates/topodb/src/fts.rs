@@ -76,9 +76,7 @@ fn read_posting(
     term: &[u8],
 ) -> Result<Vec<(NodeId, u32)>, TopoError> {
     match postings.get(term).map_err(redb::Error::from)? {
-        Some(v) => {
-            postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))
-        }
+        Some(v) => postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string())),
         None => Ok(Vec::new()),
     }
 }
@@ -112,7 +110,9 @@ fn set_posting(
     } else {
         let vec: Vec<(NodeId, u32)> = map.into_iter().collect();
         let bytes = postcard::to_allocvec(&vec).map_err(|e| TopoError::Encoding(e.to_string()))?;
-        postings.insert(term, bytes.as_slice()).map_err(redb::Error::from)?;
+        postings
+            .insert(term, bytes.as_slice())
+            .map_err(redb::Error::from)?;
     }
     Ok(())
 }
@@ -158,7 +158,9 @@ fn write_stats(
     } else {
         let bytes = postcard::to_allocvec(&(doc_count, total_len))
             .map_err(|e| TopoError::Encoding(e.to_string()))?;
-        stats.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+        stats
+            .insert(key.as_slice(), bytes.as_slice())
+            .map_err(redb::Error::from)?;
     }
     Ok(())
 }
@@ -257,7 +259,8 @@ pub(crate) fn fts_update(
     if new_text.is_some() {
         let bytes = postcard::to_allocvec(&(new_len as u32))
             .map_err(|e| TopoError::Encoding(e.to_string()))?;
-        docs.insert(key.as_slice(), bytes.as_slice()).map_err(redb::Error::from)?;
+        docs.insert(key.as_slice(), bytes.as_slice())
+            .map_err(redb::Error::from)?;
     } else {
         docs.remove(key.as_slice()).map_err(redb::Error::from)?;
     }

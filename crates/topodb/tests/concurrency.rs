@@ -22,8 +22,18 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
     let scope = Scope::Id(ScopeId::new());
     let (subject, value) = (NodeId::new(), NodeId::new());
     db.submit(vec![
-        Op::CreateNode { id: subject, scope, label: "FactKey".into(), props: Default::default() },
-        Op::CreateNode { id: value, scope, label: "Entity".into(), props: Default::default() },
+        Op::CreateNode {
+            id: subject,
+            scope,
+            label: "FactKey".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: value,
+            scope,
+            label: "Entity".into(),
+            props: Default::default(),
+        },
     ])
     .unwrap();
 
@@ -74,8 +84,13 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
     // Deterministic final supersede: one batch, closing every currently-open
     // edge and creating exactly one new one.
     let open = db.open_edges_between(subject, value);
-    let mut final_ops: Vec<Op> =
-        open.into_iter().map(|e| Op::CloseEdge { id: e, valid_to: None }).collect();
+    let mut final_ops: Vec<Op> = open
+        .into_iter()
+        .map(|e| Op::CloseEdge {
+            id: e,
+            valid_to: None,
+        })
+        .collect();
     final_ops.push(Op::CreateEdge {
         id: EdgeId::new(),
         scope,
@@ -91,7 +106,11 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
     assert_eq!(all.len(), 17);
 
     let open = db.open_edges_between(subject, value);
-    assert_eq!(open.len(), 1, "exactly one edge must remain open after the final supersede");
+    assert_eq!(
+        open.len(),
+        1,
+        "exactly one edge must remain open after the final supersede"
+    );
 
     let closed_count = all.iter().filter(|e| e.valid_to.is_some()).count();
     assert_eq!(closed_count, 16, "every non-final edge must be closed");

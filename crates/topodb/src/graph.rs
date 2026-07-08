@@ -71,9 +71,16 @@ fn index_node(
         if pi.label != rec.label {
             continue;
         }
-        let Some(value) = rec.props.get(&pi.prop) else { continue };
-        let Some(iv) = IndexValue::of(value) else { continue };
-        prop_index.entry((pi.label.clone(), pi.prop.clone(), iv)).or_default().insert(rec.id);
+        let Some(value) = rec.props.get(&pi.prop) else {
+            continue;
+        };
+        let Some(iv) = IndexValue::of(value) else {
+            continue;
+        };
+        prop_index
+            .entry((pi.label.clone(), pi.prop.clone(), iv))
+            .or_default()
+            .insert(rec.id);
     }
 }
 
@@ -89,8 +96,12 @@ fn unindex_node(
         if pi.label != rec.label {
             continue;
         }
-        let Some(value) = rec.props.get(&pi.prop) else { continue };
-        let Some(iv) = IndexValue::of(value) else { continue };
+        let Some(value) = rec.props.get(&pi.prop) else {
+            continue;
+        };
+        let Some(iv) = IndexValue::of(value) else {
+            continue;
+        };
         let key = (pi.label.clone(), pi.prop.clone(), iv);
         if let Some(set) = prop_index.get_mut(&key) {
             set.remove(&rec.id);
@@ -106,7 +117,10 @@ impl Snapshot {
     /// open time (and by tests to check incremental application against a
     /// from-scratch rebuild). `spec` governs which `(label, prop)` pairs get
     /// folded into `prop_index` as nodes load.
-    pub(crate) fn from_storage(storage: &Storage, spec: Arc<IndexSpec>) -> Result<Snapshot, TopoError> {
+    pub(crate) fn from_storage(
+        storage: &Storage,
+        spec: Arc<IndexSpec>,
+    ) -> Result<Snapshot, TopoError> {
         let mut nodes = im::HashMap::new();
         for n in storage.all_nodes()? {
             nodes.insert(n.id, n);
@@ -140,7 +154,14 @@ impl Snapshot {
             edges.insert(e.id, e);
         }
 
-        Ok(Snapshot { nodes, out, inn, edges, spec, prop_index })
+        Ok(Snapshot {
+            nodes,
+            out,
+            inn,
+            edges,
+            spec,
+            prop_index,
+        })
     }
 
     /// Applies a batch of already-resolved ops (as produced by
@@ -165,7 +186,12 @@ impl Snapshot {
 
         for op in resolved_ops {
             match op {
-                Op::CreateNode { id, scope, label, props } => {
+                Op::CreateNode {
+                    id,
+                    scope,
+                    label,
+                    props,
+                } => {
                     let rec = NodeRecord {
                         id: *id,
                         scope: *scope,
@@ -243,7 +269,15 @@ impl Snapshot {
                         }
                     }
                 }
-                Op::CreateEdge { id, scope, ty, from, to, props, valid_from } => {
+                Op::CreateEdge {
+                    id,
+                    scope,
+                    ty,
+                    from,
+                    to,
+                    props,
+                    valid_from,
+                } => {
                     let vf = valid_from
                         .expect("Snapshot::apply only runs on resolved ops (valid_from filled)");
                     out.entry(*from).or_default().push_back(AdjEntry {
@@ -300,13 +334,32 @@ impl Snapshot {
             }
         }
 
-        Snapshot { nodes, out, inn, edges, spec: self.spec.clone(), prop_index }
+        Snapshot {
+            nodes,
+            out,
+            inn,
+            edges,
+            spec: self.spec.clone(),
+            prop_index,
+        }
     }
 
-    #[doc(hidden)] pub fn debug_nodes(&self) -> &im::HashMap<NodeId, NodeRecord> { &self.nodes }
-    #[doc(hidden)] pub fn debug_out(&self) -> &im::HashMap<NodeId, im::Vector<AdjEntry>> { &self.out }
-    #[doc(hidden)] pub fn debug_inn(&self) -> &im::HashMap<NodeId, im::Vector<AdjEntry>> { &self.inn }
-    #[doc(hidden)] pub fn debug_edges(&self) -> &im::HashMap<EdgeId, EdgeRecord> { &self.edges }
+    #[doc(hidden)]
+    pub fn debug_nodes(&self) -> &im::HashMap<NodeId, NodeRecord> {
+        &self.nodes
+    }
+    #[doc(hidden)]
+    pub fn debug_out(&self) -> &im::HashMap<NodeId, im::Vector<AdjEntry>> {
+        &self.out
+    }
+    #[doc(hidden)]
+    pub fn debug_inn(&self) -> &im::HashMap<NodeId, im::Vector<AdjEntry>> {
+        &self.inn
+    }
+    #[doc(hidden)]
+    pub fn debug_edges(&self) -> &im::HashMap<EdgeId, EdgeRecord> {
+        &self.edges
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +380,10 @@ mod tests {
     #[test]
     fn prop_index_drops_emptied_keys_entirely() {
         let spec = Arc::new(IndexSpec {
-            equality: vec![PropIndex { label: "Entity".into(), prop: "name".into() }],
+            equality: vec![PropIndex {
+                label: "Entity".into(),
+                prop: "name".into(),
+            }],
             text: vec![],
         });
         let empty = Snapshot {
@@ -338,18 +394,30 @@ mod tests {
             spec,
             prop_index: Default::default(),
         };
-        let key = ("Entity".into(), "name".to_string(), IndexValue::Str("ada".into()));
+        let key = (
+            "Entity".into(),
+            "name".to_string(),
+            IndexValue::Str("ada".into()),
+        );
 
         let create = |id: NodeId| {
             let mut props = Props::new();
             props.insert("name".into(), PropValue::Str("ada".into()));
-            Op::CreateNode { id, scope: Scope::Id(ScopeId::new()), label: "Entity".into(), props }
+            Op::CreateNode {
+                id,
+                scope: Scope::Id(ScopeId::new()),
+                label: "Entity".into(),
+                props,
+            }
         };
 
         // Path 1: RemoveNode empties the set -> key must be gone.
         let a = NodeId::new();
         let snap = empty.apply(&[create(a)]);
-        assert!(snap.prop_index.contains_key(&key), "created node must be indexed");
+        assert!(
+            snap.prop_index.contains_key(&key),
+            "created node must be indexed"
+        );
         let snap = snap.apply(&[Op::RemoveNode { id: a }]);
         assert!(
             !snap.prop_index.contains_key(&key),
@@ -369,7 +437,10 @@ mod tests {
             !snap.prop_index.contains_key(&key),
             "None-removal must drop the emptied key, not leave an empty set"
         );
-        assert!(snap.nodes.contains_key(&b), "node must survive a prop clear");
+        assert!(
+            snap.nodes.contains_key(&b),
+            "node must survive a prop clear"
+        );
     }
 
     #[test]
@@ -407,7 +478,11 @@ mod tests {
         // exercises CloseEdge's endpoint lookup and per-entry valid_to
         // update on both `out` and `inn`.
         let closed_edge = edge_ids[10]; // edge ids[10] -> ids[11]
-        db.submit(vec![Op::CloseEdge { id: closed_edge, valid_to: None }]).unwrap();
+        db.submit(vec![Op::CloseEdge {
+            id: closed_edge,
+            valid_to: None,
+        }])
+        .unwrap();
 
         db.submit(vec![Op::RemoveNode { id: ids[25] }]).unwrap();
 
@@ -454,17 +529,37 @@ mod tests {
         // The closed edge's `valid_to` must agree, live vs. rebuilt, at both
         // endpoints (out[from] and inn[to]).
         let (from, to) = (ids[10], ids[11]);
-        let live_out_entry =
-            live.out.get(&from).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
-        let rebuilt_out_entry =
-            rebuilt.out.get(&from).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
+        let live_out_entry = live
+            .out
+            .get(&from)
+            .unwrap()
+            .iter()
+            .find(|e| e.edge == closed_edge)
+            .unwrap();
+        let rebuilt_out_entry = rebuilt
+            .out
+            .get(&from)
+            .unwrap()
+            .iter()
+            .find(|e| e.edge == closed_edge)
+            .unwrap();
         assert!(live_out_entry.valid_to.is_some());
         assert_eq!(live_out_entry.valid_to, rebuilt_out_entry.valid_to);
 
-        let live_inn_entry =
-            live.inn.get(&to).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
-        let rebuilt_inn_entry =
-            rebuilt.inn.get(&to).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
+        let live_inn_entry = live
+            .inn
+            .get(&to)
+            .unwrap()
+            .iter()
+            .find(|e| e.edge == closed_edge)
+            .unwrap();
+        let rebuilt_inn_entry = rebuilt
+            .inn
+            .get(&to)
+            .unwrap()
+            .iter()
+            .find(|e| e.edge == closed_edge)
+            .unwrap();
         assert!(live_inn_entry.valid_to.is_some());
         assert_eq!(live_inn_entry.valid_to, rebuilt_inn_entry.valid_to);
 
@@ -477,7 +572,10 @@ mod tests {
             live.edges.keys().copied().collect();
         let rebuilt_edges_keys: std::collections::BTreeSet<EdgeId> =
             rebuilt.edges.keys().copied().collect();
-        assert_eq!(live_edges_keys, rebuilt_edges_keys, "edges key-set mismatch");
+        assert_eq!(
+            live_edges_keys, rebuilt_edges_keys,
+            "edges key-set mismatch"
+        );
         for key in &live_edges_keys {
             let l = live.edges.get(key).unwrap();
             let r = rebuilt.edges.get(key).unwrap();

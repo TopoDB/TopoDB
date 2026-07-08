@@ -44,8 +44,18 @@ mod tests {
         let batch = s
             .apply_batch(
                 vec![
-                    Op::CreateNode { id: a, scope, label: "Memory".into(), props: Default::default() },
-                    Op::CreateNode { id: b, scope, label: "Entity".into(), props: Default::default() },
+                    Op::CreateNode {
+                        id: a,
+                        scope,
+                        label: "Memory".into(),
+                        props: Default::default(),
+                    },
+                    Op::CreateNode {
+                        id: b,
+                        scope,
+                        label: "Entity".into(),
+                        props: Default::default(),
+                    },
                     Op::CreateEdge {
                         id: e,
                         scope,
@@ -77,8 +87,18 @@ mod tests {
         let err = s
             .apply_batch(
                 vec![
-                    Op::CreateNode { id: a, scope: s1, label: "Memory".into(), props: Default::default() },
-                    Op::CreateNode { id: b, scope: s2, label: "Entity".into(), props: Default::default() },
+                    Op::CreateNode {
+                        id: a,
+                        scope: s1,
+                        label: "Memory".into(),
+                        props: Default::default(),
+                    },
+                    Op::CreateNode {
+                        id: b,
+                        scope: s2,
+                        label: "Entity".into(),
+                        props: Default::default(),
+                    },
                     Op::CreateEdge {
                         id: EdgeId::new(),
                         scope: s1,
@@ -99,8 +119,18 @@ mod tests {
         // With a Shared endpoint it works:
         s.apply_batch(
             vec![
-                Op::CreateNode { id: a, scope: s1, label: "Memory".into(), props: Default::default() },
-                Op::CreateNode { id: b, scope: Scope::Shared, label: "Entity".into(), props: Default::default() },
+                Op::CreateNode {
+                    id: a,
+                    scope: s1,
+                    label: "Memory".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope: Scope::Shared,
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
                 Op::CreateEdge {
                     id: EdgeId::new(),
                     scope: s1,
@@ -123,8 +153,18 @@ mod tests {
         let (a, b, e) = (NodeId::new(), NodeId::new(), EdgeId::new());
         s.apply_batch(
             vec![
-                Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
-                Op::CreateNode { id: b, scope, label: "M".into(), props: Default::default() },
+                Op::CreateNode {
+                    id: a,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
                 Op::CreateEdge {
                     id: e,
                     scope,
@@ -146,7 +186,9 @@ mod tests {
     #[test]
     fn remove_node_missing_is_rejected() {
         let (_d, s) = db();
-        let err = s.apply_batch(vec![Op::RemoveNode { id: NodeId::new() }], 0).unwrap_err();
+        let err = s
+            .apply_batch(vec![Op::RemoveNode { id: NodeId::new() }], 0)
+            .unwrap_err();
         assert!(matches!(err, crate::TopoError::Rejected(_)));
     }
 
@@ -157,8 +199,18 @@ mod tests {
         let (a, b, e) = (NodeId::new(), NodeId::new(), EdgeId::new());
         s.apply_batch(
             vec![
-                Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
-                Op::CreateNode { id: b, scope, label: "M".into(), props: Default::default() },
+                Op::CreateNode {
+                    id: a,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
                 Op::CreateEdge {
                     id: e,
                     scope,
@@ -187,7 +239,12 @@ mod tests {
         let err = s
             .apply_batch(
                 vec![
-                    Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
+                    Op::CreateNode {
+                        id: a,
+                        scope,
+                        label: "M".into(),
+                        props: Default::default(),
+                    },
                     Op::CreateEdge {
                         id: EdgeId::new(),
                         scope,
@@ -211,7 +268,13 @@ mod tests {
     fn close_edge_missing_is_rejected() {
         let (_d, s) = db();
         let err = s
-            .apply_batch(vec![Op::CloseEdge { id: EdgeId::new(), valid_to: None }], 0)
+            .apply_batch(
+                vec![Op::CloseEdge {
+                    id: EdgeId::new(),
+                    valid_to: None,
+                }],
+                0,
+            )
             .unwrap_err();
         assert!(matches!(err, crate::TopoError::Rejected(_)));
     }
@@ -223,8 +286,18 @@ mod tests {
         let (a, b, e) = (NodeId::new(), NodeId::new(), EdgeId::new());
         s.apply_batch(
             vec![
-                Op::CreateNode { id: a, scope, label: "M".into(), props: Default::default() },
-                Op::CreateNode { id: b, scope, label: "M".into(), props: Default::default() },
+                Op::CreateNode {
+                    id: a,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
                 Op::CreateEdge {
                     id: e,
                     scope,
@@ -238,8 +311,23 @@ mod tests {
             0,
         )
         .unwrap();
-        s.apply_batch(vec![Op::CloseEdge { id: e, valid_to: None }], 1).unwrap();
-        let err = s.apply_batch(vec![Op::CloseEdge { id: e, valid_to: None }], 2).unwrap_err();
+        s.apply_batch(
+            vec![Op::CloseEdge {
+                id: e,
+                valid_to: None,
+            }],
+            1,
+        )
+        .unwrap();
+        let err = s
+            .apply_batch(
+                vec![Op::CloseEdge {
+                    id: e,
+                    valid_to: None,
+                }],
+                2,
+            )
+            .unwrap_err();
         assert!(matches!(err, crate::TopoError::Rejected(_)));
         // The first close still stands — the second (rejected) batch never committed.
         let edge = s.load_edge(e).unwrap().unwrap();

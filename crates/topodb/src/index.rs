@@ -90,16 +90,28 @@ mod tests {
     fn validate_rejects_duplicates_within_a_list_but_not_across_lists() {
         let dup_within = IndexSpec {
             equality: vec![
-                PropIndex { label: "M".into(), prop: "x".into() },
-                PropIndex { label: "M".into(), prop: "x".into() },
+                PropIndex {
+                    label: "M".into(),
+                    prop: "x".into(),
+                },
+                PropIndex {
+                    label: "M".into(),
+                    prop: "x".into(),
+                },
             ],
             text: vec![],
         };
         assert!(matches!(dup_within.validate(), Err(TopoError::Rejected(_))));
 
         let same_key_both_lists = IndexSpec {
-            equality: vec![PropIndex { label: "M".into(), prop: "x".into() }],
-            text: vec![PropIndex { label: "M".into(), prop: "x".into() }],
+            equality: vec![PropIndex {
+                label: "M".into(),
+                prop: "x".into(),
+            }],
+            text: vec![PropIndex {
+                label: "M".into(),
+                prop: "x".into(),
+            }],
         };
         assert!(same_key_both_lists.validate().is_ok());
     }
@@ -107,13 +119,22 @@ mod tests {
     #[test]
     fn index_value_of_is_none_for_float_and_some_for_everything_else() {
         assert_eq!(IndexValue::of(&PropValue::Float(1.0)), None);
-        assert_eq!(IndexValue::of(&PropValue::Str("a".into())), Some(IndexValue::Str("a".into())));
+        assert_eq!(
+            IndexValue::of(&PropValue::Str("a".into())),
+            Some(IndexValue::Str("a".into()))
+        );
         assert_eq!(IndexValue::of(&PropValue::Int(1)), Some(IndexValue::Int(1)));
-        assert_eq!(IndexValue::of(&PropValue::Bool(true)), Some(IndexValue::Bool(true)));
+        assert_eq!(
+            IndexValue::of(&PropValue::Bool(true)),
+            Some(IndexValue::Bool(true))
+        );
         assert_eq!(
             IndexValue::of(&PropValue::Bytes(vec![1, 2])),
             Some(IndexValue::Bytes(vec![1, 2]))
         );
-        assert_eq!(IndexValue::of(&PropValue::DateTime(5)), Some(IndexValue::DateTime(5)));
+        assert_eq!(
+            IndexValue::of(&PropValue::DateTime(5)),
+            Some(IndexValue::DateTime(5))
+        );
     }
 }

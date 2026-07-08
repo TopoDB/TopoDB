@@ -32,8 +32,14 @@ fn regenerate_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1.redb");
     let _ = std::fs::remove_file(&path);
     let spec = IndexSpec {
-        equality: vec![PropIndex { label: "Entity".into(), prop: "name".into() }],
-        text: vec![PropIndex { label: "Memory".into(), prop: "content".into() }],
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
     };
     let db = Db::open_with(&path, spec).unwrap();
     // Fixed ids so the fixture's CONTENT is reproducible across regenerations
@@ -44,16 +50,36 @@ fn regenerate_fixture() {
     let mut p1 = Props::new();
     p1.insert("name".into(), PropValue::Str("ada".into()));
     let mut p2 = Props::new();
-    p2.insert("content".into(), PropValue::Str("fixture memory about databases".into()));
+    p2.insert(
+        "content".into(),
+        PropValue::Str("fixture memory about databases".into()),
+    );
     db.submit(vec![
-        Op::CreateNode { id: n1, scope: Scope::Id(s), label: "Entity".into(), props: p1 },
-        Op::CreateNode { id: n2, scope: Scope::Id(s), label: "Memory".into(), props: p2 },
+        Op::CreateNode {
+            id: n1,
+            scope: Scope::Id(s),
+            label: "Entity".into(),
+            props: p1,
+        },
+        Op::CreateNode {
+            id: n2,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: p2,
+        },
     ])
     .unwrap();
-    db.submit(vec![Op::SetEmbedding { id: n2, model: "m1".into(), vector: vec![1.0, 0.0] }])
-        .unwrap();
+    db.submit(vec![Op::SetEmbedding {
+        id: n2,
+        model: "m1".into(),
+        vector: vec![1.0, 0.0],
+    }])
+    .unwrap();
 
-    assert!(path.exists(), "regenerate_fixture: fixture file was not created at {path:?}");
+    assert!(
+        path.exists(),
+        "regenerate_fixture: fixture file was not created at {path:?}"
+    );
 }
 
 #[test]
@@ -63,14 +89,22 @@ fn v1_fixture_opens_and_reads() {
     let path = dir.path().join("v1.redb");
     std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
     let spec = IndexSpec {
-        equality: vec![PropIndex { label: "Entity".into(), prop: "name".into() }],
-        text: vec![PropIndex { label: "Memory".into(), prop: "content".into() }],
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
     };
     let db = Db::open_with(&path, spec).unwrap();
     let s = ScopeId::from_u128(1);
     let scopes = ScopeSet::of(&[s]);
     assert_eq!(
-        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into())).unwrap().len(),
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .len(),
         1
     );
     assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);

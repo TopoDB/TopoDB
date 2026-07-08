@@ -60,7 +60,11 @@ impl Db {
     #[must_use]
     pub fn node(&self, scopes: &ScopeSet, id: NodeId) -> Option<NodeRecord> {
         let snap = self.snapshot();
-        let hit = snap.nodes.get(&id).filter(|n| scopes.contains(n.scope)).cloned();
+        let hit = snap
+            .nodes
+            .get(&id)
+            .filter(|n| scopes.contains(n.scope))
+            .cloned();
         if hit.is_some() {
             self.bump([id]);
         }
@@ -96,13 +100,20 @@ impl Db {
         value: &PropValue,
     ) -> Result<Vec<NodeRecord>, TopoError> {
         let snap = self.snapshot();
-        if !snap.spec.equality.iter().any(|p| p.label == label && p.prop == prop) {
+        if !snap
+            .spec
+            .equality
+            .iter()
+            .any(|p| p.label == label && p.prop == prop)
+        {
             return Err(TopoError::Rejected(format!(
                 "({label}, {prop}) is not equality-indexed"
             )));
         }
         let Some(iv) = crate::index::IndexValue::of(value) else {
-            return Err(TopoError::Rejected("Float values are not equality-indexable".into()));
+            return Err(TopoError::Rejected(
+                "Float values are not equality-indexable".into(),
+            ));
         };
         let hits: Vec<NodeRecord> = snap
             .prop_index
@@ -174,7 +185,9 @@ impl Db {
                 if !edge_traversable(&q.scopes, q.edge_types.as_deref(), entry, t) {
                     continue;
                 }
-                let Some(other) = snap.nodes.get(&entry.other) else { continue };
+                let Some(other) = snap.nodes.get(&entry.other) else {
+                    continue;
+                };
                 if !q.scopes.contains(other.scope) {
                     continue;
                 }

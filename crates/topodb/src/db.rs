@@ -30,9 +30,7 @@ enum Job {
     /// the applier. No reply channel: bumps are auxiliary telemetry, so the
     /// applier logs nothing, broadcasts nothing to the change feed, and never
     /// acknowledges. Enqueued only by the bumper thread (see `open_with`).
-    BumpCounters {
-        bumps: Vec<(NodeId, u64, i64)>,
-    },
+    BumpCounters { bumps: Vec<(NodeId, u64, i64)> },
     /// Compacts the op log through `keep_from` on the applier thread (the sole
     /// redb writer). Broadcasts nothing — compaction touches no NODES/EDGES
     /// state and emits no change events — and replies the storage result so the
@@ -385,7 +383,12 @@ impl Db {
         // A poisoned mutex (applier panicked; poisoned-lock policy) also yields
         // `None`: bumps are auxiliary telemetry, so we silently drop them rather
         // than propagate the panic into a read path.
-        let tx = self.inner.bump_tx.lock().ok().and_then(|g| g.as_ref().cloned());
+        let tx = self
+            .inner
+            .bump_tx
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
         if let Some(tx) = tx {
             for id in ids {
                 // Full (bumper backed up) or Disconnected (shutdown) → drop.
@@ -410,10 +413,16 @@ impl Db {
         // filter directly against the snapshot: `None` if absent OR out of
         // scope (indistinguishable, mirroring `node()`).
         let snap = self.snapshot();
-        if !snap.nodes.get(&id).is_some_and(|n| scopes.contains(n.scope)) {
+        if !snap
+            .nodes
+            .get(&id)
+            .is_some_and(|n| scopes.contains(n.scope))
+        {
             return Ok(None);
         }
-        Ok(Some(self.inner.storage.read_counter(id)?.unwrap_or_default()))
+        Ok(Some(
+            self.inner.storage.read_counter(id)?.unwrap_or_default(),
+        ))
     }
 
     /// Submits a batch of ops for application, blocking until the applier
@@ -497,7 +506,13 @@ impl Db {
     /// has a floor of 1, so any `since_seq` succeeds.
     pub fn ops_since(&self, since_seq: u64) -> Result<Vec<ChangeEvent>, TopoError> {
         let ops = self.inner.storage.read_ops(since_seq)?;
-        Ok(ops.into_iter().map(|(seq, op)| ChangeEvent { seq, op: Arc::new(op) }).collect())
+        Ok(ops
+            .into_iter()
+            .map(|(seq, op)| ChangeEvent {
+                seq,
+                op: Arc::new(op),
+            })
+            .collect())
     }
 
     /// The highest op-log seq committed so far (0 when the log is empty). A
@@ -532,7 +547,11 @@ impl Db {
     pub fn compact_ops(&self, keep_from: u64) -> Result<(), TopoError> {
         let (reply_tx, reply_rx) = bounded(1);
         let tx = self.sender().ok_or(TopoError::Closed)?;
-        tx.send(Job::Compact { keep_from, reply: reply_tx }).map_err(|_| TopoError::Closed)?;
+        tx.send(Job::Compact {
+            keep_from,
+            reply: reply_tx,
+        })
+        .map_err(|_| TopoError::Closed)?;
         reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
@@ -551,7 +570,12 @@ impl Db {
     fn submit_inner(&self, ops: Vec<Op>, at: Option<i64>) -> Result<AppliedBatch, TopoError> {
         let (reply_tx, reply_rx) = bounded(1);
         let tx = self.sender().ok_or(TopoError::Closed)?;
-        tx.send(Job::Apply { ops, at, reply: reply_tx }).map_err(|_| TopoError::Closed)?;
+        tx.send(Job::Apply {
+            ops,
+            at,
+            reply: reply_tx,
+        })
+        .map_err(|_| TopoError::Closed)?;
         reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
@@ -605,7 +629,8 @@ impl Db {
     pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
         let (reply_tx, reply_rx) = bounded(1);
         let tx = self.sender().ok_or(TopoError::Closed)?;
-        tx.send(Job::Rebuild { reply: reply_tx }).map_err(|_| TopoError::Closed)?;
+        tx.send(Job::Rebuild { reply: reply_tx })
+            .map_err(|_| TopoError::Closed)?;
         reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
@@ -614,7 +639,11 @@ impl Db {
     /// `all_edges_between`.
     #[doc(hidden)]
     pub fn debug_dump_nodes(&self) -> Vec<crate::state::NodeRecord> {
-        let mut out = self.inner.storage.all_nodes().expect("debug dump: storage read failed");
+        let mut out = self
+            .inner
+            .storage
+            .all_nodes()
+            .expect("debug dump: storage read failed");
         out.sort_by_key(|n| n.id);
         out
     }
@@ -624,7 +653,11 @@ impl Db {
     /// `all_edges_between`.
     #[doc(hidden)]
     pub fn debug_dump_edges(&self) -> Vec<crate::state::EdgeRecord> {
-        let mut out = self.inner.storage.all_edges().expect("debug dump: storage read failed");
+        let mut out = self
+            .inner
+            .storage
+            .all_edges()
+            .expect("debug dump: storage read failed");
         out.sort_by_key(|e| e.id);
         out
     }
@@ -652,14 +685,27 @@ impl Drop for Inner {
         // Shutdown must proceed even if a mutex was poisoned by an applier panic
         // (poisoned-lock policy, see vector.rs) — otherwise the host leaks the
         // applier/bumper threads on drop. Recover the guard via `into_inner`.
-        self.bump_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some(h) = self.bumper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        self.bump_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(h) = self
+            .bumper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
         {
             let _ = h.join();
         }
-        self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some(h) =
-            self.applier.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(h) = self
+            .applier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
         {
             let _ = h.join();
         }
@@ -677,9 +723,16 @@ mod tests {
         let rx = db.subscribe(4);
         drop(rx);
         db.submit(vec![crate::Op::CreateNode {
-            id: crate::NodeId::new(), scope: crate::Scope::Id(crate::ScopeId::new()),
-            label: "M".into(), props: Default::default(),
-        }]).unwrap();
-        assert_eq!(db.inner.subs.lock().unwrap().len(), 0, "disconnected sender must be pruned");
+            id: crate::NodeId::new(),
+            scope: crate::Scope::Id(crate::ScopeId::new()),
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
+        assert_eq!(
+            db.inner.subs.lock().unwrap().len(),
+            0,
+            "disconnected sender must be pruned"
+        );
     }
 }
