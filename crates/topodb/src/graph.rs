@@ -327,5 +327,21 @@ mod tests {
             rebuilt.inn.get(&to).unwrap().iter().find(|e| e.edge == closed_edge).unwrap();
         assert!(live_inn_entry.valid_to.is_some());
         assert_eq!(live_inn_entry.valid_to, rebuilt_inn_entry.valid_to);
+
+        // `edges` (full EdgeRecords) must also agree, live vs. rebuilt: same
+        // key-set (exercising CreateEdge inserts + RemoveNode's incident-edge
+        // purge), and per-key record equality (exercising CloseEdge's
+        // valid_to update landing in the full record, not just the lean
+        // AdjEntry copies).
+        let live_edges_keys: std::collections::BTreeSet<EdgeId> =
+            live.edges.keys().copied().collect();
+        let rebuilt_edges_keys: std::collections::BTreeSet<EdgeId> =
+            rebuilt.edges.keys().copied().collect();
+        assert_eq!(live_edges_keys, rebuilt_edges_keys, "edges key-set mismatch");
+        for key in &live_edges_keys {
+            let l = live.edges.get(key).unwrap();
+            let r = rebuilt.edges.get(key).unwrap();
+            assert_eq!(l, r, "edges record mismatch at {key:?}");
+        }
     }
 }
