@@ -311,8 +311,66 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::graph::AdjEntry;
+    use crate::graph::{AdjEntry, Snapshot};
+    use crate::index::{IndexSpec, IndexValue, PropIndex};
+    use crate::props::{PropValue, Props};
     use crate::{Db, EdgeId, NodeId, Op, Scope, ScopeId};
+    use std::sync::Arc;
+
+    /// White-box check that `unindex_node` removes an emptied `OrdSet`'s KEY
+    /// from `prop_index` — not merely leaves an empty set behind. The two are
+    /// indistinguishable through the public read API (`nodes_by_prop` returns
+    /// `[]` either way), so this must be asserted via the `pub(crate)` field
+    /// directly. Covers both emptying paths: `RemoveNode` and a
+    /// `SetNodeProps` `None`-removal (mirror of Plan 1 Task 5's stale
+    /// empty-key bug in `out`/`inn`).
+    #[test]
+    fn prop_index_drops_emptied_keys_entirely() {
+        let spec = Arc::new(IndexSpec {
+            equality: vec![PropIndex { label: "Entity".into(), prop: "name".into() }],
+            text: vec![],
+        });
+        let empty = Snapshot {
+            nodes: Default::default(),
+            out: Default::default(),
+            inn: Default::default(),
+            edges: Default::default(),
+            spec,
+            prop_index: Default::default(),
+        };
+        let key = ("Entity".into(), "name".to_string(), IndexValue::Str("ada".into()));
+
+        let create = |id: NodeId| {
+            let mut props = Props::new();
+            props.insert("name".into(), PropValue::Str("ada".into()));
+            Op::CreateNode { id, scope: Scope::Id(ScopeId::new()), label: "Entity".into(), props }
+        };
+
+        // Path 1: RemoveNode empties the set -> key must be gone.
+        let a = NodeId::new();
+        let snap = empty.apply(&[create(a)]);
+        assert!(snap.prop_index.contains_key(&key), "created node must be indexed");
+        let snap = snap.apply(&[Op::RemoveNode { id: a }]);
+        assert!(
+            !snap.prop_index.contains_key(&key),
+            "RemoveNode must drop the emptied key, not leave an empty set"
+        );
+
+        // Path 2: SetNodeProps None-removal empties the set -> key must be
+        // gone while the node itself survives.
+        let b = NodeId::new();
+        let snap = empty.apply(&[create(b)]);
+        assert!(snap.prop_index.contains_key(&key));
+        let snap = snap.apply(&[Op::SetNodeProps {
+            id: b,
+            props: [("name".to_string(), None)].into(),
+        }]);
+        assert!(
+            !snap.prop_index.contains_key(&key),
+            "None-removal must drop the emptied key, not leave an empty set"
+        );
+        assert!(snap.nodes.contains_key(&b), "node must survive a prop clear");
+    }
 
     #[test]
     fn incremental_snapshot_equals_rebuild() {

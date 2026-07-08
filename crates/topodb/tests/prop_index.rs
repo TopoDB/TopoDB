@@ -59,6 +59,22 @@ fn index_follows_set_and_remove() {
     assert!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into())).unwrap().is_empty());
     assert_eq!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().len(), 1);
 
+    // None-removal: clearing the declared prop deletes the index entry while
+    // the node itself survives.
+    db.submit(vec![Op::SetNodeProps {
+        id: a,
+        props: [("name".to_string(), None)].into(),
+    }]).unwrap();
+    assert!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().is_empty());
+    assert!(db.node(&scopes, a).is_some(), "node must survive a prop clear");
+
+    // Re-set so the remove below exercises removal of an indexed node.
+    db.submit(vec![Op::SetNodeProps {
+        id: a,
+        props: [("name".to_string(), Some(PropValue::Str("grace".into())))].into(),
+    }]).unwrap();
+    assert_eq!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().len(), 1);
+
     // Remove: gone from the index.
     db.submit(vec![Op::RemoveNode { id: a }]).unwrap();
     assert!(db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into())).unwrap().is_empty());
