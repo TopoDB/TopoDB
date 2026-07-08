@@ -5,10 +5,16 @@
 
 use crate::error::TopoError;
 use crate::ids::{EdgeId, NodeId, Scope};
+use crate::index::{IndexSpec, IndexValue};
 use crate::op::Op;
 use crate::state::{EdgeRecord, NodeRecord};
 use crate::storage::Storage;
 use smol_str::SmolStr;
+use std::sync::Arc;
+
+/// Key into `Snapshot::prop_index`: the declared `(label, prop)` plus the
+/// indexed value.
+type PropIndexKey = (SmolStr, String, IndexValue);
 
 /// One directed adjacency edge, as seen from either endpoint. `other` is the
 /// node at the far end (i.e. under `out[from]`, `other == to`; under
@@ -37,16 +43,78 @@ pub struct Snapshot {
     /// truth for anything that needs a complete `EdgeRecord` (props
     /// included). Kept in step with `out`/`inn` by every arm below.
     pub(crate) edges: im::HashMap<EdgeId, EdgeRecord>,
+    /// The index configuration this snapshot was built/maintained under.
+    /// `Arc` so cloning a `Snapshot` (cheap, structural-share) never deep
+    /// copies it; carried alongside the index it governs so a reader never
+    /// observes `prop_index` maintained under a different spec than the one
+    /// it's validating lookups against.
+    pub(crate) spec: Arc<IndexSpec>,
+    /// Equality index: `(label, prop, value) -> node ids with that value`.
+    /// Only ever holds entries for `(label, prop)` pairs declared in
+    /// `spec.equality`, and only for nodes whose value at that prop is
+    /// equality-indexable (see `IndexValue::of`). Emptied `OrdSet`s are
+    /// dropped rather than left behind as empty values (mirrors the
+    /// `out`/`inn` empty-key lesson from Plan 1).
+    pub(crate) prop_index: im::HashMap<PropIndexKey, im::OrdSet<NodeId>>,
+}
+
+/// Inserts `rec` into `prop_index` under every `(label, prop)` declared in
+/// `spec.equality` that matches `rec.label` and whose value in `rec.props`
+/// is present and equality-indexable. Non-declared labels/props and
+/// non-indexable values (Float) are left untouched — no-ops.
+fn index_node(
+    prop_index: &mut im::HashMap<PropIndexKey, im::OrdSet<NodeId>>,
+    spec: &IndexSpec,
+    rec: &NodeRecord,
+) {
+    for pi in &spec.equality {
+        if pi.label != rec.label {
+            continue;
+        }
+        let Some(value) = rec.props.get(&pi.prop) else { continue };
+        let Some(iv) = IndexValue::of(value) else { continue };
+        prop_index.entry((pi.label.clone(), pi.prop.clone(), iv)).or_default().insert(rec.id);
+    }
+}
+
+/// Inverse of `index_node`: removes `rec` from every `(label, prop, value)`
+/// entry it currently occupies per `spec.equality`, dropping any `OrdSet`
+/// left empty by the removal (never leaves an empty-set key behind).
+fn unindex_node(
+    prop_index: &mut im::HashMap<PropIndexKey, im::OrdSet<NodeId>>,
+    spec: &IndexSpec,
+    rec: &NodeRecord,
+) {
+    for pi in &spec.equality {
+        if pi.label != rec.label {
+            continue;
+        }
+        let Some(value) = rec.props.get(&pi.prop) else { continue };
+        let Some(iv) = IndexValue::of(value) else { continue };
+        let key = (pi.label.clone(), pi.prop.clone(), iv);
+        if let Some(set) = prop_index.get_mut(&key) {
+            set.remove(&rec.id);
+            if set.is_empty() {
+                prop_index.remove(&key);
+            }
+        }
+    }
 }
 
 impl Snapshot {
     /// Rebuilds a snapshot from scratch by scanning storage. Used at `Db`
     /// open time (and by tests to check incremental application against a
-    /// from-scratch rebuild).
-    pub(crate) fn from_storage(storage: &Storage) -> Result<Snapshot, TopoError> {
+    /// from-scratch rebuild). `spec` governs which `(label, prop)` pairs get
+    /// folded into `prop_index` as nodes load.
+    pub(crate) fn from_storage(storage: &Storage, spec: Arc<IndexSpec>) -> Result<Snapshot, TopoError> {
         let mut nodes = im::HashMap::new();
         for n in storage.all_nodes()? {
             nodes.insert(n.id, n);
+        }
+
+        let mut prop_index: im::HashMap<PropIndexKey, im::OrdSet<NodeId>> = im::HashMap::new();
+        for n in nodes.values() {
+            index_node(&mut prop_index, &spec, n);
         }
 
         let mut out: im::HashMap<NodeId, im::Vector<AdjEntry>> = im::HashMap::new();
@@ -72,7 +140,7 @@ impl Snapshot {
             edges.insert(e.id, e);
         }
 
-        Ok(Snapshot { nodes, out, inn, edges })
+        Ok(Snapshot { nodes, out, inn, edges, spec, prop_index })
     }
 
     /// Applies a batch of already-resolved ops (as produced by
@@ -93,32 +161,43 @@ impl Snapshot {
         let mut out = self.out.clone();
         let mut inn = self.inn.clone();
         let mut edges = self.edges.clone();
+        let mut prop_index = self.prop_index.clone();
 
         for op in resolved_ops {
             match op {
                 Op::CreateNode { id, scope, label, props } => {
-                    nodes.insert(
-                        *id,
-                        NodeRecord {
-                            id: *id,
-                            scope: *scope,
-                            label: label.clone(),
-                            props: props.clone(),
-                            embedding: None,
-                        },
-                    );
+                    let rec = NodeRecord {
+                        id: *id,
+                        scope: *scope,
+                        label: label.clone(),
+                        props: props.clone(),
+                        embedding: None,
+                    };
+                    index_node(&mut prop_index, &self.spec, &rec);
+                    nodes.insert(*id, rec);
                 }
                 Op::SetNodeProps { id, props } => {
-                    if let Some(rec) = nodes.get_mut(id) {
-                        for (k, v) in props {
-                            match v {
-                                Some(val) => {
-                                    rec.props.insert(k.clone(), val.clone());
-                                }
-                                None => {
-                                    rec.props.remove(k);
+                    // Unindex under the old values first, then reindex under
+                    // the new ones — simplest correct maintenance, and what
+                    // the interface doc calls for ("removes the old entry...
+                    // inserts the new"). Net effect for an unchanged declared
+                    // prop is a no-op (same key removed then re-added).
+                    if let Some(old) = nodes.get(id).cloned() {
+                        unindex_node(&mut prop_index, &self.spec, &old);
+                        if let Some(rec) = nodes.get_mut(id) {
+                            for (k, v) in props {
+                                match v {
+                                    Some(val) => {
+                                        rec.props.insert(k.clone(), val.clone());
+                                    }
+                                    None => {
+                                        rec.props.remove(k);
+                                    }
                                 }
                             }
+                        }
+                        if let Some(new) = nodes.get(id) {
+                            index_node(&mut prop_index, &self.spec, new);
                         }
                     }
                 }
@@ -128,7 +207,9 @@ impl Snapshot {
                     }
                 }
                 Op::RemoveNode { id } => {
-                    nodes.remove(id);
+                    if let Some(old) = nodes.remove(id) {
+                        unindex_node(&mut prop_index, &self.spec, &old);
+                    }
                     // Drop this node's own adjacency lists, and purge the
                     // matching reverse entries recorded under the *other*
                     // endpoint's key in the opposite map. `from_storage`
@@ -219,7 +300,7 @@ impl Snapshot {
             }
         }
 
-        Snapshot { nodes, out, inn, edges }
+        Snapshot { nodes, out, inn, edges, spec: self.spec.clone(), prop_index }
     }
 
     #[doc(hidden)] pub fn debug_nodes(&self) -> &im::HashMap<NodeId, NodeRecord> { &self.nodes }

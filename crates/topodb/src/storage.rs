@@ -1,9 +1,11 @@
 use crate::error::TopoError;
 use crate::ids::{EdgeId, NodeId, Scope};
+use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::state::{EdgeRecord, NodeRecord};
 use redb::{Database, ReadableTable, Table, TableDefinition};
 use std::path::Path;
+use std::sync::Arc;
 
 pub const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
 pub const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -14,12 +16,28 @@ pub const FORMAT_VERSION: u32 = 1;
 
 pub struct Storage {
     pub(crate) db: Database,
+    /// The index configuration this storage was opened with. Not yet read
+    /// anywhere in this crate — Task 6's FTS indexing is the first consumer,
+    /// reading `spec.text` from storage-level write paths. Held here (not
+    /// just threaded through `Snapshot`) precisely so that write-path access
+    /// is possible without going through the in-memory snapshot.
+    #[allow(dead_code)]
+    pub(crate) spec: Arc<IndexSpec>,
 }
 
 impl Storage {
+    /// Delegates to `create_with` with a default (empty) `IndexSpec` — no
+    /// declared indexes. `Db::open`/`open_with` call `create_with` directly;
+    /// this delegate is currently exercised only by unit tests that don't
+    /// need a custom spec, hence `#[allow(dead_code)]` in non-test builds.
+    #[allow(dead_code)]
     pub(crate) fn create(path: impl AsRef<Path>) -> Result<Self, TopoError> {
+        Self::create_with(path, Arc::new(IndexSpec::default()))
+    }
+
+    pub(crate) fn create_with(path: impl AsRef<Path>, spec: Arc<IndexSpec>) -> Result<Self, TopoError> {
         let db = Database::create(path).map_err(redb::Error::from)?;
-        let s = Self { db };
+        let s = Self { db, spec };
         // Ensure tables + format version exist.
         let tx = s.db.begin_write().map_err(redb::Error::from)?;
         {

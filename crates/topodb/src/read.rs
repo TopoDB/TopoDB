@@ -6,6 +6,7 @@ use crate::db::Db;
 use crate::error::TopoError;
 use crate::graph::Snapshot;
 use crate::ids::{EdgeId, NodeId, ScopeSet};
+use crate::props::PropValue;
 use crate::state::{EdgeRecord, NodeRecord};
 use smol_str::SmolStr;
 use std::collections::{HashSet, VecDeque};
@@ -70,6 +71,59 @@ impl Db {
         snap.nodes
             .values()
             .filter(|n| n.label == label && scopes.contains(n.scope))
+            .cloned()
+            .collect()
+    }
+
+    /// Equality lookup against the declared `(label, prop)` index:
+    /// `Rejected` if `(label, prop)` isn't declared in `spec.equality`, or if
+    /// `value` is a `Float` (not equality-indexable — Floats never enter the
+    /// index in the first place). Otherwise an index lookup followed by a
+    /// scope filter.
+    pub fn nodes_by_prop(
+        &self,
+        scopes: &ScopeSet,
+        label: &str,
+        prop: &str,
+        value: &PropValue,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
+        let snap = self.snapshot();
+        if !snap.spec.equality.iter().any(|p| p.label == label && p.prop == prop) {
+            return Err(TopoError::Rejected(format!(
+                "({label}, {prop}) is not equality-indexed"
+            )));
+        }
+        let Some(iv) = crate::index::IndexValue::of(value) else {
+            return Err(TopoError::Rejected("Float values are not equality-indexable".into()));
+        };
+        Ok(snap
+            .prop_index
+            .get(&(SmolStr::new(label), prop.to_string(), iv))
+            .into_iter()
+            .flat_map(|set| set.iter())
+            .filter_map(|id| snap.nodes.get(id))
+            .filter(|n| scopes.contains(n.scope))
+            .cloned()
+            .collect())
+    }
+
+    /// Unindexed scoped snapshot scan for `min <= props[prop] <= max` over
+    /// `PropValue::Float` values. O(scope size) — the decay-sweep primitive;
+    /// there is no float range index (equality indexing explicitly excludes
+    /// `Float`, see `IndexValue`).
+    #[must_use]
+    pub fn nodes_by_float_range(
+        &self,
+        scopes: &ScopeSet,
+        prop: &str,
+        min: f64,
+        max: f64,
+    ) -> Vec<NodeRecord> {
+        let snap = self.snapshot();
+        snap.nodes
+            .values()
+            .filter(|n| scopes.contains(n.scope))
+            .filter(|n| matches!(n.props.get(prop), Some(PropValue::Float(f)) if *f >= min && *f <= max))
             .cloned()
             .collect()
     }

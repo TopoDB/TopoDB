@@ -1,6 +1,7 @@
 use crate::error::TopoError;
 use crate::graph::Snapshot;
 use crate::ids::{EdgeId, NodeId};
+use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
 use arc_swap::ArcSwap;
@@ -61,17 +62,29 @@ impl Db {
     /// single applier thread. `submit`/`submit_at` route through this thread;
     /// it is the only place wall-clock time is read (`submit` uses
     /// `SystemTime::now`; `submit_at` is the deterministic test/backdate
-    /// seam).
+    /// seam). Delegates to `open_with` with a default (empty) `IndexSpec`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TopoError> {
-        let storage = Arc::new(Storage::create(path)?);
-        let initial_snapshot = Snapshot::from_storage(&storage)?;
+        Self::open_with(path, IndexSpec::default())
+    }
+
+    /// Like `open`, but with a declared `IndexSpec` governing which
+    /// `(label, prop)` pairs get equality/text-indexed. `spec` is validated
+    /// (rejecting duplicate declarations) before anything else happens — an
+    /// invalid spec never touches storage.
+    pub fn open_with(path: impl AsRef<Path>, spec: IndexSpec) -> Result<Self, TopoError> {
+        spec.validate()?;
+        let spec = Arc::new(spec);
+        let storage = Arc::new(Storage::create_with(path, spec.clone())?);
+        let initial_snapshot = Snapshot::from_storage(&storage, spec.clone())?;
         let snap = Arc::new(ArcSwap::new(Arc::new(initial_snapshot)));
         let (tx, rx) = bounded::<Job>(256);
 
-        // The thread captures its own clones of `storage`/`snap` — never a
-        // clone of `Inner` itself (see the comment on `Inner::snap` for why).
+        // The thread captures its own clones of `storage`/`snap`/`spec` —
+        // never a clone of `Inner` itself (see the comment on `Inner::snap`
+        // for why).
         let storage_for_applier = storage.clone();
         let snap_for_applier = snap.clone();
+        let spec_for_applier = spec.clone();
         let applier = std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 match job {
@@ -110,7 +123,10 @@ impl Db {
                         // and the applier's incremental `apply` could both
                         // fold the same committed batch.
                         let result = match storage_for_applier.rebuild_state_from_ops() {
-                            Ok(()) => match Snapshot::from_storage(&storage_for_applier) {
+                            Ok(()) => match Snapshot::from_storage(
+                                &storage_for_applier,
+                                spec_for_applier.clone(),
+                            ) {
                                 Ok(fresh) => {
                                     snap_for_applier.store(Arc::new(fresh));
                                     Ok(())
