@@ -4,8 +4,10 @@
 //! - `--scope`: the default scope for every tool call that omits an explicit
 //!   `scope`. `"shared"` (case-insensitive) or omitted => [`Scope::Shared`];
 //!   any other value is parsed as a ULID => [`Scope::Id`].
-//! - `--spec`: path to a JSON file deserializing to [`IndexSpec`]. Omitted =>
-//!   the [built-in default spec](default_spec).
+//! - `--spec`: path to a JSON file deserializing to [`IndexSpec`], honored
+//!   verbatim (may reindex an existing db). Omitted => inherit the db's
+//!   persisted spec on an existing file, or create a fresh db with the
+//!   [built-in default spec](default_spec). See how `main` opens the db.
 //!
 //! Arg parsing is hand-rolled: the surface is three flags, so `clap` would add
 //! a dependency and a proc-macro build for no real gain here.
@@ -27,7 +29,12 @@ pub use topodb_json::{ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMOR
 pub struct Config {
     pub db_path: PathBuf,
     pub default_scope: Scope,
-    pub spec: IndexSpec,
+    /// The spec parsed from an explicit `--spec` file, or `None` when the flag
+    /// was omitted. `None` means "inherit the db's persisted spec" (see how
+    /// `main` opens the db), NOT "use `default_spec()`" — the two diverge for
+    /// an existing db: silently substituting the default would reindex it and
+    /// drop its declared equality indexes.
+    pub spec: Option<IndexSpec>,
 }
 
 /// The built-in default index spec used when `--spec` is omitted: equality on
@@ -104,10 +111,11 @@ impl Config {
             Some(p) => {
                 let text = std::fs::read_to_string(&p)
                     .map_err(|e| format!("reading --spec {}: {e}", p.display()))?;
-                serde_json::from_str(&text)
-                    .map_err(|e| format!("parsing --spec {} as IndexSpec JSON: {e}", p.display()))?
+                Some(serde_json::from_str(&text).map_err(|e| {
+                    format!("parsing --spec {} as IndexSpec JSON: {e}", p.display())
+                })?)
             }
-            None => default_spec(),
+            None => None,
         };
 
         Ok(Config {
@@ -127,11 +135,31 @@ mod tests {
     }
 
     #[test]
-    fn defaults_scope_shared_and_builtin_spec() {
+    fn defaults_scope_shared_and_no_spec() {
         let cfg = Config::from_args(argv(&["--db", "t.redb"])).unwrap();
         assert_eq!(cfg.db_path, PathBuf::from("t.redb"));
         assert!(matches!(cfg.default_scope, Scope::Shared));
-        assert_eq!(cfg.spec, default_spec());
+        // No `--spec` => None ("inherit the db's persisted spec"), NOT
+        // default_spec(): `main` only falls back to the default for a fresh db.
+        assert!(cfg.spec.is_none());
+    }
+
+    #[test]
+    fn explicit_spec_flag_is_parsed_to_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("spec.json");
+        std::fs::write(
+            &p,
+            r#"{"equality":[{"label":"Person","prop":"handle"}],"text":[]}"#,
+        )
+        .unwrap();
+        let cfg =
+            Config::from_args(argv(&["--db", "t.redb", "--spec", p.to_str().unwrap()])).unwrap();
+        let spec = cfg.spec.expect("--spec should parse to Some");
+        assert_eq!(spec.equality.len(), 1);
+        assert_eq!(spec.equality[0].label, "Person");
+        assert_eq!(spec.equality[0].prop, "handle");
+        assert!(spec.text.is_empty());
     }
 
     #[test]

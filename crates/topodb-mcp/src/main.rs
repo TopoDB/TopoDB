@@ -35,7 +35,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let db = Db::open_with(&config.db_path, config.spec.clone())?;
+    // Open using the db's own persisted index spec unless the caller passed an
+    // explicit `--spec`. This mirrors `topodb-cli`: an EXISTING file inherits
+    // its persisted spec exactly (via `open_stored`), so a db another front end
+    // (topodb-cli, or a prior `--spec` run) already populated is never
+    // reindexed nor its declared equality indexes silently dropped. A brand-new
+    // file is created with the canonical `default_spec()` — byte-identical to
+    // what topodb-cli writes — so either tool can later serve it with no
+    // reindex. An explicit `--spec` is honored verbatim (and may reindex): the
+    // power-user seam for creating a db with a custom spec or forcing a
+    // re-declare. `Path::exists` is safe here — the parent-dir check above ran,
+    // and a stdio MCP server is a single writer per db path.
+    let db = match &config.spec {
+        Some(spec) => Db::open_with(&config.db_path, spec.clone())?,
+        None if config.db_path.exists() => Db::open_stored(&config.db_path)?,
+        None => Db::open_with(&config.db_path, config::default_spec())?,
+    };
     let server = TopoServer::new(db, &config);
 
     // `serve` completes the initialize handshake; `waiting` blocks until the
