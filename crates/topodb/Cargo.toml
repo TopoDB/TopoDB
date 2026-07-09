@@ -1,6 +1,6 @@
 [package]
 name = "topodb"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
@@ -29,7 +29,3 @@ criterion = "0.5"
 [[bench]]
 name = "recall"
 harness = false
-
-[lints.clippy]
-# TopoError and redb::Error are large enum variants; Plan 4 may box
-result_large_err = "allow"

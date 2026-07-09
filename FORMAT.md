@@ -66,8 +66,8 @@ different serialization scheme.
 ### Key encodings
 
 - **`node_key(id: NodeId) -> [u8; 16]`**: the node's ULID as 16 big-endian bytes
-  (`id.0.0.to_be_bytes()`) — `storage.rs: fn node_key`. Big-endian keys make redb's natural
-  byte-order iteration equal to ULID/creation order.
+  (`id.as_u128().to_be_bytes()`) — `storage.rs: fn node_key`. Big-endian keys make redb's
+  natural byte-order iteration equal to ULID/creation order.
 - **`edge_key(id: EdgeId) -> [u8; 16]`**: identical scheme, over `EdgeId`'s ULID —
   `storage.rs: fn edge_key`.
 - **`scope_key(s: Scope) -> [u8; 17]`**: a fixed-width 17-byte encoding — 1-byte tag

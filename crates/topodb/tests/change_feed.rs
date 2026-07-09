@@ -201,6 +201,38 @@ fn ops_since_zero_replays_everything_on_uncompacted_log() {
 }
 
 #[test]
+fn current_seq_survives_empty_compaction_for_anchoring() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let scope = Scope::Id(ScopeId::new());
+    for _ in 0..3 {
+        db.submit(vec![Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
+    }
+    db.compact_ops(4).unwrap(); // empty log, floor 4
+    assert_eq!(db.current_seq().unwrap(), 3, "high-water mark survives");
+    assert_eq!(
+        db.ops_since(db.current_seq().unwrap() + 1).unwrap().len(),
+        0,
+        "anchor recipe must not spuriously Compacted"
+    );
+    // Next append still lands at the floor:
+    db.submit(vec![Op::CreateNode {
+        id: NodeId::new(),
+        scope,
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
+    assert_eq!(db.current_seq().unwrap(), 4);
+}
+
+#[test]
 fn unsupported_format_version_errors_at_open() {
     use redb::{Database, TableDefinition};
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");

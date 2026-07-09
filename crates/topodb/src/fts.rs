@@ -15,7 +15,7 @@
 //! merges (a node lives in exactly one scope — no cross-scope key collision).
 
 use crate::db::Db;
-use crate::error::TopoError;
+use crate::error::{storage_err, TopoError};
 use crate::ids::{NodeId, Scope, ScopeSet};
 use crate::index::IndexSpec;
 use crate::props::PropValue;
@@ -75,7 +75,7 @@ fn read_posting(
     postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     term: &[u8],
 ) -> Result<Vec<(NodeId, u32)>, TopoError> {
-    match postings.get(term).map_err(redb::Error::from)? {
+    match postings.get(term).map_err(storage_err)? {
         Some(v) => postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string())),
         None => Ok(Vec::new()),
     }
@@ -91,7 +91,7 @@ fn set_posting(
     id: NodeId,
     count: u32,
 ) -> Result<(), TopoError> {
-    let mut map: BTreeMap<NodeId, u32> = match postings.get(term).map_err(redb::Error::from)? {
+    let mut map: BTreeMap<NodeId, u32> = match postings.get(term).map_err(storage_err)? {
         Some(v) => {
             let vec: Vec<(NodeId, u32)> =
                 postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
@@ -106,13 +106,13 @@ fn set_posting(
     }
     if map.is_empty() {
         // Drop empty postings keys (same empty-key doctrine as the prop index).
-        postings.remove(term).map_err(redb::Error::from)?;
+        postings.remove(term).map_err(storage_err)?;
     } else {
         let vec: Vec<(NodeId, u32)> = map.into_iter().collect();
         let bytes = postcard::to_allocvec(&vec).map_err(|e| TopoError::Encoding(e.to_string()))?;
         postings
             .insert(term, bytes.as_slice())
-            .map_err(redb::Error::from)?;
+            .map_err(storage_err)?;
     }
     Ok(())
 }
@@ -136,7 +136,7 @@ fn read_stats(
     scope: Scope,
 ) -> Result<(u64, u64), TopoError> {
     let key = scope_key(scope);
-    match stats.get(key.as_slice()).map_err(redb::Error::from)? {
+    match stats.get(key.as_slice()).map_err(storage_err)? {
         Some(v) => postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string())),
         None => Ok((0, 0)),
     }
@@ -154,13 +154,13 @@ fn write_stats(
 ) -> Result<(), TopoError> {
     let key = scope_key(scope);
     if doc_count == 0 {
-        stats.remove(key.as_slice()).map_err(redb::Error::from)?;
+        stats.remove(key.as_slice()).map_err(storage_err)?;
     } else {
         let bytes = postcard::to_allocvec(&(doc_count, total_len))
             .map_err(|e| TopoError::Encoding(e.to_string()))?;
         stats
             .insert(key.as_slice(), bytes.as_slice())
-            .map_err(redb::Error::from)?;
+            .map_err(storage_err)?;
     }
     Ok(())
 }
@@ -171,7 +171,7 @@ fn read_doc_len(
     id: NodeId,
 ) -> Result<u32, TopoError> {
     let key = node_key(id);
-    match docs.get(key.as_slice()).map_err(redb::Error::from)? {
+    match docs.get(key.as_slice()).map_err(storage_err)? {
         Some(v) => {
             postcard::from_bytes::<u32>(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))
         }
@@ -260,9 +260,9 @@ pub(crate) fn fts_update(
         let bytes = postcard::to_allocvec(&(new_len as u32))
             .map_err(|e| TopoError::Encoding(e.to_string()))?;
         docs.insert(key.as_slice(), bytes.as_slice())
-            .map_err(redb::Error::from)?;
+            .map_err(storage_err)?;
     } else {
-        docs.remove(key.as_slice()).map_err(redb::Error::from)?;
+        docs.remove(key.as_slice()).map_err(storage_err)?;
     }
     write_stats(stats, scope, doc_count, total_len)?;
     Ok(())
@@ -303,10 +303,10 @@ impl Db {
         let distinct: BTreeSet<String> = tokens.into_iter().collect();
 
         let storage = self.storage();
-        let tx = storage.db.begin_read().map_err(redb::Error::from)?;
-        let postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
-        let docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
-        let stats = tx.open_table(FTS_STATS).map_err(redb::Error::from)?;
+        let tx = storage.db.begin_read().map_err(storage_err)?;
+        let postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+        let docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+        let stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
 
         // Score each requested scope against its own corpus, then merge. A node
         // lives in exactly one scope, so its entry is only ever written under

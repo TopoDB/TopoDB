@@ -468,7 +468,11 @@ impl Db {
     /// `ops_since(seq + 1)` once and dedup by `seq` against the channel. Any op
     /// committed between the two calls appears in both the replay and the live
     /// channel; deduping by `seq` collapses the overlap, and nothing in the gap
-    /// is missed.
+    /// is missed. This recipe is seamless across compaction too:
+    /// [`current_seq`](Db::current_seq) survives an empty-but-compacted log
+    /// (it falls back to the retained floor), so `ops_since(current_seq() +
+    /// 1)` never spuriously returns [`TopoError::Compacted`] right after an
+    /// emptying compaction — no special-casing needed at the call site.
     #[must_use]
     pub fn subscribe(&self, capacity: usize) -> Receiver<ChangeEvent> {
         let capacity = capacity.max(1);
@@ -515,17 +519,19 @@ impl Db {
             .collect())
     }
 
-    /// The highest op-log seq committed so far (0 when the log is empty). A
-    /// plain storage read — no applier round-trip — so it is cheap and safe to
-    /// call from any thread. Its purpose is to anchor a gap-free live tail:
-    /// take it *before* [`subscribe`](Db::subscribe), then backfill with
-    /// `ops_since(seq + 1)` (see `subscribe`'s anchoring recipe).
+    /// The highest op-log seq committed so far (0 when the log has never been
+    /// written). A plain storage read — no applier round-trip — so it is
+    /// cheap and safe to call from any thread. Its purpose is to anchor a
+    /// gap-free live tail: take it *before* [`subscribe`](Db::subscribe),
+    /// then backfill with `ops_since(seq + 1)` (see `subscribe`'s anchoring
+    /// recipe).
     ///
-    /// One compaction edge case: on an empty-but-compacted log this returns 0,
-    /// while the next assigned seq will be the compaction floor (`oldest_seq`)
-    /// rather than 1. The anchoring recipe's `ops_since(current_seq() + 1)` can
-    /// then return [`TopoError::Compacted`] — that is not a fault, it is the
-    /// signal to re-anchor from materialized state (the designed recovery).
+    /// Survives compaction: on an empty-but-compacted log the last OPS key is
+    /// gone, but this falls back to the retained floor (`oldest_seq - 1`) so
+    /// the high-water mark is never lost. The anchoring recipe's
+    /// `ops_since(current_seq() + 1)` therefore never spuriously returns
+    /// [`TopoError::Compacted`] right after an emptying compaction — it only
+    /// returns `Compacted` for a seq genuinely below the retained floor.
     #[must_use = "the seq anchors ops_since"]
     pub fn current_seq(&self) -> Result<u64, TopoError> {
         self.inner.storage.current_seq()

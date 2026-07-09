@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::fmt;
+use std::str::FromStr;
 use ulid::Ulid;
 
 macro_rules! id_type {
@@ -7,25 +9,43 @@ macro_rules! id_type {
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
-        pub struct $name(pub Ulid);
+        pub struct $name(Ulid);
         impl $name {
             pub fn new() -> Self {
                 Self(Ulid::new())
             }
 
-            /// Deterministic constructor for tests/fixtures (e.g. the committed
-            /// FORMAT.md fixture, `tests/format_fixture.rs`) that need a stable,
-            /// reproducible id rather than `Ulid::new()`'s wall-clock-derived
-            /// randomness. Same debug-seam class as `Db::debug_snapshot` — not
-            /// part of the supported public surface, hence `#[doc(hidden)]`.
-            #[doc(hidden)]
+            /// Deterministic constructor for tests/fixtures and hosts that need
+            /// a stable, reproducible id (e.g. derived from an external key)
+            /// rather than `Ulid::new()`'s wall-clock-derived randomness. The
+            /// committed FORMAT.md fixture (`tests/format_fixture.rs`) relies
+            /// on this for byte-stable ids across format-version checks.
             pub fn from_u128(v: u128) -> Self {
                 Self(Ulid(v))
+            }
+
+            /// The id's raw 128-bit value, inverse of [`from_u128`](Self::from_u128).
+            pub fn as_u128(self) -> u128 {
+                self.0 .0
             }
         }
         impl Default for $name {
             fn default() -> Self {
                 Self::new()
+            }
+        }
+        /// Canonical Crockford base32 ULID string form (26 chars), delegating
+        /// to `ulid::Ulid`'s `Display`. Round-trips through [`FromStr`].
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(&self.0, f)
+            }
+        }
+        /// Parses the canonical ULID string form produced by `Display`.
+        impl FromStr for $name {
+            type Err = ulid::DecodeError;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(Self(Ulid::from_str(s)?))
             }
         }
     };
@@ -99,5 +119,14 @@ mod tests {
         let bytes = postcard::to_allocvec(&id).unwrap();
         let back: NodeId = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(id, back);
+    }
+
+    #[test]
+    fn ids_round_trip_u128_and_string() {
+        let id = NodeId::from_u128(0xDEADBEEF);
+        assert_eq!(id.as_u128(), 0xDEADBEEF);
+        let s = id.to_string();
+        let back: NodeId = s.parse().unwrap();
+        assert_eq!(back, id);
     }
 }

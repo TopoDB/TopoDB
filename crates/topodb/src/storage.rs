@@ -1,5 +1,5 @@
 use crate::counters::AccessStats;
-use crate::error::TopoError;
+use crate::error::{storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::index::IndexSpec;
@@ -60,36 +60,35 @@ impl Storage {
         path: impl AsRef<Path>,
         spec: Arc<IndexSpec>,
     ) -> Result<Self, TopoError> {
-        let db = Database::create(path).map_err(redb::Error::from)?;
+        let db = Database::create(path).map_err(storage_err)?;
         let s = Self { db, spec };
         // Ensure tables + format version exist.
-        let tx = s.db.begin_write().map_err(redb::Error::from)?;
+        let tx = s.db.begin_write().map_err(storage_err)?;
         {
-            tx.open_table(OPS).map_err(redb::Error::from)?;
-            tx.open_table(NODES).map_err(redb::Error::from)?;
-            tx.open_table(EDGES).map_err(redb::Error::from)?;
-            tx.open_table(COUNTERS).map_err(redb::Error::from)?;
-            tx.open_table(POSTINGS).map_err(redb::Error::from)?;
-            tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
-            tx.open_table(FTS_STATS).map_err(redb::Error::from)?;
-            let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
+            tx.open_table(OPS).map_err(storage_err)?;
+            tx.open_table(NODES).map_err(storage_err)?;
+            tx.open_table(EDGES).map_err(storage_err)?;
+            tx.open_table(COUNTERS).map_err(storage_err)?;
+            tx.open_table(POSTINGS).map_err(storage_err)?;
+            tx.open_table(FTS_DOCS).map_err(storage_err)?;
+            tx.open_table(FTS_STATS).map_err(storage_err)?;
+            let mut meta = tx.open_table(META).map_err(storage_err)?;
             // Read the stored version into an owned value first so the read
             // guard's borrow of `meta` ends before we (maybe) insert into it.
-            let existing: Option<u32> =
-                match meta.get("format_version").map_err(redb::Error::from)? {
-                    Some(v) => {
-                        let bytes: [u8; 4] = v
-                            .value()
-                            .try_into()
-                            .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
-                        Some(u32::from_le_bytes(bytes))
-                    }
-                    None => None,
-                };
+            let existing: Option<u32> = match meta.get("format_version").map_err(storage_err)? {
+                Some(v) => {
+                    let bytes: [u8; 4] = v
+                        .value()
+                        .try_into()
+                        .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
+                    Some(u32::from_le_bytes(bytes))
+                }
+                None => None,
+            };
             match existing {
                 None => {
                     meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
-                        .map_err(redb::Error::from)?;
+                        .map_err(storage_err)?;
                 }
                 Some(found) if found > FORMAT_VERSION => {
                     return Err(TopoError::UnsupportedFormat {
@@ -109,7 +108,7 @@ impl Storage {
                 Some(_) => {}
             }
         }
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         // Reconcile the stored index spec with the one we were opened with;
         // a text-portion change (or a legacy layout) triggers a full reindex
         // (committed here, before any reader/`Db` observes the tables).
@@ -146,13 +145,13 @@ impl Storage {
         let incoming_bytes =
             postcard::to_allocvec(&incoming).map_err(|e| TopoError::Encoding(e.to_string()))?;
 
-        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let tx = self.db.begin_write().map_err(storage_err)?;
         let (needs_reindex, is_legacy_v1) = {
-            let meta = tx.open_table(META).map_err(redb::Error::from)?;
-            if meta.get("fts_spec").map_err(redb::Error::from)?.is_some() {
+            let meta = tx.open_table(META).map_err(storage_err)?;
+            if meta.get("fts_spec").map_err(storage_err)?.is_some() {
                 (true, true)
             } else {
-                match meta.get("index_spec").map_err(redb::Error::from)? {
+                match meta.get("index_spec").map_err(storage_err)? {
                     Some(v) => {
                         let stored: IndexSpec = postcard::from_bytes(v.value())
                             .map_err(|e| TopoError::Encoding(e.to_string()))?;
@@ -164,16 +163,16 @@ impl Storage {
         };
 
         if needs_reindex {
-            let mut postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
-            let mut docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
-            let mut stats = tx.open_table(FTS_STATS).map_err(redb::Error::from)?;
-            postings.retain(|_, _| false).map_err(redb::Error::from)?;
-            docs.retain(|_, _| false).map_err(redb::Error::from)?;
-            stats.retain(|_, _| false).map_err(redb::Error::from)?;
+            let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+            let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+            let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+            postings.retain(|_, _| false).map_err(storage_err)?;
+            docs.retain(|_, _| false).map_err(storage_err)?;
+            stats.retain(|_, _| false).map_err(storage_err)?;
 
-            let nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
-            for entry in nodes.iter().map_err(redb::Error::from)? {
-                let (_, v) = entry.map_err(redb::Error::from)?;
+            let nodes = tx.open_table(NODES).map_err(storage_err)?;
+            for entry in nodes.iter().map_err(storage_err)? {
+                let (_, v) = entry.map_err(storage_err)?;
                 let rec: NodeRecord = postcard::from_bytes(v.value())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
                 let new_text = doc_text(&self.spec, &rec);
@@ -190,20 +189,20 @@ impl Storage {
         }
 
         {
-            let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
+            let mut meta = tx.open_table(META).map_err(storage_err)?;
             if is_legacy_v1 {
-                meta.remove("fts_spec").map_err(redb::Error::from)?;
-                meta.remove("fts_doc_count").map_err(redb::Error::from)?;
-                meta.remove("fts_total_len").map_err(redb::Error::from)?;
+                meta.remove("fts_spec").map_err(storage_err)?;
+                meta.remove("fts_doc_count").map_err(storage_err)?;
+                meta.remove("fts_total_len").map_err(storage_err)?;
             }
             // Persist the full normalized spec unconditionally so the stored
             // spec always reflects the current open (a byte-identical rewrite
             // is a harmless no-op). Introspection sees equality changes even
             // when they trigger no reindex.
             meta.insert("index_spec", incoming_bytes.as_slice())
-                .map_err(redb::Error::from)?;
+                .map_err(storage_err)?;
         }
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         Ok(())
     }
 
@@ -214,11 +213,11 @@ impl Storage {
     /// `append_ops`/`open` above.
     #[allow(dead_code)]
     pub fn format_version(&self) -> Result<u32, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let meta = tx.open_table(META).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let meta = tx.open_table(META).map_err(storage_err)?;
         let v = meta
             .get("format_version")
-            .map_err(redb::Error::from)?
+            .map_err(storage_err)?
             .ok_or_else(|| TopoError::Encoding("missing format_version".into()))?;
         let bytes: [u8; 4] = v
             .value()
@@ -236,7 +235,7 @@ impl Storage {
         if ops.is_empty() {
             return Err(TopoError::Rejected("empty op batch".into()));
         }
-        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let tx = self.db.begin_write().map_err(storage_err)?;
         let (first, last);
         {
             // Floor read inside the SAME write txn as the append: after an
@@ -244,13 +243,13 @@ impl Storage {
             // high-water mark (`retain_in` leaves no sentinel key), so the
             // next seq is one past the last OPS key, clamped up to the floor.
             let floor = {
-                let meta = tx.open_table(META).map_err(redb::Error::from)?;
+                let meta = tx.open_table(META).map_err(storage_err)?;
                 read_oldest_seq(&meta)?
             };
-            let mut table = tx.open_table(OPS).map_err(redb::Error::from)?;
+            let mut table = tx.open_table(OPS).map_err(storage_err)?;
             let next = table
                 .last()
-                .map_err(redb::Error::from)?
+                .map_err(storage_err)?
                 .map(|(k, _)| k.value() + 1)
                 .unwrap_or(1)
                 .max(floor);
@@ -261,10 +260,10 @@ impl Storage {
                     postcard::to_allocvec(op).map_err(|e| TopoError::Encoding(e.to_string()))?;
                 table
                     .insert(next + i as u64, bytes.as_slice())
-                    .map_err(redb::Error::from)?;
+                    .map_err(storage_err)?;
             }
         }
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         Ok((first, last))
     }
 
@@ -273,30 +272,38 @@ impl Storage {
     /// ABSENT key means the log has never been compacted, so the oldest
     /// retained seq is 1 (the genesis seq).
     pub(crate) fn oldest_seq(&self) -> Result<u64, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let meta = tx.open_table(META).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let meta = tx.open_table(META).map_err(storage_err)?;
         read_oldest_seq(&meta)
     }
 
-    /// The highest op seq currently in the log (its last OPS key), or 0 when
-    /// the log is empty. A plain storage read — no applier round-trip — so it
-    /// is safe to call from any thread as the anchor for a live tail
+    /// The highest op seq the log has ever assigned: `max(last OPS key, 0)`
+    /// on a never-compacted log, or `max(last OPS key, oldest_seq - 1)` once
+    /// compaction has run. A plain storage read — no applier round-trip — so
+    /// it is safe to call from any thread as the anchor for a live tail
     /// (`current_seq` then `subscribe` then `ops_since(seq + 1)`).
     ///
-    /// On an empty-but-compacted log this returns 0 even though the next
-    /// assigned seq will be `oldest_seq` (the append paths clamp to the
-    /// floor); callers anchoring with `ops_since(current_seq() + 1)` may
-    /// therefore get `Compacted` and must re-anchor from materialized state —
-    /// the designed recovery.
+    /// This survives an empty-but-compacted log: `retain_in` leaves no
+    /// sentinel OPS key behind, so on its own `last OPS key` would regress to
+    /// 0 (or the prior high-water mark, if any keys remain below the new
+    /// floor — which never happens post-compaction). Falling back to
+    /// `oldest_seq - 1` recovers the true high-water mark from META in that
+    /// case, so `ops_since(current_seq() + 1)` never spuriously observes
+    /// `Compacted` right after an emptying compaction — the anchor recipe on
+    /// [`subscribe`](crate::db::Db::subscribe) is gap-free with no special
+    /// casing. On a never-written log (`oldest_seq` absent ⇒ 1), this is
+    /// `max(0, 1 - 1) == 0`, unchanged from before.
     pub(crate) fn current_seq(&self) -> Result<u64, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let table = tx.open_table(OPS).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(OPS).map_err(storage_err)?;
         let last = table
             .last()
-            .map_err(redb::Error::from)?
+            .map_err(storage_err)?
             .map(|(k, _)| k.value())
             .unwrap_or(0);
-        Ok(last)
+        let meta = tx.open_table(META).map_err(storage_err)?;
+        let oldest = read_oldest_seq(&meta)?;
+        Ok(last.max(oldest.saturating_sub(1)))
     }
 
     /// Drops op-log entries with seq `< keep_from` in one write transaction and
@@ -326,16 +333,16 @@ impl Storage {
                 "compact: keep_from {keep_from} exceeds current_seq {current} + 1"
             )));
         }
-        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let tx = self.db.begin_write().map_err(storage_err)?;
         {
-            let mut ops = tx.open_table(OPS).map_err(redb::Error::from)?;
+            let mut ops = tx.open_table(OPS).map_err(storage_err)?;
             ops.retain_in(..keep_from, |_, _| false)
-                .map_err(redb::Error::from)?;
-            let mut meta = tx.open_table(META).map_err(redb::Error::from)?;
+                .map_err(storage_err)?;
+            let mut meta = tx.open_table(META).map_err(storage_err)?;
             meta.insert("oldest_seq", keep_from.to_le_bytes().as_slice())
-                .map_err(redb::Error::from)?;
+                .map_err(storage_err)?;
         }
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         Ok(())
     }
 
@@ -360,16 +367,16 @@ impl Storage {
         // "replay-everything" idiom for callers who don't have a real anchor
         // yet.
         let since = since.max(1);
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let meta = tx.open_table(META).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let meta = tx.open_table(META).map_err(storage_err)?;
         let oldest = read_oldest_seq(&meta)?;
         if since < oldest {
             return Err(TopoError::Compacted { oldest });
         }
-        let table = tx.open_table(OPS).map_err(redb::Error::from)?;
+        let table = tx.open_table(OPS).map_err(storage_err)?;
         let mut out = Vec::new();
-        for entry in table.range(since..).map_err(redb::Error::from)? {
-            let (k, v) = entry.map_err(redb::Error::from)?;
+        for entry in table.range(since..).map_err(storage_err)? {
+            let (k, v) = entry.map_err(storage_err)?;
             let op: Op =
                 postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
             out.push((k.value(), op));
@@ -390,7 +397,7 @@ impl Storage {
         // and applied, so replay stays deterministic.
         let resolved: Vec<Op> = ops.into_iter().map(|op| resolve_op(op, now_ms)).collect();
 
-        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let tx = self.db.begin_write().map_err(storage_err)?;
         // Text-index edits collected during the op loop and applied AFTER every
         // op has succeeded — still inside this transaction, so the postings
         // ride the batch's atomicity (a later failing op aborts the whole txn,
@@ -400,8 +407,8 @@ impl Storage {
         // scope are always identical), needed to key per-scope postings/stats.
         let mut fts_edits: Vec<(Scope, NodeId, Option<String>, Option<String>)> = Vec::new();
         {
-            let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
-            let mut edges = tx.open_table(EDGES).map_err(redb::Error::from)?;
+            let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
+            let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
             for op in &resolved {
                 // `pre` carries (id, scope, old_text). For CreateNode the scope
                 // comes from the op; for existing-node ops it comes from the
@@ -428,9 +435,9 @@ impl Storage {
             }
         }
         {
-            let mut postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
-            let mut docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
-            let mut stats = tx.open_table(FTS_STATS).map_err(redb::Error::from)?;
+            let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+            let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+            let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
             for (scope, id, old_text, new_text) in &fts_edits {
                 fts_update(
                     &mut postings,
@@ -453,13 +460,13 @@ impl Storage {
             // unreadable via `read_ops` and breaking seq monotonicity). Read
             // inside this write txn so the clamp is atomic with the append.
             let floor = {
-                let meta = tx.open_table(META).map_err(redb::Error::from)?;
+                let meta = tx.open_table(META).map_err(storage_err)?;
                 read_oldest_seq(&meta)?
             };
-            let mut table = tx.open_table(OPS).map_err(redb::Error::from)?;
+            let mut table = tx.open_table(OPS).map_err(storage_err)?;
             let next = table
                 .last()
-                .map_err(redb::Error::from)?
+                .map_err(storage_err)?
                 .map(|(k, _)| k.value() + 1)
                 .unwrap_or(1)
                 .max(floor);
@@ -470,11 +477,11 @@ impl Storage {
                     postcard::to_allocvec(op).map_err(|e| TopoError::Encoding(e.to_string()))?;
                 table
                     .insert(next + i as u64, bytes.as_slice())
-                    .map_err(redb::Error::from)?;
+                    .map_err(storage_err)?;
             }
         }
 
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         Ok(AppliedBatch {
             first_seq,
             last_seq,
@@ -487,27 +494,27 @@ impl Storage {
     /// unit tests today.
     #[allow(dead_code)]
     pub fn load_node(&self, id: NodeId) -> Result<Option<NodeRecord>, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let table = tx.open_table(NODES).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(NODES).map_err(storage_err)?;
         read_node(&table, id)
     }
 
     /// See `load_node`.
     #[allow(dead_code)]
     pub fn load_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let table = tx.open_table(EDGES).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(EDGES).map_err(storage_err)?;
         read_edge(&table, id)
     }
 
     /// Crate-internal full scan — used to rebuild in-memory adjacency. Not
     /// public API: callers should go through the (future) query layer.
     pub(crate) fn all_nodes(&self) -> Result<Vec<NodeRecord>, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let table = tx.open_table(NODES).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(NODES).map_err(storage_err)?;
         let mut out = Vec::new();
-        for entry in table.iter().map_err(redb::Error::from)? {
-            let (_, v) = entry.map_err(redb::Error::from)?;
+        for entry in table.iter().map_err(storage_err)? {
+            let (_, v) = entry.map_err(storage_err)?;
             let rec: NodeRecord =
                 postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
             out.push(rec);
@@ -516,11 +523,11 @@ impl Storage {
     }
 
     pub(crate) fn all_edges(&self) -> Result<Vec<EdgeRecord>, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let table = tx.open_table(EDGES).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(EDGES).map_err(storage_err)?;
         let mut out = Vec::new();
-        for entry in table.iter().map_err(redb::Error::from)? {
-            let (_, v) = entry.map_err(redb::Error::from)?;
+        for entry in table.iter().map_err(storage_err)? {
+            let (_, v) = entry.map_err(storage_err)?;
             let rec: EdgeRecord =
                 postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
             out.push(rec);
@@ -542,12 +549,12 @@ impl Storage {
         if bumps.is_empty() {
             return Ok(());
         }
-        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let tx = self.db.begin_write().map_err(storage_err)?;
         {
-            let mut table = tx.open_table(COUNTERS).map_err(redb::Error::from)?;
+            let mut table = tx.open_table(COUNTERS).map_err(storage_err)?;
             for (id, n, ts) in bumps {
                 let key = node_key(*id);
-                let existing = match table.get(key.as_slice()).map_err(redb::Error::from)? {
+                let existing = match table.get(key.as_slice()).map_err(storage_err)? {
                     Some(v) => postcard::from_bytes::<AccessStats>(v.value())
                         .map_err(|e| TopoError::Encoding(e.to_string()))?,
                     None => AccessStats::default(),
@@ -560,10 +567,10 @@ impl Storage {
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
                 table
                     .insert(key.as_slice(), bytes.as_slice())
-                    .map_err(redb::Error::from)?;
+                    .map_err(storage_err)?;
             }
         }
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         Ok(())
     }
 
@@ -571,10 +578,10 @@ impl Storage {
     /// counted. Scope gating is the caller's responsibility (`Db::access_stats`
     /// checks node existence/scope first); this is a pure COUNTERS lookup.
     pub(crate) fn read_counter(&self, id: NodeId) -> Result<Option<AccessStats>, TopoError> {
-        let tx = self.db.begin_read().map_err(redb::Error::from)?;
-        let table = tx.open_table(COUNTERS).map_err(redb::Error::from)?;
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(COUNTERS).map_err(storage_err)?;
         let key = node_key(id);
-        match table.get(key.as_slice()).map_err(redb::Error::from)? {
+        match table.get(key.as_slice()).map_err(storage_err)? {
             None => Ok(None),
             Some(v) => {
                 let stats: AccessStats = postcard::from_bytes(v.value())
@@ -613,25 +620,25 @@ impl Storage {
         if oldest > 1 {
             return Err(TopoError::Compacted { oldest });
         }
-        let tx = self.db.begin_write().map_err(redb::Error::from)?;
+        let tx = self.db.begin_write().map_err(storage_err)?;
         {
-            let mut nodes = tx.open_table(NODES).map_err(redb::Error::from)?;
-            let mut edges = tx.open_table(EDGES).map_err(redb::Error::from)?;
+            let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
+            let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
             // The text index is derived from state, so it is drained and rebuilt
             // alongside NODES/EDGES through the very same `fts_update` used on the
             // write path — no parallel maintenance logic.
-            let mut postings = tx.open_table(POSTINGS).map_err(redb::Error::from)?;
-            let mut docs = tx.open_table(FTS_DOCS).map_err(redb::Error::from)?;
-            let mut stats = tx.open_table(FTS_STATS).map_err(redb::Error::from)?;
-            nodes.retain(|_, _| false).map_err(redb::Error::from)?;
-            edges.retain(|_, _| false).map_err(redb::Error::from)?;
-            postings.retain(|_, _| false).map_err(redb::Error::from)?;
-            docs.retain(|_, _| false).map_err(redb::Error::from)?;
-            stats.retain(|_, _| false).map_err(redb::Error::from)?;
+            let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+            let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+            let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+            nodes.retain(|_, _| false).map_err(storage_err)?;
+            edges.retain(|_, _| false).map_err(storage_err)?;
+            postings.retain(|_, _| false).map_err(storage_err)?;
+            docs.retain(|_, _| false).map_err(storage_err)?;
+            stats.retain(|_, _| false).map_err(storage_err)?;
 
-            let ops_table = tx.open_table(OPS).map_err(redb::Error::from)?;
-            for entry in ops_table.iter().map_err(redb::Error::from)? {
-                let (_, v) = entry.map_err(redb::Error::from)?;
+            let ops_table = tx.open_table(OPS).map_err(storage_err)?;
+            for entry in ops_table.iter().map_err(storage_err)? {
+                let (_, v) = entry.map_err(storage_err)?;
                 let op: Op = postcard::from_bytes(v.value())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
                 // Same (id, scope, old_text, new_text) derivation as
@@ -665,7 +672,7 @@ impl Storage {
                 }
             }
         }
-        tx.commit().map_err(redb::Error::from)?;
+        tx.commit().map_err(storage_err)?;
         Ok(())
     }
 }
@@ -712,7 +719,7 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
 }
 
 pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
-    id.0 .0.to_be_bytes()
+    id.as_u128().to_be_bytes()
 }
 
 /// Reads META `"oldest_seq"` (u64 LE) from an already-open META table; an
@@ -722,7 +729,7 @@ pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
 fn read_oldest_seq(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<u64, TopoError> {
-    match meta.get("oldest_seq").map_err(redb::Error::from)? {
+    match meta.get("oldest_seq").map_err(storage_err)? {
         Some(v) => {
             let bytes: [u8; 8] = v
                 .value()
@@ -760,14 +767,14 @@ pub(crate) fn scope_key(s: Scope) -> [u8; 17] {
         }
         Scope::Id(id) => {
             key[0] = 0x01;
-            key[1..17].copy_from_slice(&id.0 .0.to_be_bytes());
+            key[1..17].copy_from_slice(&id.as_u128().to_be_bytes());
         }
     }
     key
 }
 
 fn edge_key(id: EdgeId) -> [u8; 16] {
-    id.0 .0.to_be_bytes()
+    id.as_u128().to_be_bytes()
 }
 
 fn read_node(
@@ -775,7 +782,7 @@ fn read_node(
     id: NodeId,
 ) -> Result<Option<NodeRecord>, TopoError> {
     let key = node_key(id);
-    match table.get(key.as_slice()).map_err(redb::Error::from)? {
+    match table.get(key.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
             let rec: NodeRecord =
@@ -790,7 +797,7 @@ fn read_edge(
     id: EdgeId,
 ) -> Result<Option<EdgeRecord>, TopoError> {
     let key = edge_key(id);
-    match table.get(key.as_slice()).map_err(redb::Error::from)? {
+    match table.get(key.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
             let rec: EdgeRecord =
@@ -808,7 +815,7 @@ fn put_node(
     let bytes = postcard::to_allocvec(rec).map_err(|e| TopoError::Encoding(e.to_string()))?;
     table
         .insert(key.as_slice(), bytes.as_slice())
-        .map_err(redb::Error::from)?;
+        .map_err(storage_err)?;
     Ok(())
 }
 
@@ -820,7 +827,7 @@ fn put_edge(
     let bytes = postcard::to_allocvec(rec).map_err(|e| TopoError::Encoding(e.to_string()))?;
     table
         .insert(key.as_slice(), bytes.as_slice())
-        .map_err(redb::Error::from)?;
+        .map_err(storage_err)?;
     Ok(())
 }
 
@@ -875,7 +882,7 @@ fn apply_op(
         }
         Op::RemoveNode { id } => {
             let key = node_key(*id);
-            let removed = nodes.remove(key.as_slice()).map_err(redb::Error::from)?;
+            let removed = nodes.remove(key.as_slice()).map_err(storage_err)?;
             if removed.is_none() {
                 return Err(TopoError::Rejected(format!(
                     "RemoveNode: node {id:?} not found"
@@ -885,8 +892,8 @@ fn apply_op(
             // Remove incident edges, both directions. v0.1: linear scan is
             // acceptable; adjacency-assisted delete arrives with Task 5.
             let mut incident = Vec::new();
-            for entry in edges.iter().map_err(redb::Error::from)? {
-                let (k, v) = entry.map_err(redb::Error::from)?;
+            for entry in edges.iter().map_err(storage_err)? {
+                let (k, v) = entry.map_err(storage_err)?;
                 let rec: EdgeRecord = postcard::from_bytes(v.value())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
                 if rec.from == *id || rec.to == *id {
@@ -894,7 +901,7 @@ fn apply_op(
                 }
             }
             for key in incident {
-                edges.remove(key.as_slice()).map_err(redb::Error::from)?;
+                edges.remove(key.as_slice()).map_err(storage_err)?;
             }
             Ok(())
         }
