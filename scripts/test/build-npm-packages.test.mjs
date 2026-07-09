@@ -1,0 +1,73 @@
+import { test } from 'node:test';
+import assert from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const KEYS = ['darwin-arm64', 'darwin-x64', 'linux-x64', 'linux-arm64', 'win32-x64'];
+const binName = (key) => (key === 'win32-x64' ? 'topodb-mcp.exe' : 'topodb-mcp');
+
+function stageFakeBinaries() {
+  const dir = mkdtempSync(join(tmpdir(), 'topodb-bins-'));
+  for (const key of KEYS) {
+    mkdirSync(join(dir, key), { recursive: true });
+    writeFileSync(join(dir, key, binName(key)), `#!fake ${key}\n`);
+  }
+  return dir;
+}
+
+test('generator produces a stamped main package and five os/cpu-scoped sub-packages', () => {
+  const binaries = stageFakeBinaries();
+  const out = mkdtempSync(join(tmpdir(), 'topodb-out-'));
+  execFileSync('node', [
+    'scripts/build-npm-packages.mjs',
+    '--version', '1.2.3',
+    '--binaries', binaries,
+    '--out', out,
+  ], { stdio: 'inherit' });
+
+  // Main package: version + optionalDependency pins rewritten to 1.2.3.
+  const main = JSON.parse(readFileSync(join(out, 'topodb-mcp', 'package.json'), 'utf8'));
+  assert.equal(main.name, '@topodb/topodb-mcp');
+  assert.equal(main.version, '1.2.3');
+  for (const key of KEYS) {
+    assert.equal(main.optionalDependencies[`@topodb/topodb-mcp-${key}`], '1.2.3');
+  }
+  assert.ok(existsSync(join(out, 'topodb-mcp', 'bin', 'topodb-mcp.js')));
+
+  // Each sub-package: correct name/version/os/cpu + exactly its one binary.
+  const osFor = { darwin: 'darwin', linux: 'linux', win32: 'win32' };
+  const cpuFor = { arm64: 'arm64', x64: 'x64' };
+  for (const key of KEYS) {
+    const [plat, arch] = key.split('-');
+    const pkgDir = join(out, `topodb-mcp-${key}`);
+    const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+    assert.equal(pkg.name, `@topodb/topodb-mcp-${key}`);
+    assert.equal(pkg.version, '1.2.3');
+    assert.deepEqual(pkg.os, [osFor[plat]]);
+    assert.deepEqual(pkg.cpu, [cpuFor[arch]]);
+    assert.ok(existsSync(join(pkgDir, binName(key))), `${key} binary present`);
+  }
+});
+
+test('npm pack --dry-run bundles exactly one binary per sub-package', () => {
+  const binaries = stageFakeBinaries();
+  const out = mkdtempSync(join(tmpdir(), 'topodb-out-'));
+  execFileSync('node', [
+    'scripts/build-npm-packages.mjs',
+    '--version', '1.2.3', '--binaries', binaries, '--out', out,
+  ], { stdio: 'inherit' });
+
+  const pkgDir = join(out, 'topodb-mcp-linux-x64');
+  // shell: true so Windows resolves the `npm.cmd` wrapper (execFileSync alone
+  // ENOENTs on Windows); args are fixed literals, so no shell-injection risk.
+  const json = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+    cwd: pkgDir, encoding: 'utf8', shell: true,
+  });
+  const files = JSON.parse(json)[0].files.map((f) => f.path);
+  assert.ok(files.includes('topodb-mcp'), 'binary is packed');
+  assert.ok(files.includes('package.json'), 'manifest is packed');
+  const binaries2 = files.filter((f) => f === 'topodb-mcp' || f === 'topodb-mcp.exe');
+  assert.equal(binaries2.length, 1, 'exactly one binary');
+});
