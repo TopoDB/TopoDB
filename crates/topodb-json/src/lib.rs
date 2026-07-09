@@ -10,7 +10,10 @@
 
 use serde_json::{Map, Value};
 use std::str::FromStr;
-use topodb::{EdgeRecord, NodeRecord, PropValue, Props, Scope, ScopeId, ScopeSet, Subgraph};
+use topodb::{
+    EdgeRecord, IndexSpec, NodeRecord, PropIndex, PropValue, Props, Scope, ScopeId, ScopeSet,
+    Subgraph,
+};
 
 /// Label/prop name constants for the two built-in write shapes
 /// (`create_memory`/`create-memory`, `create_entity`/`create-entity`). Single
@@ -23,6 +26,33 @@ pub const ENTITY_LABEL: &str = "Entity";
 pub const ENTITY_NAME_PROP: &str = "name";
 pub const MEMORY_LABEL: &str = "Memory";
 pub const MEMORY_CONTENT_PROP: &str = "content";
+
+/// The ONE canonical default [`IndexSpec`] for TopoDB's built-in write shapes,
+/// shared by every front end (`topodb-mcp` when `--spec` is omitted;
+/// `topodb-cli` when it creates a brand-new db file). Declares equality on
+/// `(Entity, name)` and text on `(Memory, content)`, using the shared
+/// [`ENTITY_LABEL`]/[`ENTITY_NAME_PROP`]/[`MEMORY_LABEL`]/[`MEMORY_CONTENT_PROP`]
+/// constants.
+///
+/// Single-sourcing this is load-bearing: because a CLI-created db and an
+/// MCP-created db are opened with a *byte-identical* persisted `index_spec`,
+/// either front end can later serve a db the other created via `open_stored`
+/// without triggering an FTS reindex or mis-declaring the equality index — and
+/// both `find` (equality on `Entity`/`name`) and `search` (text on
+/// `Memory`/`content`) work out of the box on a fresh db regardless of which
+/// tool wrote it.
+pub fn default_spec() -> IndexSpec {
+    IndexSpec {
+        equality: vec![PropIndex {
+            label: ENTITY_LABEL.into(),
+            prop: ENTITY_NAME_PROP.into(),
+        }],
+        text: vec![PropIndex {
+            label: MEMORY_LABEL.into(),
+            prop: MEMORY_CONTENT_PROP.into(),
+        }],
+    }
+}
 
 /// Human/JSON-facing rendering of a [`Scope`]: `"shared"` or the ULID string.
 /// Reused by every front end's `info`/`db_info`-style output and scope

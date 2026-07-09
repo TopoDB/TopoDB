@@ -107,18 +107,17 @@ fn read_commands_round_trip() {
         .to_string();
     full(&["link", "--from", &m, "--to", &a, "--type", "mentions"]);
 
-    // find (default spec has no equality index → Entity/name is undeclared → Rejected;
-    // so this db was created with the DEFAULT spec. To exercise find, the db must be
-    // created with a spec declaring (Entity,name). For v1 the CLI opens with open_stored,
-    // and a default-spec db has no equality index — so `find` here is expected to Rejected.)
-    let (_e, s) = full(&[
+    // find works: a brand-new CLI db is created with the canonical
+    // `topodb_json::default_spec()` (equality on Entity/name, text on
+    // Memory/content) — the same spec topodb-mcp uses — so the equality
+    // lookup resolves the entity by name out of the box.
+    let (found, s) = full(&[
         "find", "--label", "Entity", "--prop", "name", "--value", "ada",
     ]);
-    assert_eq!(
-        s.code(),
-        Some(2),
-        "default-spec db: Entity/name not equality-indexed"
-    );
+    assert!(s.success());
+    let arr = found.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "exactly the one entity named ada");
+    assert_eq!(arr[0]["id"], serde_json::json!(a));
 
     // search works (default spec text-indexes Memory/content):
     let (hits, s) = full(&["search", "ada program"]);

@@ -5,26 +5,7 @@ use std::str::FromStr;
 
 use clap::Parser;
 use cli::{Cli, Command};
-use topodb::{
-    Db, Direction, EdgeId, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, TopoError,
-    TraversalQuery,
-};
-
-/// The `IndexSpec` a brand-new CLI-created db is bootstrapped with (see the
-/// comment at the `main` call site): text-indexes `Memory`/`content` (so
-/// `create-memory` + `search` work with no setup step) and declares no
-/// equality index (so `find` stays a caller-fixable `Rejected` until an
-/// equality index is explicitly declared some other way, e.g. by pointing
-/// the CLI at an existing db topodb-mcp created with its own default spec).
-fn cli_default_spec() -> IndexSpec {
-    IndexSpec {
-        equality: vec![],
-        text: vec![PropIndex {
-            label: topodb_json::MEMORY_LABEL.into(),
-            prop: topodb_json::MEMORY_CONTENT_PROP.into(),
-        }],
-    }
-}
+use topodb::{Db, Direction, EdgeId, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery};
 
 fn main() {
     let cli = Cli::parse();
@@ -40,20 +21,20 @@ fn main() {
     // Open using the file's own persisted index spec — no --spec flag on
     // this CLI. An EXISTING file always inherits its persisted spec exactly
     // (via `open_stored`), so a db another tool (e.g. topodb-mcp) already
-    // populated with a richer spec is never silently narrowed. Only a
-    // brand-new file (no `.redb` at this path yet) is bootstrapped with
-    // `cli_default_spec()` instead of the engine's bare `IndexSpec::default()`
-    // (which declares nothing at all): text-indexing `Memory`/`content` so
-    // `create-memory` + `search` work out of the box on a CLI-only db,
-    // without also equality-indexing `Entity`/`name` (so `find` on it stays
-    // correctly `Rejected` until a caller declares that index themselves,
-    // e.g. by pointing the CLI at a db topodb-mcp created with its default
-    // spec). `Path::exists` is safe here: the CLI is a single, non-concurrent
-    // process per invocation, so there's no other writer racing this check.
+    // populated is never reindexed or mis-declared. A brand-new file (no
+    // `.redb` at this path yet) is created with the SAME canonical
+    // `topodb_json::default_spec()` that topodb-mcp uses when `--spec` is
+    // omitted — equality on `(Entity, name)`, text on `(Memory, content)` —
+    // rather than the engine's bare `IndexSpec::default()` (which declares
+    // nothing). This is what makes a CLI-created db and an MCP-created db
+    // byte-identical in their persisted `index_spec`: serving one via the
+    // other never reindexes, and both `find` and `search` work out of the box
+    // on a fresh CLI db. `Path::exists` is safe here: the CLI is a single,
+    // non-concurrent process per invocation, so there's no writer racing it.
     let db = if cli.db.exists() {
         Db::open_stored(&cli.db)
     } else {
-        Db::open_with(&cli.db, cli_default_spec())
+        Db::open_with(&cli.db, topodb_json::default_spec())
     };
     let db = match db {
         Ok(db) => db,

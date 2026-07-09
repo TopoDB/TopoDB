@@ -14,7 +14,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use topodb::{IndexSpec, PropIndex, Scope, ScopeId};
+use topodb::{IndexSpec, Scope, ScopeId};
 
 /// Label/prop name constants, single-sourced in `topodb-json` (shared with
 /// `topodb-cli`'s `create-entity`/`create-memory`) and re-exported here so
@@ -30,20 +30,14 @@ pub struct Config {
     pub spec: IndexSpec,
 }
 
-/// The built-in default index spec used when `--spec` is omitted:
-/// equality on `(Entity, name)`, text on `(Memory, content)`.
-pub fn default_spec() -> IndexSpec {
-    IndexSpec {
-        equality: vec![PropIndex {
-            label: ENTITY_LABEL.into(),
-            prop: ENTITY_NAME_PROP.into(),
-        }],
-        text: vec![PropIndex {
-            label: MEMORY_LABEL.into(),
-            prop: MEMORY_CONTENT_PROP.into(),
-        }],
-    }
-}
+/// The built-in default index spec used when `--spec` is omitted: equality on
+/// `(Entity, name)`, text on `(Memory, content)`. Single-sourced in
+/// `topodb-json` (shared with `topodb-cli`'s fresh-db bootstrap) so a
+/// CLI-created db and an MCP-created db carry a byte-identical persisted
+/// `index_spec` — either front end can serve the other's db via `open_stored`
+/// with no reindex and no mis-declared index. Re-exported here so existing
+/// `topodb-mcp` call sites (`config::default_spec()`) keep working unchanged.
+pub use topodb_json::default_spec;
 
 /// Human/JSON-facing rendering of a [`Scope`]: `"shared"` or the ULID string.
 /// Single-sourced in `topodb-json`; re-exported here so existing
