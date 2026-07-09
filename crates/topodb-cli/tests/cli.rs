@@ -157,3 +157,178 @@ fn read_commands_round_trip() {
         .collect();
     assert!(seqs.windows(2).all(|w| w[0] < w[1]));
 }
+
+// --- Task 6: persistence across invocations + remaining error paths ---
+
+/// Two SEPARATE `topodb` process invocations against the same `--db` file:
+/// the first writes a memory, the second (a fresh process, fresh `Db`)
+/// searches for it. Only passes if `open_stored` actually reopens the
+/// on-disk state the first process durably wrote — an in-memory-only or
+/// not-actually-flushed implementation would see zero hits here.
+#[test]
+fn data_persists_across_invocations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let full = |a: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(a);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status,
+        )
+    };
+    full(&["create-memory", "--content", "persistent needle memory"]);
+    // A SEPARATE process (proves on-disk state through open_stored):
+    let (hits, s) = full(&["search", "needle"]);
+    assert!(s.success());
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+}
+
+/// A `(label, prop)` pair the open db's index spec never declared is a
+/// caller-fixable input error (rejected/exit 2), not an internal failure or
+/// a silent empty result.
+#[test]
+fn find_undeclared_prop_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["find", "--label", "Nope", "--prop", "x", "--value", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
+        "rejected"
+    );
+}
+
+/// A `--db` path whose parent directory doesn't exist can't be created by
+/// redb — a storage/db-open failure, not something the caller can fix by
+/// changing an id/prop/scope, so it's internal/exit 1 (not rejected/exit 2).
+/// Built under `tempdir()` with an extra non-existent path component rather
+/// than a hardcoded `/no/...` root so it fails identically on Windows.
+#[test]
+fn nonexistent_parent_dir_is_internal_error_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("missing_subdir").join("t.redb");
+    let out = bin().args(["--db"]).arg(&db).arg("info").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
+        "internal"
+    );
+}
+
+/// `--scope` that's neither "shared" nor a parseable ULID is a caller
+/// input error resolved before the db is even opened -> rejected/exit 2.
+#[test]
+fn malformed_scope_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", "not-a-ulid", "info"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// `create-memory`'s `--props` can't shadow the reserved `content` key that
+/// the subcommand itself sets from `--content` — `merge_required_prop`
+/// rejects the collision outright rather than letting either value silently
+/// win. (The same rule applies to `create-entity`'s `name`; that path is
+/// already covered directly by `topodb-json`'s own
+/// `merge_required_prop_rejects_collision_with_required_key` unit test, so
+/// one CLI-level check here is enough to pin the wiring end to end.)
+#[test]
+fn create_collision_with_reserved_prop_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "create-memory",
+            "--content",
+            "x",
+            "--props",
+            r#"{"content":"dup"}"#,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "rejected");
+}
+
+/// A db file created (outside the CLI) with a CUSTOM `IndexSpec` — one the
+/// CLI's own `topodb_json::default_spec()` does NOT declare — must have that
+/// custom equality index survive being opened by the CLI. `main.rs` only
+/// falls back to `default_spec()` for a path that doesn't exist yet
+/// (`cli.db.exists()` is false); an EXISTING file always goes through
+/// `Db::open_stored`, which inherits the persisted spec verbatim. If the CLI
+/// instead clobbered an existing file's spec with its own default, this
+/// `find` would come back Rejected (Person/handle isn't in the default
+/// spec) rather than succeeding.
+#[test]
+fn existing_custom_spec_db_is_inherited() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new();
+
+    // Build the db directly through the engine with a spec the CLI default
+    // does not declare: equality on (Person, handle).
+    let custom_spec = topodb::IndexSpec {
+        equality: vec![topodb::PropIndex {
+            label: "Person".into(),
+            prop: "handle".into(),
+        }],
+        text: vec![],
+    };
+    {
+        let engine_db = topodb::Db::open_with(&db, custom_spec).unwrap();
+        let mut props = topodb::Props::new();
+        props.insert("handle".into(), topodb::PropValue::Str("ada".into()));
+        engine_db
+            .submit(vec![topodb::Op::CreateNode {
+                id: topodb::NodeId::new(),
+                scope: topodb::Scope::Id(scope),
+                label: "Person".into(),
+                props,
+            }])
+            .unwrap();
+        // engine_db drops here, releasing the redb file lock before the CLI
+        // subprocess opens it.
+    }
+
+    // The CLI never created this file and carries no custom-spec knowledge
+    // of its own — it can only succeed here by inheriting the persisted
+    // spec via `open_stored`.
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", &scope.to_string()])
+        .args([
+            "find", "--label", "Person", "--prop", "handle", "--value", "ada",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = hits.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["props"]["handle"], serde_json::json!("ada"));
+}
