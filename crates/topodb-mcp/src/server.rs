@@ -2,11 +2,14 @@
 //!
 //! Built on rmcp 2.2.0: the tool surface is declared with `#[tool_router]` +
 //! `#[tool]` and dispatched through `#[tool_handler]` on the [`ServerHandler`]
-//! impl. Task 4 adds the six read tools below (`get_node`, `find_by_prop`,
+//! impl. Task 4 added six read tools (`get_node`, `find_by_prop`,
 //! `search_memories`, `traverse`, `access_stats`, `get_changes`), following
-//! the `db_info` pattern established in Task 3. Every tool resolves its
-//! optional `scope` param via [`TopoServer::resolve_scopes`] and maps engine
-//! `Err`s to `ErrorData` through `crate::convert` — never panics.
+//! the `db_info` pattern established in Task 3. Task 5 adds three write tools
+//! (`create_memory`, `create_entity`, `link`) — each one `Db::submit` call
+//! (atomic). Every tool resolves its optional `scope` param via
+//! [`TopoServer::resolve_scopes`] (reads) or [`TopoServer::resolve_scope`]
+//! (writes) and maps engine `Err`s to `ErrorData` through `crate::convert` —
+//! never panics.
 
 use std::str::FromStr;
 
@@ -17,9 +20,13 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use topodb::{Db, Direction, NodeId, Scope, ScopeSet, TopoError, TraversalQuery};
+use topodb::{
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeSet, TopoError, TraversalQuery,
+};
 
-use crate::config::{scope_label, Config};
+use crate::config::{
+    scope_label, Config, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
+};
 use crate::convert;
 
 /// The MCP server state. `Clone` is required by rmcp (the service clones the
@@ -65,6 +72,33 @@ impl TopoServer {
                 Ok(convert::scope_to_scope_set(resolved))
             }
         }
+    }
+
+    /// Resolves a write tool's optional `scope` param to the single [`Scope`]
+    /// the created node/edge is stamped with. Unlike `resolve_scopes` (which
+    /// expands to a `ScopeSet` for reads), a write needs exactly one `Scope`
+    /// value, not a set to filter by — so this goes through
+    /// [`convert::resolve_scope`] directly rather than also converting to a
+    /// `ScopeSet`. `link` has no `scope` param on the wire (per the plan's
+    /// tool table) and always calls this with `None`, which still resolves
+    /// through the same path to the server's configured default scope.
+    fn resolve_scope(&self, scope: Option<&str>) -> Result<Scope, ErrorData> {
+        convert::resolve_scope(scope, self.default_scope)
+            .map_err(|e| ErrorData::invalid_params(e, None))
+    }
+
+    /// Submits a one-op write batch (every Task 5 write tool is exactly one
+    /// `CreateNode`/`CreateEdge`, so the batch is trivially atomic).
+    /// `TopoError::Rejected` (e.g. `link`'s missing-endpoint check) is a
+    /// caller-fixable input problem → `invalid_params`; every other error
+    /// (storage, encoding, a closed engine) → `internal_error` — the same
+    /// classification `search_memories`/`get_changes` already use (Task 4's
+    /// review-fix pattern).
+    fn submit_write(&self, ops: Vec<Op>) -> Result<(), ErrorData> {
+        self.db.submit(ops).map(|_| ()).map_err(|e| match e {
+            TopoError::Rejected(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })
     }
 }
 
@@ -260,6 +294,68 @@ struct GetChangesResult {
     ops: Vec<ChangeEventJson>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateMemoryParams {
+    /// The memory's full-text-searchable body.
+    content: String,
+    /// Structured metadata merged into the node's props (string/number/bool
+    /// values). Must not include a `content` key — that key is set from the
+    /// `content` param above; a collision is rejected rather than silently
+    /// overwritten.
+    #[serde(default)]
+    props: Option<Value>,
+    /// Scope to create the memory in: `"shared"` or a scope ULID. Defaults to
+    /// the server's configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateEntityParams {
+    /// The entity's equality-indexed identifying name.
+    name: String,
+    /// Structured metadata merged into the node's props (string/number/bool
+    /// values). Must not include a `name` key — that key is set from the
+    /// `name` param above; a collision is rejected rather than silently
+    /// overwritten.
+    #[serde(default)]
+    props: Option<Value>,
+    /// Scope to create the entity in: `"shared"` or a scope ULID. Defaults to
+    /// the server's configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct CreateResult {
+    /// ULID of the newly created node.
+    id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LinkParams {
+    /// ULID of the edge's source (`from`) node. Must already exist.
+    from_id: String,
+    /// ULID of the edge's target (`to`) node. Must already exist.
+    to_id: String,
+    /// Free-form edge type (e.g. `"works_on"`, `"about"`). Be consistent —
+    /// `traverse` can filter by it.
+    edge_type: String,
+    /// Structured metadata on the edge (string/number/bool values).
+    #[serde(default)]
+    props: Option<Value>,
+    /// Milliseconds since Unix epoch the edge becomes valid from. Defaults to
+    /// "now" (resolved by the engine at commit time) when omitted.
+    #[serde(default)]
+    valid_from: Option<i64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct LinkResult {
+    /// ULID of the newly created edge.
+    id: String,
+}
+
 #[tool_router]
 impl TopoServer {
     #[tool(
@@ -443,6 +539,80 @@ impl TopoServer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(GetChangesResult { ops }))
+    }
+
+    #[tool(
+        description = "Store a new memory. Call this when the user or task produces information worth remembering later. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id — keep it if you plan to link this memory to entities."
+    )]
+    fn create_memory(
+        &self,
+        Parameters(p): Parameters<CreateMemoryParams>,
+    ) -> Result<Json<CreateResult>, ErrorData> {
+        let props = convert::merge_required_prop(
+            MEMORY_CONTENT_PROP,
+            PropValue::Str(p.content),
+            p.props.as_ref(),
+        )
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let id = NodeId::new();
+        self.submit_write(vec![Op::CreateNode {
+            id,
+            scope,
+            label: MEMORY_LABEL.into(),
+            props,
+        }])?;
+        Ok(Json(CreateResult { id: id.to_string() }))
+    }
+
+    #[tool(
+        description = "Create an entity node (person, project, concept). Call this the FIRST time something is mentioned that memories should attach to; use find_by_prop first to check it doesn't already exist. name is equality-indexed for exact lookup."
+    )]
+    fn create_entity(
+        &self,
+        Parameters(p): Parameters<CreateEntityParams>,
+    ) -> Result<Json<CreateResult>, ErrorData> {
+        let props = convert::merge_required_prop(
+            ENTITY_NAME_PROP,
+            PropValue::Str(p.name),
+            p.props.as_ref(),
+        )
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let id = NodeId::new();
+        self.submit_write(vec![Op::CreateNode {
+            id,
+            scope,
+            label: ENTITY_LABEL.into(),
+            props,
+        }])?;
+        Ok(Json(CreateResult { id: id.to_string() }))
+    }
+
+    #[tool(
+        description = "Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. 'works_on'). edge_type is free-form but be consistent — traverse can filter by it. Returns the edge id. Errors if either node doesn't exist."
+    )]
+    fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<Json<LinkResult>, ErrorData> {
+        let from = parse_node_id(&p.from_id)?;
+        let to = parse_node_id(&p.to_id)?;
+        let props = match &p.props {
+            Some(v) => convert::json_to_props(v).map_err(|e| ErrorData::invalid_params(e, None))?,
+            None => Props::new(),
+        };
+        // `link` has no `scope` param on the wire (see `LinkParams`) — always
+        // resolves through the server's configured default scope.
+        let scope = self.resolve_scope(None)?;
+        let id = EdgeId::new();
+        self.submit_write(vec![Op::CreateEdge {
+            id,
+            scope,
+            ty: p.edge_type.into(),
+            from,
+            to,
+            props,
+            valid_from: p.valid_from,
+        }])?;
+        Ok(Json(LinkResult { id: id.to_string() }))
     }
 }
 

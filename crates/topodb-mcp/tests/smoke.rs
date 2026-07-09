@@ -169,10 +169,11 @@ fn handshake_and_tools_list_exposes_db_info() {
 
     // Task 4 added six read tools alongside db_info: db_info, get_node,
     // find_by_prop, search_memories, traverse, access_stats, get_changes.
+    // Task 5 added three write tools: create_memory, create_entity, link.
     assert_eq!(
         tools.len(),
-        7,
-        "expected 7 tools (db_info + 6 read tools), got: {tools:#?}"
+        10,
+        "expected 10 tools (db_info + 6 read + 3 write), got: {tools:#?}"
     );
     for name in [
         "get_node",
@@ -181,6 +182,9 @@ fn handshake_and_tools_list_exposes_db_info() {
         "traverse",
         "access_stats",
         "get_changes",
+        "create_memory",
+        "create_entity",
+        "link",
     ] {
         assert!(
             tools
@@ -191,8 +195,8 @@ fn handshake_and_tools_list_exposes_db_info() {
     }
 
     // 4. tools/call get_node on a syntactically valid but nonexistent ULID —
-    // the fresh tempdir db has no nodes at all (Task 4 has no write tools
-    // yet), so this exercises the clean not-found path, not a crash.
+    // the fresh tempdir db still has no nodes at this point in the test, so
+    // this exercises the clean not-found path, not a crash.
     server.send(&serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -223,4 +227,134 @@ fn handshake_and_tools_list_exposes_db_info() {
         structured.get("node").is_none(),
         "not-found result must not carry a node field: {structured:#?}"
     );
+
+    // --- Task 5 write-tool flow (lean seed of Task 6's full e2e test) ---
+    // create_entity -> find_by_prop finds it; create_memory -> search_memories
+    // finds it; link -> traverse from the entity reaches the memory.
+
+    // 5. create_entity {name: "ada"}
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "create_entity",
+            "arguments": { "name": "ada" }
+        }
+    }));
+    let entity_id = call_tool_ok(&server, 4, timeout)["id"]
+        .as_str()
+        .expect("create_entity should return a structured id")
+        .to_string();
+
+    // 6. find_by_prop should locate the entity by its equality-indexed name.
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "find_by_prop",
+            "arguments": { "label": "Entity", "prop": "name", "value": "ada" }
+        }
+    }));
+    let found = call_tool_ok(&server, 5, timeout);
+    let nodes = found["nodes"].as_array().expect("nodes array");
+    assert!(
+        nodes.iter().any(|n| n["id"] == entity_id),
+        "find_by_prop should locate the entity just created: {found:#?}"
+    );
+
+    // 7. create_memory {content: "ada wrote the first program"}
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {
+            "name": "create_memory",
+            "arguments": { "content": "ada wrote the first program" }
+        }
+    }));
+    let memory_id = call_tool_ok(&server, 6, timeout)["id"]
+        .as_str()
+        .expect("create_memory should return a structured id")
+        .to_string();
+
+    // 8. search_memories should find it by full-text content.
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "search_memories",
+            "arguments": { "query": "ada program" }
+        }
+    }));
+    let hits = call_tool_ok(&server, 7, timeout);
+    let hits = hits["hits"].as_array().expect("hits array");
+    assert!(
+        hits.iter().any(|h| h["node"]["id"] == memory_id),
+        "search_memories should find the memory just created: {hits:#?}"
+    );
+
+    // 9. link the entity to the memory.
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "link",
+            "arguments": {
+                "from_id": entity_id,
+                "to_id": memory_id,
+                "edge_type": "about"
+            }
+        }
+    }));
+    let edge_id = call_tool_ok(&server, 8, timeout)["id"]
+        .as_str()
+        .expect("link should return a structured id")
+        .to_string();
+
+    // 10. traverse from the entity should reach the memory via the new edge.
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "traverse",
+            "arguments": { "seed_id": entity_id }
+        }
+    }));
+    let subgraph = call_tool_ok(&server, 9, timeout)["subgraph"].clone();
+    let sg_nodes = subgraph["nodes"].as_array().expect("subgraph nodes");
+    let sg_edges = subgraph["edges"].as_array().expect("subgraph edges");
+    assert!(
+        sg_nodes.iter().any(|n| n["id"] == memory_id),
+        "traverse from the entity should reach the linked memory: {subgraph:#?}"
+    );
+    assert!(
+        sg_edges.iter().any(|e| e["id"] == edge_id),
+        "traverse from the entity should surface the link edge: {subgraph:#?}"
+    );
+}
+
+/// Reads the response for `id`, asserts it isn't a tool error, and returns
+/// its `structuredContent` — the shared shape every `tools/call` assertion
+/// above needs.
+fn call_tool_ok(server: &Server, id: i64, timeout: Duration) -> serde_json::Value {
+    let call = server.recv_response(id, timeout);
+    let result = call
+        .get("result")
+        .unwrap_or_else(|| panic!("tools/call (id {id}) should return a result: {call}"));
+    assert_ne!(
+        result.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "tools/call (id {id}) should not be a tool error: {result:#?}"
+    );
+    result
+        .get("structuredContent")
+        .unwrap_or_else(|| {
+            panic!("tools/call (id {id}) should carry structuredContent: {result:#?}")
+        })
+        .clone()
 }

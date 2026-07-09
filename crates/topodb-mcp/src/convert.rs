@@ -75,13 +75,18 @@ pub fn props_to_json(props: &Props) -> Result<Value, String> {
 /// A JSON object → `Props`, propagating the first unrepresentable value as
 /// `Err`. `Err` if `v` isn't a JSON object at all.
 ///
-/// No Task 4 (read-only) tool calls this yet — it's the inverse of
-/// `props_to_json`, needed once Task 5's write tools (`create_entity` /
-/// `create_memory` / `set_node_props`) start accepting a JSON props object
-/// from the caller. Kept here (with its round-trip test) now rather than
-/// deferred, since it belongs next to `props_to_json` in the conversion
-/// contract.
-#[allow(dead_code)]
+/// The inverse of `props_to_json`; Task 5's write tools (`create_entity` /
+/// `create_memory` / `link`) call this on the caller-supplied `props` object.
+///
+/// **v0 limitation:** a JSON integer literal below `i64::MIN` (e.g.
+/// `-99999999999999999999`) is *already* an `f64` by the time it reaches
+/// [`json_to_prop_value`] — `serde_json`'s parser itself has no `i64`-sized
+/// negative bucket wide enough to hold it, so it falls back to a lossy float
+/// at parse time, upstream of anything this module can inspect or reject
+/// (unlike the positive out-of-range case above `i64::MAX`, which parses to
+/// `u64` and so is still catchable). Undetectable and unfixable at this
+/// layer without `serde_json`'s `arbitrary_precision` feature; documented
+/// here as a known v0 gap rather than silently accepted as correct.
 pub fn json_to_props(v: &Value) -> Result<Props, String> {
     let obj = v
         .as_object()
@@ -90,6 +95,34 @@ pub fn json_to_props(v: &Value) -> Result<Props, String> {
     for (k, val) in obj {
         props.insert(k.clone(), json_to_prop_value(val)?);
     }
+    Ok(props)
+}
+
+/// Builds the `Props` map for a write tool that has one required, caller-named
+/// field (`create_memory`'s `content`, `create_entity`'s `name`) plus an
+/// optional JSON `props` object of additional metadata. `key`/`value` are the
+/// required field, already converted to a `PropValue`; `extra` is the tool
+/// call's optional `props` param, converted via `json_to_props`.
+///
+/// `Err` if `extra` (once converted) already contains `key` — a collision
+/// with the required field is a caller error to be corrected, never silently
+/// overwritten. `Err` also propagates straight through from `json_to_props`
+/// (non-object `extra`, or an unrepresentable value inside it).
+pub fn merge_required_prop(
+    key: &str,
+    value: PropValue,
+    extra: Option<&Value>,
+) -> Result<Props, String> {
+    let mut props = match extra {
+        Some(v) => json_to_props(v)?,
+        None => Props::new(),
+    };
+    if props.contains_key(key) {
+        return Err(format!(
+            "props must not include {key:?}: it is already set from the tool's own parameter"
+        ));
+    }
+    props.insert(key.to_string(), value);
     Ok(props)
 }
 
@@ -328,6 +361,56 @@ mod tests {
     fn json_to_props_propagates_unsupported_field() {
         let j = serde_json::json!({"bad": [1, 2]});
         assert!(json_to_props(&j).is_err());
+    }
+
+    // --- merge_required_prop: the create_memory/create_entity collision rule ---
+
+    #[test]
+    fn merge_required_prop_with_no_extra_just_sets_the_key() {
+        let props = merge_required_prop("content", PropValue::Str("hi".into()), None).unwrap();
+        assert_eq!(props.len(), 1);
+        assert_eq!(props["content"], PropValue::Str("hi".into()));
+    }
+
+    #[test]
+    fn merge_required_prop_merges_additional_fields() {
+        let extra = serde_json::json!({"source": "chat", "confidence": 3});
+        let props =
+            merge_required_prop("content", PropValue::Str("hi".into()), Some(&extra)).unwrap();
+        assert_eq!(props.len(), 3);
+        assert_eq!(props["content"], PropValue::Str("hi".into()));
+        assert_eq!(props["source"], PropValue::Str("chat".into()));
+        assert_eq!(props["confidence"], PropValue::Int(3));
+    }
+
+    #[test]
+    fn merge_required_prop_rejects_collision_with_required_key() {
+        let extra = serde_json::json!({"content": "sneaky overwrite"});
+        let err =
+            merge_required_prop("content", PropValue::Str("hi".into()), Some(&extra)).unwrap_err();
+        assert!(
+            err.contains("content"),
+            "error should name the colliding key: {err}"
+        );
+        // And the same for `name` (create_entity's required key), to confirm
+        // this isn't hardcoded to "content".
+        let extra = serde_json::json!({"name": "sneaky"});
+        assert!(merge_required_prop("name", PropValue::Str("ada".into()), Some(&extra)).is_err());
+    }
+
+    #[test]
+    fn merge_required_prop_does_not_overwrite_on_collision() {
+        // The collision must be rejected outright, not silently resolved by
+        // either value winning — assert no props map is returned at all.
+        let extra = serde_json::json!({"content": "other"});
+        let result = merge_required_prop("content", PropValue::Str("mine".into()), Some(&extra));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn merge_required_prop_propagates_non_object_extra() {
+        let extra = serde_json::json!([1, 2]);
+        assert!(merge_required_prop("content", PropValue::Str("hi".into()), Some(&extra)).is_err());
     }
 
     // --- node/edge/subgraph -> JSON ---
