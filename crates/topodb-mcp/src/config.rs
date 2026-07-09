@@ -1,0 +1,192 @@
+//! CLI parsing and the server configuration contract.
+//!
+//! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <spec.json>]`
+//! - `--scope`: the default scope for every tool call that omits an explicit
+//!   `scope`. `"shared"` (case-insensitive) or omitted => [`Scope::Shared`];
+//!   any other value is parsed as a ULID => [`Scope::Id`].
+//! - `--spec`: path to a JSON file deserializing to [`IndexSpec`]. Omitted =>
+//!   the [built-in default spec](default_spec).
+//!
+//! Arg parsing is hand-rolled: the surface is three flags, so `clap` would add
+//! a dependency and a proc-macro build for no real gain here.
+
+use std::error::Error;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use topodb::{IndexSpec, PropIndex, Scope, ScopeId};
+
+/// Label/prop name constants. Single source of truth shared by the default
+/// [`IndexSpec`] and the write tools (Tasks 4-5) so `create_entity` /
+/// `create_memory` write exactly the `(label, prop)` pairs the default spec
+/// indexes — search and lookup work out of the box.
+pub const ENTITY_LABEL: &str = "Entity";
+pub const ENTITY_NAME_PROP: &str = "name";
+pub const MEMORY_LABEL: &str = "Memory";
+pub const MEMORY_CONTENT_PROP: &str = "content";
+
+/// Resolved server configuration (see the module docs for the CLI contract).
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub db_path: PathBuf,
+    pub default_scope: Scope,
+    pub spec: IndexSpec,
+}
+
+/// The built-in default index spec used when `--spec` is omitted:
+/// equality on `(Entity, name)`, text on `(Memory, content)`.
+pub fn default_spec() -> IndexSpec {
+    IndexSpec {
+        equality: vec![PropIndex {
+            label: ENTITY_LABEL.into(),
+            prop: ENTITY_NAME_PROP.into(),
+        }],
+        text: vec![PropIndex {
+            label: MEMORY_LABEL.into(),
+            prop: MEMORY_CONTENT_PROP.into(),
+        }],
+    }
+}
+
+/// Human/JSON-facing rendering of a [`Scope`]: `"shared"` or the ULID string.
+/// Reused by the `db_info` tool and (Task 4) scope round-tripping.
+pub fn scope_label(scope: &Scope) -> String {
+    match scope {
+        Scope::Shared => "shared".to_string(),
+        Scope::Id(id) => id.to_string(),
+    }
+}
+
+/// Parses a `--scope` value: `"shared"` (any case) => [`Scope::Shared`],
+/// otherwise a ULID string => [`Scope::Id`].
+fn parse_scope(s: &str) -> Result<Scope, Box<dyn Error>> {
+    if s.eq_ignore_ascii_case("shared") {
+        Ok(Scope::Shared)
+    } else {
+        let id = ScopeId::from_str(s).map_err(|e| {
+            format!("invalid --scope value {s:?} (expected \"shared\" or a ULID): {e}")
+        })?;
+        Ok(Scope::Id(id))
+    }
+}
+
+impl Config {
+    /// Parses config from an argument iterator (excluding argv[0]). Returns a
+    /// clear error for missing values, unknown flags, or a missing/invalid
+    /// `--spec` file. Does NOT touch the filesystem for `--db` — the parent-dir
+    /// check lives in `main` so this stays a pure parse.
+    pub fn from_args<I>(args: I) -> Result<Self, Box<dyn Error>>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut db_path: Option<PathBuf> = None;
+        let mut scope: Option<String> = None;
+        let mut spec_path: Option<PathBuf> = None;
+
+        let mut it = args.into_iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--db" => {
+                    db_path = Some(it.next().ok_or("--db requires a <path> value")?.into());
+                }
+                "--scope" => {
+                    scope = Some(it.next().ok_or("--scope requires a <ulid|shared> value")?);
+                }
+                "--spec" => {
+                    spec_path = Some(
+                        it.next()
+                            .ok_or("--spec requires a <spec.json> value")?
+                            .into(),
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <spec.json>]"
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let db_path = db_path.ok_or("missing required --db <path>")?;
+        let default_scope = match scope {
+            Some(s) => parse_scope(&s)?,
+            None => Scope::Shared,
+        };
+        let spec = match spec_path {
+            Some(p) => {
+                let text = std::fs::read_to_string(&p)
+                    .map_err(|e| format!("reading --spec {}: {e}", p.display()))?;
+                serde_json::from_str(&text)
+                    .map_err(|e| format!("parsing --spec {} as IndexSpec JSON: {e}", p.display()))?
+            }
+            None => default_spec(),
+        };
+
+        Ok(Config {
+            db_path,
+            default_scope,
+            spec,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_scope_shared_and_builtin_spec() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb"])).unwrap();
+        assert_eq!(cfg.db_path, PathBuf::from("t.redb"));
+        assert!(matches!(cfg.default_scope, Scope::Shared));
+        assert_eq!(cfg.spec, default_spec());
+    }
+
+    #[test]
+    fn scope_shared_is_case_insensitive() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--scope", "SHARED"])).unwrap();
+        assert!(matches!(cfg.default_scope, Scope::Shared));
+    }
+
+    #[test]
+    fn scope_ulid_parses_to_id_and_round_trips_label() {
+        let id = ScopeId::new();
+        let s = id.to_string();
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--scope", &s])).unwrap();
+        match cfg.default_scope {
+            Scope::Id(got) => assert_eq!(got, id),
+            other => panic!("expected Scope::Id, got {other:?}"),
+        }
+        assert_eq!(scope_label(&cfg.default_scope), s);
+    }
+
+    #[test]
+    fn scope_label_shared() {
+        assert_eq!(scope_label(&Scope::Shared), "shared");
+    }
+
+    #[test]
+    fn bad_scope_is_rejected() {
+        assert!(Config::from_args(argv(&["--db", "t.redb", "--scope", "not-a-ulid"])).is_err());
+    }
+
+    #[test]
+    fn missing_db_is_rejected() {
+        assert!(Config::from_args(argv(&["--scope", "shared"])).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert!(Config::from_args(argv(&["--db", "t.redb", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn missing_value_is_rejected() {
+        assert!(Config::from_args(argv(&["--db"])).is_err());
+    }
+}
