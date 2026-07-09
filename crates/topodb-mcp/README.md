@@ -109,6 +109,32 @@ which may not include the same `PATH` as your shell — if `topodb-mcp` isn't fo
 (e.g. `~/.cargo/bin/topodb-mcp` on macOS/Linux, `%USERPROFILE%\.cargo\bin\topodb-mcp.exe` on
 Windows).
 
+### Pi
+
+[Pi](https://pi.dev) reads standard MCP config. Add this to a project-local
+`.mcp.json` (or global `~/.pi/agent/mcp.json`) — no Rust toolchain required, the
+platform binary is fetched via npm on first run:
+
+```json
+{
+  "mcpServers": {
+    "topodb": {
+      "command": "npx",
+      "args": ["-y", "@topodb/topodb-mcp", "--db", ".topodb/memory.redb"],
+      "lifecycle": "lazy"
+    }
+  }
+}
+```
+
+- `lifecycle: "lazy"` starts the server only when a tool is first called.
+- Default scope is `shared`; add `"--scope", "<ulid>"` to the `args` to isolate a
+  scope for a specific agent.
+- Using [`pi-mcp-adapter`](https://pi.dev/packages/pi-mcp-adapter) for token
+  efficiency? No change needed — it discovers `topodb` from the same config.
+- Rust users can skip npx: `cargo install topodb-mcp`, then set
+  `"command": "topodb-mcp"` and drop the `-y`/package `args`.
+
 ## Scoping semantics
 
 TopoDB partitions nodes and edges into scopes — a shared scope plus any number of ULID-named
