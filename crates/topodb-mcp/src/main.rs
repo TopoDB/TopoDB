@@ -7,7 +7,6 @@
 //! stderr.
 
 mod config;
-mod convert;
 mod server;
 
 use std::error::Error;

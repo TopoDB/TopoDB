@@ -1,16 +1,16 @@
-//! JSON ↔ engine-type conversions shared by the MCP tool layer.
+//! JSON ↔ engine-type conversions shared by TopoDB's JSON-speaking front ends
+//! (currently `topodb-mcp`; `topodb-cli` is next).
 //!
 //! Every function here is pure (no I/O, no `Db` access) and returns `Result<_,
-//! String>` — the tool layer (`server.rs`) is responsible for mapping the
-//! `String` into an `rmcp::ErrorData` (`invalid_params` for bad input,
-//! `internal_error` otherwise). Nothing here ever panics: an unrepresentable
-//! value is always an `Err`, never an `unwrap`/`expect`.
+//! String>` — callers are responsible for mapping the `String` into their own
+//! error type (`topodb-mcp`'s `server.rs` maps it to an `rmcp::ErrorData`:
+//! `invalid_params` for bad input, `internal_error` otherwise). Nothing here
+//! ever panics: an unrepresentable value is always an `Err`, never an
+//! `unwrap`/`expect`.
 
 use serde_json::{Map, Value};
 use std::str::FromStr;
 use topodb::{EdgeRecord, NodeRecord, PropValue, Props, Scope, ScopeId, ScopeSet, Subgraph};
-
-use crate::config::scope_label;
 
 /// Error string for both directions of an unrepresentable [`PropValue`]:
 /// `Bytes` and `DateTime` have no JSON counterpart over MCP v0, and any JSON
@@ -75,8 +75,9 @@ pub fn props_to_json(props: &Props) -> Result<Value, String> {
 /// A JSON object → `Props`, propagating the first unrepresentable value as
 /// `Err`. `Err` if `v` isn't a JSON object at all.
 ///
-/// The inverse of `props_to_json`; Task 5's write tools (`create_entity` /
-/// `create_memory` / `link`) call this on the caller-supplied `props` object.
+/// The inverse of `props_to_json`; `topodb-mcp`'s write tools (`create_entity`
+/// / `create_memory` / `link`) call this on the caller-supplied `props`
+/// object.
 ///
 /// **v0 limitation:** a JSON integer literal below `i64::MIN` (e.g.
 /// `-99999999999999999999`) is *already* an `f64` by the time it reaches
@@ -127,16 +128,19 @@ pub fn merge_required_prop(
 }
 
 /// A `Scope` → its JSON rendering: `"shared"` or the scope's ULID string.
-/// Delegates to [`crate::config::scope_label`] — the single source of truth
-/// for scope rendering, also used by `db_info`.
+/// Mirrors the `shared`/ULID label convention used across TopoDB's JSON-facing
+/// front ends (e.g. `topodb-mcp`'s `db_info` tool).
 pub fn scope_to_json(scope: Scope) -> Value {
-    Value::String(scope_label(&scope))
+    Value::String(match scope {
+        Scope::Shared => "shared".to_string(),
+        Scope::Id(id) => id.to_string(),
+    })
 }
 
 /// A `NodeRecord` → JSON: `id`/`label` as strings (ULID via `Display` for
 /// `id`), `scope` per [`scope_to_json`], and `props` per [`props_to_json`].
 /// Deliberately omits the `embedding` field — no MCP v0 tool surfaces vector
-/// data (that's a Task 5/6 concern via dedicated embedding tools).
+/// data (that's a later concern via dedicated embedding tools).
 pub fn node_to_json(n: &NodeRecord) -> Result<Value, String> {
     let mut map = Map::new();
     map.insert("id".into(), Value::String(n.id.to_string()));
@@ -188,8 +192,8 @@ pub fn subgraph_to_json(sg: &Subgraph) -> Result<Value, String> {
 /// Resolves a tool's optional `scope` string param to a `Scope`: `None` →
 /// `default` (the server's configured default scope); `Some("shared")`
 /// (case-insensitive) → `Scope::Shared`; `Some(<ulid>)` → `Scope::Id`; any
-/// other string → a clear `Err`. Mirrors `config::parse_scope`'s "shared" /
-/// ULID contract, generalized to the `Option` (tool-call) case.
+/// other string → a clear `Err`. Mirrors `topodb-mcp`'s `config::parse_scope`
+/// "shared" / ULID contract, generalized to the `Option` (tool-call) case.
 pub fn resolve_scope(scope: Option<&str>, default: Scope) -> Result<Scope, String> {
     match scope {
         None => Ok(default),

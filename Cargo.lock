@@ -1278,8 +1278,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "topodb-mcp"
+name = "topodb-json"
 version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "topodb",
+]
+
+[[package]]
+name = "topodb-mcp"
+version = "0.0.2"
 dependencies = [
  "rmcp",
  "schemars",
@@ -1288,6 +1297,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "topodb",
+ "topodb-json",
 ]
 
 [[package]]

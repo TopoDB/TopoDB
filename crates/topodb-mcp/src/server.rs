@@ -8,8 +8,8 @@
 //! (`create_memory`, `create_entity`, `link`) — each one `Db::submit` call
 //! (atomic). Every tool resolves its optional `scope` param via
 //! [`TopoServer::resolve_scopes`] (reads) or [`TopoServer::resolve_scope`]
-//! (writes) and maps engine `Err`s to `ErrorData` through `crate::convert` —
-//! never panics.
+//! (writes) and maps engine `Err`s to `ErrorData` through `topodb_json`
+//! (imported here as `convert`) — never panics.
 
 use std::str::FromStr;
 
@@ -27,7 +27,7 @@ use topodb::{
 use crate::config::{
     scope_label, Config, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
 };
-use crate::convert;
+use topodb_json as convert;
 
 /// The MCP server state. `Clone` is required by rmcp (the service clones the
 /// handler per request); every field is cheap to clone — [`Db`] is an `Arc`
