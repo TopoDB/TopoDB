@@ -41,40 +41,54 @@ fn regenerate_fixture() {
             prop: "content".into(),
         }],
     };
-    let db = Db::open_with(&path, spec).unwrap();
-    // Fixed ids so the fixture's CONTENT is reproducible across regenerations
-    // (the raw bytes are not — see the module doc comment).
-    let s = ScopeId::from_u128(1);
-    let n1 = NodeId::from_u128(10);
-    let n2 = NodeId::from_u128(11);
-    let mut p1 = Props::new();
-    p1.insert("name".into(), PropValue::Str("ada".into()));
-    let mut p2 = Props::new();
-    p2.insert(
-        "content".into(),
-        PropValue::Str("fixture memory about databases".into()),
-    );
-    db.submit(vec![
-        Op::CreateNode {
-            id: n1,
-            scope: Scope::Id(s),
-            label: "Entity".into(),
-            props: p1,
-        },
-        Op::CreateNode {
+    {
+        let db = Db::open_with(&path, spec).unwrap();
+        // Fixed ids so the fixture's CONTENT is reproducible across
+        // regenerations (the raw bytes are not — see the module doc comment).
+        let s = ScopeId::from_u128(1);
+        let n1 = NodeId::from_u128(10);
+        let n2 = NodeId::from_u128(11);
+        let mut p1 = Props::new();
+        p1.insert("name".into(), PropValue::Str("ada".into()));
+        let mut p2 = Props::new();
+        p2.insert(
+            "content".into(),
+            PropValue::Str("fixture memory about databases".into()),
+        );
+        db.submit(vec![
+            Op::CreateNode {
+                id: n1,
+                scope: Scope::Id(s),
+                label: "Entity".into(),
+                props: p1,
+            },
+            Op::CreateNode {
+                id: n2,
+                scope: Scope::Id(s),
+                label: "Memory".into(),
+                props: p2,
+            },
+        ])
+        .unwrap();
+        db.submit(vec![Op::SetEmbedding {
             id: n2,
-            scope: Scope::Id(s),
-            label: "Memory".into(),
-            props: p2,
-        },
-    ])
-    .unwrap();
-    db.submit(vec![Op::SetEmbedding {
-        id: n2,
-        model: "m1".into(),
-        vector: vec![1.0, 0.0],
-    }])
-    .unwrap();
+            model: "m1".into(),
+            vector: vec![1.0, 0.0],
+        }])
+        .unwrap();
+        // `db` drops here: `Drop for Inner` joins the applier/bumper threads
+        // and closes the redb file handle, so the raw reopen+compact below
+        // gets exclusive access.
+    }
+
+    // redb pre-allocates generously as a file grows; a handful of tiny write
+    // transactions leaves several MB of free space committed to disk. Compact
+    // before shipping the fixture so the checked-in binary reflects only the
+    // handful of rows above, not incidental redb bookkeeping overhead.
+    {
+        let mut raw = redb::Database::open(&path).unwrap();
+        raw.compact().unwrap();
+    }
 
     assert!(
         path.exists(),

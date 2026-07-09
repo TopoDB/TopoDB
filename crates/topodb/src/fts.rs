@@ -209,19 +209,31 @@ pub(crate) fn fts_update(
     old_text: Option<&str>,
     new_text: Option<&str>,
 ) -> Result<(), TopoError> {
+    // Tokenize each text exactly once, up front, and reuse the token vectors
+    // below for the emptiness check, postings updates, and doc length — no
+    // text is ever re-tokenized.
+    let old_tokens = old_text.map(tokenize).unwrap_or_default();
+    let new_tokens = new_text.map(tokenize).unwrap_or_default();
+
     // A "document" is text with >= 1 token. A declared prop holding "" (or
     // pure punctuation) must not inflate n_docs / deflate avgdl for everyone
     // else's scores. Normalizing HERE makes all four call paths (apply,
     // replay, reindex, and Task 5's per-scope rework) agree by construction.
-    let old_text = old_text.filter(|t| !tokenize(t).is_empty());
-    let new_text = new_text.filter(|t| !tokenize(t).is_empty());
+    let old_text = if old_tokens.is_empty() {
+        None
+    } else {
+        old_text
+    };
+    let new_text = if new_tokens.is_empty() {
+        None
+    } else {
+        new_text
+    };
 
     if old_text == new_text {
         return Ok(());
     }
 
-    let old_tokens = old_text.map(tokenize).unwrap_or_default();
-    let new_tokens = new_text.map(tokenize).unwrap_or_default();
     let old_tf = term_freqs(&old_tokens);
     let new_tf = term_freqs(&new_tokens);
 

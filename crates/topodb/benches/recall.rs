@@ -39,10 +39,15 @@ fn seeded_db(n: usize, dim: usize) -> (tempfile::TempDir, Db, ScopeId, Vec<NodeI
             let i = chunk_idx * SEED_CHUNK + offset;
             let mut props = Props::new();
             props.insert("k".into(), PropValue::Str(format!("k{}", i % 64)));
-            props.insert(
-                "content".into(),
-                PropValue::Str(format!("memory number {i} about topic {}", i % 17)),
-            );
+            // Every 100th node's content also carries "needle" — a ~1%-selectivity
+            // term used by `search_text_selective_10k` below, contrasted against
+            // "memory"/"topic" which (per the format string) hit ~100% of docs.
+            let content = if i % 100 == 0 {
+                format!("memory number {i} about topic {} needle", i % 17)
+            } else {
+                format!("memory number {i} about topic {}", i % 17)
+            };
+            props.insert("content".into(), PropValue::Str(content));
             ops.push(Op::CreateNode {
                 id,
                 scope: Scope::Id(s),
@@ -86,6 +91,24 @@ fn seeded_db(n: usize, dim: usize) -> (tempfile::TempDir, Db, ScopeId, Vec<NodeI
     }
     db.submit(edge_ops).unwrap();
 
+    // Non-timed sanity check: the hub graph wired above must actually connect
+    // something, or `traverse_seed_2hop` below would be silently benchmarking
+    // a single-node no-op traversal instead of a real 2-hop walk.
+    let sanity = db
+        .traverse(&TraversalQuery {
+            scopes: ScopeSet::of(&[s]),
+            seeds: vec![ids[0]],
+            max_hops: 2,
+            edge_types: None,
+            direction: Direction::Both,
+            as_of: None,
+        })
+        .unwrap();
+    assert!(
+        sanity.nodes.len() > 1,
+        "hub traversal from ids[0] must reach more than itself"
+    );
+
     (dir, db, s, ids)
 }
 
@@ -93,6 +116,16 @@ fn bench_recall(c: &mut Criterion) {
     let (_d, db, s, ids) = seeded_db(10_000, 32);
     let scopes = ScopeSet::of(&[s]);
 
+    // Bench ordering note: `submit_create_10` runs first and permanently adds
+    // nodes to `db` for the remainder of this `bench_recall` invocation (there
+    // is no rollback between `c.bench_function` calls — they share one `db`).
+    // That's safe for every bench below because the nodes it creates carry
+    // `props: Default::default()` — no `k`/`content` props and no embedding —
+    // so they are invisible to `nodes_by_prop_10k` (declared-prop equality
+    // index), `search_text_10k`/`search_text_selective_10k` (no declared text,
+    // so no postings entry), and `search_vector_10k_dim32` (no `SetEmbedding`,
+    // so no slab row). `traverse_seed_2hop` only walks edges from `ids[0]`,
+    // which these orphan nodes are never wired into.
     c.bench_function("submit_create_10", |b| {
         b.iter_batched(
             || {
@@ -131,6 +164,13 @@ fn bench_recall(c: &mut Criterion) {
     });
     c.bench_function("search_text_10k", |b| {
         b.iter(|| db.search_text(&scopes, "memory topic", 10).unwrap())
+    });
+    // Contrast with `search_text_10k` above: "memory"/"topic" hit ~100% of the
+    // 10k-doc corpus (a worst-case stress query), while "needle" hits only the
+    // ~1% of nodes seeded with it (every 100th node — see `seeded_db`). Both
+    // numbers together are Plan 5's FTS-optimization go/no-go input.
+    c.bench_function("search_text_selective_10k", |b| {
+        b.iter(|| db.search_text(&scopes, "needle", 10).unwrap())
     });
     c.bench_function("traverse_seed_2hop", |b| {
         let q = TraversalQuery {

@@ -159,6 +159,70 @@ fn removed_node_stats_are_none_despite_orphan_row() {
 }
 
 #[test]
+fn multi_hit_prop_lookup_bumps_every_returned_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "M".into(),
+            prop: "k".into(),
+        }],
+        text: vec![],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+    for id in &ids {
+        let mut props = Props::new();
+        props.insert("k".into(), PropValue::Str("same".into()));
+        db.submit(vec![Op::CreateNode {
+            id: *id,
+            scope: Scope::Id(s),
+            label: "M".into(),
+            props,
+        }])
+        .unwrap();
+    }
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "M", "k", &PropValue::Str("same".into()))
+            .unwrap()
+            .len(),
+        3
+    );
+    for id in &ids {
+        let stats = wait_for_count(&db, &scopes, *id, 1);
+        assert!(
+            stats.access_count >= 1,
+            "every hit bumps, not just the first"
+        );
+    }
+}
+
+#[test]
+fn rejected_prop_lookup_does_not_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap(); // empty spec — every lookup Rejected
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let id = NodeId::new();
+    db.submit(vec![Op::CreateNode {
+        id,
+        scope: Scope::Id(s),
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
+    assert!(db
+        .nodes_by_prop(&scopes, "M", "k", &PropValue::Int(1))
+        .is_err());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        db.access_stats(&scopes, id).unwrap(),
+        Some(AccessStats::default())
+    );
+}
+
+#[test]
 fn float_range_scan_does_not_bump() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();

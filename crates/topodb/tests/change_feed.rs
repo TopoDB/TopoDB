@@ -260,3 +260,37 @@ fn unsupported_format_version_errors_at_open() {
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
 }
+
+#[test]
+fn pre_v1_format_version_errors_at_open() {
+    use redb::{Database, TableDefinition};
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    {
+        let _ = Db::open(path.clone()).unwrap();
+    } // create a valid v1 file
+    {
+        // sabotage the version to a pre-v1 value (no released build ever
+        // writes 0 — this only happens via hand-rolled/corrupt files).
+        let raw = Database::open(&path).unwrap();
+        let tx = raw.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(META).unwrap();
+            t.insert("format_version", 0u32.to_le_bytes().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    // `found < FORMAT_VERSION` takes the `found != FORMAT_VERSION` guard arm
+    // (the `found > FORMAT_VERSION` arm above it only catches the future-format
+    // case) — as of this writing that arm returns `TopoError::Encoding`, not
+    // `UnsupportedFormat`. This test PINS that as observed guard behavior, not
+    // as a contract: if a future change intentionally gives pre-v1 files their
+    // own error variant, update this assertion rather than treating it as a
+    // regression.
+    match Db::open(path) {
+        Err(TopoError::Encoding(_)) => {}
+        other => panic!("expected Encoding (guard-behavior pin, see comment), got {other:?}"),
+    }
+}

@@ -479,6 +479,45 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ScopeId;
+
+    #[test]
+    fn poisoned_slab_lock_maps_to_closed_not_panic() {
+        let idx = VectorIndex::new();
+        let scope = Scope::Id(ScopeId::new());
+        // Two distinct slabs (different scopes), so poisoning one leaves the
+        // other's lock — and the outer map lock — untouched.
+        idx.upsert("m1", scope, NodeId::new(), &[1.0, 0.0]);
+        let other_scope = Scope::Id(ScopeId::new());
+        idx.upsert("m1", other_scope, NodeId::new(), &[1.0, 0.0]);
+
+        let poisoned_arc = {
+            // sole writer in this test — no applier thread involved.
+            let slabs = idx.slabs.read().unwrap();
+            slabs.get(&("m1".to_string(), scope)).unwrap().clone()
+        };
+        // Poison ONLY this slab's inner lock from a scratch thread, holding its
+        // write guard across the panic.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoned_arc.write().unwrap();
+            panic!("poison this slab only");
+        }));
+        assert!(r.is_err());
+        // Semicolon so the match's temporary `Result` (which may hold a guard
+        // borrowing `poisoned_arc`) is dropped before it at end of scope.
+        match read_or_closed(&poisoned_arc) {
+            Err(TopoError::Closed) => {}
+            other => panic!("expected Closed, got {:?}", other.map(|_| ())),
+        };
+
+        // The OTHER slab (and the outer map lock) is unaffected by this scope's
+        // poison — the poisoned-lock policy is per-slab, not engine-wide.
+        let healthy_arc = {
+            let slabs = idx.slabs.read().unwrap();
+            slabs.get(&("m1".to_string(), other_scope)).unwrap().clone()
+        };
+        assert!(read_or_closed(&healthy_arc).is_ok());
+    }
 
     #[test]
     fn poisoned_outer_lock_maps_to_closed_not_panic() {
