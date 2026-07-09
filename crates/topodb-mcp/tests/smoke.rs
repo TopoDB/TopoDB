@@ -166,4 +166,61 @@ fn handshake_and_tools_list_exposes_db_info() {
         !description.is_empty(),
         "db_info must carry a non-empty description"
     );
+
+    // Task 4 added six read tools alongside db_info: db_info, get_node,
+    // find_by_prop, search_memories, traverse, access_stats, get_changes.
+    assert_eq!(
+        tools.len(),
+        7,
+        "expected 7 tools (db_info + 6 read tools), got: {tools:#?}"
+    );
+    for name in [
+        "get_node",
+        "find_by_prop",
+        "search_memories",
+        "traverse",
+        "access_stats",
+        "get_changes",
+    ] {
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name)),
+            "tools/list must include {name}: {tools:#?}"
+        );
+    }
+
+    // 4. tools/call get_node on a syntactically valid but nonexistent ULID —
+    // the fresh tempdir db has no nodes at all (Task 4 has no write tools
+    // yet), so this exercises the clean not-found path, not a crash.
+    server.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "get_node",
+            "arguments": { "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }
+        }
+    }));
+    let call = server.recv_response(3, timeout);
+    let result = call
+        .get("result")
+        .unwrap_or_else(|| panic!("tools/call get_node should return a result: {call}"));
+    assert_ne!(
+        result.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "get_node on a nonexistent id must not be a tool error: {result:#?}"
+    );
+    let structured = result
+        .get("structuredContent")
+        .expect("get_node result should carry structuredContent");
+    assert_eq!(
+        structured.get("found"),
+        Some(&serde_json::Value::Bool(false)),
+        "get_node on a nonexistent id should report found:false, not a crash: {structured:#?}"
+    );
+    assert!(
+        structured.get("node").is_none(),
+        "not-found result must not carry a node field: {structured:#?}"
+    );
 }
