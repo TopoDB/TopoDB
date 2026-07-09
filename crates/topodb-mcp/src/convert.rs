@@ -33,11 +33,14 @@ pub fn prop_value_to_json(v: &PropValue) -> Result<Value, String> {
     }
 }
 
-/// `serde_json::Value` → `PropValue`. Strings/bools map directly; a JSON
-/// number with no fractional part maps to `Int`, otherwise `Float` — this is
-/// the inverse of `prop_value_to_json`'s `Int`/`Float` handling. Every other
-/// JSON shape (array, object, null — and, structurally, anything that would
-/// have needed to round-trip through `Bytes`/`DateTime`) is [`UNSUPPORTED`].
+/// `serde_json::Value` → `PropValue`. Strings/bools map directly. A JSON
+/// integer maps to `Int` when it fits `i64`, and is an error when it doesn't
+/// (`(i64::MAX, u64::MAX]` — silently downgrading it to a lossy `Float` would
+/// corrupt the value); only a genuine non-integer number maps to `Float`.
+/// This is the inverse of `prop_value_to_json`'s `Int`/`Float` handling.
+/// Every other JSON shape (array, object, null — and, structurally, anything
+/// that would have needed to round-trip through `Bytes`/`DateTime`) is
+/// [`UNSUPPORTED`].
 pub fn json_to_prop_value(v: &Value) -> Result<PropValue, String> {
     match v {
         Value::String(s) => Ok(PropValue::Str(s.clone())),
@@ -45,6 +48,10 @@ pub fn json_to_prop_value(v: &Value) -> Result<PropValue, String> {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(PropValue::Int(i))
+            } else if n.is_u64() {
+                // An integer above i64::MAX: representable in JSON but not in
+                // PropValue::Int, and f64 can't hold it losslessly either.
+                Err(format!("integer out of supported range (max {})", i64::MAX))
             } else if let Some(f) = n.as_f64() {
                 Ok(PropValue::Float(f))
             } else {
@@ -229,6 +236,27 @@ mod tests {
     fn json_float_literal_decodes_to_float() {
         let j = serde_json::json!(7.5);
         assert_eq!(json_to_prop_value(&j).unwrap(), PropValue::Float(7.5));
+    }
+
+    #[test]
+    fn i64_max_round_trips_as_int() {
+        let v = PropValue::Int(i64::MAX);
+        let j = prop_value_to_json(&v).unwrap();
+        assert_eq!(j, serde_json::json!(i64::MAX));
+        assert_eq!(json_to_prop_value(&j).unwrap(), v);
+    }
+
+    #[test]
+    fn json_integer_above_i64_max_is_an_error_not_a_lossy_float() {
+        let j = serde_json::json!(u64::MAX);
+        let err = json_to_prop_value(&j).unwrap_err();
+        assert!(
+            err.contains("integer out of supported range"),
+            "expected a clear out-of-range error, got: {err}"
+        );
+        // And just past the i64 boundary too, not only at the extreme.
+        let j = serde_json::json!(i64::MAX as u64 + 1);
+        assert!(json_to_prop_value(&j).is_err());
     }
 
     #[test]

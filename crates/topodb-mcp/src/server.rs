@@ -312,6 +312,10 @@ impl TopoServer {
         let value = convert::json_to_prop_value(&p.value)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
         let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        // `nodes_by_prop` is a pure snapshot read: the only error it can
+        // produce today is `Rejected` (undeclared index / Float value), so a
+        // blanket `invalid_params` is accurate. Reconsider if the engine path
+        // ever grows storage-touching failure modes (see `search_memories`).
         let hits = self
             .db
             .nodes_by_prop(&scopes, &p.label, &p.prop, &value)
@@ -332,10 +336,17 @@ impl TopoServer {
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
         let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        // `search_text` opens a redb read transaction, so unlike the pure
+        // snapshot reads it CAN fail with `Storage`/`Encoding` — only its
+        // input-validation `Rejected` (k == 0, token-less query) maps to
+        // invalid_params; everything else is a server-side internal_error.
         let hits = self
             .db
             .search_text(&scopes, &p.query, p.k)
-            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            .map_err(|e| match e {
+                TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?;
         let hits = hits
             .iter()
             .map(|(n, score)| {
@@ -368,6 +379,10 @@ impl TopoServer {
             direction: p.direction.into(),
             as_of: None,
         };
+        // `traverse` is a pure snapshot BFS: the only error it can produce
+        // today is `Rejected` (max_hops out of 1..=4), so a blanket
+        // `invalid_params` is accurate. Reconsider if the engine path ever
+        // grows storage-touching failure modes (see `search_memories`).
         let sg = self
             .db
             .traverse(&query)
