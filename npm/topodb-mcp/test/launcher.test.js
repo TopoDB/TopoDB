@@ -53,3 +53,11 @@ test('resolveBinary requests the correct specifier and returns the resolved path
   assert.equal(calls[1], '@topodb/topodb-mcp-win32-x64/topodb-mcp.exe');
   assert.equal(w, '/abs/@topodb/topodb-mcp-win32-x64/topodb-mcp.exe');
 });
+
+test('resolveBinary gives an actionable error when the platform package is not installed', () => {
+  const missing = () => { const e = new Error('Cannot find module x'); e.code = 'MODULE_NOT_FOUND'; throw e; };
+  assert.throws(
+    () => resolveBinary('linux', 'x64', missing),
+    /prebuilt binary package @topodb\/topodb-mcp-linux-x64 is not installed/,
+  );
+});

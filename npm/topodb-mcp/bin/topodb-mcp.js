@@ -36,7 +36,19 @@ function resolveBinary(platform, arch, resolve = require.resolve) {
     );
   }
   const specifier = `${subPackageName(key)}/${binaryFileName(platform)}`;
-  return resolve(specifier);
+  try {
+    return resolve(specifier);
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND') {
+      throw new Error(
+        `topodb-mcp: the prebuilt binary package ${subPackageName(key)} is not installed. ` +
+          `The platform-specific optional dependency was likely skipped (e.g. --no-optional, a ` +
+          `registry error, or a corrupted cache). Reinstall the package, or build from source: ` +
+          `cargo install topodb-mcp`,
+      );
+    }
+    throw err;
+  }
 }
 
 function main() {

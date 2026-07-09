@@ -401,7 +401,7 @@ jobs:
             # wrapping folder) — search for the binary instead of assuming a
             # fixed depth or using a "*/name" glob that only matches nested
             # layouts.
-            found="$(find "$tmp" -type f -name "$bin" | head -n1)"
+            found="$(find "$tmp" -type f -name "$bin" -print -quit)"
             if [ -z "$found" ]; then
               echo "::error::binary '$bin' not found in $asset (searched $tmp)" >&2
               exit 1
@@ -419,6 +419,9 @@ jobs:
         # optionalDependencies in the main package pin exact versions of the
         # 5 sub-packages, so the subs must exist on the registry before main
         # is published, or npm install would fail to resolve them.
+        # npm publish is not idempotent — on a partial-failure re-run, already-published
+        # versions 409; re-run only publishes the missing packages (bump the version if a
+        # package was published but is broken).
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
