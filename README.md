@@ -2,8 +2,12 @@
 
 [![crates.io](https://img.shields.io/crates/v/topodb.svg)](https://crates.io/crates/topodb)
 [![docs.rs](https://img.shields.io/docsrs/topodb)](https://docs.rs/topodb)
+[![topodb-json on crates.io](https://img.shields.io/crates/v/topodb-json.svg?label=topodb-json)](https://crates.io/crates/topodb-json)
+[![topodb-json on docs.rs](https://img.shields.io/docsrs/topodb-json?label=docs.rs%3A%20topodb-json)](https://docs.rs/topodb-json)
 [![topodb-mcp on crates.io](https://img.shields.io/crates/v/topodb-mcp.svg?label=topodb-mcp)](https://crates.io/crates/topodb-mcp)
 [![topodb-mcp on docs.rs](https://img.shields.io/docsrs/topodb-mcp?label=docs.rs%3A%20topodb-mcp)](https://docs.rs/topodb-mcp)
+[![topodb-cli on crates.io](https://img.shields.io/crates/v/topodb-cli.svg?label=topodb-cli)](https://crates.io/crates/topodb-cli)
+[![topodb-cli on docs.rs](https://img.shields.io/docsrs/topodb-cli?label=docs.rs%3A%20topodb-cli)](https://docs.rs/topodb-cli)
 
 **The memory terrain for AI agents — embedded, temporal, graph-native.**
 
@@ -32,7 +36,23 @@ First consumer: Atlas (agentic OS desktop app).
 | Crate | crates.io | What it is |
 |---|---|---|
 | [`topodb`](crates/topodb) | [![crates.io](https://img.shields.io/crates/v/topodb.svg)](https://crates.io/crates/topodb) | The embedded engine itself — link it into your process as a library. |
+| [`topodb-json`](crates/topodb-json) | [![crates.io](https://img.shields.io/crates/v/topodb-json.svg)](https://crates.io/crates/topodb-json) | The shared JSON↔engine conversion layer used by `topodb-mcp` and `topodb-cli`. Not a library you typically depend on directly. |
 | [`topodb-mcp`](crates/topodb-mcp) | [![crates.io](https://img.shields.io/crates/v/topodb-mcp.svg)](https://crates.io/crates/topodb-mcp) | An MCP (Model Context Protocol) server exposing a `topodb` database over stdio, for coding agents and other MCP clients that want scoped recall/write tools without embedding Rust. |
+| [`topodb-cli`](crates/topodb-cli) | [![crates.io](https://img.shields.io/crates/v/topodb-cli.svg)](https://crates.io/crates/topodb-cli) | A direct-embedded `topodb` command-line binary — JSON in, JSON out, predictable exit codes — for scripting and ad hoc inspection of a database file without a server or an MCP client. |
+
+### topodb-cli
+
+`topodb-cli` installs a binary named **`topodb`**: point it at a `.redb` file and it gives you
+all 11 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
+`search`, `traverse`, `stats`, `changes`, `compact`) as one-shot, script-friendly subcommands —
+compact JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can
+branch on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
+It opens the database file directly and in-process, the same way `topodb-mcp` does — no server,
+no network hop, and (because of that) no running concurrently with something else that already
+has the same file open. Install with `cargo install topodb-cli`. See
+[`crates/topodb-cli/README.md`](crates/topodb-cli/README.md) for the full command table,
+exit-code contract, scoping rules, and v1 limitations (no vector search, no set-props/remove-node,
+no bulk/stdin submit).
 
 ### topodb-mcp
 
