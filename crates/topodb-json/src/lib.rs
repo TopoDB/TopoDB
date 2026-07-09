@@ -12,6 +12,31 @@ use serde_json::{Map, Value};
 use std::str::FromStr;
 use topodb::{EdgeRecord, NodeRecord, PropValue, Props, Scope, ScopeId, ScopeSet, Subgraph};
 
+/// Label/prop name constants for the two built-in write shapes
+/// (`create_memory`/`create-memory`, `create_entity`/`create-entity`). Single
+/// source of truth shared by every front end (`topodb-mcp`'s default
+/// [`IndexSpec`](topodb::IndexSpec) and write tools, `topodb-cli`'s
+/// `create-entity`/`create-memory` subcommands) so writes land on exactly the
+/// `(label, prop)` pairs the default spec indexes — search and lookup work
+/// out of the box regardless of which front end wrote the data.
+pub const ENTITY_LABEL: &str = "Entity";
+pub const ENTITY_NAME_PROP: &str = "name";
+pub const MEMORY_LABEL: &str = "Memory";
+pub const MEMORY_CONTENT_PROP: &str = "content";
+
+/// Human/JSON-facing rendering of a [`Scope`]: `"shared"` or the ULID string.
+/// Reused by every front end's `info`/`db_info`-style output and scope
+/// round-tripping. (Distinct from [`scope_to_json`], which wraps the same
+/// rendering in a `serde_json::Value` for a JSON response body; this returns
+/// a bare `String` for contexts — like a struct field — that want the label
+/// without a `Value` wrapper.)
+pub fn scope_label(scope: &Scope) -> String {
+    match scope {
+        Scope::Shared => "shared".to_string(),
+        Scope::Id(id) => id.to_string(),
+    }
+}
+
 /// Error string for both directions of an unrepresentable [`PropValue`]:
 /// `Bytes` and `DateTime` have no JSON counterpart over MCP v0, and any JSON
 /// shape that isn't a string/number/bool (array, object, null) has no

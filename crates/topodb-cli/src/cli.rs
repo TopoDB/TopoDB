@@ -27,6 +27,44 @@ pub enum Command {
     /// Report the open database's path, format version, current op-log
     /// sequence number, index spec, and default scope.
     Info,
-    // Tasks 4-5 add the rest (create-memory, create-entity, link, get,
-    // find, search, traverse, access-stats, changes).
+    /// Store a new memory node. `content` becomes the full-text-searchable
+    /// body (prop `content`, label `Memory` — see `topodb_json::MEMORY_*`);
+    /// `--props` merges additional structured metadata.
+    CreateMemory {
+        #[arg(long)]
+        content: String,
+        /// Additional metadata as a JSON object string, e.g. '{"source":"chat"}'.
+        #[arg(long)]
+        props: Option<String>,
+    },
+    /// Create an entity node (person, project, concept). `name` is
+    /// equality-indexed by the default spec (prop `name`, label `Entity` —
+    /// see `topodb_json::ENTITY_*`); `--props` merges additional metadata.
+    CreateEntity {
+        #[arg(long)]
+        name: String,
+        /// Additional metadata as a JSON object string.
+        #[arg(long)]
+        props: Option<String>,
+    },
+    /// Create a typed, time-aware edge between two existing nodes.
+    Link {
+        /// Source node id (ULID).
+        #[arg(long)]
+        from: String,
+        /// Target node id (ULID).
+        #[arg(long)]
+        to: String,
+        /// Free-form edge type.
+        #[arg(long = "type")]
+        ty: String,
+        /// Additional edge metadata as a JSON object string.
+        #[arg(long)]
+        props: Option<String>,
+        /// Unix ms the edge becomes valid from; defaults to "now" (applier-resolved).
+        #[arg(long = "valid-from")]
+        valid_from: Option<i64>,
+    },
+    // Task 5 adds the rest (get, find, search, traverse, access-stats,
+    // changes, compact).
 }

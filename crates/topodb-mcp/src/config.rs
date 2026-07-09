@@ -16,14 +16,11 @@ use std::str::FromStr;
 
 use topodb::{IndexSpec, PropIndex, Scope, ScopeId};
 
-/// Label/prop name constants. Single source of truth shared by the default
-/// [`IndexSpec`] and the write tools (Tasks 4-5) so `create_entity` /
-/// `create_memory` write exactly the `(label, prop)` pairs the default spec
-/// indexes — search and lookup work out of the box.
-pub const ENTITY_LABEL: &str = "Entity";
-pub const ENTITY_NAME_PROP: &str = "name";
-pub const MEMORY_LABEL: &str = "Memory";
-pub const MEMORY_CONTENT_PROP: &str = "content";
+/// Label/prop name constants, single-sourced in `topodb-json` (shared with
+/// `topodb-cli`'s `create-entity`/`create-memory`) and re-exported here so
+/// existing `topodb-mcp` call sites (`use crate::config::{ENTITY_LABEL, ...}`)
+/// keep working unchanged.
+pub use topodb_json::{ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL};
 
 /// Resolved server configuration (see the module docs for the CLI contract).
 #[derive(Debug, Clone)]
@@ -49,13 +46,9 @@ pub fn default_spec() -> IndexSpec {
 }
 
 /// Human/JSON-facing rendering of a [`Scope`]: `"shared"` or the ULID string.
-/// Reused by the `db_info` tool and (Task 4) scope round-tripping.
-pub fn scope_label(scope: &Scope) -> String {
-    match scope {
-        Scope::Shared => "shared".to_string(),
-        Scope::Id(id) => id.to_string(),
-    }
-}
+/// Single-sourced in `topodb-json`; re-exported here so existing
+/// `topodb-mcp` call sites keep working unchanged.
+pub use topodb_json::scope_label;
 
 /// Parses a `--scope` value: `"shared"` (any case) => [`Scope::Shared`],
 /// otherwise a ULID string => [`Scope::Id`].

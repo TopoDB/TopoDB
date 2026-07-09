@@ -17,10 +17,17 @@ pub fn ok(value: &Value, pretty: bool) -> ! {
         serde_json::to_string_pretty(value)
     } else {
         serde_json::to_string(value)
+    };
+    match rendered {
+        Ok(rendered) => {
+            println!("{rendered}");
+            std::process::exit(0);
+        }
+        // Unreachable in practice (a serde_json::Value always serializes),
+        // but the no-panic-on-runtime-paths contract means even this goes
+        // through fail() rather than expect()/unwrap().
+        Err(e) => fail("internal", &format!("serializing output: {e}"), 1),
     }
-    .expect("serde_json::Value always serializes");
-    println!("{rendered}");
-    std::process::exit(0);
 }
 
 /// Print `{"error":{"kind": kind, "message": message}}` to stderr and exit
