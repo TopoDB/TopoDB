@@ -26,4 +26,5 @@ pub use op::Op;
 pub use props::{PropValue, Props};
 pub use read::{Direction, Subgraph, TraversalQuery};
 pub use state::{EdgeRecord, NodeRecord};
+pub use storage::AppliedBatch;
 pub use vector::VectorQuery;

@@ -301,8 +301,8 @@ impl Storage {
 
     /// Drops op-log entries with seq `< keep_from` in one write transaction and
     /// records the new floor under META `"oldest_seq"`. Edge behaviour:
-    /// - `keep_from <= oldest_seq`: nothing to trim — no-op `Ok(())` (the write
-    ///   txn is aborted, not committed).
+    /// - `keep_from <= oldest_seq`: nothing to trim — no-op `Ok(())`, returned
+    ///   before any write transaction is begun (there is no txn to abort).
     /// - `keep_from > current_seq + 1`: would advance the floor past the log's
     ///   end (skipping never-written seqs) — `TopoError::Rejected`.
     /// - `keep_from == current_seq + 1`: legal; empties the log entirely.
@@ -351,6 +351,15 @@ impl Storage {
     /// the floor they were validated against — a concurrent compaction commits
     /// atomically and is either fully visible or not visible to this snapshot.
     pub(crate) fn read_ops(&self, since: u64) -> Result<Vec<(u64, Op)>, TopoError> {
+        // Clamp BEFORE the floor check: seq 0 never exists (seqs start at 1),
+        // so `since == 0` must mean "replay everything", exactly like `since
+        // == 1` on a never-compacted log. Without this clamp, the default
+        // floor of 1 (an uncompacted log) makes `0 < oldest` true and
+        // `ops_since(0)` falsely returns `Compacted { oldest: 1 }` on a log
+        // that was never compacted at all — breaking the natural
+        // "replay-everything" idiom for callers who don't have a real anchor
+        // yet.
+        let since = since.max(1);
         let tx = self.db.begin_read().map_err(redb::Error::from)?;
         let meta = tx.open_table(META).map_err(redb::Error::from)?;
         let oldest = read_oldest_seq(&meta)?;
@@ -661,6 +670,10 @@ impl Storage {
     }
 }
 
+/// The committed result of a successful [`crate::Db::submit`]/
+/// [`crate::Db::submit_at`] call: the inclusive `[first_seq, last_seq]` range
+/// the batch's ops were assigned in the durable op log, and the batch's ops
+/// in their fully-resolved form (timestamps filled in) as actually written.
 #[derive(Debug)]
 pub struct AppliedBatch {
     pub first_seq: u64,

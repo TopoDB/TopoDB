@@ -340,6 +340,13 @@ impl Db {
             .filter_map(|(id, score)| {
                 snap.nodes
                     .get(&id)
+                    // Defensive only, not load-bearing for isolation: postings
+                    // are already scope-prefixed (see `posting_key`), so every
+                    // `id` scored above already comes from a requested scope's
+                    // own postings list. This guards against snapshot/postings
+                    // drift (e.g. a node whose scope changed between this
+                    // read's postings scan and its snapshot lookup), not
+                    // against cross-scope leakage.
                     .filter(|n| scopes.contains(n.scope))
                     .map(|n| (n.clone(), score))
             })

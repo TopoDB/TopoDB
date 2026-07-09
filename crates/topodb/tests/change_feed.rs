@@ -187,6 +187,20 @@ fn append_after_empty_compaction_resumes_at_the_floor() {
 }
 
 #[test]
+fn ops_since_zero_replays_everything_on_uncompacted_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    db.submit(vec![Op::CreateNode {
+        id: NodeId::new(),
+        scope: Scope::Id(ScopeId::new()),
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
+    assert_eq!(db.ops_since(0).unwrap().len(), 1);
+}
+
+#[test]
 fn unsupported_format_version_errors_at_open() {
     use redb::{Database, TableDefinition};
     const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
