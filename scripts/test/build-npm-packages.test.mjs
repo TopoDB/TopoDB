@@ -71,3 +71,17 @@ test('npm pack --dry-run bundles exactly one binary per sub-package', () => {
   const binaries2 = files.filter((f) => f === 'topodb-mcp' || f === 'topodb-mcp.exe');
   assert.equal(binaries2.length, 1, 'exactly one binary');
 });
+
+test('generator does not mutate the committed main package source', () => {
+  const src = 'npm/topodb-mcp/package.json';
+  const before = readFileSync(src, 'utf8');
+  const binaries = stageFakeBinaries();
+  const out = mkdtempSync(join(tmpdir(), 'topodb-out-'));
+  execFileSync('node', [
+    'scripts/build-npm-packages.mjs',
+    '--version', '9.9.9', '--binaries', binaries, '--out', out,
+  ], { stdio: 'inherit' });
+  const after = readFileSync(src, 'utf8');
+  assert.equal(after, before,
+    'committed npm/topodb-mcp/package.json must be untouched by a generate run');
+});
