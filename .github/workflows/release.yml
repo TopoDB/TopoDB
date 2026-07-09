@@ -341,3 +341,89 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  # Publishes @topodb/topodb-mcp + 5 platform sub-packages to npm from the
+  # topodb-mcp binaries that `host` just uploaded to the GitHub Release.
+  # This is NOT a cargo-dist-generated job; hand-appended for the npm channel.
+  publish-npm:
+    # `host` is the cargo-dist job that creates the GitHub Release and uploads
+    # artifacts (jobs: plan, build-local-artifacts, build-global-artifacts,
+    # host, publish-homebrew-formula, announce). Depend on it so the release
+    # assets exist to download.
+    needs: [host]
+    runs-on: ubuntu-latest
+    # cargo-dist uses per-package tags because topodb-mcp (0.0.2) and topodb-cli
+    # (0.0.1) have independent versions. Only publish npm for a topodb-mcp
+    # release tag (`topodb-mcp-v<version>`), never a topodb-cli tag.
+    if: startsWith(github.ref_name, 'topodb-mcp-v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Derive version from tag
+        id: ver
+        # Tag is `topodb-mcp-v0.0.2` → version `0.0.2`.
+        run: echo "version=${GITHUB_REF_NAME#topodb-mcp-v}" >> "$GITHUB_OUTPUT"
+      - name: Download topodb-mcp release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          declare -A TARGET=(
+            [darwin-arm64]=aarch64-apple-darwin
+            [darwin-x64]=x86_64-apple-darwin
+            [linux-x64]=x86_64-unknown-linux-gnu
+            [linux-arm64]=aarch64-unknown-linux-gnu
+            [win32-x64]=x86_64-pc-windows-msvc
+          )
+          mkdir -p bins
+          for key in "${!TARGET[@]}"; do
+            triple="${TARGET[$key]}"
+            mkdir -p "bins/$key"
+            tmp="$(mktemp -d)"
+            if [ "$key" = "win32-x64" ]; then
+              asset="topodb-mcp-${triple}.zip"; bin="topodb-mcp.exe"
+              gh release download "$GITHUB_REF_NAME" -p "$asset" -O a.zip
+              unzip -q a.zip -d "$tmp"; rm a.zip
+            else
+              asset="topodb-mcp-${triple}.tar.xz"; bin="topodb-mcp"
+              gh release download "$GITHUB_REF_NAME" -p "$asset" -O a.tar.xz
+              tar -xf a.tar.xz -C "$tmp"; rm a.tar.xz
+            fi
+            # cargo-dist's executable-zip archives are not guaranteed to nest
+            # contents in a subdirectory (verified empirically: the
+            # x86_64-pc-windows-msvc .zip built by `dist build` for this repo
+            # has LICENSE-*/README.md/topodb-mcp.exe at the archive root, no
+            # wrapping folder) — search for the binary instead of assuming a
+            # fixed depth or using a "*/name" glob that only matches nested
+            # layouts.
+            found="$(find "$tmp" -type f -name "$bin" | head -n1)"
+            if [ -z "$found" ]; then
+              echo "::error::binary '$bin' not found in $asset (searched $tmp)" >&2
+              exit 1
+            fi
+            cp "$found" "bins/$key/$bin"
+            # cp does not reliably propagate the executable bit; the npm
+            # launcher (npm/topodb-mcp/bin/topodb-mcp.js) spawns this binary
+            # directly, so it must be executable on non-Windows.
+            [ "$key" = "win32-x64" ] || chmod +x "bins/$key/$bin"
+            rm -rf "$tmp"
+          done
+      - name: Build npm packages
+        run: node scripts/build-npm-packages.mjs --version "${{ steps.ver.outputs.version }}" --binaries bins --out dist-npm
+      - name: Publish sub-packages, then main
+        # optionalDependencies in the main package pin exact versions of the
+        # 5 sub-packages, so the subs must exist on the registry before main
+        # is published, or npm install would fail to resolve them.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for d in dist-npm/topodb-mcp-*; do
+            (cd "$d" && npm publish --access public)
+          done
+          (cd dist-npm/topodb-mcp && npm publish --access public)
