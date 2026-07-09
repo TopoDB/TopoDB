@@ -6,6 +6,7 @@ rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "MCP server exposing the TopoDB agent-memory engine"
 repository = "https://github.com/TopoDB/TopoDB"
+readme = "README.md"
 
 [dependencies]
 topodb = { path = "../topodb", version = "0.0.2" }
