@@ -65,6 +65,91 @@ pub enum Command {
         #[arg(long = "valid-from")]
         valid_from: Option<i64>,
     },
-    // Task 5 adds the rest (get, find, search, traverse, access-stats,
-    // changes, compact).
+    /// Fetch one node by id. `{"found":false}` (exit 0) if it doesn't exist
+    /// or is out of the default scope — the two are indistinguishable by
+    /// design.
+    Get {
+        /// Node id (ULID).
+        id: String,
+    },
+    /// Exact-match lookup on an equality-indexed `(label, prop)` pair.
+    /// Errors (exit 2) if that pair isn't declared in the open db's index
+    /// spec, or `--value` is a float (floats aren't equality-indexable).
+    Find {
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        prop: String,
+        /// Parsed as a JSON scalar (e.g. `42`, `true`, `"ada"`); a value that
+        /// doesn't parse as JSON is taken as a bare string (so `--value ada`
+        /// and `--value '"ada"'` are equivalent).
+        #[arg(long)]
+        value: String,
+    },
+    /// Full-text BM25 search over indexed text properties.
+    Search {
+        /// The search query.
+        query: String,
+        /// Max hits to return.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+    },
+    /// Bounded BFS from a seed node, following edges up to `max_hops`.
+    Traverse {
+        /// Seed node id (ULID) to start from.
+        seed: String,
+        /// Hop budget (1-4).
+        #[arg(long = "max-hops", default_value_t = 2)]
+        max_hops: u8,
+        /// Which adjacency to follow from each frontier node.
+        #[arg(long, value_enum, default_value_t = DirectionArg::Both)]
+        direction: DirectionArg,
+        /// Restrict the walk to these edge types; repeatable. Omit to follow
+        /// every type.
+        #[arg(long = "edge-type")]
+        edge_type: Vec<String>,
+    },
+    /// Read a node's access statistics (count, last-accessed timestamp).
+    /// `{"found":false}` (exit 0) if the node doesn't exist or is out of the
+    /// default scope. Reading stats never itself counts as an access.
+    Stats {
+        /// Node id (ULID).
+        id: String,
+    },
+    /// Replay the op log from a sequence number (inclusive). Unscoped
+    /// host-level primitive — spans every scope. `Compacted` (the requested
+    /// range is below the retained floor) is a rejected/exit-2 condition:
+    /// the caller re-anchors from current state rather than trusting a
+    /// truncated tail.
+    Changes {
+        /// Op-log sequence number to replay from, inclusive.
+        #[arg(long)]
+        since: u64,
+    },
+    /// Compact the durable op log, dropping every entry with seq <
+    /// `keep_from`.
+    Compact {
+        #[arg(long = "keep-from")]
+        keep_from: u64,
+    },
+}
+
+/// Wire form of `topodb::Direction` for `--direction`: lowercase
+/// `out`/`in`/`both`, matching the MCP server's `DirectionParam` vocabulary.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default)]
+pub enum DirectionArg {
+    Out,
+    In,
+    #[default]
+    Both,
+}
+
+impl From<DirectionArg> for topodb::Direction {
+    fn from(d: DirectionArg) -> Self {
+        match d {
+            DirectionArg::Out => topodb::Direction::Out,
+            DirectionArg::In => topodb::Direction::In,
+            DirectionArg::Both => topodb::Direction::Both,
+        }
+    }
 }
