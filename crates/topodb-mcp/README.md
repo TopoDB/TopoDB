@@ -27,7 +27,7 @@ topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <path>]
 |---|---|---|---|
 | `--db <path>` | yes | — | Path to the redb database file. A missing *file* is created on open; a missing *parent directory* is a startup error. |
 | `--scope <ulid\|shared>` | no | `shared` | The default scope applied to every tool call that omits its own `scope` parameter. `"shared"` (case-insensitive) resolves to the shared scope; any other value is parsed as a ULID and resolves to that scope id. An invalid value is a startup error. |
-| `--spec <path>` | no | built-in default | Path to a JSON file deserializing to `topodb::IndexSpec`, controlling which `(label, prop)` pairs are equality- or text-indexed. Omitted: equality index on `(Entity, name)`, text index on `(Memory, content)` — this matches the labels/props the `create_entity`/`create_memory` tools write, so lookup and search work out of the box with no spec file. |
+| `--spec <path>` | no | inherit / built-in default | Path to a JSON file deserializing to `topodb::IndexSpec`, controlling which `(label, prop)` pairs are equality- or text-indexed, honored verbatim (may reindex an existing db). Omitted: an **existing** db inherits its own persisted spec (never reindexed or clobbered); a **fresh** db is created with the built-in default — equality index on `(Entity, name)`, text index on `(Memory, content)`, matching the labels/props the `create_entity`/`create_memory` tools write, so lookup and search work out of the box with no spec file. This mirrors `topodb-cli`, so a db either tool created is served identically by the other. |
 
 Arg parsing is hand-rolled (three flags); there is no `--help` flag yet.
 
