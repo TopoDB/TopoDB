@@ -293,6 +293,29 @@ fn end_to_end_scenario_over_stdio() {
         "server should still answer correctly after the error paths: {still_alive:#?}"
     );
 
+    // get_node's clean not-found path: a well-formed ULID that was never
+    // created must come back as a SUCCESSFUL result with found:false and no
+    // `node` field — NOT a tool error (this is server.rs's `Option::None`
+    // branch of GetNodeResult, distinct from the malformed-input error paths
+    // above). This is the one get_node behaviour the error paths and the
+    // found:true liveness check don't cover.
+    let never_created = NodeId::new().to_string();
+    let not_found = server.call_tool_ok(
+        "get_node",
+        serde_json::json!({ "id": never_created }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        not_found.get("found"),
+        Some(&serde_json::Value::Bool(false)),
+        "get_node on a valid-but-nonexistent ULID should cleanly report \
+         found:false, not error or crash: {not_found:#?}"
+    );
+    assert!(
+        not_found.get("node").is_none(),
+        "a not-found get_node result must not carry a node field: {not_found:#?}"
+    );
+
     // --- Step 11: restart on the SAME db file; data persists ------------
     drop(server); // kills the child and waits for exit (see Server::drop)
 
@@ -313,9 +336,17 @@ fn end_to_end_scenario_over_stdio() {
          db file (persistence through the MCP layer): {search_after_restart:#?}"
     );
 
-    // Bogus id sanity: it must still parse as a ULID (this file constructs
-    // it deliberately, not via `FromStr` failure) — guards against the
-    // fixture silently becoming a no-op if `NodeId::new()`'s Display format
-    // ever changes shape.
-    assert!(NodeId::from_str(&bogus_id).is_ok());
+    // Bogus-id fixture sanity: `bogus_id` must be a genuine, well-formed
+    // ULID so the step-10 `link` error path tested a *valid-but-nonexistent*
+    // endpoint (engine `Rejected`), not a *malformed* one (parse error) —
+    // two different error branches. Guard the actual invariant that matters:
+    // NodeId Display/FromStr round-trips, so `bogus_id` parses back to the
+    // exact id it was rendered from. (`.is_ok()` alone was true by
+    // construction and guarded nothing.)
+    let reparsed = NodeId::from_str(&bogus_id).expect("bogus_id must be a valid ULID");
+    assert_eq!(
+        reparsed.to_string(),
+        bogus_id,
+        "NodeId Display/FromStr should round-trip"
+    );
 }
