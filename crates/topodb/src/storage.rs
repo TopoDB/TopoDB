@@ -206,12 +206,37 @@ impl Storage {
         Ok(())
     }
 
+    /// Peeks the `IndexSpec` persisted under META `"index_spec"` by a prior
+    /// `ensure_index_spec`, without going through the normal `open_with`
+    /// construction (no table-existence writes, no reindex reconciliation) —
+    /// a short, read-only look used by `Db::open_stored` to discover what
+    /// spec to reopen with. `Ok(None)` covers both "file doesn't exist yet"
+    /// (a fresh `Database::create` has no `META` rows) and "file predates
+    /// spec persistence" (no `"index_spec"` key) — in both cases the caller
+    /// falls back to `IndexSpec::default()`.
+    pub(crate) fn read_persisted_index_spec(path: &Path) -> Result<Option<IndexSpec>, TopoError> {
+        let db = Database::create(path).map_err(storage_err)?;
+        let tx = db.begin_read().map_err(storage_err)?;
+        let meta = match tx.open_table(META) {
+            Ok(t) => t,
+            // A brand-new file has no tables at all yet.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(storage_err(e)),
+        };
+        match meta.get("index_spec").map_err(storage_err)? {
+            None => Ok(None),
+            Some(v) => {
+                let spec: IndexSpec = postcard::from_bytes(v.value())
+                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                Ok(Some(spec))
+            }
+        }
+    }
+
     /// Reads back the stored `format_version`. `Storage` itself is not part
     /// of the crate's public API (never re-exported from `lib.rs`), so this
-    /// `pub` is inert outside the crate; it is exercised only by unit tests
-    /// today, hence `#[allow(dead_code)]` in non-test builds — same class as
-    /// `append_ops`/`open` above.
-    #[allow(dead_code)]
+    /// `pub` is inert outside the crate; called by `Db::format_version` (and
+    /// exercised directly by unit tests).
     pub fn format_version(&self) -> Result<u32, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let meta = tx.open_table(META).map_err(storage_err)?;

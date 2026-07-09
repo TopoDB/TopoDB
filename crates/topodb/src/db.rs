@@ -117,6 +117,22 @@ impl Db {
         Self::open_with(path, IndexSpec::default())
     }
 
+    /// Opens `path` using the `IndexSpec` persisted in its META (written by
+    /// `Storage::ensure_index_spec` on every prior open), so callers need not
+    /// supply one. A fresh file, or one predating spec persistence (no
+    /// `index_spec` key), opens with `IndexSpec::default()`.
+    ///
+    /// Idempotent: the persisted spec is passed straight back through
+    /// `open_with`, so `ensure_index_spec` sees an unchanged text list and no
+    /// FTS reindex is triggered — the equality index is declared exactly as
+    /// the file was created. A transient extra (read-only) open of the file
+    /// is used to peek the spec before the real `open_with`.
+    pub fn open_stored(path: impl AsRef<Path>) -> Result<Self, TopoError> {
+        let path = path.as_ref();
+        let spec = Storage::read_persisted_index_spec(path)?.unwrap_or_default();
+        Self::open_with(path, spec)
+    }
+
     /// Like `open`, but with a declared `IndexSpec` governing which
     /// `(label, prop)` pairs get equality/text-indexed. `spec` is validated
     /// (rejecting duplicate declarations) before anything else happens — an
@@ -354,6 +370,28 @@ impl Db {
     #[must_use]
     pub(crate) fn storage(&self) -> &Storage {
         &self.inner.storage
+    }
+
+    /// The on-disk format version of the opened file (delegates to
+    /// `Storage::format_version`). Added so `topodb-cli`'s `info` can report
+    /// it without reaching into crate internals.
+    pub fn format_version(&self) -> u32 {
+        // `Storage::format_version` only fails on a missing/malformed META
+        // row, which `open_with` guarantees exists (it writes it on first
+        // create and validates it on every open) — unreachable for a `Db`
+        // that has successfully opened.
+        self.inner
+            .storage
+            .format_version()
+            .expect("format_version: META row guaranteed by a successful open")
+    }
+
+    /// The `IndexSpec` this db is operating under — the one `open_stored`
+    /// resolved (or the one passed to `open_with`). Added so `info` can
+    /// report it. A clone of the current snapshot's `spec`.
+    #[must_use]
+    pub fn index_spec(&self) -> IndexSpec {
+        (*self.snapshot().spec).clone()
     }
 
     /// Test/inspection seam: the raw (unscoped) snapshot. `#[doc(hidden)]`
