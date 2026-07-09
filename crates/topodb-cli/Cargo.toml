@@ -1,0 +1,24 @@
+[package]
+name = "topodb-cli"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Command-line interface for the TopoDB agent-memory engine"
+repository = "https://github.com/TopoDB/TopoDB"
+readme = "README.md"
+keywords = ["cli", "graph", "database", "agent", "memory"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "topodb"
+path = "src/main.rs"
+
+[dependencies]
+topodb = { path = "../topodb", version = "0.0.3" }
+topodb-json = { path = "../topodb-json", version = "0.0.1" }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3"
