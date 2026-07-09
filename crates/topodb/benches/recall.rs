@@ -42,7 +42,7 @@ fn seeded_db(n: usize, dim: usize) -> (tempfile::TempDir, Db, ScopeId, Vec<NodeI
             // Every 100th node's content also carries "needle" — a ~1%-selectivity
             // term used by `search_text_selective_10k` below, contrasted against
             // "memory"/"topic" which (per the format string) hit ~100% of docs.
-            let content = if i % 100 == 0 {
+            let content = if i.is_multiple_of(100) {
                 format!("memory number {i} about topic {} needle", i % 17)
             } else {
                 format!("memory number {i} about topic {}", i % 17)
