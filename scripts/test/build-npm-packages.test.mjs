@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -60,11 +60,11 @@ test('npm pack --dry-run bundles exactly one binary per sub-package', () => {
   ], { stdio: 'inherit' });
 
   const pkgDir = join(out, 'topodb-mcp-linux-x64');
-  // shell: true so Windows resolves the `npm.cmd` wrapper (execFileSync alone
-  // ENOENTs on Windows); args are fixed literals, so no shell-injection risk.
-  const json = execFileSync('npm', ['pack', '--dry-run', '--json'], {
-    cwd: pkgDir, encoding: 'utf8', shell: true,
-  });
+  // npm is `npm.cmd` on Windows: execFileSync('npm.cmd') throws EINVAL
+  // (CVE-2024-27980 hardening) and execFileSync+shell:true warns (DEP0190).
+  // execSync takes a full command string and always uses a shell, resolving
+  // npm cleanly on both platforms with pristine output.
+  const json = execSync('npm pack --dry-run --json', { cwd: pkgDir, encoding: 'utf8' });
   const files = JSON.parse(json)[0].files.map((f) => f.path);
   assert.ok(files.includes('topodb-mcp'), 'binary is packed');
   assert.ok(files.includes('package.json'), 'manifest is packed');
