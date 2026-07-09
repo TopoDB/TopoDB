@@ -49,6 +49,13 @@ test('generator produces a stamped main package and five os/cpu-scoped sub-packa
     assert.deepEqual(pkg.cpu, [cpuFor[arch]]);
     assert.ok(existsSync(join(pkgDir, binName(key))), `${key} binary present`);
   }
+
+  // npm does NOT auto-include LICENSE-MIT/-APACHE (glob matches license(.ext)? only),
+  // so the generator must copy them into every package.
+  for (const f of ['LICENSE-MIT', 'LICENSE-APACHE']) {
+    assert.ok(existsSync(join(out, 'topodb-mcp', f)), `main ${f}`);
+    assert.ok(existsSync(join(out, 'topodb-mcp-linux-x64', f)), `sub ${f}`);
+  }
 });
 
 test('npm pack --dry-run bundles exactly one binary per sub-package', () => {
@@ -70,6 +77,8 @@ test('npm pack --dry-run bundles exactly one binary per sub-package', () => {
   assert.ok(files.includes('package.json'), 'manifest is packed');
   const binaries2 = files.filter((f) => f === 'topodb-mcp' || f === 'topodb-mcp.exe');
   assert.equal(binaries2.length, 1, 'exactly one binary');
+  assert.ok(files.includes('LICENSE-MIT') && files.includes('LICENSE-APACHE'),
+    'license files are packed into the sub-package');
 });
 
 test('generator does not mutate the committed main package source', () => {

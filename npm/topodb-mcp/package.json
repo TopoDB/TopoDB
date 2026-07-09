@@ -3,7 +3,7 @@
   "version": "0.0.2",
   "description": "One-command npx launcher for the topodb-mcp agent-memory MCP server.",
   "bin": { "topodb-mcp": "bin/topodb-mcp.js" },
-  "files": ["bin/"],
+  "files": ["bin/", "LICENSE-MIT", "LICENSE-APACHE"],
   "license": "MIT OR Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/TopoDB/TopoDB" },
   "optionalDependencies": {
