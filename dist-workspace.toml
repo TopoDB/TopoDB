@@ -7,6 +7,15 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# The release workflow carries a hand-appended `publish-npm` job (the npm
+# distribution channel, which cargo-dist's own npm installer intentionally does
+# not cover). `allow-dirty = ["ci"]` tells dist NOT to regenerate or
+# consistency-check `.github/workflows/release.yml`, so that custom job survives
+# and `dist plan`/`dist host` don't fail on an "out of date" check.
+# Trade-off: dist config changes (targets, version, installers) will NOT
+# auto-update release.yml — re-run `dist init` and re-apply the publish-npm job
+# by hand if you change them.
+allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
