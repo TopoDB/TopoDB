@@ -132,6 +132,22 @@ pub enum Command {
         #[arg(long = "keep-from")]
         keep_from: u64,
     },
+    /// Set or remove properties on an existing node. `--props` is a JSON
+    /// object; a `null` value REMOVES that key, any other scalar sets it.
+    /// Rejected (exit 2) if the node doesn't exist.
+    SetProps {
+        /// Node id (ULID).
+        id: String,
+        /// Property changes as a JSON object, e.g. '{"role":"x","stale":null}'.
+        #[arg(long)]
+        props: String,
+    },
+    /// Hard-delete a node and cascade-remove its incident edges. Rejected
+    /// (exit 2) if the node doesn't exist.
+    RemoveNode {
+        /// Node id (ULID).
+        id: String,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase

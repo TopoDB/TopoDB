@@ -332,3 +332,72 @@ fn existing_custom_spec_db_is_inherited() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["props"]["handle"], serde_json::json!("ada"));
 }
+
+#[test]
+fn set_props_updates_and_removes_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let full = |a: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope];
+        v.extend_from_slice(a);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status,
+        )
+    };
+    let id = full(&["create-entity", "--name", "ada", "--props", r#"{"stale":"yes"}"#]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // set one key, remove another (null).
+    let (res, s) = full(&["set-props", &id, "--props", r#"{"role":"pioneer","stale":null}"#]);
+    assert!(s.success(), "set-props should succeed");
+    assert!(res["seq"].as_u64().is_some());
+    let node = full(&["get", &id]).0;
+    assert_eq!(node["node"]["props"]["role"], serde_json::json!("pioneer"));
+    assert!(node["node"]["props"].get("stale").is_none(), "stale should be removed");
+}
+
+#[test]
+fn set_props_on_missing_node_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let ghost = topodb::NodeId::new().to_string();
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["set-props", &ghost, "--props", r#"{"x":1}"#])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
+        "rejected"
+    );
+}
+
+#[test]
+fn remove_node_deletes_and_cascades() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let full = |a: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope];
+        v.extend_from_slice(a);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status,
+        )
+    };
+    let id = full(&["create-entity", "--name", "gone"]).0["id"].as_str().unwrap().to_string();
+    let (res, s) = full(&["remove-node", &id]);
+    assert!(s.success());
+    assert!(res["seq"].as_u64().is_some());
+    // Node is gone.
+    assert_eq!(full(&["get", &id]).0["found"], serde_json::json!(false));
+}

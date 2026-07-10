@@ -87,6 +87,8 @@ fn main() {
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
         Command::Changes { since } => changes(&db, since, cli.pretty),
         Command::Compact { keep_from } => compact(&db, keep_from, cli.pretty),
+        Command::SetProps { id, props } => set_props(&db, &id, &props, cli.pretty),
+        Command::RemoveNode { id } => remove_node(&db, &id, cli.pretty),
     }
 }
 
@@ -360,4 +362,36 @@ fn link(
         output::fail_engine(&e);
     }
     output::ok(&serde_json::json!({ "id": id.to_string() }), pretty);
+}
+
+fn set_props(db: &Db, id: &str, props: &str, pretty: bool) -> ! {
+    let id = match NodeId::from_str(id) {
+        Ok(id) => id,
+        Err(e) => output::fail("rejected", &format!("invalid id {id:?}: {e}"), 2),
+    };
+    let value: serde_json::Value = match serde_json::from_str(props) {
+        Ok(v) => v,
+        Err(e) => output::fail("rejected", &format!("parsing --props as JSON: {e}"), 2),
+    };
+    let changes = match topodb_json::json_to_prop_changes(&value) {
+        Ok(c) => c,
+        Err(e) => output::fail("rejected", &e, 2),
+    };
+    let applied = match db.submit(vec![Op::SetNodeProps { id, props: changes }]) {
+        Ok(a) => a,
+        Err(e) => output::fail_engine(&e),
+    };
+    output::ok(&serde_json::json!({ "seq": applied.last_seq }), pretty);
+}
+
+fn remove_node(db: &Db, id: &str, pretty: bool) -> ! {
+    let id = match NodeId::from_str(id) {
+        Ok(id) => id,
+        Err(e) => output::fail("rejected", &format!("invalid id {id:?}: {e}"), 2),
+    };
+    let applied = match db.submit(vec![Op::RemoveNode { id }]) {
+        Ok(a) => a,
+        Err(e) => output::fail_engine(&e),
+    };
+    output::ok(&serde_json::json!({ "seq": applied.last_seq }), pretty);
 }
