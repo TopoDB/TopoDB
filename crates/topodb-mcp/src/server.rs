@@ -222,8 +222,10 @@ fn default_search_k() -> usize {
 struct SearchMemoriesParams {
     /// Free-text query.
     query: String,
-    /// Maximum number of results to return.
+    /// Maximum number of results to return. Must be at least 1 — `search_text`
+    /// rejects `k == 0`.
     #[serde(default = "default_search_k")]
+    #[schemars(range(min = 1))]
     k: usize,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
@@ -274,8 +276,10 @@ fn default_max_hops() -> u8 {
 struct TraverseParams {
     /// ULID of the node to start the traversal from.
     seed_id: String,
-    /// Hop budget (1-4).
+    /// Hop budget (1-4). Out-of-range values are rejected, not clamped — the
+    /// bound is advertised so a client never sends one.
     #[serde(default = "default_max_hops")]
+    #[schemars(range(min = 1, max = 4))]
     max_hops: u8,
     /// Which adjacency to follow from each frontier node: `"out"`, `"in"`, or
     /// `"both"`.
@@ -463,8 +467,10 @@ struct SearchVectorsParams {
     /// Query embedding as a JSON array of finite numbers (host-computed).
     #[schemars(with = "VectorSchema")]
     vector: Value,
-    /// Maximum number of results to return.
+    /// Maximum number of results to return. Must be at least 1 —
+    /// `search_vector` rejects `k == 0`.
     #[serde(default = "default_vector_k")]
+    #[schemars(range(min = 1))]
     k: usize,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.

@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{structured_content, Server, DEFAULT_TIMEOUT};
+use common::{expect_tool_error, structured_content, Server, DEFAULT_TIMEOUT};
 use serde_json::json;
 
 /// Spawns a server on a throwaway db and returns its `tools/list` array.
@@ -186,6 +186,72 @@ fn stringified_integer_value_silently_matches_nothing() {
         "a stringified integer should match nothing (silently) — this is the \
          failure mode the `value` schema exists to prevent: {miss:#?}"
     );
+}
+
+/// A numeric bound the server enforces must also be *advertised*, or a client
+/// will happily send a value that is always rejected. `max_hops` is rejected
+/// outside `1..=4` (not clamped), and both `k`s are rejected at 0 — yet the
+/// derived schemas said `minimum: 0` / `maximum: 255` (a bare `u8`/`usize`
+/// range). Each case asserts the advertised bound *and* that the runtime
+/// really rejects just outside it, so the two can't drift apart.
+#[test]
+fn numeric_bounds_match_the_runtime_contract() {
+    let (_dir, tools) = tools();
+
+    let hops = properties(&tools, "traverse");
+    let hops = &hops["max_hops"];
+    assert_eq!(
+        hops["minimum"],
+        json!(1),
+        "traverse.max_hops min: {hops:#?}"
+    );
+    assert_eq!(
+        hops["maximum"],
+        json!(4),
+        "traverse.max_hops max: {hops:#?}"
+    );
+
+    for tool in ["search_memories", "search_vectors"] {
+        let props = properties(&tools, tool);
+        let k = &props["k"];
+        assert_eq!(
+            k["minimum"],
+            json!(1),
+            "{tool}.k should advertise min 1: {k:#?}"
+        );
+    }
+
+    // And the runtime genuinely rejects just outside those bounds.
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::spawn(&dir.path().join("bounds.redb"), &[]);
+    server.initialize(DEFAULT_TIMEOUT);
+    let seed = server.call_tool_ok("create_entity", json!({ "name": "A" }), DEFAULT_TIMEOUT)["id"]
+        .as_str()
+        .expect("create_entity returns an id")
+        .to_string();
+
+    for bad in [0u8, 5u8] {
+        let resp = server.call_tool(
+            "traverse",
+            json!({ "seed_id": seed, "max_hops": bad }),
+            DEFAULT_TIMEOUT,
+        );
+        expect_tool_error(&resp);
+    }
+
+    let resp = server.call_tool(
+        "search_memories",
+        json!({ "query": "anything", "k": 0 }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+
+    let resp = server.call_tool(
+        "search_vectors",
+        json!({ "model": "m", "vector": [1.0], "k": 0 }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
 }
 
 /// Blanket invariant so a future tool can't reintroduce a typeless param: no
