@@ -224,3 +224,89 @@ fn slabs_survive_rebuild_and_reopen() {
         1
     );
 }
+
+/// A zero-dim embedding must be rejected outright. Accepting one used to fix
+/// the `(model, scope)` slab's dim at 0, after which every real embedding
+/// under that key was permanently rejected as a dim conflict — one empty
+/// array bricked the model namespace. Symmetric with `search_vector`, which
+/// has always refused an empty query vector.
+#[test]
+fn empty_embedding_is_rejected_and_does_not_poison_the_slab() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let (a, b) = (NodeId::new(), NodeId::new());
+
+    for id in [a, b] {
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
+    }
+
+    let err = db
+        .submit(vec![Op::SetEmbedding {
+            id: a,
+            model: "m1".into(),
+            vector: vec![],
+        }])
+        .unwrap_err();
+    assert!(
+        matches!(err, TopoError::Rejected(_)),
+        "empty embedding should be Rejected, got {err:?}"
+    );
+
+    // The slab was never created, so a real embedding still works. Before the
+    // fix this failed with "dim 3 does not match existing slab dim 0".
+    db.submit(vec![Op::SetEmbedding {
+        id: b,
+        model: "m1".into(),
+        vector: vec![1.0, 2.0, 3.0],
+    }])
+    .unwrap();
+
+    let hits = db
+        .search_vector(&VectorQuery {
+            scopes: ScopeSet::of(&[s]),
+            model: "m1".into(),
+            vector: vec![1.0, 2.0, 3.0],
+            k: 10,
+            candidates: None,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the real embedding should be searchable");
+    assert_eq!(hits[0].0.id, b);
+}
+
+/// The same rule must hold inside a batch, where the empty vector rides along
+/// with the `CreateNode` that gives the node its scope.
+#[test]
+fn empty_embedding_in_a_batch_is_rejected_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let a = NodeId::new();
+
+    let err = db
+        .submit(vec![
+            Op::CreateNode {
+                id: a,
+                scope: Scope::Id(s),
+                label: "M".into(),
+                props: Default::default(),
+            },
+            Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![],
+            },
+        ])
+        .unwrap_err();
+    assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+
+    // Atomic: the CreateNode must not have landed either.
+    assert!(db.node(&ScopeSet::of(&[s]), a).is_none());
+}

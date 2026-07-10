@@ -254,6 +254,58 @@ fn numeric_bounds_match_the_runtime_contract() {
     expect_tool_error(&resp);
 }
 
+/// Both embedding vectors are rejected when empty, so both must advertise
+/// `minItems: 1`. The `set_embedding` half also guards a real data bug: an
+/// accepted zero-dim embedding fixed the `(model, scope)` slab's dim at 0 and
+/// then rejected every real embedding under that key.
+#[test]
+fn empty_embedding_is_rejected_and_advertised_as_min_items_one() {
+    let (_dir, tools) = tools();
+    for tool in ["set_embedding", "search_vectors"] {
+        let props = properties(&tools, tool);
+        let v = &props["vector"];
+        assert_eq!(
+            v["minItems"],
+            json!(1),
+            "{tool}.vector should advertise minItems 1: {v:#?}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::spawn(&dir.path().join("emptyvec.redb"), &[]);
+    server.initialize(DEFAULT_TIMEOUT);
+    let id = server.call_tool_ok("create_entity", json!({ "name": "A" }), DEFAULT_TIMEOUT)["id"]
+        .as_str()
+        .expect("create_entity returns an id")
+        .to_string();
+
+    let resp = server.call_tool(
+        "set_embedding",
+        json!({ "id": id, "model": "demo", "vector": [] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+
+    // The slab was never created, so a real embedding still lands and is
+    // searchable. Before the fix this failed with "dim 3 does not match
+    // existing slab dim 0".
+    server.call_tool_ok(
+        "set_embedding",
+        json!({ "id": id, "model": "demo", "vector": [1.0, 2.0, 3.0] }),
+        DEFAULT_TIMEOUT,
+    );
+    let hits = server.call_tool_ok(
+        "search_vectors",
+        json!({ "model": "demo", "vector": [1.0, 2.0, 3.0], "k": 5 }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        hits["hits"].as_array().map(Vec::len),
+        Some(1),
+        "the real embedding should be searchable: {hits:#?}"
+    );
+}
+
 /// Blanket invariant so a future tool can't reintroduce a typeless param: no
 /// property of any tool's input schema may be left without a type.
 #[test]

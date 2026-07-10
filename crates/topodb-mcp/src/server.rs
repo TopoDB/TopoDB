@@ -128,11 +128,22 @@ fn classify_topo_error(e: TopoError) -> ErrorData {
 /// wire-level bug.
 type PropsSchema = std::collections::BTreeMap<String, Value>;
 
-/// Schema stand-in for a raw embedding: an array of numbers.
-type VectorSchema = Vec<f64>;
-
 /// Schema stand-in for `submit_batch`'s command list: an array of objects.
 type CommandsSchema = Vec<Value>;
+
+/// The JSON Schema for a raw embedding: a non-empty array of numbers.
+///
+/// `minItems: 1` is the advertised half of an engine rule — `prevalidate_dims`
+/// rejects a zero-dim embedding (it would otherwise fix the `(model, scope)`
+/// slab's dim at 0 and block every real embedding under that key), and
+/// `search_vector` rejects an empty query vector.
+fn vector_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "type": "number" },
+        "minItems": 1,
+    })
+}
 
 /// The JSON Schema for `find_by_prop`'s `value`: the equality-indexable
 /// scalars. Floats are excluded deliberately — `IndexValue::of` rejects them.
@@ -451,8 +462,9 @@ struct SetEmbeddingParams {
     id: String,
     /// Embedding model name (namespaces the vector).
     model: String,
-    /// Raw embedding as a JSON array of finite numbers (host-computed).
-    #[schemars(with = "VectorSchema")]
+    /// Raw embedding as a non-empty JSON array of finite numbers
+    /// (host-computed).
+    #[schemars(schema_with = "vector_schema")]
     vector: Value,
 }
 
@@ -464,8 +476,9 @@ fn default_vector_k() -> usize {
 struct SearchVectorsParams {
     /// Embedding model name to search within.
     model: String,
-    /// Query embedding as a JSON array of finite numbers (host-computed).
-    #[schemars(with = "VectorSchema")]
+    /// Query embedding as a non-empty JSON array of finite numbers
+    /// (host-computed).
+    #[schemars(schema_with = "vector_schema")]
     vector: Value,
     /// Maximum number of results to return. Must be at least 1 —
     /// `search_vector` rejects `k == 0`.
@@ -809,7 +822,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist or the vector's dimension conflicts with the model's existing vectors. Returns the committed seq."
+        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq."
     )]
     fn set_embedding(
         &self,

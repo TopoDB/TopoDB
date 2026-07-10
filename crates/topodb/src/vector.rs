@@ -288,11 +288,12 @@ impl VectorIndex {
 
     /// Dim pre-validation, run by the applier BEFORE `apply_batch` so a
     /// violation leaves storage untouched (atomic with the rest of the batch).
-    /// For each `SetEmbedding`, the vector's length must equal the existing
-    /// live-slab dim for `(model, node.scope)`, and must be consistent for that
-    /// key across the batch itself. The node's scope comes from a same-batch
-    /// `CreateNode` if present, otherwise from `cur`; a `SetEmbedding` for a
-    /// node that exists nowhere is left for `apply_batch` to reject.
+    /// For each `SetEmbedding`, the vector must be non-empty, its length must
+    /// equal the existing live-slab dim for `(model, node.scope)`, and must be
+    /// consistent for that key across the batch itself. The node's scope comes
+    /// from a same-batch `CreateNode` if present, otherwise from `cur`; a
+    /// `SetEmbedding` for a node that exists nowhere is left for `apply_batch`
+    /// to reject.
     pub(crate) fn prevalidate_dims(&self, cur: &Snapshot, ops: &[Op]) -> Result<(), TopoError> {
         let mut created_scope: HashMap<NodeId, Scope> = HashMap::new();
         let mut batch_dims: HashMap<(String, Scope), usize> = HashMap::new();
@@ -302,6 +303,17 @@ impl VectorIndex {
                     created_scope.insert(*id, *scope);
                 }
                 Op::SetEmbedding { id, model, vector } => {
+                    // A zero-dim embedding is meaningless on its own AND
+                    // poisons the `(model, scope)` slab: it fixes the slab's
+                    // dim at 0, after which every real embedding under that
+                    // key is rejected as a dim conflict, permanently. Reject
+                    // it here — symmetric with `search_vector`, which already
+                    // refuses an empty query vector.
+                    if vector.is_empty() {
+                        return Err(TopoError::Rejected(format!(
+                            "embedding for model {model:?} must have at least one dimension"
+                        )));
+                    }
                     let scope = match created_scope.get(id) {
                         Some(s) => *s,
                         None => match cur.nodes.get(id) {
