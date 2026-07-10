@@ -487,3 +487,48 @@ fn set_embedding_on_missing_node_is_rejected_exit_2() {
         "rejected"
     );
 }
+
+#[test]
+fn search_vector_ranks_by_cosine() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let full = |a: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope];
+        v.extend_from_slice(a);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status,
+        )
+    };
+    let m = full(&["create-memory", "--content", "near"]).0["id"].as_str().unwrap().to_string();
+    full(&["set-embedding", &m, "--model", "test", "--vector", "[1.0,0.0]"]);
+    // Query aligned with M's vector: M must come back.
+    let (hits, s) = full(&["search-vector", "--model", "test", "--vector", "[1.0,0.0]", "--k", "5"]);
+    assert!(s.success(), "search-vector should succeed");
+    let arr = hits.as_array().expect("bare array of hits");
+    assert!(
+        arr.iter().any(|h| h["node"]["id"] == serde_json::json!(m)),
+        "M should rank in the results: {hits}"
+    );
+    assert!(arr[0]["score"].as_f64().is_some());
+}
+
+#[test]
+fn search_vector_empty_vector_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["search-vector", "--model", "m", "--vector", "[]"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
+        "rejected"
+    );
+}

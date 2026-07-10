@@ -5,7 +5,9 @@ use std::str::FromStr;
 
 use clap::Parser;
 use cli::{Cli, Command};
-use topodb::{Db, Direction, EdgeId, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery};
+use topodb::{
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery, VectorQuery,
+};
 
 fn main() {
     let cli = Cli::parse();
@@ -93,6 +95,12 @@ fn main() {
         Command::SetEmbedding { id, model, vector } => {
             set_embedding(&db, &id, model, &vector, cli.pretty)
         }
+        Command::SearchVector {
+            model,
+            vector,
+            k,
+            candidate,
+        } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
     }
 }
 
@@ -430,4 +438,61 @@ fn set_embedding(db: &Db, id: &str, model: String, vector: &str, pretty: bool) -
         Err(e) => output::fail_engine(&e),
     };
     output::ok(&serde_json::json!({ "seq": applied.last_seq }), pretty);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_vector(
+    db: &Db,
+    scope: Scope,
+    model: String,
+    vector: &str,
+    k: usize,
+    candidate: Vec<String>,
+    pretty: bool,
+) -> ! {
+    let vector_json: serde_json::Value = match serde_json::from_str(vector) {
+        Ok(v) => v,
+        Err(e) => output::fail("rejected", &format!("parsing --vector as JSON: {e}"), 2),
+    };
+    let vector = match topodb_json::json_to_f32_vec(&vector_json) {
+        Ok(v) => v,
+        Err(e) => output::fail("rejected", &e, 2),
+    };
+    // Empty --candidate -> None (score the whole scope); a non-empty list is
+    // parsed to NodeIds, any bad id being a caller-fixable rejected/exit-2.
+    let candidates = if candidate.is_empty() {
+        None
+    } else {
+        let mut ids = Vec::with_capacity(candidate.len());
+        for c in &candidate {
+            match NodeId::from_str(c) {
+                Ok(id) => ids.push(id),
+                Err(e) => output::fail("rejected", &format!("invalid --candidate id {c:?}: {e}"), 2),
+            }
+        }
+        Some(ids)
+    };
+    let scopes = topodb_json::scope_to_scope_set(scope);
+    let query = VectorQuery {
+        scopes,
+        model,
+        vector,
+        k,
+        candidates,
+    };
+    let hits = match db.search_vector(&query) {
+        Ok(h) => h,
+        Err(e) => output::fail_engine(&e),
+    };
+    let out: Result<Vec<serde_json::Value>, String> = hits
+        .iter()
+        .map(|(n, score)| {
+            topodb_json::node_to_json(n).map(|node| serde_json::json!({ "node": node, "score": score }))
+        })
+        .collect();
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => output::fail("internal", &e, 1),
+    };
+    output::ok(&serde_json::Value::Array(out), pretty);
 }

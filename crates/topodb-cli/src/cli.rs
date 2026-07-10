@@ -172,6 +172,24 @@ pub enum Command {
         #[arg(long)]
         vector: String,
     },
+    /// Cosine vector search under one `model`, scoped to the default scope.
+    /// The query is a raw float array (host-computed). Rejected (exit 2) if
+    /// `--k` is 0 or the vector is empty.
+    SearchVector {
+        /// Embedding model name to search within.
+        #[arg(long)]
+        model: String,
+        /// Query embedding as a JSON array of floats.
+        #[arg(long)]
+        vector: String,
+        /// Max hits to return.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Restrict scoring to these node ids; repeatable. Omit to score the
+        /// whole scope.
+        #[arg(long = "candidate")]
+        candidate: Vec<String>,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase
