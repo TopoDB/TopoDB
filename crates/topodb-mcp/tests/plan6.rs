@@ -64,3 +64,69 @@ fn set_node_props_on_missing_node_is_tool_error() {
     );
     expect_tool_error(&resp);
 }
+
+#[test]
+fn close_edge_closes_an_open_edge() {
+    let (_dir, mut server) = fresh_server();
+    let a = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "a" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "b" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let e = server.call_tool_ok(
+        "link",
+        serde_json::json!({ "from_id": a, "to_id": b, "edge_type": "x" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = server.call_tool_ok(
+        "close_edge",
+        serde_json::json!({ "id": e, "valid_to": 1000 }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(res["seq"].as_u64().is_some());
+}
+
+#[test]
+fn set_embedding_then_vector_search_finds_it() {
+    let (_dir, mut server) = fresh_server();
+    let m = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "vectorized" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = server.call_tool_ok(
+        "set_embedding",
+        serde_json::json!({ "id": m, "model": "test", "vector": [1.0, 0.0] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(res["seq"].as_u64().is_some());
+}
+
+#[test]
+fn close_edge_missing_is_tool_error() {
+    let (_dir, mut server) = fresh_server();
+    let ghost = topodb::EdgeId::new().to_string();
+    let resp = server.call_tool(
+        "close_edge",
+        serde_json::json!({ "id": ghost }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}

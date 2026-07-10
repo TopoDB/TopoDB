@@ -398,6 +398,26 @@ struct RemoveNodeParams {
     id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CloseEdgeParams {
+    /// ULID of the edge to close.
+    id: String,
+    /// Unix ms the edge becomes valid until; defaults to "now" (engine
+    /// -resolved) when omitted.
+    #[serde(default)]
+    valid_to: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetEmbeddingParams {
+    /// ULID of the node to attach the embedding to.
+    id: String,
+    /// Embedding model name (namespaces the vector).
+    model: String,
+    /// Raw embedding as an array of finite numbers (host-computed).
+    vector: Vec<f32>,
+}
+
 #[tool_router]
 impl TopoServer {
     #[tool(
@@ -680,6 +700,39 @@ impl TopoServer {
     ) -> Result<Json<SeqResult>, ErrorData> {
         let id = parse_node_id(&p.id)?;
         let seq = self.submit_seq(vec![Op::RemoveNode { id }])?;
+        Ok(Json(SeqResult { seq }))
+    }
+
+    #[tool(
+        description = "Close an open edge, stamping its valid_to. valid_to defaults to now when omitted. Errors if the edge doesn't exist. Returns the committed seq."
+    )]
+    fn close_edge(
+        &self,
+        Parameters(p): Parameters<CloseEdgeParams>,
+    ) -> Result<Json<SeqResult>, ErrorData> {
+        let id = EdgeId::from_str(&p.id).map_err(|e| {
+            ErrorData::invalid_params(format!("invalid edge id {:?}: {e}", p.id), None)
+        })?;
+        let seq = self.submit_seq(vec![Op::CloseEdge {
+            id,
+            valid_to: p.valid_to,
+        }])?;
+        Ok(Json(SeqResult { seq }))
+    }
+
+    #[tool(
+        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist or the vector's dimension conflicts with the model's existing vectors. Returns the committed seq."
+    )]
+    fn set_embedding(
+        &self,
+        Parameters(p): Parameters<SetEmbeddingParams>,
+    ) -> Result<Json<SeqResult>, ErrorData> {
+        let id = parse_node_id(&p.id)?;
+        let seq = self.submit_seq(vec![Op::SetEmbedding {
+            id,
+            model: p.model,
+            vector: p.vector,
+        }])?;
         Ok(Json(SeqResult { seq }))
     }
 }
