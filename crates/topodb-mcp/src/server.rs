@@ -95,10 +95,7 @@ impl TopoServer {
     /// classification `search_memories`/`get_changes` already use (Task 4's
     /// review-fix pattern).
     fn submit_write(&self, ops: Vec<Op>) -> Result<(), ErrorData> {
-        self.db.submit(ops).map(|_| ()).map_err(|e| match e {
-            TopoError::Rejected(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })
+        self.db.submit(ops).map(|_| ()).map_err(classify_topo_error)
     }
 
     /// Like [`submit_write`], but returns the batch's `last_seq` for tools that
@@ -108,10 +105,18 @@ impl TopoServer {
         self.db
             .submit(ops)
             .map(|a| a.last_seq)
-            .map_err(|e| match e {
-                TopoError::Rejected(msg) => ErrorData::invalid_params(msg, None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })
+            .map_err(classify_topo_error)
+    }
+}
+
+/// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
+/// -fixable bad input) → `invalid_params`; every other variant → `internal_error`.
+/// Shared by the `submit_*` write helpers and the read tools that classify
+/// engine errors this way.
+fn classify_topo_error(e: TopoError) -> ErrorData {
+    match e {
+        TopoError::Rejected(msg) => ErrorData::invalid_params(msg, None),
+        other => ErrorData::internal_error(other.to_string(), None),
     }
 }
 
