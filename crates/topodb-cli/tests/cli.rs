@@ -445,3 +445,45 @@ fn close_edge_on_missing_edge_is_rejected_exit_2() {
         "rejected"
     );
 }
+
+#[test]
+fn set_embedding_attaches_a_vector() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let full = |a: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope];
+        v.extend_from_slice(a);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status,
+        )
+    };
+    let id = full(&["create-memory", "--content", "vectorized"]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (res, s) = full(&["set-embedding", &id, "--model", "test", "--vector", "[0.1,0.2,0.3]"]);
+    assert!(s.success(), "set-embedding should succeed");
+    assert!(res["seq"].as_u64().is_some());
+}
+
+#[test]
+fn set_embedding_on_missing_node_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let ghost = topodb::NodeId::new().to_string();
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["set-embedding", &ghost, "--model", "m", "--vector", "[1.0]"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
+        "rejected"
+    );
+}

@@ -158,6 +158,20 @@ pub enum Command {
         #[arg(long = "valid-to")]
         valid_to: Option<i64>,
     },
+    /// Attach a raw embedding vector to an existing node under `model`. The
+    /// host computes the vector; TopoDB stores it as-is. Rejected (exit 2) if
+    /// the node doesn't exist or the vector's dim conflicts with the model's
+    /// existing vectors in scope.
+    SetEmbedding {
+        /// Node id (ULID).
+        id: String,
+        /// Embedding model name (namespaces the vector).
+        #[arg(long)]
+        model: String,
+        /// Embedding as a JSON array of floats, e.g. '[0.1,0.2,0.3]'.
+        #[arg(long)]
+        vector: String,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase
