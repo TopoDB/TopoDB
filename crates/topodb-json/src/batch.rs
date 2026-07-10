@@ -1,0 +1,383 @@
+//! The batch-submit DSL: a JSON array of high-level commands (each an object
+//! keyed by `"op"`, whose value equals the corresponding MCP tool name) that
+//! both `topodb-cli submit` and `topodb-mcp submit_batch` consume. Turns the
+//! array into a `Vec<Op>` for one atomic `Db::submit`, resolving `#N`
+//! back-references to ULIDs produced by earlier commands in the same batch.
+
+use crate::{
+    json_to_f32_vec, json_to_prop_changes, json_to_props, merge_required_prop, resolve_scope,
+    ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
+};
+use serde_json::Value;
+use std::str::FromStr;
+use topodb::{EdgeId, NodeId, Op, PropValue, Props, Scope};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdKind {
+    Node,
+    Edge,
+}
+
+fn kind_name(k: IdKind) -> &'static str {
+    match k {
+        IdKind::Node => "node",
+        IdKind::Edge => "edge",
+    }
+}
+
+/// Pulls a required string field, naming the command index on failure.
+fn req_str(obj: &serde_json::Map<String, Value>, key: &str, idx: usize) -> Result<String, String> {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("command #{idx}: missing string field {key:?}"))
+}
+
+/// An optional i64 field: absent → None; present-and-integer → Some; present
+/// -but-not-integer → Err.
+fn opt_i64(obj: &serde_json::Map<String, Value>, key: &str, idx: usize) -> Result<Option<i64>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("command #{idx}: {key:?} must be an integer")),
+    }
+}
+
+/// Resolves a command's `scope` field (only create_memory/create_entity carry
+/// one): absent → the batch default; a string → parsed; non-string → Err.
+fn scope_of(
+    obj: &serde_json::Map<String, Value>,
+    default: Scope,
+    idx: usize,
+) -> Result<Scope, String> {
+    match obj.get("scope") {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) => {
+            resolve_scope(Some(s), default).map_err(|e| format!("command #{idx}: {e}"))
+        }
+        Some(_) => Err(format!("command #{idx}: \"scope\" must be a string")),
+    }
+}
+
+/// Resolves an id-bearing field to a ULID string: a literal ULID passes through
+/// verbatim; `#N` resolves to command N's produced id, requiring N < idx
+/// (backward-only) and a matching id kind (node vs edge).
+fn resolve_ref(
+    raw: &str,
+    expected: IdKind,
+    produced: &[Option<(String, IdKind)>],
+    field: &str,
+    idx: usize,
+) -> Result<String, String> {
+    let Some(rest) = raw.strip_prefix('#') else {
+        return Ok(raw.to_string());
+    };
+    let n: usize = rest
+        .parse()
+        .map_err(|_| format!("command #{idx}: {field} back-ref {raw:?} is not #<number>"))?;
+    if n >= idx {
+        return Err(format!(
+            "command #{idx}: {field} back-ref {raw:?} must point to an earlier command"
+        ));
+    }
+    match &produced[n] {
+        Some((id, kind)) if *kind == expected => Ok(id.clone()),
+        Some((_, kind)) => Err(format!(
+            "command #{idx}: {field} back-ref #{n} refers to a {} id but a {} id is required here",
+            kind_name(*kind),
+            kind_name(expected)
+        )),
+        None => Err(format!(
+            "command #{idx}: {field} back-ref #{n} refers to a command that produces no id"
+        )),
+    }
+}
+
+fn parse_node(s: &str, field: &str, idx: usize) -> Result<NodeId, String> {
+    NodeId::from_str(s).map_err(|e| format!("command #{idx}: invalid {field} node id {s:?}: {e}"))
+}
+
+fn parse_edge(s: &str, field: &str, idx: usize) -> Result<EdgeId, String> {
+    EdgeId::from_str(s).map_err(|e| format!("command #{idx}: invalid {field} edge id {s:?}: {e}"))
+}
+
+pub fn resolve_batch(
+    batch: &Value,
+    default_scope: Scope,
+) -> Result<(Vec<Op>, Vec<Option<String>>), String> {
+    let arr = batch
+        .as_array()
+        .ok_or_else(|| "batch must be a JSON array of command objects".to_string())?;
+    let mut produced: Vec<Option<(String, IdKind)>> = Vec::with_capacity(arr.len());
+    let mut ops: Vec<Op> = Vec::with_capacity(arr.len());
+
+    for (idx, cmd) in arr.iter().enumerate() {
+        let obj = cmd
+            .as_object()
+            .ok_or_else(|| format!("command #{idx}: expected a JSON object"))?;
+        let op_name = obj
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("command #{idx}: missing string field \"op\""))?;
+
+        match op_name {
+            "create_memory" => {
+                let content = req_str(obj, "content", idx)?;
+                let scope = scope_of(obj, default_scope, idx)?;
+                let props = merge_required_prop(
+                    MEMORY_CONTENT_PROP,
+                    PropValue::Str(content),
+                    obj.get("props"),
+                )
+                .map_err(|e| format!("command #{idx}: {e}"))?;
+                let id = NodeId::new();
+                produced.push(Some((id.to_string(), IdKind::Node)));
+                ops.push(Op::CreateNode {
+                    id,
+                    scope,
+                    label: MEMORY_LABEL.into(),
+                    props,
+                });
+            }
+            "create_entity" => {
+                let name = req_str(obj, "name", idx)?;
+                let scope = scope_of(obj, default_scope, idx)?;
+                let props = merge_required_prop(
+                    ENTITY_NAME_PROP,
+                    PropValue::Str(name),
+                    obj.get("props"),
+                )
+                .map_err(|e| format!("command #{idx}: {e}"))?;
+                let id = NodeId::new();
+                produced.push(Some((id.to_string(), IdKind::Node)));
+                ops.push(Op::CreateNode {
+                    id,
+                    scope,
+                    label: ENTITY_LABEL.into(),
+                    props,
+                });
+            }
+            "link" => {
+                let from_raw = req_str(obj, "from", idx)?;
+                let to_raw = req_str(obj, "to", idx)?;
+                let ty = req_str(obj, "type", idx)?;
+                let from = parse_node(
+                    &resolve_ref(&from_raw, IdKind::Node, &produced, "from", idx)?,
+                    "from",
+                    idx,
+                )?;
+                let to = parse_node(
+                    &resolve_ref(&to_raw, IdKind::Node, &produced, "to", idx)?,
+                    "to",
+                    idx,
+                )?;
+                let props = match obj.get("props") {
+                    Some(v) => json_to_props(v).map_err(|e| format!("command #{idx}: {e}"))?,
+                    None => Props::new(),
+                };
+                let valid_from = opt_i64(obj, "valid_from", idx)?;
+                let id = EdgeId::new();
+                produced.push(Some((id.to_string(), IdKind::Edge)));
+                ops.push(Op::CreateEdge {
+                    id,
+                    scope: default_scope,
+                    ty: ty.into(),
+                    from,
+                    to,
+                    props,
+                    valid_from,
+                });
+            }
+            "set_node_props" => {
+                let id_raw = req_str(obj, "id", idx)?;
+                let id = parse_node(
+                    &resolve_ref(&id_raw, IdKind::Node, &produced, "id", idx)?,
+                    "id",
+                    idx,
+                )?;
+                let props_val = obj
+                    .get("props")
+                    .ok_or_else(|| format!("command #{idx}: set_node_props requires \"props\""))?;
+                let props =
+                    json_to_prop_changes(props_val).map_err(|e| format!("command #{idx}: {e}"))?;
+                produced.push(None);
+                ops.push(Op::SetNodeProps { id, props });
+            }
+            "remove_node" => {
+                let id_raw = req_str(obj, "id", idx)?;
+                let id = parse_node(
+                    &resolve_ref(&id_raw, IdKind::Node, &produced, "id", idx)?,
+                    "id",
+                    idx,
+                )?;
+                produced.push(None);
+                ops.push(Op::RemoveNode { id });
+            }
+            "close_edge" => {
+                let id_raw = req_str(obj, "id", idx)?;
+                let id = parse_edge(
+                    &resolve_ref(&id_raw, IdKind::Edge, &produced, "id", idx)?,
+                    "id",
+                    idx,
+                )?;
+                let valid_to = opt_i64(obj, "valid_to", idx)?;
+                produced.push(None);
+                ops.push(Op::CloseEdge { id, valid_to });
+            }
+            "set_embedding" => {
+                let id_raw = req_str(obj, "id", idx)?;
+                let id = parse_node(
+                    &resolve_ref(&id_raw, IdKind::Node, &produced, "id", idx)?,
+                    "id",
+                    idx,
+                )?;
+                let model = req_str(obj, "model", idx)?;
+                let vector_val = obj
+                    .get("vector")
+                    .ok_or_else(|| format!("command #{idx}: set_embedding requires \"vector\""))?;
+                let vector =
+                    json_to_f32_vec(vector_val).map_err(|e| format!("command #{idx}: {e}"))?;
+                produced.push(None);
+                ops.push(Op::SetEmbedding { id, model, vector });
+            }
+            other => return Err(format!("command #{idx}: unknown op {other:?}")),
+        }
+    }
+
+    let produced_ids = produced.into_iter().map(|p| p.map(|(id, _)| id)).collect();
+    Ok((ops, produced_ids))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(ops: &[Op]) -> Vec<String> {
+        ops.iter()
+            .map(|op| match op {
+                Op::CreateNode { id, .. } => id.to_string(),
+                Op::CreateEdge { id, .. } => id.to_string(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_and_backref_link_resolves_to_generated_ids() {
+        let batch = serde_json::json!([
+            { "op": "create_entity", "name": "Ada" },
+            { "op": "create_memory", "content": "met Ada" },
+            { "op": "link", "from": "#1", "to": "#0", "type": "about" }
+        ]);
+        let (ops, produced) = resolve_batch(&batch, Scope::Shared).unwrap();
+        assert_eq!(ops.len(), 3);
+        let node_ids = ids(&ops);
+        // link's from == command #1's node id, to == command #0's node id.
+        match &ops[2] {
+            Op::CreateEdge { from, to, ty, .. } => {
+                assert_eq!(from.to_string(), node_ids[1]);
+                assert_eq!(to.to_string(), node_ids[0]);
+                assert_eq!(ty.as_str(), "about");
+            }
+            other => panic!("expected CreateEdge, got {other:?}"),
+        }
+        // produced ids: node, node, edge.
+        assert_eq!(produced[0].as_deref(), Some(node_ids[0].as_str()));
+        assert_eq!(produced[1].as_deref(), Some(node_ids[1].as_str()));
+        assert!(produced[2].is_some());
+    }
+
+    #[test]
+    fn set_node_props_null_removes_key() {
+        let batch = serde_json::json!([
+            { "op": "set_node_props", "id": "00000000000000000000000000",
+              "props": { "stale": null, "status": "x" } }
+        ]);
+        let (ops, produced) = resolve_batch(&batch, Scope::Shared).unwrap();
+        match &ops[0] {
+            Op::SetNodeProps { props, .. } => {
+                assert_eq!(props["stale"], None);
+                assert_eq!(props["status"], Some(PropValue::Str("x".into())));
+            }
+            other => panic!("expected SetNodeProps, got {other:?}"),
+        }
+        assert_eq!(produced[0], None);
+    }
+
+    #[test]
+    fn forward_reference_is_rejected() {
+        let batch = serde_json::json!([
+            { "op": "link", "from": "#1", "to": "#1", "type": "x" },
+            { "op": "create_entity", "name": "late" }
+        ]);
+        let err = resolve_batch(&batch, Scope::Shared).unwrap_err();
+        assert!(err.contains("earlier"), "got: {err}");
+    }
+
+    #[test]
+    fn node_slot_rejects_edge_backref() {
+        // command #0 is a link (produces an EDGE id); using #0 in link's
+        // `from` (a NODE slot) must be rejected on kind.
+        let batch = serde_json::json!([
+            { "op": "create_entity", "name": "a" },
+            { "op": "create_entity", "name": "b" },
+            { "op": "link", "from": "#0", "to": "#1", "type": "x" },
+            { "op": "link", "from": "#2", "to": "#0", "type": "y" }
+        ]);
+        let err = resolve_batch(&batch, Scope::Shared).unwrap_err();
+        assert!(err.contains("edge") && err.contains("node"), "got: {err}");
+    }
+
+    #[test]
+    fn close_edge_backref_to_in_batch_link_is_allowed() {
+        let batch = serde_json::json!([
+            { "op": "create_entity", "name": "a" },
+            { "op": "create_entity", "name": "b" },
+            { "op": "link", "from": "#0", "to": "#1", "type": "x" },
+            { "op": "close_edge", "id": "#2" }
+        ]);
+        let (ops, _) = resolve_batch(&batch, Scope::Shared).unwrap();
+        let edge_id = match &ops[2] {
+            Op::CreateEdge { id, .. } => id.to_string(),
+            _ => unreachable!(),
+        };
+        match &ops[3] {
+            Op::CloseEdge { id, valid_to } => {
+                assert_eq!(id.to_string(), edge_id);
+                assert_eq!(*valid_to, None); // applier fills "now"
+            }
+            other => panic!("expected CloseEdge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_op_names_the_index() {
+        let batch = serde_json::json!([{ "op": "nope" }]);
+        let err = resolve_batch(&batch, Scope::Shared).unwrap_err();
+        assert!(err.contains("#0") && err.contains("nope"), "got: {err}");
+    }
+
+    #[test]
+    fn non_array_batch_is_rejected() {
+        let err = resolve_batch(&serde_json::json!({"op": "x"}), Scope::Shared).unwrap_err();
+        assert!(err.contains("array"), "got: {err}");
+    }
+
+    #[test]
+    fn set_embedding_parses_vector() {
+        let batch = serde_json::json!([
+            { "op": "set_embedding", "id": "00000000000000000000000000",
+              "model": "m", "vector": [0.1, 0.2, 0.3] }
+        ]);
+        let (ops, _) = resolve_batch(&batch, Scope::Shared).unwrap();
+        match &ops[0] {
+            Op::SetEmbedding { model, vector, .. } => {
+                assert_eq!(model, "m");
+                assert_eq!(vector.len(), 3);
+            }
+            other => panic!("expected SetEmbedding, got {other:?}"),
+        }
+    }
+}

@@ -8,6 +8,9 @@
 //! ever panics: an unrepresentable value is always an `Err`, never an
 //! `unwrap`/`expect`.
 
+mod batch;
+pub use batch::resolve_batch;
+
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::str::FromStr;
