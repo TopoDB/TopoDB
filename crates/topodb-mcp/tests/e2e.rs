@@ -41,9 +41,10 @@ fn end_to_end_scenario_over_stdio() {
     );
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
-    assert!(
-        tools.len() >= 10,
-        "expected at least the 10 original tools, got: {tools:#?}"
+    assert_eq!(
+        tools.len(),
+        16,
+        "expected exactly 16 tools (db_info + 6 read + 9 write), got: {tools:#?}"
     );
     for name in [
         "db_info",
@@ -56,6 +57,12 @@ fn end_to_end_scenario_over_stdio() {
         "create_memory",
         "create_entity",
         "link",
+        "set_node_props",
+        "remove_node",
+        "close_edge",
+        "set_embedding",
+        "search_vectors",
+        "submit_batch",
     ] {
         let tool = tools
             .iter()

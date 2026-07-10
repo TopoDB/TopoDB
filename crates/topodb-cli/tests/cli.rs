@@ -688,3 +688,27 @@ fn submit_batch_from_stdin() {
     let res: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(res["ids"].as_array().unwrap().len(), 1);
 }
+
+/// `traverse --max-hops` is already wired on both surfaces; the engine clamps
+/// the budget to 1..=4. Confirm the CLI surfaces that contract: 0 and 5 are
+/// rejected (exit 2), 4 is accepted. No production code — this pins existing
+/// behavior so Plan 6 can mark the item done.
+#[test]
+fn traverse_max_hops_is_clamped_1_to_4() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let seed = topodb::NodeId::new().to_string();
+    let run = |hops: &str| {
+        bin()
+            .args(["--db", db.to_str().unwrap(), "--scope", &scope])
+            .args(["traverse", &seed, "--max-hops", hops])
+            .output()
+            .unwrap()
+    };
+    assert_eq!(run("0").status.code(), Some(2), "0 hops rejected");
+    assert_eq!(run("5").status.code(), Some(2), "5 hops rejected");
+    // 4 is in-range: a traverse from a nonexistent seed still succeeds with an
+    // empty subgraph (not an error).
+    assert!(run("4").status.success(), "4 hops accepted");
+}
