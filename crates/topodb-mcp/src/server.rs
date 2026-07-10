@@ -121,6 +121,44 @@ fn classify_topo_error(e: TopoError) -> ErrorData {
     }
 }
 
+/// Schema stand-in for a props map. The tool bodies keep taking a raw
+/// [`Value`] (so `convert::json_to_props` owns validation and its error
+/// messages), but the *advertised* schema must say "object" — see
+/// [`prop_value_schema`] and `tests/schema.rs` for why a typeless param is a
+/// wire-level bug.
+type PropsSchema = std::collections::BTreeMap<String, Value>;
+
+/// Schema stand-in for `submit_batch`'s command list: an array of objects.
+type CommandsSchema = Vec<Value>;
+
+/// The JSON Schema for a raw embedding: a non-empty array of numbers.
+///
+/// `minItems: 1` is the advertised half of an engine rule — `prevalidate_dims`
+/// rejects a zero-dim embedding (it would otherwise fix the `(model, scope)`
+/// slab's dim at 0 and block every real embedding under that key), and
+/// `search_vector` rejects an empty query vector.
+fn vector_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "type": "number" },
+        "minItems": 1,
+    })
+}
+
+/// The JSON Schema for `find_by_prop`'s `value`: the equality-indexable
+/// scalars. Floats are excluded deliberately — `IndexValue::of` rejects them.
+///
+/// Spelled out by hand because `serde_json::Value` renders as a *typeless*
+/// (permissive) schema. A client reading `{"description": "..."}` has nothing
+/// to encode against and may send `"1815"` where `1815` was meant — and since
+/// a string is itself a legal `value`, that mismatch would silently return
+/// zero rows rather than erroring. See `tests/schema.rs`.
+fn prop_value_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "integer", "boolean"],
+    })
+}
+
 /// Parses a tool-supplied ULID string into a [`NodeId`], mapping a parse
 /// failure to `invalid_params` (never a panic).
 fn parse_node_id(id: &str) -> Result<NodeId, ErrorData> {
@@ -172,6 +210,7 @@ struct FindByPropParams {
     prop: String,
     /// Value to match exactly: a string, integer, or boolean (floats are not
     /// equality-indexable).
+    #[schemars(schema_with = "prop_value_schema")]
     value: Value,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
@@ -194,8 +233,10 @@ fn default_search_k() -> usize {
 struct SearchMemoriesParams {
     /// Free-text query.
     query: String,
-    /// Maximum number of results to return.
+    /// Maximum number of results to return. Must be at least 1 — `search_text`
+    /// rejects `k == 0`.
     #[serde(default = "default_search_k")]
+    #[schemars(range(min = 1))]
     k: usize,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
@@ -246,8 +287,10 @@ fn default_max_hops() -> u8 {
 struct TraverseParams {
     /// ULID of the node to start the traversal from.
     seed_id: String,
-    /// Hop budget (1-4).
+    /// Hop budget (1-4). Out-of-range values are rejected, not clamped — the
+    /// bound is advertised so a client never sends one.
     #[serde(default = "default_max_hops")]
+    #[schemars(range(min = 1, max = 4))]
     max_hops: u8,
     /// Which adjacency to follow from each frontier node: `"out"`, `"in"`, or
     /// `"both"`.
@@ -322,6 +365,7 @@ struct CreateMemoryParams {
     /// `content` param above; a collision is rejected rather than silently
     /// overwritten.
     #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Scope to create the memory in: `"shared"` or a scope ULID. Defaults to
     /// the server's configured default scope when omitted.
@@ -338,6 +382,7 @@ struct CreateEntityParams {
     /// `name` param above; a collision is rejected rather than silently
     /// overwritten.
     #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Scope to create the entity in: `"shared"` or a scope ULID. Defaults to
     /// the server's configured default scope when omitted.
@@ -362,6 +407,7 @@ struct LinkParams {
     edge_type: String,
     /// Structured metadata on the edge (string/number/bool values).
     #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Milliseconds since Unix epoch the edge becomes valid from. Defaults to
     /// "now" (resolved by the engine at commit time) when omitted.
@@ -390,6 +436,7 @@ struct SetNodePropsParams {
     id: String,
     /// Property changes: a `null` value REMOVES the key, any other scalar sets
     /// it.
+    #[schemars(with = "PropsSchema")]
     props: Value,
 }
 
@@ -415,7 +462,9 @@ struct SetEmbeddingParams {
     id: String,
     /// Embedding model name (namespaces the vector).
     model: String,
-    /// Raw embedding as a JSON array of finite numbers (host-computed).
+    /// Raw embedding as a non-empty JSON array of finite numbers
+    /// (host-computed).
+    #[schemars(schema_with = "vector_schema")]
     vector: Value,
 }
 
@@ -427,10 +476,14 @@ fn default_vector_k() -> usize {
 struct SearchVectorsParams {
     /// Embedding model name to search within.
     model: String,
-    /// Query embedding as a JSON array of finite numbers (host-computed).
+    /// Query embedding as a non-empty JSON array of finite numbers
+    /// (host-computed).
+    #[schemars(schema_with = "vector_schema")]
     vector: Value,
-    /// Maximum number of results to return.
+    /// Maximum number of results to return. Must be at least 1 —
+    /// `search_vector` rejects `k == 0`.
     #[serde(default = "default_vector_k")]
+    #[schemars(range(min = 1))]
     k: usize,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
@@ -454,6 +507,7 @@ struct SubmitBatchParams {
     /// tool name (create_memory, create_entity, link, set_node_props,
     /// remove_node, close_edge, set_embedding); `#N` in an id field refers to
     /// the id produced by the Nth (earlier) command in the batch.
+    #[schemars(with = "CommandsSchema")]
     commands: Value,
 }
 
@@ -768,7 +822,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist or the vector's dimension conflicts with the model's existing vectors. Returns the committed seq."
+        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq."
     )]
     fn set_embedding(
         &self,
