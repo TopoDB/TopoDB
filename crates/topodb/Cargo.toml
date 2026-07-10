@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["graph", "embedded", "database", "temporal", "agent"]
 categories = ["database-implementations", "data-structures"]
 
+# Library crate, no binary — exclude from cargo-dist releases so a future
+# example/bench binary is never accidentally shipped.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 redb = "2"
 ulid = { version = "1", features = ["serde"] }

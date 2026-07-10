@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["graph", "json", "serde", "database", "agent"]
 categories = ["encoding", "database"]
 
+# Library crate, no binary — exclude from cargo-dist releases so a future
+# example/bench binary is never accidentally shipped.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 topodb = { path = "../topodb", version = "0.0.3" }
 serde = { version = "1", features = ["derive"] }
