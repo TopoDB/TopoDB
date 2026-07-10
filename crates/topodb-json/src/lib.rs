@@ -9,6 +9,7 @@
 //! `unwrap`/`expect`.
 
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use topodb::{
     EdgeRecord, IndexSpec, NodeRecord, PropIndex, PropValue, Props, Scope, ScopeId, ScopeSet,
@@ -152,6 +153,48 @@ pub fn json_to_props(v: &Value) -> Result<Props, String> {
         props.insert(k.clone(), json_to_prop_value(val)?);
     }
     Ok(props)
+}
+
+/// A JSON object of property changes for [`topodb::Op::SetNodeProps`]. A `null`
+/// value REMOVES the key (`None`); any other JSON scalar SETS it
+/// (`Some(PropValue)`, via [`json_to_prop_value`]). `Err` if `v` isn't a JSON
+/// object, or a non-null value isn't a representable scalar. The `null`-removes
+/// convention is what lets a caller delete a prop over the wire — plain
+/// [`json_to_props`] has no way to express removal.
+pub fn json_to_prop_changes(v: &Value) -> Result<BTreeMap<String, Option<PropValue>>, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "expected a JSON object for props".to_string())?;
+    let mut out = BTreeMap::new();
+    for (k, val) in obj {
+        let entry = match val {
+            Value::Null => None,
+            other => Some(json_to_prop_value(other)?),
+        };
+        out.insert(k.clone(), entry);
+    }
+    Ok(out)
+}
+
+/// A JSON array of finite numbers → `Vec<f32>`, for raw embeddings
+/// ([`topodb::Op::SetEmbedding`]) and vector-search queries. `Err` if `v` isn't
+/// a JSON array, or any element isn't a finite number. (The host computes
+/// embeddings; TopoDB stores/searches the raw floats.)
+pub fn json_to_f32_vec(v: &Value) -> Result<Vec<f32>, String> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "expected a JSON array of numbers".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, el) in arr.iter().enumerate() {
+        let f = el
+            .as_f64()
+            .ok_or_else(|| format!("vector element {i} is not a number: {el}"))?;
+        if !f.is_finite() {
+            return Err(format!("vector element {i} is not finite"));
+        }
+        out.push(f as f32);
+    }
+    Ok(out)
 }
 
 /// Builds the `Props` map for a write tool that has one required, caller-named
@@ -608,5 +651,45 @@ mod tests {
         assert!(set.contains(Scope::Id(id)));
         assert!(!set.contains(Scope::Shared));
         assert!(!set.contains(Scope::Id(ScopeId::new())));
+    }
+
+    // --- json_to_prop_changes: null removes, scalar sets ---
+
+    #[test]
+    fn prop_changes_null_is_remove_scalar_is_set() {
+        let j = serde_json::json!({ "status": "active", "stale": null, "n": 3 });
+        let changes = json_to_prop_changes(&j).unwrap();
+        assert_eq!(changes["status"], Some(PropValue::Str("active".into())));
+        assert_eq!(changes["stale"], None);
+        assert_eq!(changes["n"], Some(PropValue::Int(3)));
+    }
+
+    #[test]
+    fn prop_changes_rejects_non_object() {
+        assert!(json_to_prop_changes(&serde_json::json!([1, 2])).is_err());
+    }
+
+    #[test]
+    fn prop_changes_propagates_unsupported_value() {
+        // A nested array is not a representable scalar (and is not null).
+        assert!(json_to_prop_changes(&serde_json::json!({ "x": [1, 2] })).is_err());
+    }
+
+    // --- json_to_f32_vec ---
+
+    #[test]
+    fn f32_vec_parses_numbers() {
+        let j = serde_json::json!([0.0, 1.5, -2, 3]);
+        assert_eq!(json_to_f32_vec(&j).unwrap(), vec![0.0f32, 1.5, -2.0, 3.0]);
+    }
+
+    #[test]
+    fn f32_vec_rejects_non_array() {
+        assert!(json_to_f32_vec(&serde_json::json!({"a": 1})).is_err());
+    }
+
+    #[test]
+    fn f32_vec_rejects_non_number_element() {
+        assert!(json_to_f32_vec(&serde_json::json!([1.0, "x"])).is_err());
     }
 }
