@@ -1,6 +1,7 @@
 mod cli;
 mod output;
 
+use std::io::Read;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -101,6 +102,7 @@ fn main() {
             k,
             candidate,
         } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
+        Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
     }
 }
 
@@ -498,4 +500,38 @@ fn search_vector(
         Err(e) => output::fail("internal", &e, 1),
     };
     output::ok(&serde_json::Value::Array(out), pretty);
+}
+
+fn submit(db: &Db, default_scope: Scope, input: &str, pretty: bool) -> ! {
+    let raw = if input == "-" {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            output::fail("internal", &format!("reading stdin: {e}"), 1);
+        }
+        buf
+    } else {
+        match std::fs::read_to_string(input) {
+            Ok(s) => s,
+            Err(e) => output::fail("rejected", &format!("reading {input:?}: {e}"), 2),
+        }
+    };
+    let batch: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => output::fail("rejected", &format!("parsing batch as JSON: {e}"), 2),
+    };
+    let (ops, ids) = match topodb_json::resolve_batch(&batch, default_scope) {
+        Ok(pair) => pair,
+        Err(e) => output::fail("rejected", &e, 2),
+    };
+    if let Err(e) = db.submit(ops) {
+        output::fail_engine(&e);
+    }
+    let ids: Vec<serde_json::Value> = ids
+        .into_iter()
+        .map(|o| {
+            o.map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    output::ok(&serde_json::json!({ "ids": ids }), pretty);
 }

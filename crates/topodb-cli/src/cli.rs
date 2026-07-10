@@ -190,6 +190,16 @@ pub enum Command {
         #[arg(long = "candidate")]
         candidate: Vec<String>,
     },
+    /// Submit a batch of high-level commands (a JSON array) atomically. Each
+    /// command's `op` matches an MCP tool name; `#N` in an id field refers to
+    /// the id produced by the Nth (earlier) command. Reads from the given file,
+    /// or from stdin when the path is `-` or omitted. Prints `{"ids":[...]}`
+    /// (null for commands that produce no id). All-or-nothing.
+    Submit {
+        /// Path to a JSON command array, or `-`/omitted for stdin.
+        #[arg(default_value = "-")]
+        input: String,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase

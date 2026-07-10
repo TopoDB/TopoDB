@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::Command;
 
 fn bin() -> Command {
@@ -580,4 +581,110 @@ fn search_vector_empty_vector_is_rejected_exit_2() {
         serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
         "rejected"
     );
+}
+
+#[test]
+fn submit_batch_atomic_with_backrefs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let batch = dir.path().join("batch.json");
+    std::fs::write(
+        &batch,
+        r##"[
+          {"op":"create_entity","name":"Ada"},
+          {"op":"create_memory","content":"met Ada"},
+          {"op":"link","from":"#1","to":"#0","type":"about"}
+        ]"##,
+    )
+    .unwrap();
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "submit"])
+        .arg(&batch)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let res: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids = res["ids"].as_array().expect("ids array");
+    assert_eq!(ids.len(), 3);
+    assert!(ids[0].is_string() && ids[1].is_string() && ids[2].is_string());
+    // The entity is findable (all three committed).
+    let found = bin()
+        .args(["--db", db.to_str().unwrap(), "--scope", &scope])
+        .args([
+            "find", "--label", "Entity", "--prop", "name", "--value", "Ada",
+        ])
+        .output()
+        .unwrap();
+    let arr: serde_json::Value = serde_json::from_slice(&found.stdout).unwrap();
+    assert_eq!(arr.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn submit_batch_bad_backref_is_rejected_and_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let batch = dir.path().join("bad.json");
+    // #5 doesn't exist -> whole batch rejected, nothing committed.
+    std::fs::write(
+        &batch,
+        r##"[
+          {"op":"create_entity","name":"Nope"},
+          {"op":"link","from":"#5","to":"#0","type":"x"}
+        ]"##,
+    )
+    .unwrap();
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "submit"])
+        .arg(&batch)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "rejected");
+    // Nothing committed: the entity from command #0 must NOT be findable.
+    let found = bin()
+        .args(["--db", db.to_str().unwrap(), "--scope", &scope])
+        .args([
+            "find", "--label", "Entity", "--prop", "name", "--value", "Nope",
+        ])
+        .output()
+        .unwrap();
+    let arr: serde_json::Value = serde_json::from_slice(&found.stdout).unwrap();
+    assert_eq!(arr.as_array().unwrap().len(), 0, "batch must be atomic");
+}
+
+#[test]
+fn submit_batch_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let mut child = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "submit",
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"[{"op":"create_entity","name":"Stdin"}]"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let res: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(res["ids"].as_array().unwrap().len(), 1);
 }
