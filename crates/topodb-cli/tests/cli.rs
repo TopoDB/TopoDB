@@ -348,17 +348,32 @@ fn set_props_updates_and_removes_keys() {
             out.status,
         )
     };
-    let id = full(&["create-entity", "--name", "ada", "--props", r#"{"stale":"yes"}"#]).0["id"]
+    let id = full(&[
+        "create-entity",
+        "--name",
+        "ada",
+        "--props",
+        r#"{"stale":"yes"}"#,
+    ])
+    .0["id"]
         .as_str()
         .unwrap()
         .to_string();
     // set one key, remove another (null).
-    let (res, s) = full(&["set-props", &id, "--props", r#"{"role":"pioneer","stale":null}"#]);
+    let (res, s) = full(&[
+        "set-props",
+        &id,
+        "--props",
+        r#"{"role":"pioneer","stale":null}"#,
+    ]);
     assert!(s.success(), "set-props should succeed");
     assert!(res["seq"].as_u64().is_some());
     let node = full(&["get", &id]).0;
     assert_eq!(node["node"]["props"]["role"], serde_json::json!("pioneer"));
-    assert!(node["node"]["props"].get("stale").is_none(), "stale should be removed");
+    assert!(
+        node["node"]["props"].get("stale").is_none(),
+        "stale should be removed"
+    );
 }
 
 #[test]
@@ -394,7 +409,10 @@ fn remove_node_deletes_and_cascades() {
             out.status,
         )
     };
-    let id = full(&["create-entity", "--name", "gone"]).0["id"].as_str().unwrap().to_string();
+    let id = full(&["create-entity", "--name", "gone"]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (res, s) = full(&["remove-node", &id]);
     assert!(s.success());
     assert!(res["seq"].as_u64().is_some());
@@ -417,8 +435,14 @@ fn close_edge_closes_an_open_edge() {
             out.status,
         )
     };
-    let a = full(&["create-entity", "--name", "a"]).0["id"].as_str().unwrap().to_string();
-    let b = full(&["create-entity", "--name", "b"]).0["id"].as_str().unwrap().to_string();
+    let a = full(&["create-entity", "--name", "a"]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = full(&["create-entity", "--name", "b"]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let e = full(&["link", "--from", &a, "--to", &b, "--type", "x"]).0["id"]
         .as_str()
         .unwrap()
@@ -465,7 +489,14 @@ fn set_embedding_attaches_a_vector() {
         .as_str()
         .unwrap()
         .to_string();
-    let (res, s) = full(&["set-embedding", &id, "--model", "test", "--vector", "[0.1,0.2,0.3]"]);
+    let (res, s) = full(&[
+        "set-embedding",
+        &id,
+        "--model",
+        "test",
+        "--vector",
+        "[0.1,0.2,0.3]",
+    ]);
     assert!(s.success(), "set-embedding should succeed");
     assert!(res["seq"].as_u64().is_some());
 }
@@ -503,10 +534,28 @@ fn search_vector_ranks_by_cosine() {
             out.status,
         )
     };
-    let m = full(&["create-memory", "--content", "near"]).0["id"].as_str().unwrap().to_string();
-    full(&["set-embedding", &m, "--model", "test", "--vector", "[1.0,0.0]"]);
+    let m = full(&["create-memory", "--content", "near"]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    full(&[
+        "set-embedding",
+        &m,
+        "--model",
+        "test",
+        "--vector",
+        "[1.0,0.0]",
+    ]);
     // Query aligned with M's vector: M must come back.
-    let (hits, s) = full(&["search-vector", "--model", "test", "--vector", "[1.0,0.0]", "--k", "5"]);
+    let (hits, s) = full(&[
+        "search-vector",
+        "--model",
+        "test",
+        "--vector",
+        "[1.0,0.0]",
+        "--k",
+        "5",
+    ]);
     assert!(s.success(), "search-vector should succeed");
     let arr = hits.as_array().expect("bare array of hits");
     assert!(

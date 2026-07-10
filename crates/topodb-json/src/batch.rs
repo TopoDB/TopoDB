@@ -35,7 +35,11 @@ fn req_str(obj: &serde_json::Map<String, Value>, key: &str, idx: usize) -> Resul
 
 /// An optional i64 field: absent → None; present-and-integer → Some; present
 /// -but-not-integer → Err.
-fn opt_i64(obj: &serde_json::Map<String, Value>, key: &str, idx: usize) -> Result<Option<i64>, String> {
+fn opt_i64(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    idx: usize,
+) -> Result<Option<i64>, String> {
     match obj.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v
@@ -144,12 +148,9 @@ pub fn resolve_batch(
             "create_entity" => {
                 let name = req_str(obj, "name", idx)?;
                 let scope = scope_of(obj, default_scope, idx)?;
-                let props = merge_required_prop(
-                    ENTITY_NAME_PROP,
-                    PropValue::Str(name),
-                    obj.get("props"),
-                )
-                .map_err(|e| format!("command #{idx}: {e}"))?;
+                let props =
+                    merge_required_prop(ENTITY_NAME_PROP, PropValue::Str(name), obj.get("props"))
+                        .map_err(|e| format!("command #{idx}: {e}"))?;
                 let id = NodeId::new();
                 produced.push(Some((id.to_string(), IdKind::Node)));
                 ops.push(Op::CreateNode {

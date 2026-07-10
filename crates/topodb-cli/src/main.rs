@@ -467,7 +467,9 @@ fn search_vector(
         for c in &candidate {
             match NodeId::from_str(c) {
                 Ok(id) => ids.push(id),
-                Err(e) => output::fail("rejected", &format!("invalid --candidate id {c:?}: {e}"), 2),
+                Err(e) => {
+                    output::fail("rejected", &format!("invalid --candidate id {c:?}: {e}"), 2)
+                }
             }
         }
         Some(ids)
@@ -487,7 +489,8 @@ fn search_vector(
     let out: Result<Vec<serde_json::Value>, String> = hits
         .iter()
         .map(|(n, score)| {
-            topodb_json::node_to_json(n).map(|node| serde_json::json!({ "node": node, "score": score }))
+            topodb_json::node_to_json(n)
+                .map(|node| serde_json::json!({ "node": node, "score": score }))
         })
         .collect();
     let out = match out {
