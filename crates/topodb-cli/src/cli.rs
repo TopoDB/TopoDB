@@ -148,6 +148,16 @@ pub enum Command {
         /// Node id (ULID).
         id: String,
     },
+    /// Close an open edge, stamping its `valid_to`. `--valid-to` defaults to
+    /// "now" (applier-resolved) when omitted. Rejected (exit 2) if the edge
+    /// doesn't exist.
+    CloseEdge {
+        /// Edge id (ULID).
+        id: String,
+        /// Unix ms the edge becomes valid until; defaults to "now".
+        #[arg(long = "valid-to")]
+        valid_to: Option<i64>,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase

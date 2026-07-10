@@ -89,6 +89,7 @@ fn main() {
         Command::Compact { keep_from } => compact(&db, keep_from, cli.pretty),
         Command::SetProps { id, props } => set_props(&db, &id, &props, cli.pretty),
         Command::RemoveNode { id } => remove_node(&db, &id, cli.pretty),
+        Command::CloseEdge { id, valid_to } => close_edge(&db, &id, valid_to, cli.pretty),
     }
 }
 
@@ -390,6 +391,18 @@ fn remove_node(db: &Db, id: &str, pretty: bool) -> ! {
         Err(e) => output::fail("rejected", &format!("invalid id {id:?}: {e}"), 2),
     };
     let applied = match db.submit(vec![Op::RemoveNode { id }]) {
+        Ok(a) => a,
+        Err(e) => output::fail_engine(&e),
+    };
+    output::ok(&serde_json::json!({ "seq": applied.last_seq }), pretty);
+}
+
+fn close_edge(db: &Db, id: &str, valid_to: Option<i64>, pretty: bool) -> ! {
+    let id = match EdgeId::from_str(id) {
+        Ok(id) => id,
+        Err(e) => output::fail("rejected", &format!("invalid edge id {id:?}: {e}"), 2),
+    };
+    let applied = match db.submit(vec![Op::CloseEdge { id, valid_to }]) {
         Ok(a) => a,
         Err(e) => output::fail_engine(&e),
     };

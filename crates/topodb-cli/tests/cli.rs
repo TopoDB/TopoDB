@@ -401,3 +401,47 @@ fn remove_node_deletes_and_cascades() {
     // Node is gone.
     assert_eq!(full(&["get", &id]).0["found"], serde_json::json!(false));
 }
+
+#[test]
+fn close_edge_closes_an_open_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let full = |a: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope];
+        v.extend_from_slice(a);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status,
+        )
+    };
+    let a = full(&["create-entity", "--name", "a"]).0["id"].as_str().unwrap().to_string();
+    let b = full(&["create-entity", "--name", "b"]).0["id"].as_str().unwrap().to_string();
+    let e = full(&["link", "--from", &a, "--to", &b, "--type", "x"]).0["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (res, s) = full(&["close-edge", &e, "--valid-to", "1000"]);
+    assert!(s.success(), "close-edge should succeed");
+    assert!(res["seq"].as_u64().is_some());
+}
+
+#[test]
+fn close_edge_on_missing_edge_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let ghost = topodb::EdgeId::new().to_string();
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["close-edge", &ghost])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stderr).unwrap()["error"]["kind"],
+        "rejected"
+    );
+}
