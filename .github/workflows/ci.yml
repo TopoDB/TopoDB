@@ -20,6 +20,22 @@ jobs:
       - run: cargo test --workspace
       - run: cargo bench --no-run
         if: matrix.os == 'ubuntu-latest'
+  node-test:
+    # Guards the npm distribution layer (npm/ launcher, scripts/ generator).
+    # Runs on Windows too because the generator shells out to `npm pack` and the
+    # Windows npm.cmd/execSync path is exactly what broke during development.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node --test npm/topodb-mcp/test/launcher.test.js
+      - run: node --test scripts/test/build-npm-packages.test.mjs
   msrv:
     runs-on: ubuntu-latest
     steps:
