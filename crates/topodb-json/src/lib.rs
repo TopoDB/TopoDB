@@ -189,10 +189,11 @@ pub fn json_to_f32_vec(v: &Value) -> Result<Vec<f32>, String> {
         let f = el
             .as_f64()
             .ok_or_else(|| format!("vector element {i} is not a number: {el}"))?;
+        let f = f as f32;
         if !f.is_finite() {
             return Err(format!("vector element {i} is not finite"));
         }
-        out.push(f as f32);
+        out.push(f);
     }
     Ok(out)
 }
@@ -691,5 +692,11 @@ mod tests {
     #[test]
     fn f32_vec_rejects_non_number_element() {
         assert!(json_to_f32_vec(&serde_json::json!([1.0, "x"])).is_err());
+    }
+
+    #[test]
+    fn f32_vec_rejects_overflow_to_infinity() {
+        // Finite as f64 but overflows f32 -> must be rejected, not silently Inf.
+        assert!(json_to_f32_vec(&serde_json::json!([1e40])).is_err());
     }
 }
