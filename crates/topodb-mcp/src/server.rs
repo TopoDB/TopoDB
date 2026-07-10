@@ -100,6 +100,19 @@ impl TopoServer {
             other => ErrorData::internal_error(other.to_string(), None),
         })
     }
+
+    /// Like [`submit_write`], but returns the batch's `last_seq` for tools that
+    /// report the committed sequence number (set_node_props, remove_node,
+    /// close_edge, set_embedding). Same error classification as `submit_write`.
+    fn submit_seq(&self, ops: Vec<Op>) -> Result<u64, ErrorData> {
+        self.db
+            .submit(ops)
+            .map(|a| a.last_seq)
+            .map_err(|e| match e {
+                TopoError::Rejected(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })
+    }
 }
 
 /// Parses a tool-supplied ULID string into a [`NodeId`], mapping a parse
@@ -353,6 +366,30 @@ struct LinkParams {
 #[derive(Debug, Serialize, JsonSchema)]
 struct LinkResult {
     /// ULID of the newly created edge.
+    id: String,
+}
+
+/// The `{ "seq": <last_seq> }` result shared by the mutating tools that don't
+/// create a node/edge (set_node_props, remove_node, close_edge, set_embedding).
+#[derive(Debug, Serialize, JsonSchema)]
+struct SeqResult {
+    /// The committed op-log sequence number of this write (anchor for
+    /// get_changes).
+    seq: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetNodePropsParams {
+    /// ULID of the node to update.
+    id: String,
+    /// Property changes: a `null` value REMOVES the key, any other scalar sets
+    /// it.
+    props: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RemoveNodeParams {
+    /// ULID of the node to hard-delete (its incident edges cascade away).
     id: String,
 }
 
@@ -613,6 +650,32 @@ impl TopoServer {
             valid_from: p.valid_from,
         }])?;
         Ok(Json(LinkResult { id: id.to_string() }))
+    }
+
+    #[tool(
+        description = "Set or remove properties on an existing node. In `props`, a null value REMOVES that key; any other scalar sets it. Errors if the node doesn't exist. Returns the committed seq."
+    )]
+    fn set_node_props(
+        &self,
+        Parameters(p): Parameters<SetNodePropsParams>,
+    ) -> Result<Json<SeqResult>, ErrorData> {
+        let id = parse_node_id(&p.id)?;
+        let props = convert::json_to_prop_changes(&p.props)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let seq = self.submit_seq(vec![Op::SetNodeProps { id, props }])?;
+        Ok(Json(SeqResult { seq }))
+    }
+
+    #[tool(
+        description = "Hard-delete a node and cascade-remove its incident edges. Call this to forget something entirely. Errors if the node doesn't exist. Returns the committed seq."
+    )]
+    fn remove_node(
+        &self,
+        Parameters(p): Parameters<RemoveNodeParams>,
+    ) -> Result<Json<SeqResult>, ErrorData> {
+        let id = parse_node_id(&p.id)?;
+        let seq = self.submit_seq(vec![Op::RemoveNode { id }])?;
+        Ok(Json(SeqResult { seq }))
     }
 }
 
