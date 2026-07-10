@@ -448,6 +448,23 @@ struct SearchVectorsResult {
     hits: Vec<SearchHit>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SubmitBatchParams {
+    /// A JSON array of high-level commands. Each command's `op` matches an MCP
+    /// tool name (create_memory, create_entity, link, set_node_props,
+    /// remove_node, close_edge, set_embedding); `#N` in an id field refers to
+    /// the id produced by the Nth (earlier) command in the batch.
+    commands: Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct SubmitBatchResult {
+    /// One entry per command, in order: the produced node/edge ULID, or null
+    /// for commands that create nothing (set_node_props, remove_node,
+    /// close_edge, set_embedding).
+    ids: Vec<Option<String>>,
+}
+
 #[tool_router]
 impl TopoServer {
     #[tool(
@@ -813,6 +830,19 @@ impl TopoServer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(SearchVectorsResult { hits }))
+    }
+
+    #[tool(
+        description = "Submit a batch of high-level commands (an array) atomically — all commit or none. Each command's op matches a tool name; `#N` in an id field references the id produced by the Nth earlier command (e.g. create a memory and entity, then link them). Returns the produced ids in order (null for commands that create nothing)."
+    )]
+    fn submit_batch(
+        &self,
+        Parameters(p): Parameters<SubmitBatchParams>,
+    ) -> Result<Json<SubmitBatchResult>, ErrorData> {
+        let (ops, ids) = convert::resolve_batch(&p.commands, self.default_scope)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        self.submit_write(ops)?;
+        Ok(Json(SubmitBatchResult { ids }))
     }
 }
 

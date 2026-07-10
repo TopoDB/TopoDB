@@ -204,3 +204,52 @@ fn search_vectors_rejects_non_finite_vector() {
     );
     expect_tool_error(&resp);
 }
+
+#[test]
+fn submit_batch_atomic_with_backrefs() {
+    let (_dir, mut server) = fresh_server();
+    let res = server.call_tool_ok(
+        "submit_batch",
+        serde_json::json!({ "commands": [
+            { "op": "create_entity", "name": "Ada" },
+            { "op": "create_memory", "content": "met Ada" },
+            { "op": "link", "from": "#1", "to": "#0", "type": "about" }
+        ] }),
+        DEFAULT_TIMEOUT,
+    );
+    let ids = res["ids"].as_array().expect("ids array");
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|v| v.is_string()));
+    // All committed: the entity is findable.
+    let found = server.call_tool_ok(
+        "find_by_prop",
+        serde_json::json!({ "label": "Entity", "prop": "name", "value": "Ada" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(found["nodes"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn submit_batch_bad_backref_is_tool_error_and_atomic() {
+    let (_dir, mut server) = fresh_server();
+    let resp = server.call_tool(
+        "submit_batch",
+        serde_json::json!({ "commands": [
+            { "op": "create_entity", "name": "Nope" },
+            { "op": "link", "from": "#5", "to": "#0", "type": "x" }
+        ] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+    // Nothing committed.
+    let found = server.call_tool_ok(
+        "find_by_prop",
+        serde_json::json!({ "label": "Entity", "prop": "name", "value": "Nope" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        found["nodes"].as_array().unwrap().len(),
+        0,
+        "batch must be atomic"
+    );
+}
