@@ -151,3 +151,56 @@ fn set_embedding_rejects_non_finite_vector() {
     );
     expect_tool_error(&resp);
 }
+
+#[test]
+fn search_vectors_ranks_by_cosine() {
+    let (_dir, mut server) = fresh_server();
+    let m = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "near" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.call_tool_ok(
+        "set_embedding",
+        serde_json::json!({ "id": m, "model": "test", "vector": [1.0, 0.0] }),
+        DEFAULT_TIMEOUT,
+    );
+    let res = server.call_tool_ok(
+        "search_vectors",
+        serde_json::json!({ "model": "test", "vector": [1.0, 0.0], "k": 5 }),
+        DEFAULT_TIMEOUT,
+    );
+    let hits = res["hits"].as_array().expect("hits array");
+    assert!(
+        hits.iter().any(|h| h["node"]["id"] == serde_json::json!(m)),
+        "M should rank: {res}"
+    );
+    assert!(hits[0]["score"].as_f64().is_some());
+}
+
+#[test]
+fn search_vectors_empty_vector_is_tool_error() {
+    let (_dir, mut server) = fresh_server();
+    let resp = server.call_tool(
+        "search_vectors",
+        serde_json::json!({ "model": "test", "vector": [] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}
+
+#[test]
+fn search_vectors_rejects_non_finite_vector() {
+    let (_dir, mut server) = fresh_server();
+    // 1e300 is a finite f64 but overflows to f32::INFINITY on cast,
+    // deterministically tripping json_to_f32_vec's !is_finite() check.
+    let resp = server.call_tool(
+        "search_vectors",
+        serde_json::json!({ "model": "test", "vector": [1e300, 0.0] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}

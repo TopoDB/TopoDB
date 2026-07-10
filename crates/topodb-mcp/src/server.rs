@@ -21,7 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeSet, TopoError, TraversalQuery,
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeSet, TopoError,
+    TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
@@ -418,6 +419,35 @@ struct SetEmbeddingParams {
     vector: Value,
 }
 
+fn default_vector_k() -> usize {
+    10
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SearchVectorsParams {
+    /// Embedding model name to search within.
+    model: String,
+    /// Query embedding as a JSON array of finite numbers (host-computed).
+    vector: Value,
+    /// Maximum number of results to return.
+    #[serde(default = "default_vector_k")]
+    k: usize,
+    /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
+    /// server's configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Restrict scoring to these node ULIDs (e.g. a traversal result). Omit to
+    /// score the whole scope.
+    #[serde(default)]
+    candidates: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct SearchVectorsResult {
+    /// Up to `k` hits, ranked by descending cosine similarity.
+    hits: Vec<SearchHit>,
+}
+
 #[tool_router]
 impl TopoServer {
     #[tool(
@@ -736,6 +766,53 @@ impl TopoServer {
             vector,
         }])?;
         Ok(Json(SeqResult { seq }))
+    }
+
+    #[tool(
+        description = "Cosine vector search under one model. The query is a raw embedding array (host-computed); TopoDB ranks stored embeddings by cosine similarity. Optionally restrict scoring to a candidate node set (for hybrid recall after a traverse). Errors if k is 0 or the vector is empty."
+    )]
+    fn search_vectors(
+        &self,
+        Parameters(p): Parameters<SearchVectorsParams>,
+    ) -> Result<Json<SearchVectorsResult>, ErrorData> {
+        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let vector =
+            convert::json_to_f32_vec(&p.vector).map_err(|e| ErrorData::invalid_params(e, None))?;
+        let candidates = match p.candidates {
+            None => None,
+            Some(cs) => {
+                let mut ids = Vec::with_capacity(cs.len());
+                for c in &cs {
+                    ids.push(parse_node_id(c)?);
+                }
+                Some(ids)
+            }
+        };
+        let query = VectorQuery {
+            scopes,
+            model: p.model,
+            vector,
+            k: p.k,
+            candidates,
+        };
+        // search_vector opens read locks over slabs: input-validation Rejected
+        // (k == 0, empty vector) -> invalid_params; poisoned-lock Closed etc.
+        // -> internal_error (same split as search_memories).
+        let hits = self.db.search_vector(&query).map_err(|e| match e {
+            TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })?;
+        let hits = hits
+            .iter()
+            .map(|(n, score)| {
+                convert::node_to_json(n).map(|node| SearchHit {
+                    node,
+                    score: *score,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(Json(SearchVectorsResult { hits }))
     }
 }
 
