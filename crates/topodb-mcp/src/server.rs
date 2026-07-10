@@ -414,8 +414,8 @@ struct SetEmbeddingParams {
     id: String,
     /// Embedding model name (namespaces the vector).
     model: String,
-    /// Raw embedding as an array of finite numbers (host-computed).
-    vector: Vec<f32>,
+    /// Raw embedding as a JSON array of finite numbers (host-computed).
+    vector: Value,
 }
 
 #[tool_router]
@@ -728,10 +728,12 @@ impl TopoServer {
         Parameters(p): Parameters<SetEmbeddingParams>,
     ) -> Result<Json<SeqResult>, ErrorData> {
         let id = parse_node_id(&p.id)?;
+        let vector =
+            convert::json_to_f32_vec(&p.vector).map_err(|e| ErrorData::invalid_params(e, None))?;
         let seq = self.submit_seq(vec![Op::SetEmbedding {
             id,
             model: p.model,
-            vector: p.vector,
+            vector,
         }])?;
         Ok(Json(SeqResult { seq }))
     }

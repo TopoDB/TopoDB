@@ -130,3 +130,24 @@ fn close_edge_missing_is_tool_error() {
     );
     expect_tool_error(&resp);
 }
+
+#[test]
+fn set_embedding_rejects_non_finite_vector() {
+    let (_dir, mut server) = fresh_server();
+    let m = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "x" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 1e300 is a finite f64 but overflows to f32::INFINITY on cast,
+    // deterministically tripping json_to_f32_vec's !is_finite() check.
+    let resp = server.call_tool(
+        "set_embedding",
+        serde_json::json!({ "id": m, "model": "test", "vector": [1e300, 0.0] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}
