@@ -207,7 +207,7 @@ struct SearchMemoriesParams {
 struct SearchHit {
     /// The matched node (id/scope/label/props).
     node: Value,
-    /// BM25 relevance score (higher is more relevant).
+    /// Relevance score — BM25 for text search, cosine similarity for vector search (higher is more relevant).
     score: f32,
 }
 
@@ -812,13 +812,7 @@ impl TopoServer {
             k: p.k,
             candidates,
         };
-        // search_vector opens read locks over slabs: input-validation Rejected
-        // (k == 0, empty vector) -> invalid_params; poisoned-lock Closed etc.
-        // -> internal_error (same split as search_memories).
-        let hits = self.db.search_vector(&query).map_err(|e| match e {
-            TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })?;
+        let hits = self.db.search_vector(&query).map_err(classify_topo_error)?;
         let hits = hits
             .iter()
             .map(|(n, score)| {
@@ -833,7 +827,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Submit a batch of high-level commands (an array) atomically — all commit or none. Each command's op matches a tool name; `#N` in an id field references the id produced by the Nth earlier command (e.g. create a memory and entity, then link them). Returns the produced ids in order (null for commands that create nothing)."
+        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; link { from, to, type, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
     )]
     fn submit_batch(
         &self,

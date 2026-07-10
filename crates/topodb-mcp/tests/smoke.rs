@@ -28,8 +28,7 @@ fn handshake_and_tools_list_exposes_all_ten_tools() {
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
 
-    // Plan 6 is complete: db_info + 6 original read tools (Task 4) + 3
-    // original write tools (Task 5) + 6 Plan-6 tools = 16 total.
+    // Plan 6 is complete: db_info + 7 read tools + 8 write tools = 16 total.
     assert_eq!(
         tools.len(),
         16,

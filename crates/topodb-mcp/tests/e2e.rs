@@ -44,7 +44,7 @@ fn end_to_end_scenario_over_stdio() {
     assert_eq!(
         tools.len(),
         16,
-        "expected exactly 16 tools (db_info + 6 read + 9 write), got: {tools:#?}"
+        "expected exactly 16 tools (db_info + 7 read + 8 write), got: {tools:#?}"
     );
     for name in [
         "db_info",

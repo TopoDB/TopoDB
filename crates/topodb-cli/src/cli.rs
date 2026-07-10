@@ -191,10 +191,20 @@ pub enum Command {
         candidate: Vec<String>,
     },
     /// Submit a batch of high-level commands (a JSON array) atomically. Each
-    /// command's `op` matches an MCP tool name; `#N` in an id field refers to
-    /// the id produced by the Nth (earlier) command. Reads from the given file,
-    /// or from stdin when the path is `-` or omitted. Prints `{"ids":[...]}`
-    /// (null for commands that produce no id). All-or-nothing.
+    /// command's `op` matches an MCP tool name, but field names are the batch
+    /// DSL's own (not always identical to the tool's param names); `#N` in an
+    /// id field refers to the id produced by the Nth (earlier) command. Reads
+    /// from the given file, or from stdin when the path is `-` or omitted.
+    /// Prints `{"ids":[...]}` (null for commands that produce no id).
+    /// All-or-nothing.
+    ///
+    /// Per-op fields: create_memory { content, scope?, props? };
+    /// create_entity { name, scope?, props? };
+    /// link { from, to, type, props?, valid_from? } — note link uses
+    /// from/to/type, NOT the link tool's from_id/to_id/edge_type;
+    /// set_node_props { id, props } (props value null removes that key);
+    /// remove_node { id }; close_edge { id, valid_to? };
+    /// set_embedding { id, model, vector }.
     Submit {
         /// Path to a JSON command array, or `-`/omitted for stdin.
         #[arg(default_value = "-")]
