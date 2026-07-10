@@ -7,7 +7,11 @@ pub enum TopoError {
     Storage(Box<redb::Error>),
     #[error("encoding error: {0}")]
     Encoding(String),
-    #[error("batch rejected: {0}")]
+    /// An invalid request, rejected before anything was committed. Raised by
+    /// both write paths (a bad op in a batch) and read paths (e.g. querying a
+    /// prop that isn't equality-indexed), so the message stays neutral — the
+    /// inner string says what was actually wrong.
+    #[error("rejected: {0}")]
     Rejected(String),
     #[error("op log compacted; oldest retained seq is {oldest}")]
     Compacted { oldest: u64 },

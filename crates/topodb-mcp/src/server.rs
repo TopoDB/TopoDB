@@ -121,6 +121,33 @@ fn classify_topo_error(e: TopoError) -> ErrorData {
     }
 }
 
+/// Schema stand-in for a props map. The tool bodies keep taking a raw
+/// [`Value`] (so `convert::json_to_props` owns validation and its error
+/// messages), but the *advertised* schema must say "object" — see
+/// [`prop_value_schema`] and `tests/schema.rs` for why a typeless param is a
+/// wire-level bug.
+type PropsSchema = std::collections::BTreeMap<String, Value>;
+
+/// Schema stand-in for a raw embedding: an array of numbers.
+type VectorSchema = Vec<f64>;
+
+/// Schema stand-in for `submit_batch`'s command list: an array of objects.
+type CommandsSchema = Vec<Value>;
+
+/// The JSON Schema for `find_by_prop`'s `value`: the equality-indexable
+/// scalars. Floats are excluded deliberately — `IndexValue::of` rejects them.
+///
+/// Spelled out by hand because `serde_json::Value` renders as a *typeless*
+/// (permissive) schema. A client reading `{"description": "..."}` has nothing
+/// to encode against and may send `"1815"` where `1815` was meant — and since
+/// a string is itself a legal `value`, that mismatch would silently return
+/// zero rows rather than erroring. See `tests/schema.rs`.
+fn prop_value_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "integer", "boolean"],
+    })
+}
+
 /// Parses a tool-supplied ULID string into a [`NodeId`], mapping a parse
 /// failure to `invalid_params` (never a panic).
 fn parse_node_id(id: &str) -> Result<NodeId, ErrorData> {
@@ -172,6 +199,7 @@ struct FindByPropParams {
     prop: String,
     /// Value to match exactly: a string, integer, or boolean (floats are not
     /// equality-indexable).
+    #[schemars(schema_with = "prop_value_schema")]
     value: Value,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
@@ -322,6 +350,7 @@ struct CreateMemoryParams {
     /// `content` param above; a collision is rejected rather than silently
     /// overwritten.
     #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Scope to create the memory in: `"shared"` or a scope ULID. Defaults to
     /// the server's configured default scope when omitted.
@@ -338,6 +367,7 @@ struct CreateEntityParams {
     /// `name` param above; a collision is rejected rather than silently
     /// overwritten.
     #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Scope to create the entity in: `"shared"` or a scope ULID. Defaults to
     /// the server's configured default scope when omitted.
@@ -362,6 +392,7 @@ struct LinkParams {
     edge_type: String,
     /// Structured metadata on the edge (string/number/bool values).
     #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Milliseconds since Unix epoch the edge becomes valid from. Defaults to
     /// "now" (resolved by the engine at commit time) when omitted.
@@ -390,6 +421,7 @@ struct SetNodePropsParams {
     id: String,
     /// Property changes: a `null` value REMOVES the key, any other scalar sets
     /// it.
+    #[schemars(with = "PropsSchema")]
     props: Value,
 }
 
@@ -416,6 +448,7 @@ struct SetEmbeddingParams {
     /// Embedding model name (namespaces the vector).
     model: String,
     /// Raw embedding as a JSON array of finite numbers (host-computed).
+    #[schemars(with = "VectorSchema")]
     vector: Value,
 }
 
@@ -428,6 +461,7 @@ struct SearchVectorsParams {
     /// Embedding model name to search within.
     model: String,
     /// Query embedding as a JSON array of finite numbers (host-computed).
+    #[schemars(with = "VectorSchema")]
     vector: Value,
     /// Maximum number of results to return.
     #[serde(default = "default_vector_k")]
@@ -454,6 +488,7 @@ struct SubmitBatchParams {
     /// tool name (create_memory, create_entity, link, set_node_props,
     /// remove_node, close_edge, set_embedding); `#N` in an id field refers to
     /// the id produced by the Nth (earlier) command in the batch.
+    #[schemars(with = "CommandsSchema")]
     commands: Value,
 }
 
