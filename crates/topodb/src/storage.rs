@@ -5,6 +5,10 @@ use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::index::IndexSpec;
 use crate::op::Op;
+use crate::slots::{
+    alloc_edge_slot, alloc_node_slot, remove_edge_mapping, remove_node_mapping, EDGE_IDS,
+    EDGE_SLOTS, NODE_IDS, NODE_SLOTS,
+};
 use crate::state::{EdgeRecord, NodeRecord};
 use redb::{Database, ReadableTable, Table, TableDefinition};
 use std::path::Path;
@@ -90,6 +94,10 @@ impl Storage {
             tx.open_table(FTS_STATS).map_err(storage_err)?;
             tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             tx.open_table(DICT).map_err(storage_err)?;
+            tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+            tx.open_table(NODE_IDS).map_err(storage_err)?;
+            tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+            tx.open_table(EDGE_IDS).map_err(storage_err)?;
             let meta = tx.open_table(META).map_err(storage_err)?;
             let version = match meta.get("format_version").map_err(storage_err)? {
                 Some(v) => {
@@ -558,6 +566,11 @@ impl Storage {
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
             let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
+            let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
+            let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+            let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+            let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+            let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
             for op in &resolved {
                 // `pre` carries (id, scope, old_text). For CreateNode the scope
                 // comes from the op; for existing-node ops it comes from the
@@ -579,6 +592,11 @@ impl Storage {
                     &mut embeddings,
                     &mut dict_table,
                     &mut dicts,
+                    &mut slot_meta,
+                    &mut node_slots,
+                    &mut node_ids,
+                    &mut edge_slots,
+                    &mut edge_ids,
                     op,
                 )?;
                 if let Some((id, scope, old_text)) = pre {
@@ -805,6 +823,11 @@ impl Storage {
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
             let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
+            let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
+            let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+            let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+            let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+            let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
             // The text index is derived from state, so it is drained and rebuilt
             // alongside NODES/EDGES through the very same `fts_update` used on the
             // write path — no parallel maintenance logic.
@@ -815,6 +838,12 @@ impl Storage {
             edges.retain(|_, _| false).map_err(storage_err)?;
             embeddings.retain(|_, _| false).map_err(storage_err)?;
             dict_table.retain(|_, _| false).map_err(storage_err)?;
+            slot_meta.remove("next_node_slot").map_err(storage_err)?;
+            slot_meta.remove("next_edge_slot").map_err(storage_err)?;
+            node_slots.retain(|_, _| false).map_err(storage_err)?;
+            node_ids.retain(|_, _| false).map_err(storage_err)?;
+            edge_slots.retain(|_, _| false).map_err(storage_err)?;
+            edge_ids.retain(|_, _| false).map_err(storage_err)?;
             dicts.clear();
             postings.retain(|_, _| false).map_err(storage_err)?;
             docs.retain(|_, _| false).map_err(storage_err)?;
@@ -844,6 +873,11 @@ impl Storage {
                     &mut embeddings,
                     &mut dict_table,
                     &mut dicts,
+                    &mut slot_meta,
+                    &mut node_slots,
+                    &mut node_ids,
+                    &mut edge_slots,
+                    &mut edge_ids,
                     &op,
                 )?;
                 if let Some((id, scope, old_text)) = pre {
@@ -1067,12 +1101,18 @@ fn put_embedding(
 /// reflects every earlier op in the same batch since we mutate the tables
 /// incrementally within the one write transaction. Factored out so Task 7's
 /// replay can reuse it without re-deriving the mutation logic.
+#[allow(clippy::too_many_arguments)] // transactional table set is expanded incrementally by v3 dual writes.
 fn apply_op(
     nodes: &mut Table<'_, &'static [u8], &'static [u8]>,
     edges: &mut Table<'_, &'static [u8], &'static [u8]>,
     embeddings: &mut Table<'_, &'static [u8], &'static [u8]>,
     dict: &mut Table<'_, &'static [u8], &'static str>,
     dicts: &mut Dicts,
+    slot_meta: &mut Table<'_, &'static str, &'static [u8]>,
+    node_slots: &mut Table<'_, &'static [u8], &'static [u8]>,
+    node_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
+    edge_slots: &mut Table<'_, &'static [u8], &'static [u8]>,
+    edge_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
     op: &Op,
 ) -> Result<(), TopoError> {
     match op {
@@ -1082,6 +1122,7 @@ fn apply_op(
             label,
             props,
         } => {
+            alloc_node_slot(slot_meta, node_slots, node_ids, *id)?;
             let rec = NodeRecord {
                 id: *id,
                 scope: *scope,
@@ -1123,6 +1164,7 @@ fn apply_op(
             }
 
             embeddings.remove(key.as_slice()).map_err(storage_err)?;
+            remove_node_mapping(node_slots, node_ids, *id)?;
             // Remove incident edges, both directions. v0.1: linear scan is
             // acceptable; adjacency-assisted delete arrives with Task 5.
             let mut incident = Vec::new();
@@ -1137,7 +1179,18 @@ fn apply_op(
                 }
             }
             for key in incident {
+                let edge = {
+                    let raw = edges
+                        .get(key.as_slice())
+                        .map_err(storage_err)?
+                        .ok_or_else(|| TopoError::Encoding("incident edge vanished".into()))?;
+                    let payload = crate::codec::unframe_value(raw.value())?;
+                    let disk = postcard::from_bytes(payload.as_ref())
+                        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                    crate::disk::edge_from_disk(disk, dicts)?
+                };
                 edges.remove(key.as_slice()).map_err(storage_err)?;
+                remove_edge_mapping(edge_slots, edge_ids, edge.id)?;
             }
             Ok(())
         }
@@ -1164,6 +1217,7 @@ fn apply_op(
                     "CreateEdge {id:?}: cross-scope edge requires at least one Shared endpoint"
                 )));
             }
+            alloc_edge_slot(slot_meta, edge_slots, edge_ids, *id)?;
             let rec = EdgeRecord {
                 id: *id,
                 scope: *scope,
