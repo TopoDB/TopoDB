@@ -305,12 +305,23 @@ scope. But `topodb-cli link` (`crates/topodb-cli/src/cli.rs`) has **no `--scope`
 flag**, so it still stamps every edge with the process-wide `--scope`.
 
 **The CLI's two ways to create an edge now disagree with each other.** One can
-cross a scope boundary; the other silently cannot. That divergence did not exist
-before P1 — P1 created it.
+cross a scope boundary; the other silently cannot.
 
-Fix: add `--scope` to `topodb-cli link`, matching the MCP tool's semantics.
-Also update `crates/topodb-cli/README.md:84`, which claims *"There's no
-per-command `--scope` override in v1"* — already false for `submit`'s three ops.
+> **CORRECTION (2026-07-11).** This section originally claimed *"That divergence
+> did not exist before P1 — P1 created it."* **That is false.** Before P1,
+> `batch.rs`'s `scope_of` was documented as *"Resolves a command's `scope` field
+> (only create_memory/create_entity carry one)"*, and `topodb-cli`'s
+> `create-memory`/`create-entity` have **never** had a `--scope` flag. The
+> divergence predates P1 by two ops; P1 added `scope` to the DSL's `link` op and
+> thereby **widened an inherited divergence from two ops to three**. Consequently
+> the fix is larger than "add `--scope` to `link`" — patching only `link` would
+> leave `create-memory`/`create-entity` divergent. See
+> `specs/2026-07-11-p1-tail-design.md` §1, which supersedes this section.
+
+Fix: add `--scope` to `topodb-cli` **`create-memory`, `create-entity`, and
+`link`**, matching the MCP tools' semantics. Also update
+`crates/topodb-cli/README.md:84`, which claims *"There's no per-command `--scope`
+override in v1"* — already false for `submit`'s three ops.
 
 ### D2 — `topodb-cli changes` is an ungated unscoped read
 
@@ -350,7 +361,18 @@ vec![], .. }` yields a `ScopeSet` admitting nothing, and every default read
 silently returns empty. It **fails closed** (returns nothing, never everything),
 and `main.rs` is today the only constructor — so this is latent, not live. But
 "there is no unscoped read" is load-bearing enough to deserve a type, not a
-convention. The plugin's launcher will be a second constructor of these args.
+convention.
+
+> **CORRECTION (2026-07-11).** This section originally ended *"The plugin's
+> launcher will be a second constructor of these args."* **That is false.** The
+> launcher execs `topodb-mcp --db … --scope … --read-scopes …` — it produces an
+> **argv**, which still flows through `Config::from_args` and is validated there.
+> It is not a second constructor of `Config`. **P2 does not make D4 live**; it
+> stays latent. D4 is still fixed (a `ReadScopes` newtype), but on its own merits
+> — the invariant is assumed in two places (`config.rs`, `server.rs:51`) and
+> enforced in zero past the parser. Note also that D4, unlike D1 and D3, **fails
+> closed and loudly**; grouping it with them as the same "quiet failure family"
+> was a mis-triage. See `specs/2026-07-11-p1-tail-design.md` §3.
 
 ### D5 — the `get_changes` gate is a breaking change with no semver signal
 
