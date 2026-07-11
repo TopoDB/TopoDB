@@ -8,7 +8,8 @@
     "strict": true,
     "declaration": false,
     "skipLibCheck": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "rewriteRelativeImportExtensions": true
   },
   "include": ["src"]
 }

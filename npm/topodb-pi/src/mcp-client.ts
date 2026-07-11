@@ -1,13 +1,14 @@
 // src/mcp-client.ts
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
+import type { Writable, Readable } from "node:stream";
 
 export type McpTool = { name: string; description?: string; inputSchema?: unknown };
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 
 export class McpStdioClient {
-  private child?: ChildProcessWithoutNullStreams;
+  private child?: ChildProcessByStdio<Writable, Readable, null>;
   private rl?: Interface;
   private nextId = 1;
   private pending = new Map<number, Pending>();
