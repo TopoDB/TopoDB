@@ -411,6 +411,12 @@ impl Db {
         self.inner.snap.load_full()
     }
 
+    /// Per-table logical byte counts; benchmark/inspection seam.
+    #[doc(hidden)]
+    pub fn storage_report(&self) -> Result<Vec<crate::storage::TableReport>, TopoError> {
+        self.inner.storage.storage_report()
+    }
+
     /// Records an access bump for each id in `ids`, timestamped with a single
     /// wall-clock read taken once per call. Fire-and-forget: each `(id, now)`
     /// is `try_send`'d to the bumper thread, and on a full or closed channel it

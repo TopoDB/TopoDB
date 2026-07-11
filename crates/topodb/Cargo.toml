@@ -25,6 +25,7 @@ thiserror = "2"
 crossbeam-channel = "0.5"
 im = { version = "15", features = ["serde"] }
 arc-swap = "1"
+lz4_flex = "0.11"
 
 [dev-dependencies]
 proptest = "1"
@@ -33,4 +34,8 @@ criterion = "0.5"
 
 [[bench]]
 name = "recall"
+harness = false
+
+[[bench]]
+name = "storage"
 harness = false
