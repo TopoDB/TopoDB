@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+#[allow(dead_code)] // Task 4 codec is wired into dual writes in Task 5.
+mod adj;
 mod codec;
 mod counters;
 mod db;
