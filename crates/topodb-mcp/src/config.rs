@@ -1,15 +1,21 @@
 //! CLI parsing and the server configuration contract.
 //!
-//! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <spec.json>]`
-//! - `--scope`: the default scope for every tool call that omits an explicit
-//!   `scope`. `"shared"` (case-insensitive) or omitted => [`Scope::Shared`];
-//!   any other value is parsed as a ULID => [`Scope::Id`].
+//! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>]
+//!      [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]`
+//! - `--scope`: the default **write** scope — the scope a created node/edge is
+//!   stamped with when a write tool omits `scope`. `"shared"` (case-insensitive)
+//!   or omitted => [`Scope::Shared`]; any other value is parsed as a ULID.
+//! - `--read-scopes`: the default **read** scope set — the scopes a read tool
+//!   filters by when it omits `scope`/`scopes`. Comma-separated. Defaults to
+//!   just `--scope`'s value, which is the single-scope behaviour every existing
+//!   client relies on. A read filters by a *set*; a write picks *one* scope —
+//!   hence two flags rather than one overloaded flag.
 //! - `--spec`: path to a JSON file deserializing to [`IndexSpec`], honored
 //!   verbatim (may reindex an existing db). Omitted => inherit the db's
 //!   persisted spec on an existing file, or create a fresh db with the
 //!   [built-in default spec](default_spec). See how `main` opens the db.
 //!
-//! Arg parsing is hand-rolled: the surface is three flags, so `clap` would add
+//! Arg parsing is hand-rolled: the surface is four flags, so `clap` would add
 //! a dependency and a proc-macro build for no real gain here.
 
 use std::error::Error;
@@ -29,6 +35,12 @@ pub use topodb_json::{ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMOR
 pub struct Config {
     pub db_path: PathBuf,
     pub default_scope: Scope,
+    /// The default read `ScopeSet`, as a non-empty list of scopes. Seeded from
+    /// `--read-scopes`, or from `--scope` alone when that flag is omitted (so
+    /// the single-scope behaviour every existing client relies on is preserved
+    /// exactly). Distinct from `default_scope`, which is the single scope a
+    /// *write* is stamped with — a read filters by a set, a write picks one.
+    pub default_read_scopes: Vec<Scope>,
     /// The spec parsed from an explicit `--spec` file, or `None` when the flag
     /// was omitted. `None` means "inherit the db's persisted spec" (see how
     /// `main` opens the db), NOT "use `default_spec()`" — the two diverge for
@@ -64,6 +76,26 @@ fn parse_scope(s: &str) -> Result<Scope, Box<dyn Error>> {
     }
 }
 
+/// Parses a `--read-scopes` value: a comma-separated list of `shared` / ULID
+/// entries, whitespace around each entry ignored. Rejects an empty list — an
+/// empty `ScopeSet` admits nothing, and "read nothing" is never what a caller
+/// means (there is no unscoped read).
+fn parse_read_scopes(s: &str) -> Result<Vec<Scope>, Box<dyn Error>> {
+    let scopes = s
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(parse_scope)
+        .collect::<Result<Vec<_>, _>>()?;
+    if scopes.is_empty() {
+        return Err(format!(
+            "--read-scopes value {s:?} is empty; expected a comma-separated list of \"shared\" or scope ULIDs"
+        )
+        .into());
+    }
+    Ok(scopes)
+}
+
 impl Config {
     /// Parses config from an argument iterator (excluding argv[0]). Returns a
     /// clear error for missing values, unknown flags, or a missing/invalid
@@ -75,6 +107,7 @@ impl Config {
     {
         let mut db_path: Option<PathBuf> = None;
         let mut scope: Option<String> = None;
+        let mut read_scopes: Option<String> = None;
         let mut spec_path: Option<PathBuf> = None;
 
         let mut it = args.into_iter();
@@ -86,6 +119,12 @@ impl Config {
                 "--scope" => {
                     scope = Some(it.next().ok_or("--scope requires a <ulid|shared> value")?);
                 }
+                "--read-scopes" => {
+                    read_scopes = Some(
+                        it.next()
+                            .ok_or("--read-scopes requires a comma-separated <ulid|shared> list")?,
+                    );
+                }
                 "--spec" => {
                     spec_path = Some(
                         it.next()
@@ -95,7 +134,7 @@ impl Config {
                 }
                 other => {
                     return Err(format!(
-                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <spec.json>]"
+                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]"
                     )
                     .into());
                 }
@@ -106,6 +145,10 @@ impl Config {
         let default_scope = match scope {
             Some(s) => parse_scope(&s)?,
             None => Scope::Shared,
+        };
+        let default_read_scopes = match read_scopes {
+            Some(s) => parse_read_scopes(&s)?,
+            None => vec![default_scope],
         };
         let spec = match spec_path {
             Some(p) => {
@@ -121,6 +164,7 @@ impl Config {
         Ok(Config {
             db_path,
             default_scope,
+            default_read_scopes,
             spec,
         })
     }
@@ -203,5 +247,64 @@ mod tests {
     #[test]
     fn missing_value_is_rejected() {
         assert!(Config::from_args(argv(&["--db"])).is_err());
+    }
+
+    #[test]
+    fn read_scopes_defaults_to_the_write_scope() {
+        let id = ScopeId::new();
+        let s = id.to_string();
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--scope", &s])).unwrap();
+        assert_eq!(cfg.default_read_scopes, vec![Scope::Id(id)]);
+    }
+
+    #[test]
+    fn read_scopes_defaults_to_shared_when_scope_omitted() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb"])).unwrap();
+        assert_eq!(cfg.default_read_scopes, vec![Scope::Shared]);
+    }
+
+    #[test]
+    fn read_scopes_parses_a_comma_separated_list() {
+        let a = ScopeId::new();
+        let list = format!("{a},shared");
+        let cfg = Config::from_args(argv(&[
+            "--db",
+            "t.redb",
+            "--scope",
+            &a.to_string(),
+            "--read-scopes",
+            &list,
+        ]))
+        .unwrap();
+        assert_eq!(cfg.default_read_scopes, vec![Scope::Id(a), Scope::Shared]);
+        // The write scope is untouched by --read-scopes.
+        assert!(matches!(cfg.default_scope, Scope::Id(got) if got == a));
+    }
+
+    #[test]
+    fn read_scopes_tolerates_whitespace_around_entries() {
+        let a = ScopeId::new();
+        let list = format!(" {a} , shared ");
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--read-scopes", &list])).unwrap();
+        assert_eq!(cfg.default_read_scopes, vec![Scope::Id(a), Scope::Shared]);
+    }
+
+    #[test]
+    fn read_scopes_rejects_a_bad_ulid() {
+        assert!(Config::from_args(argv(&[
+            "--db",
+            "t.redb",
+            "--read-scopes",
+            "shared,not-a-ulid"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn read_scopes_rejects_an_empty_list() {
+        // An empty read set admits nothing — there is no unscoped read, so this is
+        // a caller error, not "read everything".
+        assert!(Config::from_args(argv(&["--db", "t.redb", "--read-scopes", ""])).is_err());
+        assert!(Config::from_args(argv(&["--db", "t.redb", "--read-scopes", " , "])).is_err());
     }
 }

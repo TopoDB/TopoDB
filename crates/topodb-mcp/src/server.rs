@@ -38,8 +38,9 @@ pub struct TopoServer {
     db: Db,
     /// The configured default scope, applied to tool calls that omit `scope`.
     default_scope: Scope,
-    /// `default_scope` pre-resolved to a [`ScopeSet`], reused by every scoped
-    /// read tool call that omits `scope` (see [`TopoServer::resolve_scopes`]).
+    /// The configured default **read** set (from `--read-scopes`, or `--scope`
+    /// alone), reused by every scoped read tool call that omits `scope`/`scopes`
+    /// (see [`TopoServer::resolve_scopes`]).
     default_scopes: ScopeSet,
     /// Rendered db path, reported by `db_info`.
     db_path: String,
@@ -49,7 +50,7 @@ pub struct TopoServer {
 impl TopoServer {
     /// Wraps an open [`Db`] and the resolved [`Config`] into a server handler.
     pub fn new(db: Db, config: &Config) -> Self {
-        let default_scopes = convert::scope_to_scope_set(config.default_scope);
+        let default_scopes = convert::scopes_to_scope_set(&config.default_read_scopes);
         Self {
             db,
             default_scope: config.default_scope,
