@@ -6,7 +6,7 @@ recall (get/find/search/traverse/access-stats/changes) and write (create memory,
 entity, link) tools backed by a scoped, temporal property graph — no separate database
 process, no network hop.
 
-Status: **v0** — read + write tools, no vector search yet. See [Limitations](#v0-limitations).
+Status: **v0** — read + write tools, including vector search. See [Limitations](#v0-limitations).
 
 ## Install
 
@@ -46,6 +46,7 @@ Arg parsing is hand-rolled (five flags); there is no `--help` flag yet.
 | `search_memories` | `query` (required), `k` (integer, default 10), `scope?`, `scopes?` | Full-text BM25 search over indexed text properties. Call this when looking for memories relevant to a topic or phrase. Returns up to `k` nodes ranked by relevance with scores. |
 | `traverse` | `seed_id` (required), `max_hops` (integer, default 2), `direction` (enum: `out`/`in`/`both`, default `both`), `edge_types` (array of strings, optional), `scope?`, `scopes?` | Walk the graph outward from a seed node, following edges up to `max_hops`. Call this to gather the context AROUND something you already found — related entities, linked memories. Returns the subgraph (nodes + edges). |
 | `access_stats` | `id` (required), `scope?`, `scopes?` | Read a node's access statistics (count, last-accessed timestamp). Call this when deciding what to consolidate or forget — e.g. finding stale memories. Reading stats does not itself count as an access. |
+| `search_vectors` | `model` (string, required), `vector` (number array, required), `k` (integer, default 10), `candidates` (array of node ids, optional), `scope?`, `scopes?` | Cosine similarity search over embeddings stored under `model`. Call this when you have a host-computed query embedding and want nodes ranked by vector similarity rather than text relevance. `candidates` restricts scoring to a given node id set (e.g. narrow to a `traverse` result for hybrid recall). Errors if `k` is 0 or the vector is empty. |
 | `get_changes` | `since_seq` (integer, required) | Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The `db_info` tool reports `current_seq`. Rejected with `invalid_params` unless the server was started with `--allow-unscoped-changes`. |
 | `create_memory` | `content` (string, required), `props` (object, optional), `scope?` | Store a new memory. Call this when the user or task produces information worth remembering later. `content` becomes the full-text-searchable body; `props` holds structured metadata (strings/numbers/bools). Returns the new node's id — keep it if you plan to link this memory to entities. |
 | `create_entity` | `name` (string, required), `props` (object, optional), `scope?` | Create an entity node (person, project, concept). Call this the FIRST time something is mentioned that memories should attach to; use `find_by_prop` first to check it doesn't already exist. `name` is equality-indexed for exact lookup. |
@@ -186,9 +187,6 @@ explicitly on each tool call from a single server instance).
 
 ## v0 limitations
 
-- **No vector search.** MCP clients don't carry embedders, and accepting raw vector params over
-  the wire invites garbage queries — this is deferred to a future version with a real embedding
-  story. `search_memories` is BM25 full-text only.
 - **No `set_props` / `remove_node`.** The write surface is create-only (`create_memory`,
   `create_entity`, `link`); mutating or deleting existing nodes isn't exposed yet.
   Corrections must go through a fresh fact (TopoDB facts supersede, they don't overwrite).
