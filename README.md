@@ -18,8 +18,9 @@ for external consolidation — running in-process, no server.
 
 Status: **early development (0.0.x)** — the engine core works (op-log write
 path, single-applier concurrency, scoped k-hop temporal traversal,
-replay-determinism property tests); the recall layer (vector search,
-full-text, change feed) is next. API not yet stable.
+replay-determinism property tests), and so does the recall layer: BM25
+full-text search, graph-scoped cosine vector search, and the change feed all
+ship today, exposed by both front ends. API not yet stable.
 
 First consumer: Atlas (agentic OS desktop app).
 
