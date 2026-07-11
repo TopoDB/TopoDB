@@ -64,4 +64,4 @@ Code or Claude Desktop in a couple of lines. See
 [`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
 table, client config examples, and v0 limitations (no vector search yet, create-only writes).
 
-- **Pi (pi.dev):** one-command via `npx -y @topodb/topodb-mcp` — see [topodb-mcp README → Pi](crates/topodb-mcp/README.md#pi).
+- **Pi (pi.dev):** one command via `pi install npm:@topodb/pi` — see [topodb-mcp README → Pi](crates/topodb-mcp/README.md#pi).

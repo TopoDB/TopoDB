@@ -111,9 +111,21 @@ Windows).
 
 ### Pi
 
-[Pi](https://pi.dev) reads standard MCP config. Add this to a project-local
-`.mcp.json` (or global `~/.pi/agent/mcp.json`) — no Rust toolchain required, the
-platform binary is fetched via npm on first run:
+**One command** — the [`@topodb/pi`](https://www.npmjs.com/package/@topodb/pi)
+extension bundles everything (no Rust, no separate MCP adapter):
+
+    pi install npm:@topodb/pi
+
+It registers a `topodb` tool that spawns this server for you. Config via env:
+`TOPODB_DB` (default `.topodb/memory.redb`), `TOPODB_SCOPE` (default `shared`).
+
+**Manual (any MCP server on Pi)** — Pi has no built-in MCP client, so install an
+MCP client extension once, then point it at `topodb-mcp`:
+
+    pi install npm:pi-mcp-adapter
+
+Then add topodb to the config that adapter reads (`~/.pi/agent/mcp.json` global,
+or `.mcp.json` project):
 
 ```json
 {
@@ -127,13 +139,7 @@ platform binary is fetched via npm on first run:
 }
 ```
 
-- `lifecycle: "lazy"` starts the server only when a tool is first called.
-- Default scope is `shared`; add `"--scope", "<ulid>"` to the `args` to isolate a
-  scope for a specific agent.
-- Using [`pi-mcp-adapter`](https://pi.dev/packages/pi-mcp-adapter) for token
-  efficiency? No change needed — it discovers `topodb` from the same config.
-- Rust users can skip npx: `cargo install topodb-mcp`, then set
-  `"command": "topodb-mcp"` and drop the `-y`/package `args`.
+(`pi-mcp-extension` works too, but reads `.pi/mcp.json` instead of `.mcp.json`.)
 
 ## Scoping semantics
 
