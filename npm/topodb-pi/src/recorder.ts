@@ -86,6 +86,58 @@ export function isUsed(memContent: string, text: string): boolean {
   return hits / mem.size >= 0.5;
 }
 
+/** A topodb-mcp node as it appears embedded in tool results: `{id, label,
+ * props, scope}`. Only the fields we read are declared here. */
+interface WireNode {
+  id?: unknown;
+  props?: { content?: unknown };
+}
+
+function collect(node: WireNode | undefined, i: number, score: number, out: ReturnedMemory[], contents: Map<string, string>): void {
+  const id = node?.id;
+  if (typeof id !== "string") return;
+  out.push({ id, rank: i, score });
+  const content = node?.props?.content;
+  if (typeof content === "string") contents.set(id, content);
+}
+
+/** Map a `search_memories`/`traverse` tool result to a `RetrievalRecord` plus
+ * the memory contents it surfaced, or `undefined` when the tool isn't a
+ * retrieval call or the result doesn't match the expected wire shape (never
+ * throws — recording must never break the agent). Field names follow
+ * topodb-mcp's actual JSON (captured from the running server, not guessed):
+ * `search_memories` -> `{hits: [{node, score}]}`; `traverse` -> `{subgraph:
+ * {nodes, edges}}` where edges use `type` (not `ty`). */
+export function toRetrievalRecord(
+  tool: string,
+  args: Record<string, unknown>,
+  result: unknown,
+): { record: RetrievalRecord; contents: Map<string, string> } | undefined {
+  const contents = new Map<string, string>();
+  const returned: ReturnedMemory[] = [];
+
+  if (tool === "search_memories") {
+    const hits = (result as { hits?: unknown })?.hits;
+    if (!Array.isArray(hits)) return undefined;
+    hits.forEach((h: { node?: WireNode; score?: unknown }, i) => {
+      const score = typeof h?.score === "number" ? h.score : 0;
+      collect(h?.node, i, score, returned, contents);
+    });
+    const query = typeof args.query === "string" ? args.query : "";
+    return { record: { query, at: Date.now(), channel: "text", returned }, contents };
+  }
+
+  if (tool === "traverse") {
+    const nodes = (result as { subgraph?: { nodes?: unknown } })?.subgraph?.nodes;
+    if (!Array.isArray(nodes)) return undefined;
+    nodes.forEach((n: WireNode, i) => collect(n, i, 0, returned, contents));
+    const query = typeof args.seed_id === "string" ? args.seed_id : "";
+    return { record: { query, at: Date.now(), channel: "graph", returned }, contents };
+  }
+
+  return undefined;
+}
+
 /** Assemble the single atomic submit_batch command array for one episode.
  * `used` maps retrieval index -> the set of memory ids judged used. */
 export function buildEpisodeBatch(args: {
