@@ -45,8 +45,8 @@ pub struct TopoServer {
     /// alone), reused by every scoped read tool call that omits `scope`/`scopes`
     /// (see [`TopoServer::resolve_scopes`]).
     default_scopes: ScopeSet,
-    /// The same default read set as `default_scopes`, kept as the original
-    /// `Vec<Scope>` too: `ScopeSet::iter_scopes` is `pub(crate)` to `topodb`,
+    /// The same default read set as `default_scopes`, kept as `ReadScopes`:
+    /// `ScopeSet::iter_scopes` is `pub(crate)` to `topodb`,
     /// so `db_info` (Finding 2) renders its reported read set from this list
     /// via `scope_label` rather than from `default_scopes` directly.
     default_read_scopes: ReadScopes,
