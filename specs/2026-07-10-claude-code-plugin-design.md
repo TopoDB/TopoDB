@@ -67,38 +67,80 @@ architectural (`topodb-mcp/src/server.rs:67`, `:87`):
 - `resolve_scopes(Option<&str>) -> ScopeSet` — **reads**
 - `resolve_scope(Option<&str>) -> Scope` — **writes**
 
-**CLI.** `--scope` accepts a comma-separated list of `shared | <ULID>`:
+**CLI — two flags, two concerns.**
 
-- the **first** entry is the default **write** scope,
-- the **whole list** is the default **read** `ScopeSet`.
+- `--scope <shared|ULID>` — **unchanged**. The default **write** scope.
+- `--read-scopes <list>` — **new**. Comma-separated `shared | <ULID>`, defining
+  the default read `ScopeSet`. Defaults to the single value of `--scope`.
 
-A single value behaves exactly as today. Existing behavior and tests are
-untouched; this is backwards compatible by construction.
+An earlier draft overloaded `--scope` with a list whose *first element silently
+became the write scope*. That was rejected: one flag carrying two meanings, with
+order-dependent semantics nobody would predict (`--scope shared,<ulid>` vs
+`--scope <ulid>,shared` would differ invisibly). Two flags cost nothing and are
+backwards compatible by definition.
 
 **MCP read tools.** Add an optional `scopes: string[]` alongside the existing
 `scope: string`. Precedence:
 
 1. `scopes` present → build a real multi-member `ScopeSet`
 2. else `scope` present → one-member set (today's behavior)
-3. else → the server's configured default set
+3. else → the server's configured default read set
 
-**MCP write tools.** Unchanged. A write lands in exactly one scope. This
-asymmetry between reads (a set) and writes (a single scope) is correct and
-intentional, and the code already models it.
+Read tools with a `scope` param today: `get_node`, `find_by_prop`,
+`search_memories`, `traverse`, `access_stats`, `search_vectors`.
 
-**Typing.** Both params are explicitly typed. No `serde_json::Value` — that was
+**MCP write tools.** A write lands in exactly one scope; that asymmetry with
+reads is intentional and already modelled in the code. But one write tool is
+**missing** its scope, and it is a correctness bug for §2:
+
+> **`link` has no `scope` param on the wire** (`server.rs:400`, `LinkParams`),
+> and neither does the `link` op in the `submit_batch` DSL. Every edge is
+> therefore stamped with the server's default write scope. Under §2 that is the
+> *project* scope — so an edge attached to a `shared` node would be
+> project-scoped and **invisible from every other project**. Shared memories
+> would become disconnected islands: `search_memories` would still surface the
+> node's text, but `traverse` would not cross projects. The feature would appear
+> to work and quietly not.
+
+**Fix: add `scope: Option<String>` to `LinkParams` and a `scope?` field to the
+batch DSL's `link` op**, resolving through the existing `resolve_scope` write
+path. Without this, §2's cross-project memory model does not function.
+
+**`get_changes` — gate the unscoped read.** Its own description states it is
+*"the ONE unscoped read; the log spans all scopes."* Correct for a per-project
+db. Under §2's **global** db it means any project's agent can call
+`get_changes(since_seq: 0)` and replay every other project's writes verbatim —
+cross-project context contamination and a token bomb, arrived at by accident
+rather than by choice.
+
+**Fix: add `--allow-unscoped-changes` (default OFF).** When off, `get_changes`
+returns `invalid_params` explaining the flag. Sync/consolidation hosts that
+genuinely need the op log opt in explicitly; the Claude Code plugin does not set
+it. The primitive is preserved, the accident is removed. Scope-*filtering* the
+op log was considered and rejected — a partial log cannot be replayed
+deterministically, which would break the tool's actual contract.
+
+**Typing.** Every param is explicitly typed. No `serde_json::Value` — that was
 the bug fixed in `topodb-mcp@0.0.3` (it made several tools uncallable from any
 client) and it will not be reintroduced in a new form.
 
-**Errors.** An unparseable ULID anywhere in the list → `invalid_params`.
+**Errors.** An unparseable ULID anywhere in a list → `invalid_params`.
 
 ### Tests
 
-- config parse: single value (back-compat), list, list containing `shared`,
-  empty string, malformed ULID
+- config parse: `--scope` alone (back-compat), `--read-scopes` list, list
+  containing `shared`, empty string, malformed ULID, `--read-scopes` absent
+  (defaults to `--scope`)
 - `ScopeSet` construction from a list, including the `shared` flag
-- read-tool precedence: `scopes` > `scope` > server default
-- a write with a multi-value default `--scope` lands in the **first** entry only
+- read-tool precedence: `scopes` > `scope` > server default read set
+- writes land in `--scope` regardless of `--read-scopes`
+- **`link` with an explicit `scope` stamps that scope**, and a `shared` edge is
+  visible from a read set of `{other-project, shared}` — the regression test for
+  the "disconnected islands" bug above
+- `link` with `scope` omitted still resolves to the default write scope
+- batch DSL `link { scope }` behaves identically to the `link` tool
+- `get_changes` returns `invalid_params` without `--allow-unscoped-changes`, and
+  replays the log with it
 - existing `topodb-mcp` tests pass unmodified
 
 ### Ships as
@@ -125,10 +167,21 @@ Two scopes are live in every session:
 | **project** — a ScopeId derived from the project path | facts about *this* repo |
 | **`shared`** | durable, transferable, cross-project lessons |
 
-The server launches with `--scope <project-ulid>,shared`. **Reads see both.
-Writes default to the project scope.** The bundled skill instructs the agent to
-pass `scope: "shared"` explicitly when a lesson generalizes beyond the current
-repo.
+The server launches with:
+
+```
+--scope <project-ulid> --read-scopes <project-ulid>,shared
+```
+
+**Reads see both. Writes default to the project scope.** The bundled skill
+instructs the agent to pass `scope: "shared"` explicitly when a lesson
+generalizes beyond the current repo — on `create_memory`, `create_entity`, **and
+`link`** (see §1: `link` gains a `scope` param precisely so shared lessons can
+carry their relationships across projects).
+
+`--allow-unscoped-changes` is **not** passed, so `get_changes` — the one unscoped
+read — is unavailable to the agent and cannot leak other projects' op logs into
+this session's context.
 
 This cross-project recall is the entire reason to prefer a global database over
 Pi's per-project `.topodb/`, and **P1 is what makes it possible** — without it,
@@ -184,8 +237,8 @@ failure mode for plugin hooks and MCP entries.
 1. derives the project ScopeId from `cwd`,
 2. **creates the db's parent directory** — the exact bug that shipped in
    `@topodb/pi` 0.0.1 and made the db fail to come up in a fresh project,
-3. execs `topodb-mcp --db <plugin-data>/memory.redb --scope <ulid>,shared`,
-   passing stdio straight through.
+3. execs `topodb-mcp --db <plugin-data>/memory.redb --scope <ulid>
+   --read-scopes <ulid>,shared`, passing stdio straight through.
 
 It is a **shim, not a proxy.** Unlike the Pi extension — which had to bridge MCP
 to Pi's tool API and re-implement protocol plumbing — Claude Code speaks MCP
