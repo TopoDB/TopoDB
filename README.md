@@ -85,11 +85,13 @@ and scoped recall as a library call.
 | Access stats (recall-driven counters) | engine | ✅ |
 | Change feed (`subscribe` / `ops_since`) + op-log compaction | engine | ✅ |
 | Versioned on-disk format ([FORMAT.md](FORMAT.md)) | engine | ✅ |
-| MCP server (10 tools) | `topodb-mcp` | ✅ v0 |
-| CLI (all 11 engine operations) | `topodb-cli` | ✅ v1 |
+| MCP server (16 tools) | `topodb-mcp` | ✅ |
+| CLI (all 17 engine operations) | `topodb-cli` | ✅ v1 |
 | One-command Pi install | `@topodb/pi` | ✅ |
-| Vector search exposed over MCP / CLI | layers | Planned |
-| `set-props` / `remove-node` / bulk submit over CLI | `topodb-cli` | Planned |
+| Vector search exposed over MCP / CLI | layers | ✅ |
+| `set-props` / `remove-node` / bulk submit over CLI | `topodb-cli` | ✅ |
+| Multi-scope reads (read across a scope *set*) | `topodb-mcp` | ✅ |
+| Multi-scope reads over CLI | `topodb-cli` | Planned |
 | API stabilization (0.1) | engine | Planned |
 | Reproducible benchmarks | repo | Planned |
 | LLM calls inside the engine | — | **Never** (principle 4) |
@@ -107,25 +109,34 @@ and scoped recall as a library call.
 ### topodb-cli
 
 `topodb-cli` installs a binary named **`topodb`**: point it at a `.redb` file and it gives you
-all 11 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
-`search`, `traverse`, `stats`, `changes`, `compact`) as one-shot, script-friendly subcommands —
-compact JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can
-branch on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
-It opens the database file directly and in-process, the same way `topodb-mcp` does — no server,
-no network hop, and (because of that) no running concurrently with something else that already
-has the same file open. Install with `cargo install topodb-cli`. See
+all 17 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
+`search`, `traverse`, `stats`, `changes`, `compact`, `set-props`, `remove-node`, `close-edge`,
+`set-embedding`, `search-vector`, `submit`) as one-shot, script-friendly subcommands — compact
+JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can branch
+on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
+`create-memory`, `create-entity`, and `link` each also take their own per-command `--scope`,
+overriding the global `--scope` for that one invocation — the same override the batch DSL's
+same-named ops and the equivalent `topodb-mcp` tools support. It opens the database file
+directly and in-process, the same way `topodb-mcp` does — no server, no network hop, and
+(because of that) no running concurrently with something else that already has the same file
+open. Install with `cargo install topodb-cli`. See
 [`crates/topodb-cli/README.md`](crates/topodb-cli/README.md) for the full command table,
-exit-code contract, scoping rules, and v1 limitations (no vector search, no set-props/remove-node,
-no bulk/stdin submit).
+exit-code contract, scoping rules, and v1 limitations (no `--spec` flag; no multi-scope reads —
+this CLI reads under one scope at a time, while `topodb-mcp` can read across a set; direct-embedded
+single-process access only).
 
 ### topodb-mcp
 
-`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 10 MCP tools —
-`db_info`, six read tools (`get_node`, `find_by_prop`, `search_memories`, `traverse`,
-`access_stats`, `get_changes`), and three write tools (`create_memory`, `create_entity`,
-`link`) — over stdio JSON-RPC. Install with `cargo install topodb-mcp` and wire it into Claude
-Code or Claude Desktop in a couple of lines. See
-[`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
-table, client config examples, and v0 limitations (no vector search yet, create-only writes).
+`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 16 MCP tools over
+stdio JSON-RPC — `db_info`; scoped reads (`get_node`, `find_by_prop`, `search_memories`,
+`traverse`, `access_stats`, `search_vectors`); writes (`create_memory`, `create_entity`, `link`,
+`set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`); and
+`get_changes`, the one unscoped read, which replays the op log across every scope and is therefore
+off unless you pass `--allow-unscoped-changes`. Reads filter by a *set* of scopes (`--read-scopes`
+at startup, or a per-call `scopes` array); a write is stamped with exactly *one* scope (`--scope`,
+or a per-call `scope`) — `link` included, so an edge can join nodes living in different scopes.
+Install with `cargo install topodb-mcp` and wire it into Claude Code or Claude Desktop in a couple
+of lines. See [`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI
+reference, tool table, and client config examples.
 
 - **Pi (pi.dev):** one command via `pi install npm:@topodb/pi` — see [topodb-mcp README → Pi](crates/topodb-mcp/README.md#pi).

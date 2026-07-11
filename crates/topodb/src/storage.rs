@@ -1,4 +1,5 @@
 use crate::counters::AccessStats;
+use crate::dict::{Dicts, DICT};
 use crate::error::{storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
@@ -7,7 +8,7 @@ use crate::op::Op;
 use crate::state::{EdgeRecord, NodeRecord};
 use redb::{Database, ReadableTable, Table, TableDefinition};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub(crate) const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
 pub(crate) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -30,8 +31,19 @@ pub(crate) const FTS_STATS: TableDefinition<&[u8], &[u8]> = TableDefinition::new
 /// NODES. Deliberately *outside* the op log: never appended to OPS, never
 /// broadcast to the change feed, and never touched by `rebuild_state_from_ops`.
 pub(crate) const COUNTERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("counters");
+/// Cold vector rows: node key -> framed postcard (model, vector).
+pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("embeddings");
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Stable logical table-byte measurement (redb page and free-list overhead excluded).
+#[derive(Debug, Clone)]
+pub struct TableReport {
+    pub table: &'static str,
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+}
 
 pub struct Storage {
     pub(crate) db: Database,
@@ -42,6 +54,7 @@ pub struct Storage {
     /// that write-path access is possible without going through the
     /// in-memory snapshot.
     pub(crate) spec: Arc<IndexSpec>,
+    pub(crate) dicts: RwLock<Dicts>,
 }
 
 impl Storage {
@@ -61,10 +74,13 @@ impl Storage {
         spec: Arc<IndexSpec>,
     ) -> Result<Self, TopoError> {
         let db = Database::create(path).map_err(storage_err)?;
-        let s = Self { db, spec };
-        // Ensure tables + format version exist.
+        let s = Self {
+            db,
+            spec,
+            dicts: RwLock::new(Dicts::default()),
+        };
         let tx = s.db.begin_write().map_err(storage_err)?;
-        {
+        let existing = {
             tx.open_table(OPS).map_err(storage_err)?;
             tx.open_table(NODES).map_err(storage_err)?;
             tx.open_table(EDGES).map_err(storage_err)?;
@@ -72,46 +88,61 @@ impl Storage {
             tx.open_table(POSTINGS).map_err(storage_err)?;
             tx.open_table(FTS_DOCS).map_err(storage_err)?;
             tx.open_table(FTS_STATS).map_err(storage_err)?;
-            let mut meta = tx.open_table(META).map_err(storage_err)?;
-            // Read the stored version into an owned value first so the read
-            // guard's borrow of `meta` ends before we (maybe) insert into it.
-            let existing: Option<u32> = match meta.get("format_version").map_err(storage_err)? {
+            tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            tx.open_table(DICT).map_err(storage_err)?;
+            let meta = tx.open_table(META).map_err(storage_err)?;
+            let version = match meta.get("format_version").map_err(storage_err)? {
                 Some(v) => {
-                    let bytes: [u8; 4] = v
+                    let b: [u8; 4] = v
                         .value()
                         .try_into()
                         .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
-                    Some(u32::from_le_bytes(bytes))
+                    Some(u32::from_le_bytes(b))
                 }
                 None => None,
             };
-            match existing {
-                None => {
-                    meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
-                        .map_err(storage_err)?;
-                }
-                Some(found) if found > FORMAT_VERSION => {
-                    return Err(TopoError::UnsupportedFormat {
-                        found,
-                        supported: FORMAT_VERSION,
-                    });
-                }
-                // Reachable only for `found < FORMAT_VERSION` (the `>` arm
-                // above catches the rest) — i.e. a pre-1 file, which no
-                // released build ever writes. Kept as a guard against
-                // corrupt/hand-rolled files rather than dead logic.
-                Some(found) if found != FORMAT_VERSION => {
-                    return Err(TopoError::Encoding(format!(
-                        "unsupported format version {found}, this build supports {FORMAT_VERSION}"
-                    )));
-                }
-                Some(_) => {}
+            version
+        };
+        match existing {
+            None => {
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
+            Some(2) => {}
+            Some(1) => {
+                let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
+                let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                let mut emb = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
+                let mut d = Dicts::default();
+                crate::migrate::migrate_v1_to_v2(
+                    &mut nodes, &mut edges, &mut emb, &mut dict, &mut d,
+                )?;
+                drop(nodes);
+                drop(edges);
+                drop(emb);
+                drop(dict);
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
+            Some(found) if found > FORMAT_VERSION => {
+                return Err(TopoError::UnsupportedFormat {
+                    found,
+                    supported: FORMAT_VERSION,
+                })
+            }
+            Some(found) => {
+                return Err(TopoError::Encoding(format!(
+                    "unsupported format version {found}"
+                )))
             }
         }
         tx.commit().map_err(storage_err)?;
-        // Reconcile the stored index spec with the one we were opened with;
-        // a text-portion change (or a legacy layout) triggers a full reindex
-        // (committed here, before any reader/`Db` observes the tables).
+        let r = s.db.begin_read().map_err(storage_err)?;
+        *s.dicts.write().expect("dict lock poisoned") = Dicts::load(&r)?;
+        drop(r);
         s.ensure_index_spec()?;
         Ok(s)
     }
@@ -172,9 +203,16 @@ impl Storage {
 
             let nodes = tx.open_table(NODES).map_err(storage_err)?;
             for entry in nodes.iter().map_err(storage_err)? {
-                let (_, v) = entry.map_err(storage_err)?;
-                let rec: NodeRecord = postcard::from_bytes(v.value())
-                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                let (key_guard, _) = entry.map_err(storage_err)?;
+                let dicts = self.dicts.read().expect("dict lock poisoned");
+                let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                let key: [u8; 16] = key_guard
+                    .value()
+                    .try_into()
+                    .map_err(|_| TopoError::Encoding("bad node key".into()))?;
+                let id = NodeId::from_u128(u128::from_be_bytes(key));
+                let rec = read_node(&nodes, &embeddings, &dicts, id)?
+                    .ok_or_else(|| TopoError::Encoding("missing node during reindex".into()))?;
                 let new_text = doc_text(&self.spec, &rec);
                 fts_update(
                     &mut postings,
@@ -204,6 +242,83 @@ impl Storage {
         }
         tx.commit().map_err(storage_err)?;
         Ok(())
+    }
+
+    /// Per-table logical byte counts, used by the reproducible storage benchmark.
+    pub fn storage_report(&self) -> Result<Vec<TableReport>, TopoError> {
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        fn bytes(
+            tx: &redb::ReadTransaction,
+            table: TableDefinition<&[u8], &[u8]>,
+            name: &'static str,
+        ) -> Result<TableReport, TopoError> {
+            let table = tx.open_table(table).map_err(storage_err)?;
+            let mut out = TableReport {
+                table: name,
+                rows: 0,
+                key_bytes: 0,
+                value_bytes: 0,
+            };
+            for entry in table.iter().map_err(storage_err)? {
+                let (key, value) = entry.map_err(storage_err)?;
+                out.rows += 1;
+                out.key_bytes += key.value().len() as u64;
+                out.value_bytes += value.value().len() as u64;
+            }
+            Ok(out)
+        }
+        let mut out = vec![
+            bytes(&tx, NODES, "nodes")?,
+            bytes(&tx, EDGES, "edges")?,
+            bytes(&tx, EMBEDDINGS, "embeddings")?,
+            bytes(&tx, POSTINGS, "postings")?,
+            bytes(&tx, FTS_DOCS, "fts_docs")?,
+            bytes(&tx, FTS_STATS, "fts_stats")?,
+            bytes(&tx, COUNTERS, "counters")?,
+        ];
+        let dict = tx.open_table(DICT).map_err(storage_err)?;
+        let mut dict_report = TableReport {
+            table: "dict",
+            rows: 0,
+            key_bytes: 0,
+            value_bytes: 0,
+        };
+        for entry in dict.iter().map_err(storage_err)? {
+            let (k, v) = entry.map_err(storage_err)?;
+            dict_report.rows += 1;
+            dict_report.key_bytes += k.value().len() as u64;
+            dict_report.value_bytes += v.value().len() as u64;
+        }
+        out.push(dict_report);
+        let ops = tx.open_table(OPS).map_err(storage_err)?;
+        let mut ops_report = TableReport {
+            table: "ops",
+            rows: 0,
+            key_bytes: 0,
+            value_bytes: 0,
+        };
+        for entry in ops.iter().map_err(storage_err)? {
+            let (_, v) = entry.map_err(storage_err)?;
+            ops_report.rows += 1;
+            ops_report.key_bytes += 8;
+            ops_report.value_bytes += v.value().len() as u64;
+        }
+        out.push(ops_report);
+        let meta = tx.open_table(META).map_err(storage_err)?;
+        let mut meta_report = TableReport {
+            table: "meta",
+            rows: 0,
+            key_bytes: 0,
+            value_bytes: 0,
+        };
+        for entry in meta.iter().map_err(storage_err)? {
+            let (k, v) = entry.map_err(storage_err)?;
+            meta_report.rows += 1;
+            meta_report.key_bytes += k.value().len() as u64;
+            meta_report.value_bytes += v.value().len() as u64;
+        }
+        out.push(meta_report);
+        Ok(out)
     }
 
     /// Peeks the `IndexSpec` persisted under META `"index_spec"` by a prior
@@ -422,6 +537,13 @@ impl Storage {
         // and applied, so replay stays deterministic.
         let resolved: Vec<Op> = ops.into_iter().map(|op| resolve_op(op, now_ms)).collect();
 
+        let mut dicts = self.dicts.write().expect("dict lock poisoned");
+        // A failed prior write transaction may have interned only in memory.
+        // Refresh from committed rows before each write so aborted batches cannot
+        // leave phantom ids that a later batch would reference.
+        let dict_read = self.db.begin_read().map_err(storage_err)?;
+        *dicts = Dicts::load(&dict_read)?;
+        drop(dict_read);
         let tx = self.db.begin_write().map_err(storage_err)?;
         // Text-index edits collected during the op loop and applied AFTER every
         // op has succeeded — still inside this transaction, so the postings
@@ -434,6 +556,8 @@ impl Storage {
         {
             let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+            let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
             for op in &resolved {
                 // `pre` carries (id, scope, old_text). For CreateNode the scope
                 // comes from the op; for existing-node ops it comes from the
@@ -441,7 +565,7 @@ impl Storage {
                 let pre: Option<(NodeId, Scope, Option<String>)> = match op {
                     Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
-                        match read_node(&nodes, *id)? {
+                        match read_node(&nodes, &embeddings, &dicts, *id)? {
                             Some(rec) => Some((*id, rec.scope, doc_text(&self.spec, &rec))),
                             None => None,
                         }
@@ -449,11 +573,19 @@ impl Storage {
                     // SetEmbedding never changes text; edge ops carry none.
                     _ => None,
                 };
-                apply_op(&mut nodes, &mut edges, op)?;
+                apply_op(
+                    &mut nodes,
+                    &mut edges,
+                    &mut embeddings,
+                    &mut dict_table,
+                    &mut dicts,
+                    op,
+                )?;
                 if let Some((id, scope, old_text)) = pre {
                     let new_text = match op {
                         Op::RemoveNode { .. } => None,
-                        _ => read_node(&nodes, id)?.and_then(|rec| doc_text(&self.spec, &rec)),
+                        _ => read_node(&nodes, &embeddings, &dicts, id)?
+                            .and_then(|rec| doc_text(&self.spec, &rec)),
                     };
                     fts_edits.push((scope, id, old_text, new_text));
                 }
@@ -521,7 +653,9 @@ impl Storage {
     pub fn load_node(&self, id: NodeId) -> Result<Option<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
-        read_node(&table, id)
+        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        read_node(&table, &embeddings, &dicts, id)
     }
 
     /// See `load_node`.
@@ -529,7 +663,8 @@ impl Storage {
     pub fn load_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(EDGES).map_err(storage_err)?;
-        read_edge(&table, id)
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        read_edge(&table, &dicts, id)
     }
 
     /// Crate-internal full scan — used to rebuild in-memory adjacency. Not
@@ -537,12 +672,23 @@ impl Storage {
     pub(crate) fn all_nodes(&self) -> Result<Vec<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
+        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
         let mut out = Vec::new();
         for entry in table.iter().map_err(storage_err)? {
-            let (_, v) = entry.map_err(storage_err)?;
-            let rec: NodeRecord =
-                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
-            out.push(rec);
+            let (k, _) = entry.map_err(storage_err)?;
+            let key: [u8; 16] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad node key".into()))?;
+            if let Some(rec) = read_node(
+                &table,
+                &embeddings,
+                &dicts,
+                NodeId::from_u128(u128::from_be_bytes(key)),
+            )? {
+                out.push(rec);
+            }
         }
         Ok(out)
     }
@@ -550,12 +696,19 @@ impl Storage {
     pub(crate) fn all_edges(&self) -> Result<Vec<EdgeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(EDGES).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
         let mut out = Vec::new();
         for entry in table.iter().map_err(storage_err)? {
-            let (_, v) = entry.map_err(storage_err)?;
-            let rec: EdgeRecord =
-                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
-            out.push(rec);
+            let (k, _) = entry.map_err(storage_err)?;
+            let key: [u8; 16] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad edge key".into()))?;
+            if let Some(rec) =
+                read_edge(&table, &dicts, EdgeId::from_u128(u128::from_be_bytes(key)))?
+            {
+                out.push(rec);
+            }
         }
         Ok(out)
     }
@@ -645,10 +798,13 @@ impl Storage {
         if oldest > 1 {
             return Err(TopoError::Compacted { oldest });
         }
+        let mut dicts = self.dicts.write().expect("dict lock poisoned");
         let tx = self.db.begin_write().map_err(storage_err)?;
         {
             let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+            let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
             // The text index is derived from state, so it is drained and rebuilt
             // alongside NODES/EDGES through the very same `fts_update` used on the
             // write path — no parallel maintenance logic.
@@ -657,6 +813,9 @@ impl Storage {
             let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
             nodes.retain(|_, _| false).map_err(storage_err)?;
             edges.retain(|_, _| false).map_err(storage_err)?;
+            embeddings.retain(|_, _| false).map_err(storage_err)?;
+            dict_table.retain(|_, _| false).map_err(storage_err)?;
+            dicts.clear();
             postings.retain(|_, _| false).map_err(storage_err)?;
             docs.retain(|_, _| false).map_err(storage_err)?;
             stats.retain(|_, _| false).map_err(storage_err)?;
@@ -672,18 +831,26 @@ impl Storage {
                 let pre: Option<(NodeId, Scope, Option<String>)> = match &op {
                     Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
-                        match read_node(&nodes, *id)? {
+                        match read_node(&nodes, &embeddings, &dicts, *id)? {
                             Some(rec) => Some((*id, rec.scope, doc_text(&self.spec, &rec))),
                             None => None,
                         }
                     }
                     _ => None,
                 };
-                apply_op(&mut nodes, &mut edges, &op)?;
+                apply_op(
+                    &mut nodes,
+                    &mut edges,
+                    &mut embeddings,
+                    &mut dict_table,
+                    &mut dicts,
+                    &op,
+                )?;
                 if let Some((id, scope, old_text)) = pre {
                     let new_text = match &op {
                         Op::RemoveNode { .. } => None,
-                        _ => read_node(&nodes, id)?.and_then(|rec| doc_text(&self.spec, &rec)),
+                        _ => read_node(&nodes, &embeddings, &dicts, id)?
+                            .and_then(|rec| doc_text(&self.spec, &rec)),
                     };
                     fts_update(
                         &mut postings,
@@ -802,56 +969,95 @@ fn edge_key(id: EdgeId) -> [u8; 16] {
     id.as_u128().to_be_bytes()
 }
 
-fn read_node(
+fn read_embedding(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     id: NodeId,
-) -> Result<Option<NodeRecord>, TopoError> {
+) -> Result<Option<(String, Vec<f32>)>, TopoError> {
     let key = node_key(id);
     match table.get(key.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
-            let rec: NodeRecord =
-                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
-            Ok(Some(rec))
+            let raw = crate::codec::unframe_value(v.value())?;
+            postcard::from_bytes(&raw)
+                .map(Some)
+                .map_err(|e| TopoError::Encoding(e.to_string()))
         }
     }
 }
-
-fn read_edge(
+fn read_node(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    id: EdgeId,
-) -> Result<Option<EdgeRecord>, TopoError> {
-    let key = edge_key(id);
-    match table.get(key.as_slice()).map_err(storage_err)? {
+    embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    dicts: &Dicts,
+    id: NodeId,
+) -> Result<Option<NodeRecord>, TopoError> {
+    let k = node_key(id);
+    match table.get(k.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
-            let rec: EdgeRecord =
-                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let raw = crate::codec::unframe_value(v.value())?;
+            let disk = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let mut rec = crate::disk::node_from_disk(disk, dicts)?;
+            rec.embedding = read_embedding(embeddings, id)?;
             Ok(Some(rec))
         }
     }
 }
-
+fn read_edge(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    dicts: &Dicts,
+    id: EdgeId,
+) -> Result<Option<EdgeRecord>, TopoError> {
+    let k = edge_key(id);
+    match table.get(k.as_slice()).map_err(storage_err)? {
+        None => Ok(None),
+        Some(v) => {
+            let raw = crate::codec::unframe_value(v.value())?;
+            let disk = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            Ok(Some(crate::disk::edge_from_disk(disk, dicts)?))
+        }
+    }
+}
 fn put_node(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    dict: &mut Table<'_, &'static [u8], &'static str>,
+    dicts: &mut Dicts,
     rec: &NodeRecord,
 ) -> Result<(), TopoError> {
-    let key = node_key(rec.id);
-    let bytes = postcard::to_allocvec(rec).map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let raw = postcard::to_allocvec(&crate::disk::node_to_disk(rec, dict, dicts)?)
+        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let f = crate::codec::frame_value(raw);
     table
-        .insert(key.as_slice(), bytes.as_slice())
+        .insert(node_key(rec.id).as_slice(), f.as_slice())
         .map_err(storage_err)?;
     Ok(())
 }
-
 fn put_edge(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    dict: &mut Table<'_, &'static [u8], &'static str>,
+    dicts: &mut Dicts,
     rec: &EdgeRecord,
 ) -> Result<(), TopoError> {
-    let key = edge_key(rec.id);
-    let bytes = postcard::to_allocvec(rec).map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk(rec, dict, dicts)?)
+        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let f = crate::codec::frame_value(raw);
     table
-        .insert(key.as_slice(), bytes.as_slice())
+        .insert(edge_key(rec.id).as_slice(), f.as_slice())
+        .map_err(storage_err)?;
+    Ok(())
+}
+fn put_embedding(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    id: NodeId,
+    model: &str,
+    vector: &[f32],
+) -> Result<(), TopoError> {
+    let raw =
+        postcard::to_allocvec(&(model, vector)).map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let f = crate::codec::frame_value(raw);
+    table
+        .insert(node_key(id).as_slice(), f.as_slice())
         .map_err(storage_err)?;
     Ok(())
 }
@@ -864,6 +1070,9 @@ fn put_edge(
 fn apply_op(
     nodes: &mut Table<'_, &'static [u8], &'static [u8]>,
     edges: &mut Table<'_, &'static [u8], &'static [u8]>,
+    embeddings: &mut Table<'_, &'static [u8], &'static [u8]>,
+    dict: &mut Table<'_, &'static [u8], &'static str>,
+    dicts: &mut Dicts,
     op: &Op,
 ) -> Result<(), TopoError> {
     match op {
@@ -880,10 +1089,10 @@ fn apply_op(
                 props: props.clone(),
                 embedding: None,
             };
-            put_node(nodes, &rec)
+            put_node(nodes, dict, dicts, &rec)
         }
         Op::SetNodeProps { id, props } => {
-            let mut rec = read_node(nodes, *id)?.ok_or_else(|| {
+            let mut rec = read_node(nodes, embeddings, dicts, *id)?.ok_or_else(|| {
                 TopoError::Rejected(format!("SetNodeProps: node {id:?} not found"))
             })?;
             for (k, v) in props {
@@ -896,14 +1105,13 @@ fn apply_op(
                     }
                 }
             }
-            put_node(nodes, &rec)
+            put_node(nodes, dict, dicts, &rec)
         }
         Op::SetEmbedding { id, model, vector } => {
-            let mut rec = read_node(nodes, *id)?.ok_or_else(|| {
+            read_node(nodes, embeddings, dicts, *id)?.ok_or_else(|| {
                 TopoError::Rejected(format!("SetEmbedding: node {id:?} not found"))
             })?;
-            rec.embedding = Some((model.clone(), vector.clone()));
-            put_node(nodes, &rec)
+            put_embedding(embeddings, *id, model, vector)
         }
         Op::RemoveNode { id } => {
             let key = node_key(*id);
@@ -914,13 +1122,16 @@ fn apply_op(
                 )));
             }
 
+            embeddings.remove(key.as_slice()).map_err(storage_err)?;
             // Remove incident edges, both directions. v0.1: linear scan is
             // acceptable; adjacency-assisted delete arrives with Task 5.
             let mut incident = Vec::new();
             for entry in edges.iter().map_err(storage_err)? {
                 let (k, v) = entry.map_err(storage_err)?;
-                let rec: EdgeRecord = postcard::from_bytes(v.value())
+                let raw = crate::codec::unframe_value(v.value())?;
+                let disk = postcard::from_bytes(raw.as_ref())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                let rec = crate::disk::edge_from_disk(disk, dicts)?;
                 if rec.from == *id || rec.to == *id {
                     incident.push(k.value().to_vec());
                 }
@@ -939,10 +1150,10 @@ fn apply_op(
             props,
             valid_from,
         } => {
-            let from_rec = read_node(nodes, *from)?.ok_or_else(|| {
+            let from_rec = read_node(nodes, embeddings, dicts, *from)?.ok_or_else(|| {
                 TopoError::Rejected(format!("CreateEdge {id:?}: from node {from:?} not found"))
             })?;
-            let to_rec = read_node(nodes, *to)?.ok_or_else(|| {
+            let to_rec = read_node(nodes, embeddings, dicts, *to)?.ok_or_else(|| {
                 TopoError::Rejected(format!("CreateEdge {id:?}: to node {to:?} not found"))
             })?;
             if from_rec.scope != to_rec.scope
@@ -964,10 +1175,10 @@ fn apply_op(
                     .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)"),
                 valid_to: None,
             };
-            put_edge(edges, &rec)
+            put_edge(edges, dict, dicts, &rec)
         }
         Op::CloseEdge { id, valid_to } => {
-            let mut rec = read_edge(edges, *id)?
+            let mut rec = read_edge(edges, dicts, *id)?
                 .ok_or_else(|| TopoError::Rejected(format!("CloseEdge: edge {id:?} not found")))?;
             if rec.valid_to.is_some() {
                 return Err(TopoError::Rejected(format!(
@@ -978,7 +1189,7 @@ fn apply_op(
                 valid_to
                     .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)"),
             );
-            put_edge(edges, &rec)
+            put_edge(edges, dict, dicts, &rec)
         }
     }
 }
@@ -1013,7 +1224,7 @@ mod tests {
         let read = s.read_ops(1).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].1, ops[0]);
-        assert_eq!(s.format_version().unwrap(), 1);
+        assert_eq!(s.format_version().unwrap(), 2);
     }
 
     #[test]
@@ -1030,7 +1241,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             {
                 let mut meta = tx.open_table(META).unwrap();
-                meta.insert("format_version", 2u32.to_le_bytes().as_slice())
+                meta.insert("format_version", 3u32.to_le_bytes().as_slice())
                     .unwrap();
             }
             tx.commit().unwrap();
@@ -1041,13 +1252,60 @@ mod tests {
         let err = Storage::open(&path).err().expect("reopen must be rejected");
         match err {
             TopoError::UnsupportedFormat {
-                found: 2,
-                supported: 1,
+                found: 3,
+                supported: 2,
             } => {}
             other => {
-                panic!("expected UnsupportedFormat {{ found: 2, supported: 1 }}, got {other:?}")
+                panic!("expected UnsupportedFormat {{ found: 3, supported: 2 }}, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn storage_report_counts_v2_tables_and_embeddings_are_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let id = NodeId::from_u128(1);
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id,
+                    scope: Scope::Shared,
+                    label: "Memory".into(),
+                    props: Default::default(),
+                },
+                Op::SetEmbedding {
+                    id,
+                    model: "m".into(),
+                    vector: vec![1.0; 64],
+                },
+            ],
+            0,
+        )
+        .unwrap();
+        let report = s.storage_report().unwrap();
+        assert_eq!(
+            report
+                .iter()
+                .find(|r| r.table == "embeddings")
+                .unwrap()
+                .rows,
+            1
+        );
+        assert_eq!(
+            s.load_node(id).unwrap().unwrap().embedding.unwrap().1.len(),
+            64
+        );
+        s.apply_batch(vec![Op::RemoveNode { id }], 1).unwrap();
+        assert_eq!(
+            s.storage_report()
+                .unwrap()
+                .iter()
+                .find(|r| r.table == "embeddings")
+                .unwrap()
+                .rows,
+            0
+        );
     }
 
     #[test]

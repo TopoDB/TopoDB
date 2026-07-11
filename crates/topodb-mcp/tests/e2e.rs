@@ -27,7 +27,9 @@ fn end_to_end_scenario_over_stdio() {
     // else that might touch the db file, and doubles as the "arbitrary valid
     // ULID" fixture for the malformed/bogus-id error-path assertions below.
     let scope = topodb::ScopeId::new().to_string();
-    let scope_args = ["--scope", scope.as_str()];
+    // --allow-unscoped-changes: this test drives get_changes exactly as a
+    // legitimate sync host would (see Task 5's sanctioned carve-out).
+    let scope_args = ["--scope", scope.as_str(), "--allow-unscoped-changes"];
 
     let mut server = Server::spawn(&db_path, &scope_args);
 

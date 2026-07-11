@@ -26,7 +26,8 @@ use topodb::{
 };
 
 use crate::config::{
-    scope_label, Config, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
+    scope_label, Config, ReadScopes, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP,
+    MEMORY_LABEL,
 };
 use topodb_json as convert;
 
@@ -36,42 +37,82 @@ use topodb_json as convert;
 #[derive(Clone)]
 pub struct TopoServer {
     db: Db,
-    /// The configured default scope, applied to tool calls that omit `scope`.
+    /// The configured default **write** scope: a create/link tool call that
+    /// omits `scope` is stamped with this. Reads never consult this directly —
+    /// see `default_scopes` below.
     default_scope: Scope,
-    /// `default_scope` pre-resolved to a [`ScopeSet`], reused by every scoped
-    /// read tool call that omits `scope` (see [`TopoServer::resolve_scopes`]).
+    /// The configured default **read** set (from `--read-scopes`, or `--scope`
+    /// alone), reused by every scoped read tool call that omits `scope`/`scopes`
+    /// (see [`TopoServer::resolve_scopes`]).
     default_scopes: ScopeSet,
+    /// The same default read set as `default_scopes`, kept as `ReadScopes`:
+    /// `ScopeSet::iter_scopes` is `pub(crate)` to `topodb`,
+    /// so `db_info` (Finding 2) renders its reported read set from this list
+    /// via `scope_label` rather than from `default_scopes` directly.
+    default_read_scopes: ReadScopes,
     /// Rendered db path, reported by `db_info`.
     db_path: String,
+    /// See `Config::allow_unscoped_changes`.
+    allow_unscoped_changes: bool,
     tool_router: ToolRouter<Self>,
 }
 
 impl TopoServer {
     /// Wraps an open [`Db`] and the resolved [`Config`] into a server handler.
     pub fn new(db: Db, config: &Config) -> Self {
-        let default_scopes = convert::scope_to_scope_set(config.default_scope);
+        let default_scopes = convert::scopes_to_scope_set(config.default_read_scopes.as_slice());
         Self {
             db,
             default_scope: config.default_scope,
             default_scopes,
+            default_read_scopes: config.default_read_scopes.clone(),
             db_path: config.db_path.display().to_string(),
+            allow_unscoped_changes: config.allow_unscoped_changes,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Resolves a tool call's optional `scope` param to the [`ScopeSet`] the
-    /// read should run against. `None` reuses the pre-resolved
-    /// `default_scopes` (no need to re-derive it on every call that omits
-    /// `scope` — the common case); `Some(s)` is parsed fresh via
-    /// [`convert::resolve_scope`].
-    fn resolve_scopes(&self, scope: Option<&str>) -> Result<ScopeSet, ErrorData> {
-        match scope {
-            None => Ok(self.default_scopes.clone()),
-            Some(_) => {
-                let resolved = convert::resolve_scope(scope, self.default_scope)
+    /// Resolves a read tool's optional `scope` / `scopes` params to the
+    /// [`ScopeSet`] the read runs against. Precedence:
+    ///
+    /// 1. `scopes` (non-empty) → a genuine multi-member set. This is the only
+    ///    way a client can read across e.g. a project scope *and* `shared`.
+    /// 2. `scope` → a one-member set (the pre-P1 behaviour).
+    /// 3. neither → the server's configured default read set (`--read-scopes`,
+    ///    or `--scope` alone), pre-resolved once in `new` rather than re-derived
+    ///    on every call — the common case.
+    ///
+    /// An explicitly empty `scopes: []` is rejected: an empty set admits
+    /// nothing, so it is a caller error, never "read everything" (there is no
+    /// unscoped read).
+    fn resolve_scopes(
+        &self,
+        scope: Option<&str>,
+        scopes: Option<&[String]>,
+    ) -> Result<ScopeSet, ErrorData> {
+        match scopes {
+            Some([]) => Err(ErrorData::invalid_params(
+                "`scopes` must not be empty (an empty scope set admits nothing); \
+                 omit it to use the server's default read scopes"
+                    .to_string(),
+                None,
+            )),
+            Some(list) => {
+                let resolved = list
+                    .iter()
+                    .map(|s| convert::resolve_scope(Some(s), self.default_scope))
+                    .collect::<Result<Vec<Scope>, String>>()
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
-                Ok(convert::scope_to_scope_set(resolved))
+                Ok(convert::scopes_to_scope_set(&resolved))
             }
+            None => match scope {
+                None => Ok(self.default_scopes.clone()),
+                Some(_) => {
+                    let resolved = convert::resolve_scope(scope, self.default_scope)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    Ok(convert::scope_to_scope_set(resolved))
+                }
+            },
         }
     }
 
@@ -80,9 +121,9 @@ impl TopoServer {
     /// expands to a `ScopeSet` for reads), a write needs exactly one `Scope`
     /// value, not a set to filter by — so this goes through
     /// [`convert::resolve_scope`] directly rather than also converting to a
-    /// `ScopeSet`. `link` has no `scope` param on the wire (per the plan's
-    /// tool table) and always calls this with `None`, which still resolves
-    /// through the same path to the server's configured default scope.
+    /// `ScopeSet`. Every write tool (`create_memory`, `create_entity`, `link`)
+    /// passes its optional `scope` param through here; `None` resolves to the
+    /// server's configured default write scope.
     fn resolve_scope(&self, scope: Option<&str>) -> Result<Scope, ErrorData> {
         convert::resolve_scope(scope, self.default_scope)
             .map_err(|e| ErrorData::invalid_params(e, None))
@@ -175,12 +216,22 @@ struct DbInfo {
     /// Highest op-log sequence number committed so far (0 on a fresh db). Use
     /// this as the `since_seq` anchor for `get_changes`.
     current_seq: u64,
-    /// Default scope applied to tool calls that omit `scope`: `"shared"` or a
-    /// ULID string.
+    /// Default WRITE scope applied to a create/link tool call that omits
+    /// `scope`: `"shared"` or a ULID string. NOT the read set — see
+    /// `default_read_scopes`. A read tool call that passes this value as its
+    /// own `scope` narrows the read to just this one scope, which can be
+    /// STRICTER than the default read set below.
     default_scope: String,
+    /// Default READ scope set applied to a read tool call that omits both
+    /// `scope` and `scopes` (from `--read-scopes`, or `--scope` alone):
+    /// `"shared"` and/or ULID strings. Distinct from `default_scope` — a read
+    /// filters by this whole set, a write is stamped with the single
+    /// `default_scope` above.
+    default_read_scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetNodeParams {
     /// ULID of the node to fetch.
     id: String,
@@ -188,6 +239,15 @@ struct GetNodeParams {
     /// the server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -202,6 +262,7 @@ struct GetNodeResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct FindByPropParams {
     /// Node label to match, e.g. `"Entity"`.
     label: String,
@@ -216,6 +277,15 @@ struct FindByPropParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -230,6 +300,7 @@ fn default_search_k() -> usize {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchMemoriesParams {
     /// Free-text query.
     query: String,
@@ -242,6 +313,15 @@ struct SearchMemoriesParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -284,6 +364,7 @@ fn default_max_hops() -> u8 {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TraverseParams {
     /// ULID of the node to start the traversal from.
     seed_id: String,
@@ -303,6 +384,15 @@ struct TraverseParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -312,6 +402,7 @@ struct TraverseResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AccessStatsParams {
     /// ULID of the node.
     id: String,
@@ -319,6 +410,15 @@ struct AccessStatsParams {
     /// the server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -337,6 +437,7 @@ struct AccessStatsResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetChangesParams {
     /// Op-log sequence number to replay from, inclusive.
     since_seq: u64,
@@ -357,6 +458,7 @@ struct GetChangesResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateMemoryParams {
     /// The memory's full-text-searchable body.
     content: String,
@@ -374,6 +476,7 @@ struct CreateMemoryParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateEntityParams {
     /// The entity's equality-indexed identifying name.
     name: String,
@@ -397,6 +500,7 @@ struct CreateResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LinkParams {
     /// ULID of the edge's source (`from`) node. Must already exist.
     from_id: String,
@@ -405,6 +509,13 @@ struct LinkParams {
     /// Free-form edge type (e.g. `"works_on"`, `"about"`). Be consistent —
     /// `traverse` can filter by it.
     edge_type: String,
+    /// Scope to create the edge in: `"shared"` or a scope ULID. Defaults to
+    /// the server's configured default scope when omitted. Set this explicitly
+    /// when linking nodes that live in a scope other than the default —
+    /// otherwise the edge is stamped with the default scope and is invisible
+    /// to readers of the nodes' own scope.
+    #[serde(default)]
+    scope: Option<String>,
     /// Structured metadata on the edge (string/number/bool values).
     #[serde(default)]
     #[schemars(with = "Option<PropsSchema>")]
@@ -431,6 +542,7 @@ struct SeqResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetNodePropsParams {
     /// ULID of the node to update.
     id: String,
@@ -441,12 +553,14 @@ struct SetNodePropsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveNodeParams {
     /// ULID of the node to hard-delete (its incident edges cascade away).
     id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CloseEdgeParams {
     /// ULID of the edge to close.
     id: String,
@@ -457,6 +571,7 @@ struct CloseEdgeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetEmbeddingParams {
     /// ULID of the node to attach the embedding to.
     id: String,
@@ -473,6 +588,7 @@ fn default_vector_k() -> usize {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchVectorsParams {
     /// Embedding model name to search within.
     model: String,
@@ -489,6 +605,15 @@ struct SearchVectorsParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
     /// Restrict scoring to these node ULIDs (e.g. a traversal result). Omit to
     /// score the whole scope.
     #[serde(default)]
@@ -502,6 +627,7 @@ struct SearchVectorsResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SubmitBatchParams {
     /// A JSON array of high-level commands. Each command's `op` matches an MCP
     /// tool name (create_memory, create_entity, link, set_node_props,
@@ -522,7 +648,7 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, current op-log sequence number, and the default scope applied to tool calls that omit `scope`. Call this first to confirm the server is wired to the expected database, and to obtain current_seq as the anchor for get_changes."
+        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, and the default READ scope set applied to a read call that omits both scope/scopes. Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
@@ -533,6 +659,12 @@ impl TopoServer {
             path: self.db_path.clone(),
             current_seq,
             default_scope: scope_label(&self.default_scope),
+            default_read_scopes: self
+                .default_read_scopes
+                .as_slice()
+                .iter()
+                .map(scope_label)
+                .collect(),
         }))
     }
 
@@ -544,8 +676,8 @@ impl TopoServer {
         Parameters(p): Parameters<GetNodeParams>,
     ) -> Result<Json<GetNodeResult>, ErrorData> {
         let id = parse_node_id(&p.id)?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
-        match self.db.node(&scopes, id) {
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        match self.db.node(&scope_set, id) {
             Some(n) => {
                 let node =
                     convert::node_to_json(&n).map_err(|e| ErrorData::internal_error(e, None))?;
@@ -570,14 +702,14 @@ impl TopoServer {
     ) -> Result<Json<FindByPropResult>, ErrorData> {
         let value = convert::json_to_prop_value(&p.value)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         // `nodes_by_prop` is a pure snapshot read: the only error it can
         // produce today is `Rejected` (undeclared index / Float value), so a
         // blanket `invalid_params` is accurate. Reconsider if the engine path
         // ever grows storage-touching failure modes (see `search_memories`).
         let hits = self
             .db
-            .nodes_by_prop(&scopes, &p.label, &p.prop, &value)
+            .nodes_by_prop(&scope_set, &p.label, &p.prop, &value)
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let nodes = hits
             .iter()
@@ -594,14 +726,14 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         // `search_text` opens a redb read transaction, so unlike the pure
         // snapshot reads it CAN fail with `Storage`/`Encoding` — only its
         // input-validation `Rejected` (k == 0, token-less query) maps to
         // invalid_params; everything else is a server-side internal_error.
         let hits = self
             .db
-            .search_text(&scopes, &p.query, p.k)
+            .search_text(&scope_set, &p.query, p.k)
             .map_err(|e| match e {
                 TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
                 other => ErrorData::internal_error(other.to_string(), None),
@@ -627,9 +759,9 @@ impl TopoServer {
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<Json<TraverseResult>, ErrorData> {
         let seed = parse_node_id(&p.seed_id)?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let query = TraversalQuery {
-            scopes,
+            scopes: scope_set,
             seeds: vec![seed],
             max_hops: p.max_hops,
             edge_types: p
@@ -659,10 +791,10 @@ impl TopoServer {
         Parameters(p): Parameters<AccessStatsParams>,
     ) -> Result<Json<AccessStatsResult>, ErrorData> {
         let id = parse_node_id(&p.id)?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let stats = self
             .db
-            .access_stats(&scopes, id)
+            .access_stats(&scope_set, id)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(Json(match stats {
             Some(s) => AccessStatsResult {
@@ -679,12 +811,21 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The db_info tool reports current_seq."
+        description = "Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The db_info tool reports current_seq. Disabled unless the server was started with --allow-unscoped-changes."
     )]
     fn get_changes(
         &self,
         Parameters(p): Parameters<GetChangesParams>,
     ) -> Result<Json<GetChangesResult>, ErrorData> {
+        if !self.allow_unscoped_changes {
+            return Err(ErrorData::invalid_params(
+                "get_changes is disabled: it is the one unscoped read (the op log \
+                 spans every scope in the db), so it is off by default. Restart \
+                 topodb-mcp with --allow-unscoped-changes to enable it."
+                    .to_string(),
+                None,
+            ));
+        }
         let events = self.db.ops_since(p.since_seq).map_err(|e| match e {
             // Carries `oldest` in the message (TopoError::Compacted's Display
             // already renders it) so the caller can re-anchor from current
@@ -762,9 +903,7 @@ impl TopoServer {
             Some(v) => convert::json_to_props(v).map_err(|e| ErrorData::invalid_params(e, None))?,
             None => Props::new(),
         };
-        // `link` has no `scope` param on the wire (see `LinkParams`) — always
-        // resolves through the server's configured default scope.
-        let scope = self.resolve_scope(None)?;
+        let scope = self.resolve_scope(p.scope.as_deref())?;
         let id = EdgeId::new();
         self.submit_write(vec![Op::CreateEdge {
             id,
@@ -846,7 +985,7 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<SearchVectorsParams>,
     ) -> Result<Json<SearchVectorsResult>, ErrorData> {
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let vector =
             convert::json_to_f32_vec(&p.vector).map_err(|e| ErrorData::invalid_params(e, None))?;
         let candidates = match p.candidates {
@@ -860,7 +999,7 @@ impl TopoServer {
             }
         };
         let query = VectorQuery {
-            scopes,
+            scopes: scope_set,
             model: p.model,
             vector,
             k: p.k,
@@ -881,7 +1020,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; create_node { label, props?, scope? } — a node with an arbitrary label (for host-level schemas like episode recording); link { from, to, type, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
+        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; create_node { label, props?, scope? } — a node with an arbitrary label (for host-level schemas like episode recording); link { from, to, type, scope?, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
     )]
     fn submit_batch(
         &self,
@@ -907,8 +1046,12 @@ impl ServerHandler for TopoServer {
             ))
             .with_instructions(
                 "TopoDB agent-memory engine exposed over MCP: a temporal property graph with \
-                 scoped recall. Tool calls that omit `scope` use the server's configured default \
-                 scope (see db_info). Start with db_info to confirm wiring.",
+                 scoped recall. Reads filter by a SET of scopes (per-call `scopes: string[]`, \
+                 or the server's default read set when omitted); a write is stamped with \
+                 exactly ONE scope (per-call `scope: string`, or the server's default write \
+                 scope when omitted). The default read set can be WIDER than the default write \
+                 scope. Start with db_info to confirm wiring — it reports both defaults \
+                 separately.",
             )
     }
 }

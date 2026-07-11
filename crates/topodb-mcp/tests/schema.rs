@@ -306,6 +306,49 @@ fn empty_embedding_is_rejected_and_advertised_as_min_items_one() {
     );
 }
 
+/// Every scoped read tool's `scopes` array must advertise `minItems: 1`,
+/// mirroring `empty_embedding_is_rejected_and_advertised_as_min_items_one`
+/// above: `resolve_scopes`'s `Some([])` arm (server.rs) is the runtime half
+/// of "an empty `scopes` is rejected" (there is no unscoped read); this pins
+/// the advertised half so a client never sends `scopes: []` in the first
+/// place. Also proves the runtime really rejects it, so the two can't drift
+/// apart — same shape as the embedding test.
+#[test]
+fn empty_scopes_is_rejected_and_advertised_as_min_items_one() {
+    let (_dir, tools) = tools();
+    for tool in [
+        "get_node",
+        "find_by_prop",
+        "search_memories",
+        "traverse",
+        "access_stats",
+        "search_vectors",
+    ] {
+        let props = properties(&tools, tool);
+        let s = &props["scopes"];
+        assert_eq!(
+            s["minItems"],
+            json!(1),
+            "{tool}.scopes should advertise minItems 1: {s:#?}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::spawn(&dir.path().join("emptyscopes.redb"), &[]);
+    server.initialize(DEFAULT_TIMEOUT);
+    let id = server.call_tool_ok("create_entity", json!({ "name": "A" }), DEFAULT_TIMEOUT)["id"]
+        .as_str()
+        .expect("create_entity returns an id")
+        .to_string();
+
+    let resp = server.call_tool(
+        "get_node",
+        json!({ "id": id, "scopes": [] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}
+
 /// Blanket invariant so a future tool can't reintroduce a typeless param: no
 /// property of any tool's input schema may be left without a type.
 #[test]

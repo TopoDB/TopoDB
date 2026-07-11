@@ -1,6 +1,9 @@
 //! `topodb-mcp` — a stdio MCP server exposing the TopoDB agent-memory engine.
 //!
-//! Usage: `topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <spec.json>]`
+//! Usage: `topodb-mcp --db <path> [--scope <ulid|shared>]
+//!         [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
+//!         [--allow-unscoped-changes]` — see `config`'s module doc for what
+//! each flag controls.
 //!
 //! The process speaks newline-delimited JSON-RPC over stdio (rmcp's `stdio`
 //! transport). stdout is reserved for the protocol; all diagnostics go to
