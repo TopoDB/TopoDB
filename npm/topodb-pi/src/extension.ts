@@ -26,6 +26,14 @@ export default function (pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       try {
+        if (params.action === "list" && params.tool) {
+          return {
+            content: [
+              { type: "text", text: 'error: provide exactly one of {action:"list"} or {tool, args}' },
+            ],
+            details: { error: "bad-params" },
+          };
+        }
         if (params.action === "list") {
           const tools = await server.list();
           return { content: [{ type: "text", text: JSON.stringify(tools) }], details: { action: "list" } };

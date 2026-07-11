@@ -5,6 +5,15 @@ import type { Writable, Readable } from "node:stream";
 
 export type McpTool = { name: string; description?: string; inputSchema?: unknown };
 
+export type McpClientOptions = {
+  /** Per-request timeout, in ms. Applies to every request(), including the initial handshake. */
+  requestTimeoutMs?: number;
+  /** Executable to spawn instead of the current node binary. Mainly for tests. */
+  command?: string;
+};
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 
 export class McpStdioClient {
@@ -12,18 +21,35 @@ export class McpStdioClient {
   private rl?: Interface;
   private nextId = 1;
   private pending = new Map<number, Pending>();
+  private readonly requestTimeoutMs: number;
+  private readonly command: string;
 
-  constructor(private readonly nodeArgs: string[]) {}
+  constructor(
+    private readonly nodeArgs: string[],
+    opts: McpClientOptions = {},
+  ) {
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.command = opts.command ?? process.execPath;
+  }
 
   get running(): boolean {
     return !!this.child && this.child.exitCode === null && !this.child.killed;
   }
 
   async start(): Promise<void> {
-    const child = spawn(process.execPath, this.nodeArgs, {
-      stdio: ["pipe", "pipe", "inherit"],
+    const child = spawn(this.command, this.nodeArgs, {
+      stdio: ["pipe", "pipe", "ignore"],
     });
     this.child = child;
+    // A spawn failure (bad executable, EMFILE/EAGAIN, ...) emits 'error' instead of
+    // (or in addition to) 'exit'. Without a handler this is an uncaught exception
+    // that crashes the host process. Route it through the same failAll() path.
+    child.on("error", (e) => this.failAll(e));
+    // Writing to stdin after the child has died surfaces as EPIPE here. failAll()
+    // (via the 'exit'/'error' handlers above) already rejects pending requests, so
+    // this handler exists purely to prevent an unhandled 'error' event from
+    // throwing and crashing the host process.
+    child.stdin.on("error", () => {});
     this.rl = createInterface({ input: child.stdout });
     this.rl.on("line", (line) => this.onLine(line));
     child.on("exit", () => this.failAll(new Error("topodb-mcp exited")));
@@ -45,7 +71,11 @@ export class McpStdioClient {
     const r = (await this.request("tools/call", { name, arguments: args })) as {
       structuredContent?: unknown;
       content?: unknown;
+      isError?: boolean;
     };
+    // NOTE: tool-level MCP `isError:true` results are currently surfaced as a
+    // success (the content is returned as-is). Treating that as a rejection is
+    // deferred — accepted v0 limitation, tracked as finding 5.
     return r.structuredContent ?? r.content ?? r;
   }
 
@@ -70,7 +100,23 @@ export class McpStdioClient {
     const id = this.nextId++;
     const line = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(
+          new Error(`topodb-mcp request timed out after ${this.requestTimeoutMs}ms: ${method}`),
+        );
+      }, this.requestTimeoutMs);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
       this.child!.stdin.write(line);
     });
   }
