@@ -57,6 +57,70 @@ fn read_spans_project_scope_and_shared() {
     );
 }
 
+/// THE REGRESSION TEST for the leak direction that matters: a default
+/// (scope-omitting) WRITE must land in the configured WRITE scope
+/// (`--scope`), never drift into a scope that's merely part of the
+/// configured READ set (`--read-scopes`). `read_spans_project_scope_and_shared`
+/// above proves a {project, shared} read set sees both a project write and a
+/// shared write, but that assertion alone would ALSO pass if the unscoped
+/// write had wrongly landed in `shared` instead of `project` — the read set
+/// includes both, so either placement is invisible to a 2-hits assertion.
+/// This test narrows the read to each single scope in turn to pin down WHICH
+/// scope the unscoped write actually landed in.
+#[test]
+fn unscoped_write_lands_in_the_write_scope_not_merely_a_read_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("write_scope_leak.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let read_list = format!("{project},shared");
+
+    let mut server = Server::spawn(
+        &db_path,
+        &[
+            "--scope",
+            project.as_str(),
+            "--read-scopes",
+            read_list.as_str(),
+        ],
+    );
+    server.initialize(DEFAULT_TIMEOUT);
+
+    // No explicit `scope` => stamped with the default WRITE scope (project).
+    server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "leakcheck9000 unscoped write" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Narrowed to project ONLY: must find it — it landed in the write scope.
+    let in_project = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "leakcheck9000", "k": 10, "scopes": [project.as_str()] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        in_project["hits"].as_array().unwrap().len(),
+        1,
+        "an unscoped write must land in the configured WRITE scope \
+         (--scope): {in_project:#?}"
+    );
+
+    // Narrowed to `shared` ONLY: must NOT find it — it must not have drifted
+    // into `shared` merely because `shared` is part of the READ set.
+    let in_shared = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "leakcheck9000", "k": 10, "scopes": ["shared"] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        in_shared["hits"].as_array().unwrap().len(),
+        0,
+        "an unscoped write must NOT drift into `shared` just because \
+         `shared` is part of --read-scopes (this is the cross-project leak \
+         direction that matters): {in_shared:#?}"
+    );
+}
+
 /// Per-call `scopes` overrides the server default, and beats `scope`.
 #[test]
 fn per_call_scopes_param_overrides_the_default_and_beats_scope() {

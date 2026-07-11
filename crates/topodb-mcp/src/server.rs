@@ -240,8 +240,12 @@ struct GetNodeParams {
     scope: Option<String>,
     /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
     /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
 }
 
@@ -274,8 +278,12 @@ struct FindByPropParams {
     scope: Option<String>,
     /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
     /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
 }
 
@@ -306,8 +314,12 @@ struct SearchMemoriesParams {
     scope: Option<String>,
     /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
     /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
 }
 
@@ -373,8 +385,12 @@ struct TraverseParams {
     scope: Option<String>,
     /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
     /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
 }
 
@@ -395,8 +411,12 @@ struct AccessStatsParams {
     scope: Option<String>,
     /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
     /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
 }
 
@@ -586,8 +606,12 @@ struct SearchVectorsParams {
     scope: Option<String>,
     /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
     /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
     /// Restrict scoring to these node ULIDs (e.g. a traversal result). Omit to
     /// score the whole scope.
