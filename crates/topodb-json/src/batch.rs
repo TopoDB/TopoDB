@@ -169,6 +169,16 @@ pub fn resolve_batch(
                 if label.is_empty() {
                     return Err(format!("command #{idx}: \"label\" must be non-empty"));
                 }
+                if label == ENTITY_LABEL {
+                    return Err(format!(
+                        "command #{idx}: label {ENTITY_LABEL:?} is reserved — use the create_entity command"
+                    ));
+                }
+                if label == MEMORY_LABEL {
+                    return Err(format!(
+                        "command #{idx}: label {MEMORY_LABEL:?} is reserved — use the create_memory command"
+                    ));
+                }
                 let scope = scope_of(obj, default_scope, idx)?;
                 let props = match obj.get("props") {
                     Some(v) => json_to_props(v).map_err(|e| format!("command #{idx}: {e}"))?,
@@ -444,6 +454,18 @@ mod tests {
             serde_json::json!([{ "op": "create_node", "label": "" }]),
         ] {
             assert!(resolve_batch(&batch, Scope::Shared).is_err());
+        }
+    }
+
+    #[test]
+    fn create_node_rejects_reserved_labels() {
+        for (label, dedicated) in [("Entity", "create_entity"), ("Memory", "create_memory")] {
+            let batch = serde_json::json!([{ "op": "create_node", "label": label }]);
+            let err = resolve_batch(&batch, Scope::Shared).unwrap_err();
+            assert!(
+                err.contains("#0") && err.contains("reserved") && err.contains(dedicated),
+                "label {label:?}: got: {err}"
+            );
         }
     }
 
