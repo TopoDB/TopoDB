@@ -3,6 +3,10 @@
 //! both `topodb-cli submit` and `topodb-mcp submit_batch` consume. Turns the
 //! array into a `Vec<Op>` for one atomic `Db::submit`, resolving `#N`
 //! back-references to ULIDs produced by earlier commands in the same batch.
+//!
+//! Supported ops: `create_memory`, `create_entity`, `create_node` (an
+//! arbitrary-label node, for host-level schemas like episode recording),
+//! `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`.
 
 use crate::{
     json_to_f32_vec, json_to_prop_changes, json_to_props, merge_required_prop, resolve_scope,
@@ -157,6 +161,25 @@ pub fn resolve_batch(
                     id,
                     scope,
                     label: ENTITY_LABEL.into(),
+                    props,
+                });
+            }
+            "create_node" => {
+                let label = req_str(obj, "label", idx)?;
+                if label.is_empty() {
+                    return Err(format!("command #{idx}: \"label\" must be non-empty"));
+                }
+                let scope = scope_of(obj, default_scope, idx)?;
+                let props = match obj.get("props") {
+                    Some(v) => json_to_props(v).map_err(|e| format!("command #{idx}: {e}"))?,
+                    None => Props::new(),
+                };
+                let id = NodeId::new();
+                produced.push(Some((id.to_string(), IdKind::Node)));
+                ops.push(Op::CreateNode {
+                    id,
+                    scope,
+                    label: label.into(),
                     props,
                 });
             }
@@ -379,6 +402,60 @@ mod tests {
                 assert_eq!(vector.len(), 3);
             }
             other => panic!("expected SetEmbedding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_node_with_arbitrary_label_props_and_backref() {
+        let batch = serde_json::json!([
+            { "op": "create_node", "label": "Episode",
+              "props": { "goal": "fix the bug", "turns": 3 } },
+            { "op": "create_node", "label": "RetrievalEvent",
+              "props": { "query": "bug history" } },
+            { "op": "link", "from": "#0", "to": "#1", "type": "ISSUED" }
+        ]);
+        let (ops, ids) = resolve_batch(&batch, Scope::Shared).unwrap();
+        assert_eq!(ops.len(), 3);
+        assert!(ids[0].is_some() && ids[1].is_some() && ids[2].is_some());
+        match &ops[0] {
+            Op::CreateNode { label, props, .. } => {
+                assert_eq!(label, "Episode");
+                assert_eq!(
+                    props.get("goal"),
+                    Some(&PropValue::Str("fix the bug".into()))
+                );
+                assert_eq!(props.get("turns"), Some(&PropValue::Int(3)));
+            }
+            other => panic!("expected CreateNode, got {other:?}"),
+        }
+        match &ops[2] {
+            Op::CreateEdge { from, to, .. } => {
+                assert_eq!(from.to_string(), ids[0].clone().unwrap());
+                assert_eq!(to.to_string(), ids[1].clone().unwrap());
+            }
+            other => panic!("expected CreateEdge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_node_requires_nonempty_label() {
+        for batch in [
+            serde_json::json!([{ "op": "create_node" }]),
+            serde_json::json!([{ "op": "create_node", "label": "" }]),
+        ] {
+            assert!(resolve_batch(&batch, Scope::Shared).is_err());
+        }
+    }
+
+    #[test]
+    fn create_node_scope_field_is_honored() {
+        let batch = serde_json::json!([
+            { "op": "create_node", "label": "Harness", "scope": "shared" }
+        ]);
+        let (ops, _) = resolve_batch(&batch, Scope::Id(topodb::ScopeId::new())).unwrap();
+        match &ops[0] {
+            Op::CreateNode { scope, .. } => assert_eq!(*scope, Scope::Shared),
+            other => panic!("expected CreateNode, got {other:?}"),
         }
     }
 }
