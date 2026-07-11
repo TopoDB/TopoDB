@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "topodb"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-json"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",

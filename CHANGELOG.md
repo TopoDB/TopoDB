@@ -12,9 +12,57 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ---
 
+## `topodb` (engine)
+
+### 0.0.4
+
+> **Read this if you depend on `topodb` 0.0.3 from crates.io.** The 0.0.3 *published* to crates.io
+> does **not** match the 0.0.3 in this repository's git history: fixes landed under the
+> already-published version number and were never released. crates.io's 0.0.3 is therefore missing
+> everything below. A published version is immutable and cannot be corrected in place, so 0.0.4 is
+> the first release that carries these. Treat crates.io 0.0.3 as superseded.
+
+#### Fixed
+
+- **A zero-dimension embedding permanently poisoned a `(model, scope)` vector slab.**
+  `SetEmbedding` with an empty vector was accepted, which fixed that slab's dimension at 0 — after
+  which **every** real embedding under that `(model, scope)` was rejected as a dim conflict, with no
+  way to recover. The op is now rejected up front (`TopoError::Rejected`), symmetric with
+  `search_vector`, which already refused an empty query vector.
+
+#### Changed
+
+- `TopoError::Rejected`'s message is now `"rejected: {0}"` (was `"batch rejected: {0}"`). It is
+  raised by read paths too — e.g. querying a prop that isn't equality-indexed — so the old wording
+  was misleading. **If you string-match on that prefix, update it.**
+
+---
+
+## `topodb-json`
+
+### 0.0.2
+
+> **Read this if you depend on `topodb-json` 0.0.1 from crates.io.** As with the engine, the
+> *published* 0.0.1 does not match this repository's 0.0.1 — it predates the entire batch DSL and
+> the scope helpers, and `batch.rs` does not exist in it at all. 0.0.2 is the first release that
+> carries them. Treat crates.io 0.0.1 as superseded.
+
+#### Added
+
+- The **batch DSL** (`resolve_batch`, `batch.rs`) — resolves a JSON command array into engine ops,
+  with `#N` back-references to ids produced by earlier commands. Backs `topodb-cli submit` and the
+  `submit_batch` MCP tool. Carries a per-op `scope` on `create_memory`, `create_entity`, and `link`.
+- Scope helpers shared by both front ends, so the CLI and the MCP server cannot drift:
+  `resolve_scope`, `scope_to_scope_set`, `scopes_to_scope_set`, `scope_label`.
+- Single-sourced index-spec and label/prop constants (`default_spec`, `MEMORY_LABEL`,
+  `MEMORY_CONTENT_PROP`, `ENTITY_LABEL`, `ENTITY_NAME_PROP`), so a CLI-created database and an
+  MCP-created one carry a byte-identical persisted `index_spec`.
+
+---
+
 ## `topodb-mcp`
 
-### 0.0.4 — unreleased
+### 0.0.4
 
 #### Breaking
 
@@ -68,7 +116,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-cli`
 
-### 0.0.2 — unreleased
+### 0.0.2
 
 #### Added
 
