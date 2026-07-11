@@ -140,6 +140,17 @@ pub enum Command {
     /// range is below the retained floor) is a rejected/exit-2 condition:
     /// the caller re-anchors from current state rather than trusting a
     /// truncated tail.
+    ///
+    /// Deliberately **not** gated behind a flag, unlike `topodb-mcp`'s
+    /// `get_changes` (which requires `--allow-unscoped-changes`). That gate
+    /// stops an LLM from tripping over an *advertised* tool and replaying every
+    /// other project's writes into its context — it is accident-prevention, not
+    /// a security boundary. This CLI advertises nothing to a model, and whoever
+    /// can run it already holds the db file.
+    ///
+    /// Accepted risk: an agent with shell access bypasses the MCP gate by
+    /// calling this command against the same file. If a host ever drives this
+    /// CLI from an agent loop, revisit that.
     Changes {
         /// Op-log sequence number to replay from, inclusive.
         #[arg(long)]

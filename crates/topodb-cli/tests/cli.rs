@@ -937,9 +937,32 @@ fn link_without_scope_stamps_the_global_scope_and_a_shared_reader_cannot_travers
 fn per_command_bad_scope_is_rejected_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
+    let dbs = db.to_str().unwrap().to_string();
+    // Real nodes, so the `link` case below fails on the scope and nothing
+    // else — a bogus id would also come back `kind: "rejected"`, which would
+    // let this test pass for the wrong reason.
+    let a = run_scoped(&dbs, "shared", &["create-entity", "--name", "ada"])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = run_scoped(&dbs, "shared", &["create-entity", "--name", "grace"])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     for args in [
         vec!["create-memory", "--content", "x", "--scope", "not-a-ulid"],
         vec!["create-entity", "--name", "x", "--scope", "not-a-ulid"],
+        vec![
+            "link",
+            "--from",
+            &a,
+            "--to",
+            &b,
+            "--type",
+            "knows",
+            "--scope",
+            "not-a-ulid",
+        ],
     ] {
         let out = bin().args(["--db"]).arg(&db).args(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "args: {args:?}");
