@@ -34,6 +34,16 @@ fn main() {
     // other never reindexes, and both `find` and `search` work out of the box
     // on a fresh CLI db. `Path::exists` is safe here: the CLI is a single,
     // non-concurrent process per invocation, so there's no writer racing it.
+    // Resolve any per-command --scope override BEFORE opening the db, so a
+    // bad value never leaves an empty file behind — same contract as the
+    // global --scope above.
+    let write_scope = match &cli.cmd {
+        Command::CreateMemory { scope, .. }
+        | Command::CreateEntity { scope, .. }
+        | Command::Link { scope, .. } => resolve_cmd_scope(scope.as_deref(), default_scope),
+        _ => default_scope,
+    };
+
     let db = if cli.db.exists() {
         Db::open_stored(&cli.db)
     } else {
@@ -46,34 +56,22 @@ fn main() {
 
     match cli.cmd {
         Command::Info => info(&db, &cli.db, default_scope, cli.pretty),
-        Command::CreateMemory {
-            content,
-            props,
-            scope,
-        } => create_memory(
-            &db,
-            resolve_cmd_scope(scope.as_deref(), default_scope),
-            content,
-            props.as_deref(),
-            cli.pretty,
-        ),
-        Command::CreateEntity { name, props, scope } => create_entity(
-            &db,
-            resolve_cmd_scope(scope.as_deref(), default_scope),
-            name,
-            props.as_deref(),
-            cli.pretty,
-        ),
+        Command::CreateMemory { content, props, .. } => {
+            create_memory(&db, write_scope, content, props.as_deref(), cli.pretty)
+        }
+        Command::CreateEntity { name, props, .. } => {
+            create_entity(&db, write_scope, name, props.as_deref(), cli.pretty)
+        }
         Command::Link {
             from,
             to,
             ty,
             props,
             valid_from,
-            scope,
+            ..
         } => link(
             &db,
-            resolve_cmd_scope(scope.as_deref(), default_scope),
+            write_scope,
             &from,
             &to,
             ty,

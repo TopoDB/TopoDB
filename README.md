@@ -43,16 +43,21 @@ First consumer: Atlas (agentic OS desktop app).
 ### topodb-cli
 
 `topodb-cli` installs a binary named **`topodb`**: point it at a `.redb` file and it gives you
-all 11 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
-`search`, `traverse`, `stats`, `changes`, `compact`) as one-shot, script-friendly subcommands —
-compact JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can
-branch on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
-It opens the database file directly and in-process, the same way `topodb-mcp` does — no server,
-no network hop, and (because of that) no running concurrently with something else that already
-has the same file open. Install with `cargo install topodb-cli`. See
+all 17 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
+`search`, `traverse`, `stats`, `changes`, `compact`, `set-props`, `remove-node`, `close-edge`,
+`set-embedding`, `search-vector`, `submit`) as one-shot, script-friendly subcommands — compact
+JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can branch
+on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
+`create-memory`, `create-entity`, and `link` each also take their own per-command `--scope`,
+overriding the global `--scope` for that one invocation — the same override the batch DSL's
+same-named ops and the equivalent `topodb-mcp` tools support. It opens the database file
+directly and in-process, the same way `topodb-mcp` does — no server, no network hop, and
+(because of that) no running concurrently with something else that already has the same file
+open. Install with `cargo install topodb-cli`. See
 [`crates/topodb-cli/README.md`](crates/topodb-cli/README.md) for the full command table,
-exit-code contract, scoping rules, and v1 limitations (no vector search, no set-props/remove-node,
-no bulk/stdin submit).
+exit-code contract, scoping rules, and v1 limitations (no `--spec` flag; no multi-scope reads —
+this CLI reads under one scope at a time, while `topodb-mcp` can read across a set; direct-embedded
+single-process access only).
 
 ### topodb-mcp
 

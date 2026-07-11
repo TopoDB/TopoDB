@@ -968,5 +968,39 @@ fn per_command_bad_scope_is_rejected_exit_2() {
         assert_eq!(out.status.code(), Some(2), "args: {args:?}");
         let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
         assert_eq!(err["error"]["kind"], "rejected");
+        let message = err["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("invalid scope"),
+            "expected an 'invalid scope' message so this test can't pass off an unrelated \
+             rejection (e.g. a bogus node id) as a scope failure, got: {message:?}"
+        );
     }
+}
+
+/// A bad per-command `--scope` must be resolved BEFORE the db is opened —
+/// same contract `--scope` already has (documented in
+/// `crates/topodb-cli/README.md` under Global flags). Run against a
+/// non-existent `--db` path: if the per-command override were resolved
+/// after `Db::open_with` (as it was before this fix), the db file would be
+/// created empty and then the process would exit 2 — leaving a stray file
+/// behind. Assert both: exit 2, AND no file at that path.
+#[test]
+fn per_command_bad_scope_is_rejected_before_db_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("never_created.redb");
+    assert!(!db.exists(), "precondition: db path must not exist yet");
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["create-memory", "--content", "x", "--scope", "not-a-ulid"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "rejected");
+    assert!(
+        !db.exists(),
+        "a rejected per-command --scope must not leave an empty db file behind"
+    );
 }

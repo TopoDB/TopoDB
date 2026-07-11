@@ -75,7 +75,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **`--scope <ulid|shared>` on `create-memory`, `create-entity`, and `link`** — a per-command
   override of the global `--scope`, for the three commands that stamp a scope.
 
-  These are the same three ops that `submit`'s batch DSL has been able to scope per-op, so the
+  These are the same three ops `submit`'s batch DSL scopes per-op, so the
   CLI's two ways to write now agree. `link --scope shared` in particular is what lets a `shared`
   edge join two `shared` nodes; without it the edge takes the global scope and is invisible from
   every other project.
@@ -83,7 +83,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
   `set-props`, `remove-node`, `close-edge`, and `set-embedding` address an existing node or edge
   by id and stamp no scope, so they take no `--scope`.
 
-#### Documentation
+#### Changed
 
 - `changes` is documented as deliberately **ungated**, unlike `topodb-mcp`'s `get_changes`. The
   MCP gate stops an LLM tripping over an advertised tool; it prevents accidents, not attackers.
