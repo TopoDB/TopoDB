@@ -2,9 +2,26 @@
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpStdioClient, type McpTool } from "./mcp-client.ts";
 
 const require = createRequire(import.meta.url);
+
+/** Recording defaults ON; `TOPODB_RECORD=0` disables it. */
+export function recordingEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.TOPODB_RECORD !== "0";
+}
+
+/** `--spec` launch args pointing at the bundled episode IndexSpec, or `[]`
+ * when recording is disabled. `../spec/` is relative to the COMPILED
+ * `dist/server-handle.js` — `spec/` sits at the package root alongside
+ * `dist/`, so from `dist/` this resolves correctly both in-repo and once
+ * published (see package.json `files`). */
+export function episodeSpecArgs(env: NodeJS.ProcessEnv): string[] {
+  if (!recordingEnabled(env)) return [];
+  const specPath = new URL("../spec/episode-index-spec.json", import.meta.url);
+  return ["--spec", fileURLToPath(specPath)];
+}
 
 export class TopodbServer {
   private client?: McpStdioClient;
@@ -24,7 +41,14 @@ export class TopodbServer {
     // directory as a startup error — and the default `.topodb/` won't exist in
     // a fresh project. Create it so the server comes up on first use.
     mkdirSync(dirname(db), { recursive: true });
-    const args = [TopodbServer.resolveLauncher(), "--db", db, "--scope", scope];
+    const args = [
+      TopodbServer.resolveLauncher(),
+      "--db",
+      db,
+      "--scope",
+      scope,
+      ...episodeSpecArgs(this.env),
+    ];
     this.client = new McpStdioClient(args);
     await this.client.start();
     return this.client;

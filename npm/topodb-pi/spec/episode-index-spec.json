@@ -1,0 +1,14 @@
+{
+  "equality": [
+    { "label": "Entity", "prop": "name" },
+    { "label": "Artifact", "prop": "sha256" },
+    { "label": "PolicyVersion", "prop": "version" },
+    { "label": "Procedure", "prop": "name" },
+    { "label": "Episode", "prop": "outcome" }
+  ],
+  "text": [
+    { "label": "Memory", "prop": "content" },
+    { "label": "Lesson", "prop": "content" },
+    { "label": "Episode", "prop": "goal" }
+  ]
+}
