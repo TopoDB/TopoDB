@@ -200,7 +200,7 @@ pub enum Command {
     ///
     /// Per-op fields: create_memory { content, scope?, props? };
     /// create_entity { name, scope?, props? };
-    /// link { from, to, type, props?, valid_from? } — note link uses
+    /// link { from, to, type, scope?, props?, valid_from? } — note link uses
     /// from/to/type, NOT the link tool's from_id/to_id/edge_type;
     /// set_node_props { id, props } (props value null removes that key);
     /// remove_node { id }; close_edge { id, valid_to? };

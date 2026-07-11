@@ -315,6 +315,31 @@ pub fn scope_to_scope_set(scope: Scope) -> ScopeSet {
     }
 }
 
+/// Several resolved `Scope`s → the `ScopeSet` a multi-scope read runs against.
+/// `Scope::Shared` sets the set's `include_shared` flag; each `Scope::Id`
+/// becomes a member id. This is the only constructor that can produce a
+/// genuinely multi-member `ScopeSet` — [`scope_to_scope_set`] always collapses
+/// to a singleton, which is why "this project *plus* shared" was previously
+/// unexpressible from any client.
+///
+/// An empty slice yields a set that admits nothing. Callers must not hand a
+/// read an empty set expecting "everything" — there is no unscoped read.
+pub fn scopes_to_scope_set(scopes: &[Scope]) -> ScopeSet {
+    let ids: Vec<ScopeId> = scopes
+        .iter()
+        .filter_map(|s| match s {
+            Scope::Id(id) => Some(*id),
+            Scope::Shared => None,
+        })
+        .collect();
+    let set = ScopeSet::of(&ids);
+    if scopes.iter().any(|s| matches!(s, Scope::Shared)) {
+        set.with_shared()
+    } else {
+        set
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +680,55 @@ mod tests {
         assert!(set.contains(Scope::Id(id)));
         assert!(!set.contains(Scope::Shared));
         assert!(!set.contains(Scope::Id(ScopeId::new())));
+    }
+
+    #[test]
+    fn scopes_to_scope_set_admits_every_member() {
+        let a = ScopeId::new();
+        let b = ScopeId::new();
+        let set = scopes_to_scope_set(&[Scope::Id(a), Scope::Shared, Scope::Id(b)]);
+        assert!(set.contains(Scope::Id(a)));
+        assert!(set.contains(Scope::Id(b)));
+        assert!(set.contains(Scope::Shared));
+    }
+
+    #[test]
+    fn scopes_to_scope_set_without_shared_excludes_shared() {
+        let a = ScopeId::new();
+        let set = scopes_to_scope_set(&[Scope::Id(a)]);
+        assert!(set.contains(Scope::Id(a)));
+        assert!(!set.contains(Scope::Shared));
+    }
+
+    #[test]
+    fn scopes_to_scope_set_matches_singleton_for_one_member() {
+        // The new multi-member constructor must agree with the existing
+        // single-scope one for a one-element input — that equivalence is what
+        // makes seeding the server's default read set from a 1-length list
+        // backwards compatible.
+        let a = ScopeId::new();
+        let multi = scopes_to_scope_set(&[Scope::Id(a)]);
+        let single = scope_to_scope_set(Scope::Id(a));
+        assert_eq!(multi.contains(Scope::Id(a)), single.contains(Scope::Id(a)));
+        assert_eq!(
+            multi.contains(Scope::Shared),
+            single.contains(Scope::Shared)
+        );
+
+        let multi_shared = scopes_to_scope_set(&[Scope::Shared]);
+        let single_shared = scope_to_scope_set(Scope::Shared);
+        assert_eq!(
+            multi_shared.contains(Scope::Shared),
+            single_shared.contains(Scope::Shared)
+        );
+    }
+
+    #[test]
+    fn scopes_to_scope_set_empty_admits_nothing() {
+        let a = ScopeId::new();
+        let set = scopes_to_scope_set(&[]);
+        assert!(!set.contains(Scope::Shared));
+        assert!(!set.contains(Scope::Id(a)));
     }
 
     // --- json_to_prop_changes: null removes, scalar sets ---

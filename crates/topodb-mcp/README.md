@@ -2,11 +2,13 @@
 
 An MCP (Model Context Protocol) server exposing the [TopoDB](https://crates.io/crates/topodb)
 agent-memory engine over stdio. Point an MCP client at a `.redb` database file and it gets
-recall (get/find/search/traverse/access-stats/changes) and write (create memory, create
-entity, link) tools backed by a scoped, temporal property graph — no separate database
-process, no network hop.
+recall (get/find/search-text/search-vectors/traverse/access-stats/changes) and write
+(create memory, create entity, link, set-props, remove-node, close-edge, set-embedding,
+batch) tools backed by a scoped, temporal property graph — no separate database process,
+no network hop.
 
-Status: **v0** — read + write tools, no vector search yet. See [Limitations](#v0-limitations).
+Status: **v0** — read + write tools, including vector search and node/edge mutation.
+See [Limitations](#v0-limitations).
 
 ## Install
 
@@ -20,37 +22,55 @@ which must be on `PATH` for the client configs below to find it by name.
 ## CLI reference
 
 ```
-topodb-mcp --db <path> [--scope <ulid|shared>] [--spec <path>]
+topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]]
+           [--spec <path>] [--allow-unscoped-changes]
 ```
 
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
 | `--db <path>` | yes | — | Path to the redb database file. A missing *file* is created on open; a missing *parent directory* is a startup error. |
-| `--scope <ulid\|shared>` | no | `shared` | The default scope applied to every tool call that omits its own `scope` parameter. `"shared"` (case-insensitive) resolves to the shared scope; any other value is parsed as a ULID and resolves to that scope id. An invalid value is a startup error. |
+| `--scope <ulid\|shared>` | no | `shared` | The default **write** scope: the one scope a create/link tool call is stamped with when it omits its own `scope` parameter. `"shared"` (case-insensitive) resolves to the shared scope; any other value is parsed as a ULID and resolves to that scope id. An invalid value is a startup error. |
+| `--read-scopes <list>` | no | `--scope`'s value | The default **read** scope *set*: a comma-separated list of `"shared"`/scope ULIDs (whitespace around entries ignored) that a read tool call filters by when it omits both its own `scope` and `scopes` parameters. Reads filter by a set; `--scope` picks the single scope a write is stamped with — that asymmetry is why there are two flags instead of one. An empty list is a startup error (there is no unscoped read). |
 | `--spec <path>` | no | inherit / built-in default | Path to a JSON file deserializing to `topodb::IndexSpec`, controlling which `(label, prop)` pairs are equality- or text-indexed, honored verbatim (may reindex an existing db). Omitted: an **existing** db inherits its own persisted spec (never reindexed or clobbered); a **fresh** db is created with the built-in default — equality index on `(Entity, name)`, text index on `(Memory, content)`, matching the labels/props the `create_entity`/`create_memory` tools write, so lookup and search work out of the box with no spec file. This mirrors `topodb-cli`, so a db either tool created is served identically by the other. |
+| `--allow-unscoped-changes` | no | off | Bare toggle. `get_changes` is the one deliberately unscoped read tool — its op log spans every scope in the db — so it is rejected with `invalid_params` unless the server was started with this flag. Sync/consolidation hosts that legitimately need the whole log pass it. |
 
-Arg parsing is hand-rolled (three flags); there is no `--help` flag yet.
+Arg parsing is hand-rolled (five flags); there is no `--help` flag yet.
 
 ## Tools
 
-`tools/list` reports exactly 10 tools: `db_info`, six read tools, three write tools.
+`tools/list` reports exactly 16 tools: `db_info`, six read tools (`get_changes` included), and
+nine write tools.
 
 | Tool | Params | Description |
 |---|---|---|
-| `db_info` | — | Report the open database's path, current op-log sequence number, and the default scope applied to tool calls that omit `scope`. Call this first to confirm the server is wired to the expected database, and to obtain `current_seq` as the anchor for `get_changes`. |
-| `get_node` | `id` (string, required); `scope` (string, optional) | Fetch one node by its ULID. Call this when you already have a node id (from a previous search, traverse, or create) and need its current label and properties. |
-| `find_by_prop` | `label`, `prop`, `value` (string/number/bool), `scope?` | Exact-match lookup on an equality-indexed property (e.g. an Entity's name). Call this to resolve a known identifier to a node — NOT for fuzzy or full-text search; use `search_memories` for that. Errors if `(label, prop)` is not declared in the index spec. |
-| `search_memories` | `query` (required), `k` (integer, default 10), `scope?` | Full-text BM25 search over indexed text properties. Call this when looking for memories relevant to a topic or phrase. Returns up to `k` nodes ranked by relevance with scores. |
-| `traverse` | `seed_id` (required), `max_hops` (integer, default 2), `direction` (enum: `out`/`in`/`both`, default `both`), `edge_types` (array of strings, optional), `scope?` | Walk the graph outward from a seed node, following edges up to `max_hops`. Call this to gather the context AROUND something you already found — related entities, linked memories. Returns the subgraph (nodes + edges). |
-| `access_stats` | `id` (required), `scope?` | Read a node's access statistics (count, last-accessed timestamp). Call this when deciding what to consolidate or forget — e.g. finding stale memories. Reading stats does not itself count as an access. |
-| `get_changes` | `since_seq` (integer, required) | Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The `db_info` tool reports `current_seq`. |
+| `db_info` | — | Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits `scope`, and the default READ scope set applied to a read call that omits both `scope`/`scopes`. Call this first to confirm the server is wired to the expected database and read set, and to obtain `current_seq` as the anchor for `get_changes`. |
+| `get_node` | `id` (string, required); `scope` (string, optional); `scopes` (string[], optional) | Fetch one node by its ULID. Call this when you already have a node id (from a previous search, traverse, or create) and need its current label and properties. |
+| `find_by_prop` | `label`, `prop`, `value` (string/number/bool), `scope?`, `scopes?` | Exact-match lookup on an equality-indexed property (e.g. an Entity's name). Call this to resolve a known identifier to a node — NOT for fuzzy or full-text search; use `search_memories` for that. Errors if `(label, prop)` is not declared in the index spec. |
+| `search_memories` | `query` (required), `k` (integer, default 10), `scope?`, `scopes?` | Full-text BM25 search over indexed text properties. Call this when looking for memories relevant to a topic or phrase. Returns up to `k` nodes ranked by relevance with scores. |
+| `traverse` | `seed_id` (required), `max_hops` (integer, default 2), `direction` (enum: `out`/`in`/`both`, default `both`), `edge_types` (array of strings, optional), `scope?`, `scopes?` | Walk the graph outward from a seed node, following edges up to `max_hops`. Call this to gather the context AROUND something you already found — related entities, linked memories. Returns the subgraph (nodes + edges). |
+| `access_stats` | `id` (required), `scope?`, `scopes?` | Read a node's access statistics (count, last-accessed timestamp). Call this when deciding what to consolidate or forget — e.g. finding stale memories. Reading stats does not itself count as an access. |
+| `search_vectors` | `model` (string, required), `vector` (number array, required), `k` (integer, default 10), `candidates` (array of node ids, optional), `scope?`, `scopes?` | Cosine similarity search over embeddings stored under `model`. Call this when you have a host-computed query embedding and want nodes ranked by vector similarity rather than text relevance. `candidates` restricts scoring to a given node id set (e.g. narrow to a `traverse` result for hybrid recall). Errors if `k` is 0 or the vector is empty. |
+| `get_changes` | `since_seq` (integer, required) | Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The `db_info` tool reports `current_seq`. Rejected with `invalid_params` unless the server was started with `--allow-unscoped-changes`. |
 | `create_memory` | `content` (string, required), `props` (object, optional), `scope?` | Store a new memory. Call this when the user or task produces information worth remembering later. `content` becomes the full-text-searchable body; `props` holds structured metadata (strings/numbers/bools). Returns the new node's id — keep it if you plan to link this memory to entities. |
 | `create_entity` | `name` (string, required), `props` (object, optional), `scope?` | Create an entity node (person, project, concept). Call this the FIRST time something is mentioned that memories should attach to; use `find_by_prop` first to check it doesn't already exist. `name` is equality-indexed for exact lookup. |
-| `link` | `from_id`, `to_id`, `edge_type` (all required strings), `props` (object, optional), `valid_from` (integer ms, optional) | Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. `'works_on'`). `edge_type` is free-form but be consistent — `traverse` can filter by it. Returns the edge id. Errors if either node doesn't exist. |
+| `link` | `from_id`, `to_id`, `edge_type` (all required strings), `props` (object, optional), `valid_from` (integer ms, optional), `scope?` | Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. `'works_on'`). `edge_type` is free-form but be consistent — `traverse` can filter by it. Returns the edge id. Errors if either node doesn't exist. |
+| `set_node_props` | `id` (string, required), `props` (object, required — a `null` value REMOVES that key) | Set or remove properties on an existing node. Errors if the node doesn't exist. Returns the committed seq. |
+| `remove_node` | `id` (string, required) | Hard-delete a node and cascade-remove its incident edges. Call this to forget something entirely. Errors if the node doesn't exist. Returns the committed seq. |
+| `close_edge` | `id` (string, required), `valid_to` (integer ms, optional — defaults to now) | Close an open edge, stamping its `valid_to`. Errors if the edge doesn't exist. Returns the committed seq. |
+| `set_embedding` | `id` (string, required), `model` (string, required), `vector` (non-empty number array, required) | Attach a raw embedding vector (host-computed) to an existing node under `model`. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq. |
+| `submit_batch` | `commands` (array of command objects, required) | Submit a batch of high-level commands atomically — all commit or none. Each command's `op` matches a tool name (own field names, not always identical to that tool's param names — see the batch DSL). `#N` in an id field references the id produced by the Nth earlier command. Returns the produced ids in order (`null` for commands that create nothing). |
 
-Every scoped tool that omits `scope` uses the server's configured `--scope` default (see
-[Scoping semantics](#scoping-semantics)). Engine errors and parse failures are returned as MCP
-tool errors carrying the engine's message — the server never panics on bad input.
+Every scoped read tool accepts both `scope` (one scope) and `scopes` (an array of several,
+e.g. a project scope plus `"shared"`) — a non-empty `scopes` wins over `scope`, which wins over
+the server's configured default read set (`--read-scopes`, or `--scope` alone). An explicitly
+empty `scopes: []` is rejected (`invalid_params`) rather than treated as "read everything" —
+there is no unscoped read except `get_changes`, gated separately behind
+`--allow-unscoped-changes`. Every write tool accepts only `scope` (one scope) — see
+[Scoping semantics](#scoping-semantics) for the full reads-filter-a-set-writes-stamp-one
+picture. `scopes` is not a write-tool param at all: every param struct rejects an unknown
+field rather than silently ignoring it, so passing `scopes` to a write tool is a clean tool
+error, not a quiet no-op. Engine errors and parse failures are returned as MCP tool errors
+carrying the engine's message — the server never panics on bad input.
 
 ## Client configuration
 
@@ -145,34 +165,39 @@ or `.mcp.json` project):
 
 TopoDB partitions nodes and edges into scopes — a shared scope plus any number of ULID-named
 scopes — so multiple agents or conversations can share one database file without stepping on
-each other's memories. `topodb-mcp` resolves scope as follows:
+each other's memories. **Reads filter by a *set* of scopes; a write is stamped with exactly
+*one*.** That asymmetry is the thing to get right: a read tool can gather results from several
+scopes at once (e.g. a private project scope plus `shared`), but a create/link tool call always
+picks exactly one scope for the node/edge it produces. `topodb-mcp` resolves scope as follows:
 
-- The server is started with one **default scope** (`--scope`, default `shared`).
-- Every scoped tool call (all of them except `get_changes`) accepts an optional `scope`
-  parameter. Omit it to use the server's default scope; pass `"shared"` or a scope ULID to
-  target a specific scope explicitly.
-- `link` has no `scope` parameter on the wire — it always writes to the server's configured
-  default scope.
+- The server is started with two independent defaults:
+  - `--scope` (default `shared`) — the default **write** scope, used by `create_memory`,
+    `create_entity`, and `link` when a call omits its own `scope`.
+  - `--read-scopes` (default: `--scope`'s value alone) — the default **read** scope *set*, used
+    by every scoped read tool when a call omits both `scope` and `scopes`. Comma-separated; an
+    empty list is a startup error — there is no unscoped read.
+- Every scoped read tool call also accepts, per call: an optional `scope` (one scope), and an
+  optional `scopes` (an array of several). Precedence: a non-empty `scopes` wins over `scope`,
+  which wins over the server's default read set. An explicitly empty `scopes: []` is **rejected**
+  (`invalid_params`) rather than treated as "read everything".
+- Every write tool call accepts only a single optional `scope`, resolved against the server's
+  default *write* scope (`--scope`), never against `--read-scopes`. `link` is the exception worth
+  noting: its `scope` param determines which scope the *edge itself* lives in, independent of the
+  scopes of the two nodes it connects — this is what lets an edge join nodes that live in a scope
+  other than the server's default, e.g. an edge from a `shared`-scope entity to a private-scope
+  memory. The batch DSL's `link` op takes the same `scope` field.
 - `get_changes` is the one deliberately **unscoped** tool: the operation log spans every scope,
-  so a host can replay it for cross-scope consolidation or sync. There is no way to filter it
-  by scope.
+  so a host can replay it for cross-scope consolidation or sync. There is no way to filter it by
+  scope, and for that reason it is rejected with `invalid_params` unless the server was started
+  with `--allow-unscoped-changes`.
 
 If you want per-conversation isolation, start a separate `topodb-mcp` process per conversation
-with a distinct `--scope <ulid>` against the same `--db` file (or pass `scope` explicitly on
-each tool call from a single server instance).
+with a distinct `--scope <ulid>` against the same `--db` file (or pass `scope`/`scopes`
+explicitly on each tool call from a single server instance).
 
 ## v0 limitations
 
-- **No vector search.** MCP clients don't carry embedders, and accepting raw vector params over
-  the wire invites garbage queries — this is deferred to a future version with a real embedding
-  story. `search_memories` is BM25 full-text only.
-- **No `set_props` / `remove_node`.** The write surface is create-only (`create_memory`,
-  `create_entity`, `link`); mutating or deleting existing nodes isn't exposed yet.
-  Corrections must go through a fresh fact (TopoDB facts supersede, they don't overwrite).
 - **`Bytes` and `DateTime` prop values are unsupported over MCP.** Only string, integer, float,
   and bool prop values round-trip through JSON; attempting to write or a stored node that
   contains a `Bytes`/`DateTime` prop is rejected/errors rather than silently coerced.
-- **`link` always uses the default scope.** There is no way to create a cross-scope edge or an
-  edge in a non-default scope through this tool in v0 — start a server with the target scope as
-  its default, or wait for a future `scope` param on `link`.
 - **No HTTP/SSE transport.** Only stdio, i.e. one client process per server process.
