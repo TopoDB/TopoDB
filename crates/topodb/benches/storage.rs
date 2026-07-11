@@ -20,13 +20,13 @@ fn cold_open(c: &mut Criterion) {
     {
         let db = Db::open_with(&path, spec()).unwrap();
         for b in batches(&WorkloadSpec {
-            memories: 1_000,
+            memories: 10_000,
             ..Default::default()
         }) {
             db.submit(b).unwrap();
         }
     }
-    c.bench_function("cold_open_1k", |b| {
+    c.bench_function("cold_open_10k", |b| {
         b.iter(|| Db::open_with(&path, spec()).unwrap())
     });
 }
