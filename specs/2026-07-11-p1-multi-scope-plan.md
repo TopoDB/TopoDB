@@ -13,6 +13,7 @@
 ## Global Constraints
 
 - **Backwards compatible.** Every existing `topodb-mcp` and `topodb-json` test must pass **unmodified**. `--scope` keeps its exact current meaning (the default *write* scope).
+- **The ONE sanctioned exception to the above** (approved by the human before execution): Task 5 gates `get_changes`, which breaks three existing tests that call it — `tests/e2e.rs:56`, `tests/e2e.rs:218`, `tests/smoke.rs:44`. Those three tests may add `--allow-unscoped-changes` to their **spawn args only**. **Every assertion in them must remain byte-identical.** Weakening, deleting, or re-scoping an existing assertion is a defect, not a carve-out. No other existing test may be touched.
 - **All MCP params explicitly typed.** No `serde_json::Value` for new params. Untyped params were the `0.0.3` bug — they made several tools uncallable from any client. `Option<Vec<String>>` and `Option<String>`, never `Value`.
 - **Writes take one scope; reads take a set.** This asymmetry is intentional and already modelled by `TopoServer::resolve_scope` (write) vs `resolve_scopes` (read). Do not "unify" them.
 - **`cargo` is NOT on the Bash PATH on this machine.** Run all `cargo` commands with the **PowerShell** tool.
@@ -903,7 +904,7 @@ Amend the tool description (:682) so a client isn't told it can call something i
 PowerShell: `cargo test --workspace`
 Expected: PASS.
 
-> If a pre-existing test in `e2e.rs` or `plan6.rs` calls `get_changes`, it will now fail. That is expected and is **the one sanctioned exception** to "existing tests pass unmodified": add `--allow-unscoped-changes` to that test's spawn args (it is a sync-host-style test and legitimately wants the log). Do not weaken the gate.
+Three pre-existing tests call `get_changes` and will now fail: `tests/e2e.rs:56`, `tests/e2e.rs:218`, `tests/smoke.rs:44`. This is the sanctioned exception recorded in Global Constraints. For each, add `--allow-unscoped-changes` to the `Server::spawn` args — **nothing else**. Every assertion stays byte-identical: these tests drive `get_changes` exactly as a sync host would, so granting them the flag is honest, and their proof value is unchanged. **Do not** weaken the gate, and **do not** touch any other test.
 
 - [ ] **Step 6: Commit**
 
