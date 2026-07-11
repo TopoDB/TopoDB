@@ -1,5 +1,8 @@
+use crate::adj::{
+    adj_close, adj_insert, adj_remove_all, adj_remove_edge, AdjEntryDisk, IN_ADJ, OUT_ADJ,
+};
 use crate::counters::AccessStats;
-use crate::dict::{Dicts, DICT};
+use crate::dict::{DictKind, Dicts, DICT};
 use crate::error::{storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
@@ -103,6 +106,8 @@ impl Storage {
             tx.open_table(EDGE_IDS).map_err(storage_err)?;
             let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
             seed_shared(&mut scopes)?;
+            tx.open_table(OUT_ADJ).map_err(storage_err)?;
+            tx.open_table(IN_ADJ).map_err(storage_err)?;
             let meta = tx.open_table(META).map_err(storage_err)?;
             let version = match meta.get("format_version").map_err(storage_err)? {
                 Some(v) => {
@@ -587,6 +592,8 @@ impl Storage {
             let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
             let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
             let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
+            let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+            let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
             for op in &resolved {
                 match op {
                     Op::CreateNode { scope, .. } | Op::CreateEdge { scope, .. } => {
@@ -621,6 +628,9 @@ impl Storage {
                     &mut node_ids,
                     &mut edge_slots,
                     &mut edge_ids,
+                    &mut out_adj,
+                    &mut in_adj,
+                    &scope_registry,
                     op,
                 )?;
                 if let Some((id, scope, old_text)) = pre {
@@ -857,6 +867,8 @@ impl Storage {
             let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
             let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
             let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
+            let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+            let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
             // The text index is derived from state, so it is drained and rebuilt
             // alongside NODES/EDGES through the very same `fts_update` used on the
             // write path — no parallel maintenance logic.
@@ -875,6 +887,8 @@ impl Storage {
             edge_ids.retain(|_, _| false).map_err(storage_err)?;
             dicts.clear();
             scopes_table.retain(|_, _| false).map_err(storage_err)?;
+            out_adj.retain(|_, _| false).map_err(storage_err)?;
+            in_adj.retain(|_, _| false).map_err(storage_err)?;
             seed_shared(&mut scopes_table)?;
             *scope_registry = ScopeRegistry::load_table_for_rebuild(&scopes_table)?;
             postings.retain(|_, _| false).map_err(storage_err)?;
@@ -916,6 +930,9 @@ impl Storage {
                     &mut node_ids,
                     &mut edge_slots,
                     &mut edge_ids,
+                    &mut out_adj,
+                    &mut in_adj,
+                    &scope_registry,
                     &op,
                 )?;
                 if let Some((id, scope, old_text)) = pre {
@@ -1151,6 +1168,9 @@ fn apply_op(
     node_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
     edge_slots: &mut Table<'_, &'static [u8], &'static [u8]>,
     edge_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
+    out_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
+    in_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scope_registry: &ScopeRegistry,
     op: &Op,
 ) -> Result<(), TopoError> {
     match op {
@@ -1201,7 +1221,11 @@ fn apply_op(
                 )));
             }
 
+            let removed_slot = crate::slots::node_slot(node_slots, *id)?
+                .ok_or_else(|| TopoError::Encoding("missing node slot".into()))?;
             embeddings.remove(key.as_slice()).map_err(storage_err)?;
+            adj_remove_all(out_adj, removed_slot)?;
+            adj_remove_all(in_adj, removed_slot)?;
             remove_node_mapping(node_slots, node_ids, *id)?;
             // Remove incident edges, both directions. v0.1: linear scan is
             // acceptable; adjacency-assisted delete arrives with Task 5.
@@ -1227,6 +1251,23 @@ fn apply_op(
                         .map_err(|e| TopoError::Encoding(e.to_string()))?;
                     crate::disk::edge_from_disk(disk, dicts)?
                 };
+                let edge_slot = crate::slots::edge_slot(edge_slots, edge.id)?
+                    .ok_or_else(|| TopoError::Encoding("missing cascade edge slot".into()))?;
+                let from_slot = if edge.from == *id {
+                    removed_slot
+                } else {
+                    crate::slots::node_slot(node_slots, edge.from)?
+                        .ok_or_else(|| TopoError::Encoding("missing cascade from slot".into()))?
+                };
+                let to_slot = if edge.to == *id {
+                    removed_slot
+                } else {
+                    crate::slots::node_slot(node_slots, edge.to)?
+                        .ok_or_else(|| TopoError::Encoding("missing cascade to slot".into()))?
+                };
+                let edge_type = dicts.intern(dict, DictKind::EdgeType, edge.ty.as_str())?;
+                adj_remove_edge(out_adj, from_slot, edge_type, edge_slot)?;
+                adj_remove_edge(in_adj, to_slot, edge_type, edge_slot)?;
                 edges.remove(key.as_slice()).map_err(storage_err)?;
                 remove_edge_mapping(edge_slots, edge_ids, edge.id)?;
             }
@@ -1255,7 +1296,13 @@ fn apply_op(
                     "CreateEdge {id:?}: cross-scope edge requires at least one Shared endpoint"
                 )));
             }
-            alloc_edge_slot(slot_meta, edge_slots, edge_ids, *id)?;
+            let edge_slot = alloc_edge_slot(slot_meta, edge_slots, edge_ids, *id)?;
+            let from_slot = crate::slots::node_slot(node_slots, *from)?
+                .ok_or_else(|| TopoError::Encoding("missing from slot".into()))?;
+            let to_slot = crate::slots::node_slot(node_slots, *to)?
+                .ok_or_else(|| TopoError::Encoding("missing to slot".into()))?;
+            let edge_type = dicts.intern(dict, DictKind::EdgeType, ty)?;
+            let scope_id = scope_registry.id_of(*scope)?; // placeholder
             let rec = EdgeRecord {
                 id: *id,
                 scope: *scope,
@@ -1267,7 +1314,27 @@ fn apply_op(
                     .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)"),
                 valid_to: None,
             };
-            put_edge(edges, dict, dicts, &rec)
+            put_edge(edges, dict, dicts, &rec)?;
+            let entry = AdjEntryDisk {
+                target: to_slot,
+                edge: edge_slot,
+                scope: scope_id,
+                valid_from: rec.valid_from,
+                valid_to: None,
+            };
+            adj_insert(out_adj, from_slot, edge_type, entry)?;
+            adj_insert(
+                in_adj,
+                to_slot,
+                edge_type,
+                AdjEntryDisk {
+                    target: from_slot,
+                    edge: edge_slot,
+                    scope: scope_id,
+                    valid_from: rec.valid_from,
+                    valid_to: None,
+                },
+            )
         }
         Op::CloseEdge { id, valid_to } => {
             let mut rec = read_edge(edges, dicts, *id)?
@@ -1281,7 +1348,21 @@ fn apply_op(
                 valid_to
                     .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)"),
             );
-            put_edge(edges, dict, dicts, &rec)
+            put_edge(edges, dict, dicts, &rec)?;
+            let edge_slot = crate::slots::edge_slot(edge_slots, *id)?
+                .ok_or_else(|| TopoError::Encoding("missing edge slot".into()))?;
+            let from_slot = crate::slots::node_slot(node_slots, rec.from)?
+                .ok_or_else(|| TopoError::Encoding("missing from slot".into()))?;
+            let to_slot = crate::slots::node_slot(node_slots, rec.to)?
+                .ok_or_else(|| TopoError::Encoding("missing to slot".into()))?;
+            let edge_type = dicts.intern(dict, DictKind::EdgeType, rec.ty.as_str())?;
+            let valid_to = rec.valid_to.expect("set above");
+            if !adj_close(out_adj, from_slot, edge_type, edge_slot, valid_to)?
+                || !adj_close(in_adj, to_slot, edge_type, edge_slot, valid_to)?
+            {
+                return Err(TopoError::Encoding("adjacency missing closed edge".into()));
+            }
+            Ok(())
         }
     }
 }

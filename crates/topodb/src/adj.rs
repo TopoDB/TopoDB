@@ -1,8 +1,12 @@
 //! Versioned delta-varint adjacency block payloads for format v3.
 use crate::error::TopoError;
+use redb::ReadableTable;
 
 pub(crate) const ADJ_BLOCK_FORMAT_V0: u8 = 0;
 pub(crate) const CHUNK_SPLIT_TARGET: usize = 8 * 1024;
+pub(crate) const OUT_ADJ: redb::TableDefinition<&[u8], &[u8]> =
+    redb::TableDefinition::new("out_adj");
+pub(crate) const IN_ADJ: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("in_adj");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdjEntryDisk {
@@ -134,6 +138,161 @@ pub(crate) fn decode_block(payload: &[u8]) -> Result<Vec<AdjEntryDisk>, TopoErro
         return Err(TopoError::Encoding(
             "trailing bytes in adjacency block".into(),
         ));
+    }
+    Ok(entries)
+}
+
+fn key_parts(key: &[u8]) -> Option<(u64, u32, u32)> {
+    let bytes: [u8; 16] = key.try_into().ok()?;
+    Some((
+        u64::from_be_bytes(bytes[..8].try_into().ok()?),
+        u32::from_be_bytes(bytes[8..12].try_into().ok()?),
+        u32::from_be_bytes(bytes[12..].try_into().ok()?),
+    ))
+}
+
+fn load_chunk(
+    table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    key: [u8; 16],
+) -> Result<Vec<AdjEntryDisk>, TopoError> {
+    match table
+        .get(key.as_slice())
+        .map_err(crate::error::storage_err)?
+    {
+        None => Ok(Vec::new()),
+        Some(value) => {
+            let raw = crate::codec::unframe_value(value.value())?;
+            decode_block(raw.as_ref())
+        }
+    }
+}
+
+fn store_chunk(
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    key: [u8; 16],
+    entries: &[AdjEntryDisk],
+) -> Result<(), TopoError> {
+    let framed = crate::codec::frame_value(encode_block(entries)?);
+    table
+        .insert(key.as_slice(), framed.as_slice())
+        .map_err(crate::error::storage_err)?;
+    Ok(())
+}
+
+/// Inserts one entry, rewriting only the final chunk for this `(slot, type)`.
+pub(crate) fn adj_insert(
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    slot: u64,
+    edge_type: u32,
+    entry: AdjEntryDisk,
+) -> Result<(), TopoError> {
+    let mut last = None;
+    for item in table.iter().map_err(crate::error::storage_err)? {
+        let (key, _) = item.map_err(crate::error::storage_err)?;
+        if let Some((found_slot, found_type, chunk)) = key_parts(key.value()) {
+            if found_slot == slot && found_type == edge_type {
+                last = Some(last.map_or(chunk, |previous: u32| previous.max(chunk)));
+            }
+        }
+    }
+    let chunk = last.unwrap_or(0);
+    let key = out_adj_key(slot, edge_type, chunk);
+    let mut entries = load_chunk(table, key)?;
+    let at = entries
+        .binary_search_by_key(&(entry.target, entry.edge), |current| {
+            (current.target, current.edge)
+        })
+        .unwrap_or_else(|index| index);
+    entries.insert(at, entry);
+    if encode_block(&entries)?.len() <= CHUNK_SPLIT_TARGET {
+        store_chunk(table, key, &entries)
+    } else {
+        let split = entries.len() / 2;
+        store_chunk(table, key, &entries[..split])?;
+        store_chunk(
+            table,
+            out_adj_key(slot, edge_type, chunk + 1),
+            &entries[split..],
+        )
+    }
+}
+
+pub(crate) fn adj_close(
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    slot: u64,
+    edge_type: u32,
+    edge_slot: u64,
+    valid_to: i64,
+) -> Result<bool, TopoError> {
+    let mut keys = Vec::new();
+    for item in table.iter().map_err(crate::error::storage_err)? {
+        let (key, _) = item.map_err(crate::error::storage_err)?;
+        if key_parts(key.value()).is_some_and(|(s, ty, _)| s == slot && ty == edge_type) {
+            keys.push(key.value().to_vec());
+        }
+    }
+    for bytes in keys {
+        let key: [u8; 16] = bytes.as_slice().try_into().expect("table key width");
+        let mut entries = load_chunk(table, key)?;
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.edge == edge_slot) {
+            entry.valid_to = Some(valid_to);
+            store_chunk(table, key, &entries)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn adj_remove_edge(
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    slot: u64,
+    edge_type: u32,
+    edge_slot: u64,
+) -> Result<bool, TopoError> {
+    let mut keys = Vec::new();
+    for item in table.iter().map_err(crate::error::storage_err)? {
+        let (key, _) = item.map_err(crate::error::storage_err)?;
+        if key_parts(key.value()).is_some_and(|(s, ty, _)| s == slot && ty == edge_type) {
+            keys.push(key.value().to_vec());
+        }
+    }
+    for bytes in keys {
+        let key: [u8; 16] = bytes.as_slice().try_into().expect("table key width");
+        let mut entries = load_chunk(table, key)?;
+        let before = entries.len();
+        entries.retain(|entry| entry.edge != edge_slot);
+        if entries.len() != before {
+            if entries.is_empty() {
+                table
+                    .remove(key.as_slice())
+                    .map_err(crate::error::storage_err)?;
+            } else {
+                store_chunk(table, key, &entries)?;
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn adj_remove_all(
+    table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    slot: u64,
+) -> Result<Vec<AdjEntryDisk>, TopoError> {
+    let mut keys = Vec::new();
+    for item in table.iter().map_err(crate::error::storage_err)? {
+        let (key, _) = item.map_err(crate::error::storage_err)?;
+        if key_parts(key.value()).is_some_and(|(s, _, _)| s == slot) {
+            keys.push(key.value().to_vec());
+        }
+    }
+    let mut entries = Vec::new();
+    for bytes in keys {
+        let key: [u8; 16] = bytes.as_slice().try_into().expect("table key width");
+        entries.extend(load_chunk(table, key)?);
+        table
+            .remove(key.as_slice())
+            .map_err(crate::error::storage_err)?;
     }
     Ok(entries)
 }
