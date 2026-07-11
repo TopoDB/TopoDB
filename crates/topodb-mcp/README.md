@@ -46,7 +46,7 @@ Arg parsing is hand-rolled (three flags); there is no `--help` flag yet.
 | `get_changes` | `since_seq` (integer, required) | Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The `db_info` tool reports `current_seq`. |
 | `create_memory` | `content` (string, required), `props` (object, optional), `scope?` | Store a new memory. Call this when the user or task produces information worth remembering later. `content` becomes the full-text-searchable body; `props` holds structured metadata (strings/numbers/bools). Returns the new node's id — keep it if you plan to link this memory to entities. |
 | `create_entity` | `name` (string, required), `props` (object, optional), `scope?` | Create an entity node (person, project, concept). Call this the FIRST time something is mentioned that memories should attach to; use `find_by_prop` first to check it doesn't already exist. `name` is equality-indexed for exact lookup. |
-| `link` | `from_id`, `to_id`, `edge_type` (all required strings), `props` (object, optional), `valid_from` (integer ms, optional) | Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. `'works_on'`). `edge_type` is free-form but be consistent — `traverse` can filter by it. Returns the edge id. Errors if either node doesn't exist. |
+| `link` | `from_id`, `to_id`, `edge_type` (all required strings), `props` (object, optional), `valid_from` (integer ms, optional), `scope?` | Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. `'works_on'`). `edge_type` is free-form but be consistent — `traverse` can filter by it. Returns the edge id. Errors if either node doesn't exist. |
 
 Every scoped tool that omits `scope` uses the server's configured `--scope` default (see
 [Scoping semantics](#scoping-semantics)). Engine errors and parse failures are returned as MCP
@@ -151,8 +151,11 @@ each other's memories. `topodb-mcp` resolves scope as follows:
 - Every scoped tool call (all of them except `get_changes`) accepts an optional `scope`
   parameter. Omit it to use the server's default scope; pass `"shared"` or a scope ULID to
   target a specific scope explicitly.
-- `link` has no `scope` parameter on the wire — it always writes to the server's configured
-  default scope.
+- Reads filter by a *set* of scopes; a write is stamped with exactly *one*. `link` is the
+  exception worth noting: its `scope` param determines which scope the *edge itself* lives in,
+  independent of the scopes of the two nodes it connects — this is what lets an edge join nodes
+  that live in a scope other than the server's default, e.g. an edge from a `shared`-scope
+  entity to a private-scope memory.
 - `get_changes` is the one deliberately **unscoped** tool: the operation log spans every scope,
   so a host can replay it for cross-scope consolidation or sync. There is no way to filter it
   by scope.
@@ -172,7 +175,4 @@ each tool call from a single server instance).
 - **`Bytes` and `DateTime` prop values are unsupported over MCP.** Only string, integer, float,
   and bool prop values round-trip through JSON; attempting to write or a stored node that
   contains a `Bytes`/`DateTime` prop is rejected/errors rather than silently coerced.
-- **`link` always uses the default scope.** There is no way to create a cross-scope edge or an
-  edge in a non-default scope through this tool in v0 — start a server with the target scope as
-  its default, or wait for a future `scope` param on `link`.
 - **No HTTP/SSE transport.** Only stdio, i.e. one client process per server process.

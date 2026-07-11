@@ -49,8 +49,9 @@ fn opt_i64(
     }
 }
 
-/// Resolves a command's `scope` field (only create_memory/create_entity carry
-/// one): absent → the batch default; a string → parsed; non-string → Err.
+/// Resolves a command's `scope` field (create_memory/create_entity/link all
+/// carry one): absent → the batch default; a string → parsed; non-string →
+/// Err.
 fn scope_of(
     obj: &serde_json::Map<String, Value>,
     default: Scope,
