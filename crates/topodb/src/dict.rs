@@ -105,6 +105,9 @@ impl Dicts {
         m.ids.insert(id, n);
         Ok(id)
     }
+    pub(crate) fn id_of(&self, kind: DictKind, value: &str) -> Option<u32> {
+        self.map(kind).names.get(value).copied()
+    }
     pub(crate) fn resolve(&self, k: DictKind, id: u32) -> Result<SmolStr, TopoError> {
         self.map(k)
             .ids

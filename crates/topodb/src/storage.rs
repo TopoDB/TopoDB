@@ -8,6 +8,7 @@ use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::index::IndexSpec;
 use crate::op::Op;
+use crate::prop_index::{index_node, unindex_node, PROP_INDEX};
 use crate::scopes::{seed_shared, ScopeRegistry, SCOPES};
 use crate::slots::{
     alloc_edge_slot, alloc_node_slot, remove_edge_mapping, remove_node_mapping, EDGE_IDS,
@@ -108,6 +109,7 @@ impl Storage {
             seed_shared(&mut scopes)?;
             tx.open_table(OUT_ADJ).map_err(storage_err)?;
             tx.open_table(IN_ADJ).map_err(storage_err)?;
+            tx.open_table(PROP_INDEX).map_err(storage_err)?;
             let meta = tx.open_table(META).map_err(storage_err)?;
             let version = match meta.get("format_version").map_err(storage_err)? {
                 Some(v) => {
@@ -594,6 +596,7 @@ impl Storage {
             let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
             let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
             let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+            let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
             for op in &resolved {
                 match op {
                     Op::CreateNode { scope, .. } | Op::CreateEdge { scope, .. } => {
@@ -617,6 +620,17 @@ impl Storage {
                     // SetEmbedding never changes text; edge ops carry none.
                     _ => None,
                 };
+                let old_index_node = match op {
+                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
+                        read_node(&nodes, &embeddings, &dicts, *id)?
+                    }
+                    _ => None,
+                };
+                if let Some(node) = &old_index_node {
+                    if let Some(slot) = crate::slots::node_slot(&node_slots, node.id)? {
+                        unindex_node(&mut prop_index, &self.spec, &dicts, node, slot)?;
+                    }
+                }
                 apply_op(
                     &mut nodes,
                     &mut edges,
@@ -633,6 +647,19 @@ impl Storage {
                     &scope_registry,
                     op,
                 )?;
+                if !matches!(op, Op::RemoveNode { .. }) {
+                    let id = match op {
+                        Op::CreateNode { id, .. } | Op::SetNodeProps { id, .. } => Some(*id),
+                        _ => None,
+                    };
+                    if let Some(id) = id {
+                        if let Some(node) = read_node(&nodes, &embeddings, &dicts, id)? {
+                            if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
+                                index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
+                            }
+                        }
+                    }
+                }
                 if let Some((id, scope, old_text)) = pre {
                     let new_text = match op {
                         Op::RemoveNode { .. } => None,
@@ -869,6 +896,7 @@ impl Storage {
             let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
             let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
             let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+            let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
             // The text index is derived from state, so it is drained and rebuilt
             // alongside NODES/EDGES through the very same `fts_update` used on the
             // write path — no parallel maintenance logic.
@@ -889,6 +917,7 @@ impl Storage {
             scopes_table.retain(|_, _| false).map_err(storage_err)?;
             out_adj.retain(|_, _| false).map_err(storage_err)?;
             in_adj.retain(|_, _| false).map_err(storage_err)?;
+            prop_index.retain(|_, _| false).map_err(storage_err)?;
             seed_shared(&mut scopes_table)?;
             *scope_registry = ScopeRegistry::load_table_for_rebuild(&scopes_table)?;
             postings.retain(|_, _| false).map_err(storage_err)?;
@@ -935,6 +964,19 @@ impl Storage {
                     &scope_registry,
                     &op,
                 )?;
+                if !matches!(op, Op::RemoveNode { .. }) {
+                    let id = match &op {
+                        Op::CreateNode { id, .. } | Op::SetNodeProps { id, .. } => Some(*id),
+                        _ => None,
+                    };
+                    if let Some(id) = id {
+                        if let Some(node) = read_node(&nodes, &embeddings, &dicts, id)? {
+                            if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
+                                index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
+                            }
+                        }
+                    }
+                }
                 if let Some((id, scope, old_text)) = pre {
                     let new_text = match &op {
                         Op::RemoveNode { .. } => None,

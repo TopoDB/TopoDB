@@ -15,6 +15,8 @@ mod ids;
 mod index;
 mod migrate;
 mod op;
+#[allow(dead_code)] // dual-maintained until the v3 disk read cutover.
+mod prop_index;
 mod props;
 mod read;
 #[allow(dead_code)] // Scope IDs are consumed by v3 re-keyed rows.
