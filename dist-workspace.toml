@@ -16,12 +16,18 @@ ci = "github"
 # auto-update release.yml — re-run `dist init` and re-apply the publish-npm job
 # by hand if you change them.
 allow-dirty = ["ci"]
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# A GitHub repo to push Homebrew formulas to
-tap = "TopoDB/homebrew-tap"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# The installers to generate for each app.
+#
+# No `homebrew` installer, and no `tap`/`publish-jobs = ["homebrew"]`. The tap
+# was configured but never existed: `TopoDB/homebrew-tap` was not a repo and
+# `HOMEBREW_TAP_TOKEN` was not a secret, so `publish-homebrew-formula` failed on
+# every release (`Input required and not supplied: token`) while dist still
+# stamped `brew install TopoDB/tap/topodb-mcp` into the release notes — an
+# install command that could not work. Shipping no brew channel beats
+# advertising a broken one. To add it back: create the tap repo, add a PAT with
+# write access to it as HOMEBREW_TAP_TOKEN, restore these keys, and re-add the
+# `publish-homebrew-formula` job to release.yml by hand (see `allow-dirty`).
+installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Which actions to run on pull requests
