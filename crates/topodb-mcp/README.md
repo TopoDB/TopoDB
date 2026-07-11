@@ -2,11 +2,13 @@
 
 An MCP (Model Context Protocol) server exposing the [TopoDB](https://crates.io/crates/topodb)
 agent-memory engine over stdio. Point an MCP client at a `.redb` database file and it gets
-recall (get/find/search/traverse/access-stats/changes) and write (create memory, create
-entity, link) tools backed by a scoped, temporal property graph — no separate database
-process, no network hop.
+recall (get/find/search-text/search-vectors/traverse/access-stats/changes) and write
+(create memory, create entity, link, set-props, remove-node, close-edge, set-embedding,
+batch) tools backed by a scoped, temporal property graph — no separate database process,
+no network hop.
 
-Status: **v0** — read + write tools, including vector search. See [Limitations](#v0-limitations).
+Status: **v0** — read + write tools, including vector search and node/edge mutation.
+See [Limitations](#v0-limitations).
 
 ## Install
 
@@ -36,11 +38,12 @@ Arg parsing is hand-rolled (five flags); there is no `--help` flag yet.
 
 ## Tools
 
-`tools/list` reports exactly 10 tools: `db_info`, six read tools, three write tools.
+`tools/list` reports exactly 16 tools: `db_info`, six read tools (`get_changes` included), and
+nine write tools.
 
 | Tool | Params | Description |
 |---|---|---|
-| `db_info` | — | Report the open database's path, current op-log sequence number, and the default scope applied to tool calls that omit `scope`. Call this first to confirm the server is wired to the expected database, and to obtain `current_seq` as the anchor for `get_changes`. |
+| `db_info` | — | Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits `scope`, and the default READ scope set applied to a read call that omits both `scope`/`scopes`. Call this first to confirm the server is wired to the expected database and read set, and to obtain `current_seq` as the anchor for `get_changes`. |
 | `get_node` | `id` (string, required); `scope` (string, optional); `scopes` (string[], optional) | Fetch one node by its ULID. Call this when you already have a node id (from a previous search, traverse, or create) and need its current label and properties. |
 | `find_by_prop` | `label`, `prop`, `value` (string/number/bool), `scope?`, `scopes?` | Exact-match lookup on an equality-indexed property (e.g. an Entity's name). Call this to resolve a known identifier to a node — NOT for fuzzy or full-text search; use `search_memories` for that. Errors if `(label, prop)` is not declared in the index spec. |
 | `search_memories` | `query` (required), `k` (integer, default 10), `scope?`, `scopes?` | Full-text BM25 search over indexed text properties. Call this when looking for memories relevant to a topic or phrase. Returns up to `k` nodes ranked by relevance with scores. |
@@ -51,6 +54,11 @@ Arg parsing is hand-rolled (five flags); there is no `--help` flag yet.
 | `create_memory` | `content` (string, required), `props` (object, optional), `scope?` | Store a new memory. Call this when the user or task produces information worth remembering later. `content` becomes the full-text-searchable body; `props` holds structured metadata (strings/numbers/bools). Returns the new node's id — keep it if you plan to link this memory to entities. |
 | `create_entity` | `name` (string, required), `props` (object, optional), `scope?` | Create an entity node (person, project, concept). Call this the FIRST time something is mentioned that memories should attach to; use `find_by_prop` first to check it doesn't already exist. `name` is equality-indexed for exact lookup. |
 | `link` | `from_id`, `to_id`, `edge_type` (all required strings), `props` (object, optional), `valid_from` (integer ms, optional), `scope?` | Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. `'works_on'`). `edge_type` is free-form but be consistent — `traverse` can filter by it. Returns the edge id. Errors if either node doesn't exist. |
+| `set_node_props` | `id` (string, required), `props` (object, required — a `null` value REMOVES that key) | Set or remove properties on an existing node. Errors if the node doesn't exist. Returns the committed seq. |
+| `remove_node` | `id` (string, required) | Hard-delete a node and cascade-remove its incident edges. Call this to forget something entirely. Errors if the node doesn't exist. Returns the committed seq. |
+| `close_edge` | `id` (string, required), `valid_to` (integer ms, optional — defaults to now) | Close an open edge, stamping its `valid_to`. Errors if the edge doesn't exist. Returns the committed seq. |
+| `set_embedding` | `id` (string, required), `model` (string, required), `vector` (non-empty number array, required) | Attach a raw embedding vector (host-computed) to an existing node under `model`. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq. |
+| `submit_batch` | `commands` (array of command objects, required) | Submit a batch of high-level commands atomically — all commit or none. Each command's `op` matches a tool name (own field names, not always identical to that tool's param names — see the batch DSL). `#N` in an id field references the id produced by the Nth earlier command. Returns the produced ids in order (`null` for commands that create nothing). |
 
 Every scoped read tool accepts both `scope` (one scope) and `scopes` (an array of several,
 e.g. a project scope plus `"shared"`) — a non-empty `scopes` wins over `scope`, which wins over
@@ -59,8 +67,10 @@ empty `scopes: []` is rejected (`invalid_params`) rather than treated as "read e
 there is no unscoped read except `get_changes`, gated separately behind
 `--allow-unscoped-changes`. Every write tool accepts only `scope` (one scope) — see
 [Scoping semantics](#scoping-semantics) for the full reads-filter-a-set-writes-stamp-one
-picture. Engine errors and parse failures are returned as MCP tool errors carrying the engine's
-message — the server never panics on bad input.
+picture. `scopes` is not a write-tool param at all: every param struct rejects an unknown
+field rather than silently ignoring it, so passing `scopes` to a write tool is a clean tool
+error, not a quiet no-op. Engine errors and parse failures are returned as MCP tool errors
+carrying the engine's message — the server never panics on bad input.
 
 ## Client configuration
 
@@ -187,9 +197,6 @@ explicitly on each tool call from a single server instance).
 
 ## v0 limitations
 
-- **No `set_props` / `remove_node`.** The write surface is create-only (`create_memory`,
-  `create_entity`, `link`); mutating or deleting existing nodes isn't exposed yet.
-  Corrections must go through a fresh fact (TopoDB facts supersede, they don't overwrite).
 - **`Bytes` and `DateTime` prop values are unsupported over MCP.** Only string, integer, float,
   and bool prop values round-trip through JSON; attempting to write or a stored node that
   contains a `Bytes`/`DateTime` prop is rejected/errors rather than silently coerced.
