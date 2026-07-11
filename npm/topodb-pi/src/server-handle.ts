@@ -1,5 +1,7 @@
 // src/server-handle.ts
 import { createRequire } from "node:module";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { McpStdioClient, type McpTool } from "./mcp-client.ts";
 
 const require = createRequire(import.meta.url);
@@ -14,15 +16,16 @@ export class TopodbServer {
     return require.resolve("@topodb/topodb-mcp/bin/topodb-mcp.js");
   }
 
-  private args(): string[] {
-    const db = this.env.TOPODB_DB || ".topodb/memory.redb";
-    const scope = this.env.TOPODB_SCOPE || "shared";
-    return [TopodbServer.resolveLauncher(), "--db", db, "--scope", scope];
-  }
-
   private async ensure(): Promise<McpStdioClient> {
     if (this.client?.running) return this.client;
-    this.client = new McpStdioClient(this.args());
+    const db = this.env.TOPODB_DB || ".topodb/memory.redb";
+    const scope = this.env.TOPODB_SCOPE || "shared";
+    // topodb-mcp creates the db file on open but treats a missing parent
+    // directory as a startup error — and the default `.topodb/` won't exist in
+    // a fresh project. Create it so the server comes up on first use.
+    mkdirSync(dirname(db), { recursive: true });
+    const args = [TopodbServer.resolveLauncher(), "--db", db, "--scope", scope];
+    this.client = new McpStdioClient(args);
     await this.client.start();
     return this.client;
   }

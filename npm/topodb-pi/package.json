@@ -1,6 +1,6 @@
 {
   "name": "@topodb/pi",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Pi (pi.dev) extension: topodb agent memory via one install.",
   "type": "module",
   "license": "MIT OR Apache-2.0",

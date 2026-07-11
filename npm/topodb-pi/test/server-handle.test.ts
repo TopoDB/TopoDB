@@ -1,9 +1,9 @@
 // test/server-handle.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { TopodbServer } from "../src/server-handle.ts";
 
 const env = () => ({
@@ -31,4 +31,20 @@ test("call respawns after shutdown", async () => {
 
 test("resolveLauncher finds the topodb-mcp launcher", () => {
   assert.match(TopodbServer.resolveLauncher(), /topodb-mcp\.js$/);
+});
+
+test("creates the db's parent directory if it does not exist", async () => {
+  // topodb-mcp creates the .redb file but treats a missing parent directory as
+  // a startup error. The default db path (.topodb/memory.redb) has a parent
+  // that won't exist in a fresh project, so the extension must create it.
+  const base = mkdtempSync(join(tmpdir(), "topodb-pi-mkdir-"));
+  const db = join(base, "nested", "deep", "memory.redb"); // parents don't exist
+  assert.equal(existsSync(dirname(db)), false, "precondition: parent absent");
+
+  const s = new TopodbServer({ ...process.env, TOPODB_DB: db });
+  const tools = await s.list(); // before the fix this rejects (server exits)
+  assert.equal(tools.length, 16);
+  assert.ok(existsSync(dirname(db)), "parent directory was created");
+  assert.ok(existsSync(db), "db file was created");
+  s.shutdown();
 });
