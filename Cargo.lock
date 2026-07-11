@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "serde_json",

@@ -4,7 +4,7 @@ A direct-embedded, script-friendly command-line interface over a [TopoDB](https:
 agent-memory database file. JSON in, JSON out, predictable exit codes — no server process, no
 network hop.
 
-Status: **v1** — the full read/write surface (11 commands). See [v1 limitations](#v1-limitations).
+Status: **v1** — the full read/write surface (17 commands). See [v1 limitations](#v1-limitations).
 
 ## Install
 
@@ -29,14 +29,14 @@ topodb --db <path> [--scope <ulid|shared>] [--pretty] <command> [args...]
 
 ## Commands
 
-All 11 subcommands, in scaffold + write + read order:
+All 17 subcommands, in scaffold + write + read order:
 
 | Command | Key flags | Output |
 |---|---|---|
 | `info` | — | `{"path","format_version","current_seq","index_spec","default_scope"}` |
-| `create-memory` | `--content <text>` (required), `--props <json-object>` | `{"id": "<ulid>"}` |
-| `create-entity` | `--name <text>` (required), `--props <json-object>` | `{"id": "<ulid>"}` |
-| `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>` | `{"id": "<ulid>"}` |
+| `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
+| `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
+| `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
 | `get <id>` | positional node id | `{"found": bool, "node"?: {...}}` |
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
 | `search <query>` | positional query, `--k <n>` (default 10) | `[ {"node":..., "score": f}, ... ]` |
@@ -44,6 +44,12 @@ All 11 subcommands, in scaffold + write + read order:
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
+| `set-props <id>` | positional node id, `--props <json-object>` (required; a `null` value removes that key) | `{"seq": <seq>}` |
+| `remove-node <id>` | positional node id | `{"seq": <seq>}` |
+| `close-edge <id>` | positional edge id, `--valid-to <unix-ms>` (defaults to "now") | `{"seq": <seq>}` |
+| `set-embedding <id>` | positional node id, `--model <name>`, `--vector <json-float-array>` (both required) | `{"seq": <seq>}` |
+| `search-vector` | `--model <name>`, `--vector <json-float-array>` (both required), `--k <n>` (default 10), `--candidate <id>` (repeatable) | `[ {"node":..., "score": f}, ... ]` |
+| `submit [input]` | positional path to a JSON command array, or `-`/omitted for stdin | `{"ids": [...]}` |
 
 Notes on individual commands:
 
@@ -78,27 +84,54 @@ exit 2.
 
 ## Scoping
 
-- The default scope (`--scope`, default `shared`) applies to every command except `changes`.
-- `changes` is deliberately **unscoped**: the op log spans every scope, so a host can replay it
-  for cross-scope consolidation. There's no way to filter it by scope on this CLI.
-- There's no per-command `--scope` override in v1 — every invocation targets exactly one scope.
-  To touch a different scope, pass a different global `--scope` on that invocation.
+**A write is stamped with exactly one scope; a read filters by a set.** That asymmetry is the
+model, not an oversight.
+
+- The global `--scope` (default `shared`) supplies the default for every command except `changes`.
+- **Per-command `--scope` override.** The three commands that *stamp* a scope — `create-memory`,
+  `create-entity`, `link` — each take their own `--scope <ulid|shared>`, overriding the global one
+  for that invocation. This matches `submit`'s batch DSL (whose `create_memory`, `create_entity`,
+  and `link` ops each take an optional `scope` field) and the `topodb-mcp` tools of the same names.
+- `set-props`, `remove-node`, `close-edge`, and `set-embedding` address an existing node or edge
+  **by id** and stamp no scope of their own, so they take no `--scope`.
+- **`link --scope` is what keeps shared memories connected.** An edge created while `--scope` names
+  a project is stamped with that project, so it is invisible from every other project — the nodes
+  would be shared but disconnected. Pass `--scope shared` on a `link` between `shared` nodes.
+- `changes` is deliberately **unscoped**: the op log spans every scope, so a host can replay it for
+  cross-scope consolidation. There's no way to filter it by scope on this CLI.
+
+### Why `changes` isn't gated here, but `get_changes` is on `topodb-mcp`
+
+`topodb-mcp` serves `get_changes` only when started with `--allow-unscoped-changes`. This CLI needs
+no such flag. The difference is deliberate.
+
+**The MCP gate prevents accidents, not attackers.** MCP *advertises* `get_changes` in the model's
+tool list, so an agent can trip over it while doing something else and replay every other project's
+writes into its own context. This CLI advertises nothing to a model: reaching `changes` takes
+deliberate intent, and whoever can run `topodb --db <file> changes` already holds the file and could
+read it directly.
+
+**Accepted risk, stated plainly:** an agent with shell access bypasses the MCP gate entirely by
+invoking this CLI against the same database file. `--allow-unscoped-changes` is not a security
+boundary and nothing here pretends otherwise. If a future host drives this CLI from an agent loop,
+that decision needs revisiting.
 
 ## v1 limitations
 
-- **No vector search.** `search` is BM25 full-text only; there's no way to submit a raw vector
-  query from the CLI.
-- **No `set-props` / `remove-node`.** The write surface is create-only (`create-memory`,
-  `create-entity`, `link`); mutating or deleting an existing node isn't exposed. Corrections go
-  through a fresh fact (TopoDB facts supersede, they don't overwrite).
-- **No bulk/stdin `submit`.** Each invocation does exactly one op; there's no way to pipe a batch
-  of ops in over stdin. Scripting a bulk load means one process per op today.
-- **Direct-embedded only, single-process access.** There's no `--connect`/HTTP mode — the CLI
-  opens the `.redb` file directly in-process, the same way `topodb-mcp` does. That means you
-  can't run `topodb` against a database file that another process (another `topodb` invocation,
-  or a running `topodb-mcp` server) currently has open; opening will fail as a db-open error
-  (exit 1). Point the CLI at the file only when nothing else has it open, or use a separate
-  scope/file per concurrent consumer.
+- **No `--spec` flag.** An existing db is always opened with its own persisted index spec; a fresh
+  one is created with the canonical default (equality on `Entity/name`, text on `Memory/content`).
+  There's no way to declare a different spec from this CLI.
+- **No multi-scope reads.** Every read filters by the single scope named in the global `--scope`.
+  `topodb-mcp` can read across a *set* of scopes (`--read-scopes`, and a `scopes` param on its read
+  tools); this CLI cannot. To read another scope, run again with a different `--scope`.
+- **Direct-embedded only, single-process access.** There's no `--connect`/HTTP mode — the CLI opens
+  the `.redb` file directly in-process, the same way `topodb-mcp` does. You can't run `topodb`
+  against a database file another process (another `topodb` invocation, or a running `topodb-mcp`
+  server) currently has open; opening fails as a db-open error (exit 1). Point the CLI at the file
+  only when nothing else has it open, or use a separate file per concurrent consumer.
+
+> The removed bullets ("No vector search", "No `set-props`/`remove-node`", "No bulk/stdin `submit`")
+> were all false. `search-vector`, `set-props`, `remove-node`, and `submit` exist.
 
 ## Examples
 

@@ -1,5 +1,6 @@
-//! `clap`-derive CLI surface: global args + the subcommand enum. Tasks 4-5
-//! add write/read subcommands to [`Command`]; only `Info` exists so far.
+//! `clap`-derive CLI surface: global args + the subcommand enum. [`Command`]
+//! holds all 17 subcommands, covering info, writes, reads, maintenance, and
+//! batch submission.
 
 use std::path::PathBuf;
 
@@ -29,25 +30,39 @@ pub enum Command {
     Info,
     /// Store a new memory node. `content` becomes the full-text-searchable
     /// body (prop `content`, label `Memory` — see `topodb_json::MEMORY_*`);
-    /// `--props` merges additional structured metadata.
+    /// `--props` merges additional structured metadata. `--scope` stamps
+    /// this node's own scope (default: the global `--scope`).
     CreateMemory {
         #[arg(long)]
         content: String,
         /// Additional metadata as a JSON object string, e.g. '{"source":"chat"}'.
         #[arg(long)]
         props: Option<String>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        /// Defaults to the global `--scope`. Only the commands that STAMP a
+        /// scope take this — a write lands in exactly one scope.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Create an entity node (person, project, concept). `name` is
     /// equality-indexed by the default spec (prop `name`, label `Entity` —
     /// see `topodb_json::ENTITY_*`); `--props` merges additional metadata.
+    /// `--scope` stamps this node's own scope (default: the global `--scope`).
     CreateEntity {
         #[arg(long)]
         name: String,
         /// Additional metadata as a JSON object string.
         #[arg(long)]
         props: Option<String>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        /// Defaults to the global `--scope`. Only the commands that STAMP a
+        /// scope take this — a write lands in exactly one scope.
+        #[arg(long)]
+        scope: Option<String>,
     },
-    /// Create a typed, time-aware edge between two existing nodes.
+    /// Create a typed, time-aware edge between two existing nodes. `--scope`
+    /// stamps the EDGE's own scope (default: the global `--scope`) — a `shared`
+    /// edge is what lets two `shared` nodes stay connected across projects.
     Link {
         /// Source node id (ULID).
         #[arg(long)]
@@ -64,6 +79,11 @@ pub enum Command {
         /// Unix ms the edge becomes valid from; defaults to "now" (applier-resolved).
         #[arg(long = "valid-from")]
         valid_from: Option<i64>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        /// Defaults to the global `--scope`. Only the commands that STAMP a
+        /// scope take this — a write lands in exactly one scope.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Fetch one node by id. `{"found":false}` (exit 0) if it doesn't exist
     /// or is out of the default scope — the two are indistinguishable by
@@ -121,6 +141,17 @@ pub enum Command {
     /// range is below the retained floor) is a rejected/exit-2 condition:
     /// the caller re-anchors from current state rather than trusting a
     /// truncated tail.
+    ///
+    /// Deliberately **not** gated behind a flag, unlike `topodb-mcp`'s
+    /// `get_changes` (which requires `--allow-unscoped-changes`). That gate
+    /// stops an LLM from tripping over an *advertised* tool and replaying every
+    /// other project's writes into its context — it is accident-prevention, not
+    /// a security boundary. This CLI advertises nothing to a model, and whoever
+    /// can run it already holds the db file.
+    ///
+    /// Accepted risk: an agent with shell access bypasses the MCP gate by
+    /// calling this command against the same file. If a host ever drives this
+    /// CLI from an agent loop, revisit that.
     Changes {
         /// Op-log sequence number to replay from, inclusive.
         #[arg(long)]
