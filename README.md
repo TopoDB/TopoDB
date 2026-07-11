@@ -59,9 +59,11 @@ no bulk/stdin submit).
 `topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 10 MCP tools —
 `db_info`, six read tools (`get_node`, `find_by_prop`, `search_memories`, `traverse`,
 `access_stats`, `get_changes`), and three write tools (`create_memory`, `create_entity`,
-`link`) — over stdio JSON-RPC. Install with `cargo install topodb-mcp` and wire it into Claude
-Code or Claude Desktop in a couple of lines. See
-[`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
+`link`) — over stdio JSON-RPC. Reads filter by a *set* of scopes (`--read-scopes` at startup, or
+a per-call `scopes` array); a write is stamped with exactly *one* scope (`--scope`, or a per-call
+`scope`) — `link` included, so an edge can join nodes living in different scopes. Install with
+`cargo install topodb-mcp` and wire it into Claude Code or Claude Desktop in a couple of lines.
+See [`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
 table, client config examples, and v0 limitations (no vector search yet, create-only writes).
 
 - **Pi (pi.dev):** one command via `pi install npm:@topodb/pi` — see [topodb-mcp README → Pi](crates/topodb-mcp/README.md#pi).
