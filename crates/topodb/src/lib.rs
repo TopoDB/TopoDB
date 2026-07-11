@@ -14,6 +14,8 @@ mod graph;
 mod ids;
 mod index;
 mod migrate;
+#[allow(dead_code)] // v3 cutover is staged; migration helpers land before open_with flips.
+mod migrate_v3;
 mod op;
 #[allow(dead_code)] // dual-maintained until the v3 disk read cutover.
 mod prop_index;
