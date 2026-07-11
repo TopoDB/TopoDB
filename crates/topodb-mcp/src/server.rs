@@ -36,7 +36,9 @@ use topodb_json as convert;
 #[derive(Clone)]
 pub struct TopoServer {
     db: Db,
-    /// The configured default scope, applied to tool calls that omit `scope`.
+    /// The configured default **write** scope: a create/link tool call that
+    /// omits `scope` is stamped with this. Reads never consult this directly —
+    /// see `default_scopes` below.
     default_scope: Scope,
     /// The configured default **read** set (from `--read-scopes`, or `--scope`
     /// alone), reused by every scoped read tool call that omits `scope`/`scopes`
@@ -60,19 +62,47 @@ impl TopoServer {
         }
     }
 
-    /// Resolves a tool call's optional `scope` param to the [`ScopeSet`] the
-    /// read should run against. `None` reuses the pre-resolved
-    /// `default_scopes` (no need to re-derive it on every call that omits
-    /// `scope` — the common case); `Some(s)` is parsed fresh via
-    /// [`convert::resolve_scope`].
-    fn resolve_scopes(&self, scope: Option<&str>) -> Result<ScopeSet, ErrorData> {
-        match scope {
-            None => Ok(self.default_scopes.clone()),
-            Some(_) => {
-                let resolved = convert::resolve_scope(scope, self.default_scope)
+    /// Resolves a read tool's optional `scope` / `scopes` params to the
+    /// [`ScopeSet`] the read runs against. Precedence:
+    ///
+    /// 1. `scopes` (non-empty) → a genuine multi-member set. This is the only
+    ///    way a client can read across e.g. a project scope *and* `shared`.
+    /// 2. `scope` → a one-member set (the pre-P1 behaviour).
+    /// 3. neither → the server's configured default read set (`--read-scopes`,
+    ///    or `--scope` alone), pre-resolved once in `new` rather than re-derived
+    ///    on every call — the common case.
+    ///
+    /// An explicitly empty `scopes: []` is rejected: an empty set admits
+    /// nothing, so it is a caller error, never "read everything" (there is no
+    /// unscoped read).
+    fn resolve_scopes(
+        &self,
+        scope: Option<&str>,
+        scopes: Option<&[String]>,
+    ) -> Result<ScopeSet, ErrorData> {
+        match scopes {
+            Some([]) => Err(ErrorData::invalid_params(
+                "`scopes` must not be empty (an empty scope set admits nothing); \
+                 omit it to use the server's default read scopes"
+                    .to_string(),
+                None,
+            )),
+            Some(list) => {
+                let resolved = list
+                    .iter()
+                    .map(|s| convert::resolve_scope(Some(s), self.default_scope))
+                    .collect::<Result<Vec<Scope>, String>>()
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
-                Ok(convert::scope_to_scope_set(resolved))
+                Ok(convert::scopes_to_scope_set(&resolved))
             }
+            None => match scope {
+                None => Ok(self.default_scopes.clone()),
+                Some(_) => {
+                    let resolved = convert::resolve_scope(scope, self.default_scope)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    Ok(convert::scope_to_scope_set(resolved))
+                }
+            },
         }
     }
 
@@ -189,6 +219,11 @@ struct GetNodeParams {
     /// the server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes.
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -217,6 +252,11 @@ struct FindByPropParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes.
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -243,6 +283,11 @@ struct SearchMemoriesParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes.
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -304,6 +349,11 @@ struct TraverseParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes.
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -320,6 +370,11 @@ struct AccessStatsParams {
     /// the server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes.
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -497,6 +552,11 @@ struct SearchVectorsParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes.
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
     /// Restrict scoring to these node ULIDs (e.g. a traversal result). Omit to
     /// score the whole scope.
     #[serde(default)]
@@ -552,8 +612,8 @@ impl TopoServer {
         Parameters(p): Parameters<GetNodeParams>,
     ) -> Result<Json<GetNodeResult>, ErrorData> {
         let id = parse_node_id(&p.id)?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
-        match self.db.node(&scopes, id) {
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        match self.db.node(&scope_set, id) {
             Some(n) => {
                 let node =
                     convert::node_to_json(&n).map_err(|e| ErrorData::internal_error(e, None))?;
@@ -578,14 +638,14 @@ impl TopoServer {
     ) -> Result<Json<FindByPropResult>, ErrorData> {
         let value = convert::json_to_prop_value(&p.value)
             .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         // `nodes_by_prop` is a pure snapshot read: the only error it can
         // produce today is `Rejected` (undeclared index / Float value), so a
         // blanket `invalid_params` is accurate. Reconsider if the engine path
         // ever grows storage-touching failure modes (see `search_memories`).
         let hits = self
             .db
-            .nodes_by_prop(&scopes, &p.label, &p.prop, &value)
+            .nodes_by_prop(&scope_set, &p.label, &p.prop, &value)
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let nodes = hits
             .iter()
@@ -602,14 +662,14 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         // `search_text` opens a redb read transaction, so unlike the pure
         // snapshot reads it CAN fail with `Storage`/`Encoding` — only its
         // input-validation `Rejected` (k == 0, token-less query) maps to
         // invalid_params; everything else is a server-side internal_error.
         let hits = self
             .db
-            .search_text(&scopes, &p.query, p.k)
+            .search_text(&scope_set, &p.query, p.k)
             .map_err(|e| match e {
                 TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
                 other => ErrorData::internal_error(other.to_string(), None),
@@ -635,9 +695,9 @@ impl TopoServer {
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<Json<TraverseResult>, ErrorData> {
         let seed = parse_node_id(&p.seed_id)?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let query = TraversalQuery {
-            scopes,
+            scopes: scope_set,
             seeds: vec![seed],
             max_hops: p.max_hops,
             edge_types: p
@@ -667,10 +727,10 @@ impl TopoServer {
         Parameters(p): Parameters<AccessStatsParams>,
     ) -> Result<Json<AccessStatsResult>, ErrorData> {
         let id = parse_node_id(&p.id)?;
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let stats = self
             .db
-            .access_stats(&scopes, id)
+            .access_stats(&scope_set, id)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(Json(match stats {
             Some(s) => AccessStatsResult {
@@ -852,7 +912,7 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<SearchVectorsParams>,
     ) -> Result<Json<SearchVectorsResult>, ErrorData> {
-        let scopes = self.resolve_scopes(p.scope.as_deref())?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let vector =
             convert::json_to_f32_vec(&p.vector).map_err(|e| ErrorData::invalid_params(e, None))?;
         let candidates = match p.candidates {
@@ -866,7 +926,7 @@ impl TopoServer {
             }
         };
         let query = VectorQuery {
-            scopes,
+            scopes: scope_set,
             model: p.model,
             vector,
             k: p.k,
