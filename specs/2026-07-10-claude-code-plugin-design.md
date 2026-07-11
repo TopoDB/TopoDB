@@ -1,8 +1,10 @@
 # Design — Multi-scope MCP reads + the Claude Code plugin
 
-- **Date:** 2026-07-10
-- **Status:** Approved, not yet implemented.
-- **Scope:** Two sub-projects, sequential. P1 ships first and stands alone.
+- **Date:** 2026-07-10 (updated 2026-07-11)
+- **Status:** **P1 is DONE** — merged to `main` as `0db2d5f`, `topodb-mcp` 0.0.4,
+  not yet published/tagged. **P2 is designed, not yet planned or built.**
+- **Scope:** Two sub-projects, sequential. P1 shipped first and stands alone.
+  P2 now also carries five parity debts inherited from P1's review — see §2.5.
 
 > Note: `docs/` is gitignored in this repo, so specs live under `specs/`.
 
@@ -280,6 +282,85 @@ Install:
 - Requires `node` at runtime. Same constraint as `@topodb/pi`. Acceptable.
 - Global db = a single file across all projects. Mitigated by per-project scopes;
   the blast radius is real and accepted in exchange for cross-project recall.
+
+---
+
+## 2.5 Folded into P2 from P1 — the parity debts
+
+P1 shipped (merged `0db2d5f`, `topodb-mcp` 0.0.4). Its final whole-branch review
+surfaced five items that were deliberately **not** fixed there because P1 was
+scoped MCP-only. They are folded into P2 rather than left as loose ends, because
+three of them are the *same quiet-failure family* as the `link` bug P1 exists to
+fix, and shipping the Claude Code plugin on top of them would bake them in.
+
+**The through-line: P1 made the MCP surface scope-correct. These are the places
+that surface's guarantees stop being true.** Each must be either fixed or stated
+as a limitation — an accident is not acceptable.
+
+### D1 — `topodb-cli link` still has the bug (the sharpest one)
+
+The batch DSL fix lives in shared code (`topodb-json/src/batch.rs`), so
+`topodb-cli submit '[{"op":"link", …, "scope":"…"}]'` **can** now stamp an edge
+scope. But `topodb-cli link` (`crates/topodb-cli/src/cli.rs`) has **no `--scope`
+flag**, so it still stamps every edge with the process-wide `--scope`.
+
+**The CLI's two ways to create an edge now disagree with each other.** One can
+cross a scope boundary; the other silently cannot. That divergence did not exist
+before P1 — P1 created it.
+
+Fix: add `--scope` to `topodb-cli link`, matching the MCP tool's semantics.
+Also update `crates/topodb-cli/README.md:84`, which claims *"There's no
+per-command `--scope` override in v1"* — already false for `submit`'s three ops.
+
+### D2 — `topodb-cli changes` is an ungated unscoped read
+
+P1 gated `get_changes` behind `--allow-unscoped-changes` because, in a database
+shared across projects, replaying the op log hands one project every other
+project's writes. **That rationale does not stop at the MCP boundary.**
+`topodb-cli changes` reads the same log, unscoped, with no gate.
+
+Decide explicitly: gate it to match, or state why the CLI is trusted differently
+(a human at a terminal is not an LLM with a token budget — that is a real
+argument, but it must be *made*, not assumed).
+
+### D3 — an edge's scope is never validated against its endpoints'
+
+`crates/topodb/src/storage.rs:941-955` validates only that the *endpoints*
+satisfy the cross-scope rule (at least one `Shared`). The **edge's own** scope is
+stamped as given, unconstrained. So this commits happily:
+
+```
+link(from=<shared A>, to=<shared B>, scope=<some unrelated project ULID>)
+```
+
+…and produces an edge **no reader can ever traverse** — invisible to anyone who
+can see A and B. P1 handed clients the ability to set an edge scope; it did not
+give them a way to get it wrong loudly. Same quiet-failure family as the bug P1
+fixed.
+
+Engine-level fix: reject an edge scope that is neither `Shared` nor equal to one
+of its endpoints' scopes. This is a behaviour change to the engine — it needs its
+own think, and it may belong in a `topodb` release rather than the plugin's.
+
+### D4 — the non-empty read-set invariant lives in the parser, not the type
+
+`Config.default_read_scopes: Vec<Scope>` is `pub`, and its non-empty invariant is
+enforced only in `Config::from_args`. A hand-built `Config { default_read_scopes:
+vec![], .. }` yields a `ScopeSet` admitting nothing, and every default read
+silently returns empty. It **fails closed** (returns nothing, never everything),
+and `main.rs` is today the only constructor — so this is latent, not live. But
+"there is no unscoped read" is load-bearing enough to deserve a type, not a
+convention. The plugin's launcher will be a second constructor of these args.
+
+### D5 — the `get_changes` gate is a breaking change with no semver signal
+
+`topodb-mcp` 0.0.3 → 0.0.4 silently breaks any existing client that calls
+`get_changes`. There is **no CHANGELOG in the repo**. A sync/consolidation host
+upgrading will fail at runtime with no warning.
+
+Before the 0.0.4 release is cut: add a CHANGELOG, and make the `get_changes` gate
+loud in the release notes. This is release hygiene, not code — but it is the one
+item that bites a real user today.
 
 ---
 
