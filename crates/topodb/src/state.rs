@@ -279,6 +279,52 @@ mod tests {
         assert!(matches!(err, crate::TopoError::Rejected(_)));
     }
 
+    /// Old logs must remain replayable even if they contain an edge scope that
+    /// current live-submit validation would reject. The D3 rule therefore lives
+    /// above `Storage`, not in `apply_op`, which rebuild uses for replay.
+    #[test]
+    fn an_old_log_with_an_unrelated_edge_scope_still_replays() {
+        let (_d, s) = db();
+        let (a, p) = (ScopeId::new(), ScopeId::new());
+        let (x, y) = (NodeId::new(), NodeId::new());
+        let e = EdgeId::new();
+
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id: x,
+                    scope: Scope::Id(a),
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: y,
+                    scope: Scope::Id(a),
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
+                Op::CreateEdge {
+                    id: e,
+                    scope: Scope::Id(p),
+                    ty: "KNOWS".into(),
+                    from: x,
+                    to: y,
+                    props: Default::default(),
+                    valid_from: None,
+                },
+            ],
+            0,
+        )
+        .expect("Storage has no edge-scope rule; this is a pre-0.0.5 log");
+
+        s.rebuild_state_from_ops()
+            .expect("an old log must still replay");
+        assert!(
+            s.load_edge(e).unwrap().is_some(),
+            "replay must preserve the edge"
+        );
+    }
+
     #[test]
     fn close_edge_already_closed_is_rejected() {
         let (_d, s) = db();

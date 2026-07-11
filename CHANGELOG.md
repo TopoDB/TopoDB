@@ -14,6 +14,29 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### 0.0.5
+
+#### Changed
+
+- **An edge scoped to a project unrelated to its endpoints is now rejected.** If either endpoint is
+  project-scoped `A`, the edge must be scoped `A` or `shared`. Submitting one that isn't now returns
+  `TopoError::Rejected` instead of committing.
+
+  Such an edge had **inverted visibility**: it was invisible to the project that wrote it and visible
+  to an unrelated project. A relationship asserted by project P leaked into project Q's reads and
+  vanished from P's own. (It was *not* unreachable, as previously documented — the read path's scope
+  gates are independent, so a reader spanning both projects saw it fine.)
+
+  **A project-scoped edge between two `shared` nodes remains legal**, and is unaffected. It means
+  "in project P, these two shared entities are related" — visible to P's reader, hidden from other
+  projects — and is the reason a per-project scope is layered over a shared one at all.
+
+  **Migration:** none for a database. Existing databases open unchanged, and an old op log containing
+  such an edge still replays — the rule is enforced on submit, not on replay, so nothing already
+  committed is retroactively condemned. A *client* that was silently creating these edges will now
+  get an error; pass an explicit scope (`link`'s `scope` param on `topodb-mcp`, `--scope` on
+  `topodb-cli`) to say what was meant.
+
 ### 0.0.4
 
 > **Read this if you depend on `topodb` 0.0.3 from crates.io.** The 0.0.3 *published* to crates.io

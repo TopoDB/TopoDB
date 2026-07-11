@@ -181,6 +181,13 @@ impl Db {
                             let _ = reply.send(Err(e));
                             continue;
                         }
+                        // Edge-scope pre-validation has the same contract: reject
+                        // before `apply_batch` so storage is untouched. It must not
+                        // live in `apply_op`, which is shared with op-log replay.
+                        if let Err(e) = crate::validate::prevalidate_edge_scopes(&cur, &ops) {
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
                         match storage_for_applier.apply_batch(ops, now) {
                             Ok(batch) => {
                                 // Slab maintenance runs after `apply_batch`

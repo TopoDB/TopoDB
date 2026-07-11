@@ -13,6 +13,7 @@ mod props;
 mod read;
 mod state;
 mod storage;
+mod validate;
 mod vector;
 
 pub use counters::AccessStats;
