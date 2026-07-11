@@ -1,5 +1,6 @@
-//! `clap`-derive CLI surface: global args + the subcommand enum. Tasks 4-5
-//! add write/read subcommands to [`Command`]; only `Info` exists so far.
+//! `clap`-derive CLI surface: global args + the subcommand enum. [`Command`]
+//! holds all 17 subcommands, covering info, writes, reads, maintenance, and
+//! batch submission.
 
 use std::path::PathBuf;
 
