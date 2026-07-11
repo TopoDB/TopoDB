@@ -165,6 +165,52 @@ fn a_shared_edge_is_traversable_from_a_multi_scope_reader() {
     );
 }
 
+/// THE REGRESSION TEST for the review finding: `scopes` is a genuine param
+/// name on the six READ tools but was never wired to the WRITE tools — before
+/// `#[serde(deny_unknown_fields)]`, a write call carrying `scopes` (e.g. an
+/// agent generalising the read pattern to "write across scopes") was silently
+/// deserialized with `scopes` dropped on the floor and the write landed in
+/// the default project scope anyway, reporting success. That is the same
+/// quiet-failure family as the `link`-scope bug this branch exists to fix, so
+/// it must now be a clean tool error, AND the memory must genuinely not have
+/// been created (not just "erred but wrote anyway").
+#[test]
+fn create_memory_rejects_unknown_scopes_field_instead_of_silently_ignoring_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("deny_unknown.redb");
+    let mut server = Server::spawn(&db_path, &[]);
+    server.initialize(DEFAULT_TIMEOUT);
+
+    let resp = server.call_tool(
+        "create_memory",
+        serde_json::json!({ "content": "probeqqq fact", "scopes": ["shared"] }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+    let message = tool_error_message(&resp);
+    assert!(
+        message.contains("scopes"),
+        "the rejection should name the unknown `scopes` field so a caller can \
+         tell `scopes` isn't a write-tool param (write tools take one `scope`, \
+         not a `scopes` set), got: {resp:#?}"
+    );
+
+    // Not merely erred — genuinely never wrote anything, not even into the
+    // default scope. A default-scope search for the unique probe content
+    // must come back empty.
+    let found = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "probeqqq" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        found["hits"].as_array().unwrap().len(),
+        0,
+        "create_memory with an unknown `scopes` field must not silently create \
+         a project-scoped memory: {found:#?}"
+    );
+}
+
 /// Extracts a tool error's message text, regardless of which of the two
 /// shapes [`expect_tool_error`] accepts it landed on (see that helper's doc
 /// comment): a top-level JSON-RPC `error.message`, or `result.content[0].text`

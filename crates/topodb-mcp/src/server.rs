@@ -215,6 +215,7 @@ struct DbInfo {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetNodeParams {
     /// ULID of the node to fetch.
     id: String,
@@ -241,6 +242,7 @@ struct GetNodeResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct FindByPropParams {
     /// Node label to match, e.g. `"Entity"`.
     label: String,
@@ -274,6 +276,7 @@ fn default_search_k() -> usize {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchMemoriesParams {
     /// Free-text query.
     query: String,
@@ -333,6 +336,7 @@ fn default_max_hops() -> u8 {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TraverseParams {
     /// ULID of the node to start the traversal from.
     seed_id: String,
@@ -366,6 +370,7 @@ struct TraverseResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AccessStatsParams {
     /// ULID of the node.
     id: String,
@@ -396,6 +401,7 @@ struct AccessStatsResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetChangesParams {
     /// Op-log sequence number to replay from, inclusive.
     since_seq: u64,
@@ -416,6 +422,7 @@ struct GetChangesResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateMemoryParams {
     /// The memory's full-text-searchable body.
     content: String,
@@ -433,6 +440,7 @@ struct CreateMemoryParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateEntityParams {
     /// The entity's equality-indexed identifying name.
     name: String,
@@ -456,6 +464,7 @@ struct CreateResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LinkParams {
     /// ULID of the edge's source (`from`) node. Must already exist.
     from_id: String,
@@ -497,6 +506,7 @@ struct SeqResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetNodePropsParams {
     /// ULID of the node to update.
     id: String,
@@ -507,12 +517,14 @@ struct SetNodePropsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveNodeParams {
     /// ULID of the node to hard-delete (its incident edges cascade away).
     id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CloseEdgeParams {
     /// ULID of the edge to close.
     id: String,
@@ -523,6 +535,7 @@ struct CloseEdgeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetEmbeddingParams {
     /// ULID of the node to attach the embedding to.
     id: String,
@@ -539,6 +552,7 @@ fn default_vector_k() -> usize {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchVectorsParams {
     /// Embedding model name to search within.
     model: String,
@@ -573,6 +587,7 @@ struct SearchVectorsResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SubmitBatchParams {
     /// A JSON array of high-level commands. Each command's `op` matches an MCP
     /// tool name (create_memory, create_entity, link, set_node_props,
