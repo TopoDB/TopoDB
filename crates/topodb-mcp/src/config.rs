@@ -1,7 +1,8 @@
 //! CLI parsing and the server configuration contract.
 //!
 //! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>]
-//!      [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]`
+//!      [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
+//!      [--allow-unscoped-changes]`
 //! - `--scope`: the default **write** scope — the scope a created node/edge is
 //!   stamped with when a write tool omits `scope`. `"shared"` (case-insensitive)
 //!   or omitted => [`Scope::Shared`]; any other value is parsed as a ULID.
@@ -14,8 +15,13 @@
 //!   verbatim (may reindex an existing db). Omitted => inherit the db's
 //!   persisted spec on an existing file, or create a fresh db with the
 //!   [built-in default spec](default_spec). See how `main` opens the db.
+//! - `--allow-unscoped-changes`: a bare toggle enabling `get_changes`, the one
+//!   unscoped read (the op log spans every scope in the db). Off by default —
+//!   in a db shared across projects, an agent calling `get_changes` would
+//!   otherwise replay every other project's writes. Sync/consolidation hosts
+//!   that legitimately need the whole log pass this flag.
 //!
-//! Arg parsing is hand-rolled: the surface is four flags, so `clap` would add
+//! Arg parsing is hand-rolled: the surface is five flags, so `clap` would add
 //! a dependency and a proc-macro build for no real gain here.
 
 use std::error::Error;
@@ -47,6 +53,12 @@ pub struct Config {
     /// an existing db: silently substituting the default would reindex it and
     /// drop its declared equality indexes.
     pub spec: Option<IndexSpec>,
+    /// Opt-in for `get_changes`, the one unscoped read — the op log spans every
+    /// scope in the db, so in a db shared across projects it is a cross-project
+    /// read of everything. Off unless the host explicitly asks for it. Sync and
+    /// consolidation hosts, which legitimately need the whole log, pass
+    /// `--allow-unscoped-changes`.
+    pub allow_unscoped_changes: bool,
 }
 
 /// The built-in default index spec used when `--spec` is omitted: equality on
@@ -109,6 +121,7 @@ impl Config {
         let mut scope: Option<String> = None;
         let mut read_scopes: Option<String> = None;
         let mut spec_path: Option<PathBuf> = None;
+        let mut allow_unscoped_changes = false;
 
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
@@ -132,9 +145,12 @@ impl Config {
                             .into(),
                     );
                 }
+                "--allow-unscoped-changes" => {
+                    allow_unscoped_changes = true;
+                }
                 other => {
                     return Err(format!(
-                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]"
+                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes]"
                     )
                     .into());
                 }
@@ -166,6 +182,7 @@ impl Config {
             default_scope,
             default_read_scopes,
             spec,
+            allow_unscoped_changes,
         })
     }
 }
@@ -306,5 +323,18 @@ mod tests {
         // a caller error, not "read everything".
         assert!(Config::from_args(argv(&["--db", "t.redb", "--read-scopes", ""])).is_err());
         assert!(Config::from_args(argv(&["--db", "t.redb", "--read-scopes", " , "])).is_err());
+    }
+
+    #[test]
+    fn unscoped_changes_is_off_by_default() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb"])).unwrap();
+        assert!(!cfg.allow_unscoped_changes);
+    }
+
+    #[test]
+    fn unscoped_changes_flag_is_a_bare_toggle() {
+        let cfg =
+            Config::from_args(argv(&["--db", "t.redb", "--allow-unscoped-changes"])).unwrap();
+        assert!(cfg.allow_unscoped_changes);
     }
 }

@@ -46,6 +46,8 @@ pub struct TopoServer {
     default_scopes: ScopeSet,
     /// Rendered db path, reported by `db_info`.
     db_path: String,
+    /// See `Config::allow_unscoped_changes`.
+    allow_unscoped_changes: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -58,6 +60,7 @@ impl TopoServer {
             default_scope: config.default_scope,
             default_scopes,
             db_path: config.db_path.display().to_string(),
+            allow_unscoped_changes: config.allow_unscoped_changes,
             tool_router: Self::tool_router(),
         }
     }
@@ -747,12 +750,21 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The db_info tool reports current_seq."
+        description = "Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The db_info tool reports current_seq. Disabled unless the server was started with --allow-unscoped-changes."
     )]
     fn get_changes(
         &self,
         Parameters(p): Parameters<GetChangesParams>,
     ) -> Result<Json<GetChangesResult>, ErrorData> {
+        if !self.allow_unscoped_changes {
+            return Err(ErrorData::invalid_params(
+                "get_changes is disabled: it is the one unscoped read (the op log \
+                 spans every scope in the db), so it is off by default. Restart \
+                 topodb-mcp with --allow-unscoped-changes to enable it."
+                    .to_string(),
+                None,
+            ));
+        }
         let events = self.db.ops_since(p.since_seq).map_err(|e| match e {
             // Carries `oldest` in the message (TopoError::Compacted's Display
             // already renders it) so the caller can re-anchor from current

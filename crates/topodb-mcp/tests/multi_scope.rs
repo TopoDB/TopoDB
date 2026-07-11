@@ -436,3 +436,43 @@ fn all_six_read_tools_honour_scopes_default_vs_override() {
         "search_vectors with scopes: [\"shared\"] must find the embedding: {overridden:#?}"
     );
 }
+
+/// `get_changes` is the one unscoped read — it spans every scope in the db.
+/// In a db shared across projects that is a cross-project leak, so it is off
+/// unless the host explicitly opts in.
+#[test]
+fn get_changes_is_gated_unless_explicitly_allowed() {
+    use common::expect_tool_error;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("gate.redb");
+
+    // Without the flag: the call is a tool error naming the flag.
+    let mut server = Server::spawn(&db_path, &["--scope", "shared"]);
+    server.initialize(DEFAULT_TIMEOUT);
+    let resp = server.call_tool(
+        "get_changes",
+        serde_json::json!({ "since_seq": 0 }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+    let body = resp.to_string();
+    assert!(
+        body.contains("--allow-unscoped-changes"),
+        "the error must name the flag that enables it; got: {body}"
+    );
+    drop(server); // release the db file before reopening it below
+
+    // With the flag: it works.
+    let mut server = Server::spawn(
+        &db_path,
+        &["--scope", "shared", "--allow-unscoped-changes"],
+    );
+    server.initialize(DEFAULT_TIMEOUT);
+    let res = server.call_tool_ok(
+        "get_changes",
+        serde_json::json!({ "since_seq": 0 }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(res.get("ops").is_some());
+}
