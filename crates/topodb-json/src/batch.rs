@@ -164,6 +164,7 @@ pub fn resolve_batch(
                 let from_raw = req_str(obj, "from", idx)?;
                 let to_raw = req_str(obj, "to", idx)?;
                 let ty = req_str(obj, "type", idx)?;
+                let scope = scope_of(obj, default_scope, idx)?;
                 let from = parse_node(
                     &resolve_ref(&from_raw, IdKind::Node, &produced, "from", idx)?,
                     "from",
@@ -183,7 +184,7 @@ pub fn resolve_batch(
                 produced.push(Some((id.to_string(), IdKind::Edge)));
                 ops.push(Op::CreateEdge {
                     id,
-                    scope: default_scope,
+                    scope,
                     ty: ty.into(),
                     from,
                     to,
@@ -254,6 +255,7 @@ pub fn resolve_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use topodb::ScopeId;
 
     fn ids(ops: &[Op]) -> Vec<String> {
         ops.iter()
@@ -379,6 +381,37 @@ mod tests {
                 assert_eq!(vector.len(), 3);
             }
             other => panic!("expected SetEmbedding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_honours_an_explicit_scope() {
+        let other = ScopeId::new();
+        let batch = serde_json::json!([
+            { "op": "create_entity", "name": "a" },
+            { "op": "create_entity", "name": "b" },
+            { "op": "link", "from": "#0", "to": "#1", "type": "x", "scope": other.to_string() }
+        ]);
+        // Default scope is Shared; the link must land in `other`, NOT the default.
+        let (ops, _produced) = resolve_batch(&batch, Scope::Shared).unwrap();
+        match &ops[2] {
+            Op::CreateEdge { scope, .. } => assert_eq!(*scope, Scope::Id(other)),
+            other_op => panic!("expected CreateEdge, got {other_op:?}"),
+        }
+    }
+
+    #[test]
+    fn link_without_scope_falls_back_to_the_default() {
+        let default_id = ScopeId::new();
+        let batch = serde_json::json!([
+            { "op": "create_entity", "name": "a" },
+            { "op": "create_entity", "name": "b" },
+            { "op": "link", "from": "#0", "to": "#1", "type": "x" }
+        ]);
+        let (ops, _produced) = resolve_batch(&batch, Scope::Id(default_id)).unwrap();
+        match &ops[2] {
+            Op::CreateEdge { scope, .. } => assert_eq!(*scope, Scope::Id(default_id)),
+            other_op => panic!("expected CreateEdge, got {other_op:?}"),
         }
     }
 }

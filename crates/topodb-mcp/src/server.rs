@@ -80,9 +80,9 @@ impl TopoServer {
     /// expands to a `ScopeSet` for reads), a write needs exactly one `Scope`
     /// value, not a set to filter by — so this goes through
     /// [`convert::resolve_scope`] directly rather than also converting to a
-    /// `ScopeSet`. `link` has no `scope` param on the wire (per the plan's
-    /// tool table) and always calls this with `None`, which still resolves
-    /// through the same path to the server's configured default scope.
+    /// `ScopeSet`. Every write tool (`create_memory`, `create_entity`, `link`)
+    /// passes its optional `scope` param through here; `None` resolves to the
+    /// server's configured default write scope.
     fn resolve_scope(&self, scope: Option<&str>) -> Result<Scope, ErrorData> {
         convert::resolve_scope(scope, self.default_scope)
             .map_err(|e| ErrorData::invalid_params(e, None))
@@ -405,6 +405,13 @@ struct LinkParams {
     /// Free-form edge type (e.g. `"works_on"`, `"about"`). Be consistent —
     /// `traverse` can filter by it.
     edge_type: String,
+    /// Scope to create the edge in: `"shared"` or a scope ULID. Defaults to
+    /// the server's configured default scope when omitted. Set this explicitly
+    /// when linking nodes that live in a scope other than the default —
+    /// otherwise the edge is stamped with the default scope and is invisible
+    /// to readers of the nodes' own scope.
+    #[serde(default)]
+    scope: Option<String>,
     /// Structured metadata on the edge (string/number/bool values).
     #[serde(default)]
     #[schemars(with = "Option<PropsSchema>")]
@@ -762,9 +769,7 @@ impl TopoServer {
             Some(v) => convert::json_to_props(v).map_err(|e| ErrorData::invalid_params(e, None))?,
             None => Props::new(),
         };
-        // `link` has no `scope` param on the wire (see `LinkParams`) — always
-        // resolves through the server's configured default scope.
-        let scope = self.resolve_scope(None)?;
+        let scope = self.resolve_scope(p.scope.as_deref())?;
         let id = EdgeId::new();
         self.submit_write(vec![Op::CreateEdge {
             id,
@@ -881,7 +886,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; link { from, to, type, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
+        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; link { from, to, type, scope?, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
     )]
     fn submit_batch(
         &self,
