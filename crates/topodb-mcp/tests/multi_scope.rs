@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{Server, DEFAULT_TIMEOUT};
+use common::{expect_tool_error, Server, DEFAULT_TIMEOUT};
 
 /// A memory in scope A and a memory in `shared` are BOTH visible to a reader
 /// whose set is {A, shared} — the capability that did not exist before P1.
@@ -140,8 +140,8 @@ fn a_shared_edge_is_traversable_from_a_multi_scope_reader() {
     );
 
     // Traverse from A across `shared` — the edge must be visible.
-    // NB: traverse's params are `seed_id` / `max_hops` (see TraverseParams,
-    // server.rs:287), and its result is `{ "subgraph": {...} }`.
+    // NB: traverse's params are `seed_id` / `max_hops` (see TraverseParams
+    // in server.rs), and its result is `{ "subgraph": {...} }`.
     let res = server.call_tool_ok(
         "traverse",
         serde_json::json!({ "seed_id": a_id, "max_hops": 1, "scopes": ["shared"] }),
@@ -152,5 +152,287 @@ fn a_shared_edge_is_traversable_from_a_multi_scope_reader() {
         body.contains(&b_id),
         "a `shared`-scoped edge must be traversable by a reader of `shared`; \
          got subgraph: {body}"
+    );
+}
+
+/// Extracts a tool error's message text, regardless of which of the two
+/// shapes [`expect_tool_error`] accepts it landed on (see that helper's doc
+/// comment): a top-level JSON-RPC `error.message`, or `result.content[0].text`
+/// for the `isError: true` case. Lets a test assert on *what* the rejection
+/// says, not just that a rejection happened.
+fn tool_error_message(resp: &serde_json::Value) -> String {
+    if let Some(msg) = resp
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        return msg.to_string();
+    }
+    resp.get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// THE REGRESSION TEST for the empty-`scopes` constraint: `resolve_scopes`'s
+/// `Some([])` arm (server.rs) rejects an explicitly empty `scopes: []` rather
+/// than silently treating it as "read everything" — there is no unscoped
+/// read, so an empty set must be a caller error. This is verified today for
+/// all six read tools, but until now nothing pinned it: a future refactor
+/// that deleted that arm would compile, pass every other test, and quietly
+/// turn "reject" into "admit nothing" or "read the default set" without a
+/// single test noticing.
+///
+/// Every case's `id`/`seed_id` (where required) is a syntactically valid,
+/// freshly-minted ULID that need not actually exist — `resolve_scopes` runs
+/// before any id lookup in every one of these tools (see each tool's body in
+/// server.rs), so the rejection observed here is genuinely the `scopes` one,
+/// not an unrelated "no such node" error dressed up the same way.
+#[test]
+fn empty_scopes_is_rejected_by_every_read_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("empty_scopes.redb");
+    let project = topodb::ScopeId::new().to_string();
+
+    let mut server = Server::spawn(&db_path, &["--scope", project.as_str()]);
+    server.initialize(DEFAULT_TIMEOUT);
+
+    let node_id = topodb::NodeId::new().to_string();
+
+    let cases: [(&str, serde_json::Value); 6] = [
+        ("get_node", serde_json::json!({ "id": node_id, "scopes": [] })),
+        (
+            "find_by_prop",
+            serde_json::json!({
+                "label": "Entity", "prop": "name", "value": "ada", "scopes": []
+            }),
+        ),
+        (
+            "search_memories",
+            serde_json::json!({ "query": "ada", "scopes": [] }),
+        ),
+        (
+            "traverse",
+            serde_json::json!({ "seed_id": node_id, "scopes": [] }),
+        ),
+        (
+            "access_stats",
+            serde_json::json!({ "id": node_id, "scopes": [] }),
+        ),
+        (
+            "search_vectors",
+            serde_json::json!({ "model": "test", "vector": [1.0], "scopes": [] }),
+        ),
+    ];
+
+    for (tool, args) in cases {
+        let resp = server.call_tool(tool, args, DEFAULT_TIMEOUT);
+        expect_tool_error(&resp);
+        let message = tool_error_message(&resp);
+        assert!(
+            message.contains("scopes") && message.contains("empty"),
+            "{tool}'s `scopes: []` error should mention `scopes` being empty \
+             (so a future error-message change can't silently turn rejection \
+             into acceptance unnoticed), got: {resp:#?}"
+        );
+    }
+}
+
+/// Table-driven: with a server whose DEFAULT read set is project-only and
+/// the fixture data written into `shared`, every one of the six read tools
+/// must see NOTHING by default and see the data once `scopes: ["shared"]` is
+/// passed. Closes the coverage gap the reviewer flagged: before this test
+/// only `search_memories` and `traverse` were exercised by a committed test
+/// (per [`per_call_scopes_param_overrides_the_default_and_beats_scope`] and
+/// [`a_shared_edge_is_traversable_from_a_multi_scope_reader`]), and even
+/// `traverse`'s existing coverage used a default read set that already
+/// included `shared` — never the "invisible by default" half of the
+/// precedence this test pins for all six.
+#[test]
+fn all_six_read_tools_honour_scopes_default_vs_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("all_six.redb");
+    let project = topodb::ScopeId::new().to_string();
+
+    // No `--read-scopes` => the default read set is project-only.
+    let mut server = Server::spawn(&db_path, &["--scope", project.as_str()]);
+    server.initialize(DEFAULT_TIMEOUT);
+
+    // --- Fixture: nodes/edge/embedding, ALL stamped `shared` ---------------
+    let entity = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "zzzscope-entity", "scope": "shared" }),
+        DEFAULT_TIMEOUT,
+    );
+    let entity_id = entity["id"].as_str().unwrap().to_string();
+
+    let other = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "zzzscope-entity-2", "scope": "shared" }),
+        DEFAULT_TIMEOUT,
+    );
+    let other_id = other["id"].as_str().unwrap().to_string();
+
+    server.call_tool_ok(
+        "link",
+        serde_json::json!({
+            "from_id": entity_id, "to_id": other_id, "edge_type": "about", "scope": "shared"
+        }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let memory = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "zzzscope memory content", "scope": "shared" }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_id = memory["id"].as_str().unwrap().to_string();
+
+    // `set_embedding` takes no `scope` param — the embedding attaches to the
+    // node by id, so it lives wherever the node itself does (`shared`).
+    server.call_tool_ok(
+        "set_embedding",
+        serde_json::json!({ "id": memory_id, "model": "zzzscope-model", "vector": [1.0, 0.0] }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // --- get_node ------------------------------------------------------
+    let default = server.call_tool_ok(
+        "get_node",
+        serde_json::json!({ "id": entity_id }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        default["found"], false,
+        "get_node's default (project-only) read set must not see a `shared` node: {default:#?}"
+    );
+    let overridden = server.call_tool_ok(
+        "get_node",
+        serde_json::json!({ "id": entity_id, "scopes": ["shared"] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        overridden["found"], true,
+        "get_node with scopes: [\"shared\"] must see the node: {overridden:#?}"
+    );
+
+    // --- access_stats ----------------------------------------------------
+    let default = server.call_tool_ok(
+        "access_stats",
+        serde_json::json!({ "id": entity_id }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        default["found"], false,
+        "access_stats's default (project-only) read set must not see a `shared` node: {default:#?}"
+    );
+    let overridden = server.call_tool_ok(
+        "access_stats",
+        serde_json::json!({ "id": entity_id, "scopes": ["shared"] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        overridden["found"], true,
+        "access_stats with scopes: [\"shared\"] must see the node: {overridden:#?}"
+    );
+
+    // --- find_by_prop ------------------------------------------------------
+    let default = server.call_tool_ok(
+        "find_by_prop",
+        serde_json::json!({ "label": "Entity", "prop": "name", "value": "zzzscope-entity" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        default["nodes"].as_array().unwrap().len(),
+        0,
+        "find_by_prop's default (project-only) read set must find 0 nodes in \
+         `shared`: {default:#?}"
+    );
+    let overridden = server.call_tool_ok(
+        "find_by_prop",
+        serde_json::json!({
+            "label": "Entity", "prop": "name", "value": "zzzscope-entity", "scopes": ["shared"]
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        overridden["nodes"].as_array().unwrap().len(),
+        1,
+        "find_by_prop with scopes: [\"shared\"] must find the node: {overridden:#?}"
+    );
+
+    // --- search_memories -------------------------------------------------
+    let default = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "zzzscope", "k": 10 }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        default["hits"].as_array().unwrap().len(),
+        0,
+        "search_memories's default (project-only) read set must find 0 hits \
+         in `shared`: {default:#?}"
+    );
+    let overridden = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "zzzscope", "k": 10, "scopes": ["shared"] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        overridden["hits"].as_array().unwrap().len(),
+        1,
+        "search_memories with scopes: [\"shared\"] must find the memory: {overridden:#?}"
+    );
+
+    // --- traverse ----------------------------------------------------------
+    let default = server.call_tool_ok(
+        "traverse",
+        serde_json::json!({ "seed_id": entity_id, "max_hops": 1 }),
+        DEFAULT_TIMEOUT,
+    );
+    let default_body = default["subgraph"].to_string();
+    assert!(
+        !default_body.contains(&other_id),
+        "traverse's default (project-only) read set must not reach the \
+         `shared` edge: {default_body}"
+    );
+    let overridden = server.call_tool_ok(
+        "traverse",
+        serde_json::json!({ "seed_id": entity_id, "max_hops": 1, "scopes": ["shared"] }),
+        DEFAULT_TIMEOUT,
+    );
+    let overridden_body = overridden["subgraph"].to_string();
+    assert!(
+        overridden_body.contains(&other_id),
+        "traverse with scopes: [\"shared\"] must reach the `shared` edge: {overridden_body}"
+    );
+
+    // --- search_vectors ----------------------------------------------------
+    let default = server.call_tool_ok(
+        "search_vectors",
+        serde_json::json!({ "model": "zzzscope-model", "vector": [1.0, 0.0], "k": 5 }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        default["hits"].as_array().unwrap().len(),
+        0,
+        "search_vectors's default (project-only) read set must find 0 hits \
+         in `shared`: {default:#?}"
+    );
+    let overridden = server.call_tool_ok(
+        "search_vectors",
+        serde_json::json!({
+            "model": "zzzscope-model", "vector": [1.0, 0.0], "k": 5, "scopes": ["shared"]
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        overridden["hits"].as_array().unwrap().len(),
+        1,
+        "search_vectors with scopes: [\"shared\"] must find the embedding: {overridden:#?}"
     );
 }
