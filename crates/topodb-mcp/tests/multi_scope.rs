@@ -532,3 +532,46 @@ fn get_changes_is_gated_unless_explicitly_allowed() {
     );
     assert!(res.get("ops").is_some());
 }
+
+/// THE REGRESSION TEST for Finding 2: `db_info` must report the default READ
+/// scope SET, not just the default WRITE scope — otherwise a client that
+/// (per db_info's own advertised purpose) calls it first and sees only
+/// `default_scope: "A"` would reasonably conclude reads only see A, and then
+/// pass `scope: "shared"` on a read call to reach shared knowledge — which
+/// per the (correct) precedence rule NARROWS the read to shared-only and
+/// silently drops every project result. Reporting `default_read_scopes`
+/// alongside `default_scope` closes that trap.
+#[test]
+fn db_info_reports_both_the_default_write_scope_and_the_default_read_scope_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("dbinfo_scopes.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let read_list = format!("{project},shared");
+
+    let mut server = Server::spawn(
+        &db_path,
+        &[
+            "--scope",
+            project.as_str(),
+            "--read-scopes",
+            read_list.as_str(),
+        ],
+    );
+    server.initialize(DEFAULT_TIMEOUT);
+
+    let info = server.call_tool_ok("db_info", serde_json::json!({}), DEFAULT_TIMEOUT);
+    assert_eq!(
+        info["default_scope"], project,
+        "db_info's default_scope should be the configured --scope: {info:#?}"
+    );
+    let read_scopes = info["default_read_scopes"]
+        .as_array()
+        .expect("db_info should report default_read_scopes as an array");
+    let read_scopes: Vec<&str> = read_scopes.iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(
+        read_scopes,
+        vec![project.as_str(), "shared"],
+        "db_info's default_read_scopes should list BOTH --read-scopes entries, \
+         not just the default write scope: {info:#?}"
+    );
+}

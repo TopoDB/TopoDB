@@ -44,6 +44,11 @@ pub struct TopoServer {
     /// alone), reused by every scoped read tool call that omits `scope`/`scopes`
     /// (see [`TopoServer::resolve_scopes`]).
     default_scopes: ScopeSet,
+    /// The same default read set as `default_scopes`, kept as the original
+    /// `Vec<Scope>` too: `ScopeSet::iter_scopes` is `pub(crate)` to `topodb`,
+    /// so `db_info` (Finding 2) renders its reported read set from this list
+    /// via `scope_label` rather than from `default_scopes` directly.
+    default_read_scopes: Vec<Scope>,
     /// Rendered db path, reported by `db_info`.
     db_path: String,
     /// See `Config::allow_unscoped_changes`.
@@ -59,6 +64,7 @@ impl TopoServer {
             db,
             default_scope: config.default_scope,
             default_scopes,
+            default_read_scopes: config.default_read_scopes.clone(),
             db_path: config.db_path.display().to_string(),
             allow_unscoped_changes: config.allow_unscoped_changes,
             tool_router: Self::tool_router(),
@@ -209,9 +215,18 @@ struct DbInfo {
     /// Highest op-log sequence number committed so far (0 on a fresh db). Use
     /// this as the `since_seq` anchor for `get_changes`.
     current_seq: u64,
-    /// Default scope applied to tool calls that omit `scope`: `"shared"` or a
-    /// ULID string.
+    /// Default WRITE scope applied to a create/link tool call that omits
+    /// `scope`: `"shared"` or a ULID string. NOT the read set — see
+    /// `default_read_scopes`. A read tool call that passes this value as its
+    /// own `scope` narrows the read to just this one scope, which can be
+    /// STRICTER than the default read set below.
     default_scope: String,
+    /// Default READ scope set applied to a read tool call that omits both
+    /// `scope` and `scopes` (from `--read-scopes`, or `--scope` alone):
+    /// `"shared"` and/or ULID strings. Distinct from `default_scope` — a read
+    /// filters by this whole set, a write is stamped with the single
+    /// `default_scope` above.
+    default_read_scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -608,7 +623,7 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, current op-log sequence number, and the default scope applied to tool calls that omit `scope`. Call this first to confirm the server is wired to the expected database, and to obtain current_seq as the anchor for get_changes."
+        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, and the default READ scope set applied to a read call that omits both scope/scopes. Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
@@ -619,6 +634,7 @@ impl TopoServer {
             path: self.db_path.clone(),
             current_seq,
             default_scope: scope_label(&self.default_scope),
+            default_read_scopes: self.default_read_scopes.iter().map(scope_label).collect(),
         }))
     }
 
@@ -1000,8 +1016,12 @@ impl ServerHandler for TopoServer {
             ))
             .with_instructions(
                 "TopoDB agent-memory engine exposed over MCP: a temporal property graph with \
-                 scoped recall. Tool calls that omit `scope` use the server's configured default \
-                 scope (see db_info). Start with db_info to confirm wiring.",
+                 scoped recall. Reads filter by a SET of scopes (per-call `scopes: string[]`, \
+                 or the server's default read set when omitted); a write is stamped with \
+                 exactly ONE scope (per-call `scope: string`, or the server's default write \
+                 scope when omitted). The default read set can be WIDER than the default write \
+                 scope. Start with db_info to confirm wiring — it reports both defaults \
+                 separately.",
             )
     }
 }
