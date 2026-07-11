@@ -17,6 +17,8 @@ mod migrate;
 mod op;
 mod props;
 mod read;
+#[allow(dead_code)] // Scope IDs are consumed by v3 re-keyed rows.
+mod scopes;
 #[allow(dead_code)] // allocated tables are wired incrementally in v3 Tasks 2–7.
 mod slots;
 mod state;

@@ -5,6 +5,7 @@ use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::index::IndexSpec;
 use crate::op::Op;
+use crate::scopes::{seed_shared, ScopeRegistry, SCOPES};
 use crate::slots::{
     alloc_edge_slot, alloc_node_slot, remove_edge_mapping, remove_node_mapping, EDGE_IDS,
     EDGE_SLOTS, NODE_IDS, NODE_SLOTS,
@@ -59,6 +60,7 @@ pub struct Storage {
     /// in-memory snapshot.
     pub(crate) spec: Arc<IndexSpec>,
     pub(crate) dicts: RwLock<Dicts>,
+    pub(crate) scope_registry: RwLock<ScopeRegistry>,
 }
 
 impl Storage {
@@ -82,6 +84,7 @@ impl Storage {
             db,
             spec,
             dicts: RwLock::new(Dicts::default()),
+            scope_registry: RwLock::new(ScopeRegistry::default()),
         };
         let tx = s.db.begin_write().map_err(storage_err)?;
         let existing = {
@@ -98,6 +101,8 @@ impl Storage {
             tx.open_table(NODE_IDS).map_err(storage_err)?;
             tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
             tx.open_table(EDGE_IDS).map_err(storage_err)?;
+            let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
+            seed_shared(&mut scopes)?;
             let meta = tx.open_table(META).map_err(storage_err)?;
             let version = match meta.get("format_version").map_err(storage_err)? {
                 Some(v) => {
@@ -150,6 +155,9 @@ impl Storage {
         tx.commit().map_err(storage_err)?;
         let r = s.db.begin_read().map_err(storage_err)?;
         *s.dicts.write().expect("dict lock poisoned") = Dicts::load(&r)?;
+        *s.scope_registry
+            .write()
+            .expect("scope registry lock poisoned") = ScopeRegistry::load(&r)?;
         drop(r);
         s.ensure_index_spec()?;
         Ok(s)
@@ -552,6 +560,13 @@ impl Storage {
         let dict_read = self.db.begin_read().map_err(storage_err)?;
         *dicts = Dicts::load(&dict_read)?;
         drop(dict_read);
+        let mut scope_registry = self
+            .scope_registry
+            .write()
+            .expect("scope registry lock poisoned");
+        let scope_read = self.db.begin_read().map_err(storage_err)?;
+        *scope_registry = ScopeRegistry::load(&scope_read)?;
+        drop(scope_read);
         let tx = self.db.begin_write().map_err(storage_err)?;
         // Text-index edits collected during the op loop and applied AFTER every
         // op has succeeded — still inside this transaction, so the postings
@@ -571,6 +586,15 @@ impl Storage {
             let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
             let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
             let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+            let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
+            for op in &resolved {
+                match op {
+                    Op::CreateNode { scope, .. } | Op::CreateEdge { scope, .. } => {
+                        scope_registry.intern(&mut scopes_table, *scope)?;
+                    }
+                    _ => {}
+                }
+            }
             for op in &resolved {
                 // `pre` carries (id, scope, old_text). For CreateNode the scope
                 // comes from the op; for existing-node ops it comes from the
@@ -817,6 +841,10 @@ impl Storage {
             return Err(TopoError::Compacted { oldest });
         }
         let mut dicts = self.dicts.write().expect("dict lock poisoned");
+        let mut scope_registry = self
+            .scope_registry
+            .write()
+            .expect("scope registry lock poisoned");
         let tx = self.db.begin_write().map_err(storage_err)?;
         {
             let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
@@ -828,6 +856,7 @@ impl Storage {
             let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
             let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
             let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+            let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
             // The text index is derived from state, so it is drained and rebuilt
             // alongside NODES/EDGES through the very same `fts_update` used on the
             // write path — no parallel maintenance logic.
@@ -845,6 +874,9 @@ impl Storage {
             edge_slots.retain(|_, _| false).map_err(storage_err)?;
             edge_ids.retain(|_, _| false).map_err(storage_err)?;
             dicts.clear();
+            scopes_table.retain(|_, _| false).map_err(storage_err)?;
+            seed_shared(&mut scopes_table)?;
+            *scope_registry = ScopeRegistry::load_table_for_rebuild(&scopes_table)?;
             postings.retain(|_, _| false).map_err(storage_err)?;
             docs.retain(|_, _| false).map_err(storage_err)?;
             stats.retain(|_, _| false).map_err(storage_err)?;
@@ -857,6 +889,12 @@ impl Storage {
                 // Same (id, scope, old_text, new_text) derivation as
                 // `apply_batch`: old_text read BEFORE `apply_op` mutates the
                 // record; scope from the op (create) or the pre-mutation record.
+                match &op {
+                    Op::CreateNode { scope, .. } | Op::CreateEdge { scope, .. } => {
+                        scope_registry.intern(&mut scopes_table, *scope)?;
+                    }
+                    _ => {}
+                }
                 let pre: Option<(NodeId, Scope, Option<String>)> = match &op {
                     Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
