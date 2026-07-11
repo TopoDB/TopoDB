@@ -712,3 +712,238 @@ fn traverse_max_hops_is_clamped_1_to_4() {
     // empty subgraph (not an error).
     assert!(run("4").status.success(), "4 hops accepted");
 }
+
+// --- Task 2: per-command --scope on create-memory, create-entity, link (D1) ---
+
+/// A per-command `--scope` must override the global `--scope` for that one
+/// invocation — the same semantics an MCP tool's optional `scope` param has
+/// against the server's default write scope.
+#[test]
+fn create_memory_scope_overrides_the_global_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let project = topodb::ScopeId::new().to_string();
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "--scope",
+            &project,
+            "create-memory",
+            "--content",
+            "a lesson that generalises",
+            "--scope",
+            "shared",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Visible to a `shared` reader...
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", "shared", "get", &id])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["found"], true,
+        "the node should have landed in `shared`, not the global project scope"
+    );
+
+    // ...and NOT to a reader in the project scope the global flag named.
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", &project, "get", &id])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["found"], false,
+        "--scope on the command must override the global --scope"
+    );
+}
+
+#[test]
+fn create_entity_scope_overrides_the_global_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let project = topodb::ScopeId::new().to_string();
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "--scope",
+            &project,
+            "create-entity",
+            "--name",
+            "ada",
+            "--scope",
+            "shared",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", "shared", "get", &id])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["found"], true);
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", &project, "get", &id])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["found"], false);
+}
+
+/// Shared by the two `link --scope` pinning tests below (both originally
+/// defined this same closure verbatim; hoisted here so the duplication
+/// doesn't drift). Runs the CLI against a given `--db`/`--scope`, asserting
+/// success, and parses stdout as JSON.
+fn run_scoped(dbs: &str, scope: &str, extra: &[&str]) -> serde_json::Value {
+    let mut v = vec!["--db", dbs, "--scope", scope];
+    v.extend_from_slice(extra);
+    let out = bin().args(&v).output().unwrap();
+    assert!(
+        out.status.success(),
+        "args {:?} -- stderr: {}",
+        extra,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// The regression test that carries the actual risk. `link --scope shared` is
+/// what lets a `shared` edge join two `shared` nodes. Without it, the edge is
+/// stamped with the global (project) scope and becomes invisible from every
+/// other project — the nodes are shared but disconnected. Mirrors the MCP-side
+/// test P1 already has.
+#[test]
+fn link_scope_makes_a_shared_edge_traversable_by_a_shared_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let dbs = db.to_str().unwrap().to_string();
+
+    // Two `shared` nodes, created while the GLOBAL scope is the project.
+    let a = run_scoped(
+        &dbs,
+        &project,
+        &["create-entity", "--name", "ada", "--scope", "shared"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = run_scoped(
+        &dbs,
+        &project,
+        &["create-entity", "--name", "grace", "--scope", "shared"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The edge is stamped `shared` too.
+    run_scoped(
+        &dbs,
+        &project,
+        &[
+            "link", "--from", &a, "--to", &b, "--type", "knows", "--scope", "shared",
+        ],
+    );
+
+    let sg = run_scoped(&dbs, "shared", &["traverse", &a, "--max-hops", "1"]);
+    let edges = sg["subgraph"]["edges"].as_array().unwrap();
+    assert_eq!(
+        edges.len(),
+        1,
+        "a `shared` edge must be traversable by a `shared` reader"
+    );
+}
+
+/// The other half of the pin: WITHOUT `--scope`, the edge takes the global
+/// (project) scope and a `shared` reader cannot traverse it. This is the
+/// "disconnected islands" bug, and it is the behaviour `--scope` exists to let
+/// callers avoid.
+///
+/// Note this also documents debt D3: the engine happily stamps an edge with a
+/// scope neither of its endpoints can see, producing an edge no reader can ever
+/// traverse. D3 is deliberately out of scope for this plan; if it is ever fixed
+/// by rejecting such an edge at submit time, THIS TEST MUST CHANGE — the link
+/// would then be rejected rather than committed-and-invisible.
+#[test]
+fn link_without_scope_stamps_the_global_scope_and_a_shared_reader_cannot_traverse_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let dbs = db.to_str().unwrap().to_string();
+
+    let a = run_scoped(
+        &dbs,
+        &project,
+        &["create-entity", "--name", "ada", "--scope", "shared"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = run_scoped(
+        &dbs,
+        &project,
+        &["create-entity", "--name", "grace", "--scope", "shared"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No --scope on the link: it takes the global project scope.
+    run_scoped(
+        &dbs,
+        &project,
+        &["link", "--from", &a, "--to", &b, "--type", "knows"],
+    );
+
+    let sg = run_scoped(&dbs, "shared", &["traverse", &a, "--max-hops", "1"]);
+    assert!(
+        sg["subgraph"]["edges"].as_array().unwrap().is_empty(),
+        "an edge stamped with the project scope must NOT be visible to a `shared` reader"
+    );
+}
+
+#[test]
+fn per_command_bad_scope_is_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    for args in [
+        vec!["create-memory", "--content", "x", "--scope", "not-a-ulid"],
+        vec!["create-entity", "--name", "x", "--scope", "not-a-ulid"],
+    ] {
+        let out = bin().args(["--db"]).arg(&db).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "args: {args:?}");
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(err["error"]["kind"], "rejected");
+    }
+}

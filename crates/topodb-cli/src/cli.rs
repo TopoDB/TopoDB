@@ -29,25 +29,39 @@ pub enum Command {
     Info,
     /// Store a new memory node. `content` becomes the full-text-searchable
     /// body (prop `content`, label `Memory` — see `topodb_json::MEMORY_*`);
-    /// `--props` merges additional structured metadata.
+    /// `--props` merges additional structured metadata. `--scope` stamps
+    /// this node's own scope (default: the global `--scope`).
     CreateMemory {
         #[arg(long)]
         content: String,
         /// Additional metadata as a JSON object string, e.g. '{"source":"chat"}'.
         #[arg(long)]
         props: Option<String>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        /// Defaults to the global `--scope`. Only the commands that STAMP a
+        /// scope take this — a write lands in exactly one scope.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Create an entity node (person, project, concept). `name` is
     /// equality-indexed by the default spec (prop `name`, label `Entity` —
     /// see `topodb_json::ENTITY_*`); `--props` merges additional metadata.
+    /// `--scope` stamps this node's own scope (default: the global `--scope`).
     CreateEntity {
         #[arg(long)]
         name: String,
         /// Additional metadata as a JSON object string.
         #[arg(long)]
         props: Option<String>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        /// Defaults to the global `--scope`. Only the commands that STAMP a
+        /// scope take this — a write lands in exactly one scope.
+        #[arg(long)]
+        scope: Option<String>,
     },
-    /// Create a typed, time-aware edge between two existing nodes.
+    /// Create a typed, time-aware edge between two existing nodes. `--scope`
+    /// stamps the EDGE's own scope (default: the global `--scope`) — a `shared`
+    /// edge is what lets two `shared` nodes stay connected across projects.
     Link {
         /// Source node id (ULID).
         #[arg(long)]
@@ -64,6 +78,11 @@ pub enum Command {
         /// Unix ms the edge becomes valid from; defaults to "now" (applier-resolved).
         #[arg(long = "valid-from")]
         valid_from: Option<i64>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        /// Defaults to the global `--scope`. Only the commands that STAMP a
+        /// scope take this — a write lands in exactly one scope.
+        #[arg(long)]
+        scope: Option<String>,
     },
     /// Fetch one node by id. `{"found":false}` (exit 0) if it doesn't exist
     /// or is out of the default scope — the two are indistinguishable by

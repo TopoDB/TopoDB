@@ -46,21 +46,34 @@ fn main() {
 
     match cli.cmd {
         Command::Info => info(&db, &cli.db, default_scope, cli.pretty),
-        Command::CreateMemory { content, props } => {
-            create_memory(&db, default_scope, content, props.as_deref(), cli.pretty)
-        }
-        Command::CreateEntity { name, props } => {
-            create_entity(&db, default_scope, name, props.as_deref(), cli.pretty)
-        }
+        Command::CreateMemory {
+            content,
+            props,
+            scope,
+        } => create_memory(
+            &db,
+            resolve_cmd_scope(scope.as_deref(), default_scope),
+            content,
+            props.as_deref(),
+            cli.pretty,
+        ),
+        Command::CreateEntity { name, props, scope } => create_entity(
+            &db,
+            resolve_cmd_scope(scope.as_deref(), default_scope),
+            name,
+            props.as_deref(),
+            cli.pretty,
+        ),
         Command::Link {
             from,
             to,
             ty,
             props,
             valid_from,
+            scope,
         } => link(
             &db,
-            default_scope,
+            resolve_cmd_scope(scope.as_deref(), default_scope),
             &from,
             &to,
             ty,
@@ -103,6 +116,18 @@ fn main() {
             candidate,
         } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
         Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
+    }
+}
+
+/// Resolves a per-command `--scope` override against the global `--scope`.
+/// Absent → the global default; present → parsed, a bad value being a
+/// caller-fixable input error (rejected/exit-2). Routed through the same
+/// `topodb_json::resolve_scope` the batch DSL uses, so `topodb link --scope X`
+/// and `topodb submit '[{"op":"link", ..., "scope":"X"}]'` cannot drift apart.
+fn resolve_cmd_scope(scope: Option<&str>, default: Scope) -> Scope {
+    match topodb_json::resolve_scope(scope, default) {
+        Ok(s) => s,
+        Err(e) => output::fail("rejected", &e, 2),
     }
 }
 
