@@ -6,10 +6,10 @@
 // through `traverse` and `find_by_prop` to confirm the on-disk graph shape
 // and that the index spec was actually applied.
 //
-// Gated on `target/debug/topodb-mcp(.exe)` existing (built by Step 1 of the
-// task brief: `cargo build -p topodb-mcp` from the repo root). Skips rather
-// than fails when the binary hasn't been built, mirroring how the rest of
-// this suite skips/gates on optional preconditions instead of hard-failing.
+// Gated on `target/debug/topodb-mcp(.exe)` existing (prerequisite: run
+// `cargo build -p topodb-mcp` from the repo root). Skips rather than fails
+// when the binary hasn't been built, mirroring how the rest of this suite
+// skips/gates on optional preconditions instead of hard-failing.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync } from "node:fs";

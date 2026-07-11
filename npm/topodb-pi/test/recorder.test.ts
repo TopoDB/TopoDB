@@ -80,9 +80,8 @@ test("buildEpisodeBatch: exact command array shape", () => {
 });
 
 // Fixtures below are the ACTUAL JSON returned by the branch-built
-// topodb-mcp binary (target/debug/topodb-mcp.exe), captured by driving it
-// over stdio with a throwaway script — not guessed. See task-5-report.md
-// for the full capture transcript.
+// topodb-mcp binary (target/debug/topodb-mcp.exe), captured by driving the
+// real server binary over stdio with a throwaway script — not guessed.
 
 test("toRetrievalRecord: search_memories hit -> text-channel RetrievalRecord + contents", () => {
   const result = {

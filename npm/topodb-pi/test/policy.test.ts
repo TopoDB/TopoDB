@@ -32,7 +32,7 @@ test("ensurePolicyVersion: existing matching version is reused, nothing written"
       return { subgraph: { nodes: [
         { id: "01VER", label: "PolicyVersion", props: { version: 1 } },
         { id: "01ART", label: "Artifact", props: { sha256: arts[0].sha256 } },
-      ], edges: [ { from: "01VER", to: "01ART", ty: "INCLUDES" } ] } };
+      ], edges: [ { from: "01VER", to: "01ART", type: "INCLUDES" } ] } };
     throw new Error(`unexpected tool ${tool}`);
   };
   return ensurePolicyVersion(fake, [join(dir, "a.md")]).then((id) => {
@@ -91,7 +91,7 @@ test("ensurePolicyVersion: duplicate-content files still reuse an existing versi
       return { subgraph: { nodes: [
         { id: "01VER", label: "PolicyVersion", props: { version: 1 } },
         { id: "01ART", label: "Artifact", props: { sha256: arts[0].sha256 } },
-      ], edges: [ { from: "01VER", to: "01ART", ty: "INCLUDES" } ] } };
+      ], edges: [ { from: "01VER", to: "01ART", type: "INCLUDES" } ] } };
     throw new Error(`unexpected tool ${tool}`);
   };
   return ensurePolicyVersion(fake, [join(dir, "a.md"), join(dir, "b.md")]).then((id) => {

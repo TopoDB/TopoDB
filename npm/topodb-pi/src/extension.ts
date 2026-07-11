@@ -73,17 +73,21 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("agent_start", async () => {
     if (!recording) return;
-    buffer.start(Date.now());
-    memContents.clear();
-    if (!policyResolved) {
-      policyResolved = true;
-      const paths = (process.env.TOPODB_POLICY_PATHS ?? "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (paths.length) {
-        policyId = await ensurePolicyVersion((t, a) => server.call(t, a), paths);
+    try {
+      buffer.start(Date.now());
+      memContents.clear();
+      if (!policyResolved) {
+        policyResolved = true;
+        const paths = (process.env.TOPODB_POLICY_PATHS ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (paths.length) {
+          policyId = await ensurePolicyVersion((t, a) => server.call(t, a), paths);
+        }
       }
+    } catch (e) {
+      console.error(`topodb recorder: agent_start failed: ${(e as Error).message}`);
     }
   });
 
@@ -150,8 +154,9 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    // Flush a still-open run (crash/quit mid-episode) as a failure before
-    // tearing down the server, per spec §2b.
+    // An episode still open at shutdown (crash/quit mid-run) must be flushed
+    // as a failure before the server goes down, so the graph never has a
+    // dangling in-progress episode with no outcome recorded.
     if (recording && buffer.open) {
       try {
         buffer.close();

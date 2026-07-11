@@ -1,7 +1,8 @@
-// src/policy.ts — optional PolicyVersion bootstrap (spec §1 "PolicyVersion").
-// Hash configured artifact files; find-or-create the content-addressed
-// Artifact nodes, the PolicyVersion containing exactly that set, and the
-// Harness singleton with its temporal ACTIVE_POLICY edge.
+// src/policy.ts — optional PolicyVersion bootstrap: records which prompt/
+// config artifacts were in effect for a run. Hashes the configured artifact
+// files and find-or-creates the content-addressed Artifact nodes plus the
+// PolicyVersion node that INCLUDES exactly that set, so later analysis can
+// tell which policy version produced which episodes.
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
@@ -103,10 +104,13 @@ export async function ensurePolicyVersion(
     }
 
     // 3. Create what's missing in ONE batch: absent Artifacts, the new
-    //    PolicyVersion, INCLUDES edges. (Harness/ACTIVE_POLICY maintenance
-    //    needs the previous version's open edge closed; v1 keeps this
-    //    simple: find-or-create Harness, then link ACTIVE_POLICY — closing
-    //    the prior edge uses close_edge with the edge id found via traverse.)
+    //    PolicyVersion, INCLUDES edges. v1 intentionally does NOT maintain a
+    //    Harness node or an ACTIVE_POLICY edge pointing at "the current"
+    //    version — that would need the previous version's edge closed on
+    //    every rotation, which is out of scope here. Each episode instead
+    //    links directly to the PolicyVersion it used (see USED_POLICY in
+    //    recorder.ts), so "what was active when" is derivable per-episode
+    //    without a mutable singleton.
     const cmds: unknown[] = [];
     const refOf = new Map<string, string>(); // sha256 -> "#N" or literal id
     for (const a of arts) {
