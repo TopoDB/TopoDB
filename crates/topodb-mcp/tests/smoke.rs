@@ -16,9 +16,7 @@ use common::{Server, DEFAULT_TIMEOUT};
 fn handshake_and_tools_list_exposes_all_ten_tools() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("smoke.redb");
-    // --allow-unscoped-changes: sanctioned carve-out (Task 5) so get_changes'
-    // now-conditional advertised description stays exercised here too.
-    let mut server = Server::spawn(&db_path, &["--allow-unscoped-changes"]);
+    let mut server = Server::spawn(&db_path, &[]);
 
     let init = server.initialize(DEFAULT_TIMEOUT);
     assert!(
