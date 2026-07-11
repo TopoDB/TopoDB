@@ -7,33 +7,86 @@ pure Rust: a scoped temporal property graph on [redb], with an op-log write
 path, lock-free snapshot reads, and k-hop temporal traversal — running
 in-process, no server.
 
-Status: **early development (0.0.x)** — the engine core works (op log,
-single-applier concurrency, scoped temporal traversal, replay-determinism
-property tests), but the API is not yet stable and the recall layer (vector
-search, full-text, change feed) is still landing. Not production-ready;
-pin exact versions.
+Status: **early development (0.0.x)** — the engine core **and the recall
+layer** are implemented: op log, single-applier concurrency, scoped temporal
+traversal, BM25 full-text search, graph-scoped vector search, access stats,
+change feed, and replay-determinism property tests. The API is not yet
+stable; pin exact versions.
 
-```rust
-use topodb::{Db, Op, Scope, ScopeId, ScopeSet, NodeId, TraversalQuery, Direction};
+```rust,no_run
+use topodb::{
+    Db, Direction, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, ScopeId,
+    ScopeSet, TraversalQuery, VectorQuery,
+};
 
-let db = Db::open("memory.topodb")?;
-let scope = ScopeId::new();
-let (a, b) = (NodeId::new(), NodeId::new());
+fn main() -> Result<(), topodb::TopoError> {
+    // Declare what gets indexed up front (Db::open defaults to NO indexes;
+    // the CLI/MCP layers declare this same spec for you automatically).
+    let spec = IndexSpec {
+        equality: vec![PropIndex { label: "Entity".into(), prop: "name".into() }],
+        text: vec![PropIndex { label: "Memory".into(), prop: "content".into() }],
+    };
+    let db = Db::open_with("memory.topodb", spec)?;
+    let scope = ScopeId::new();
+    let (a, b) = (NodeId::new(), NodeId::new());
 
-// Every mutation is a batch of ops, applied atomically.
-db.submit(vec![
-    Op::CreateNode { id: a, scope: Scope::Id(scope), label: "Memory".into(), props: Default::default() },
-    Op::CreateNode { id: b, scope: Scope::Shared, label: "Entity".into(), props: Default::default() },
-    Op::CreateEdge { id: Default::default(), scope: Scope::Id(scope), ty: "ABOUT".into(),
-                     from: a, to: b, props: Default::default(), valid_from: None },
-])?;
+    // Every mutation is a batch of ops, applied atomically.
+    db.submit(vec![
+        Op::CreateNode {
+            id: a,
+            scope: Scope::Id(scope),
+            label: "Memory".into(),
+            props: [(
+                "content".to_string(),
+                PropValue::Str("ada wrote the first program".into()),
+            )]
+            .into(),
+        },
+        Op::CreateNode {
+            id: b,
+            scope: Scope::Shared,
+            label: "Entity".into(),
+            props: Default::default(),
+        },
+        Op::CreateEdge {
+            id: Default::default(),
+            scope: Scope::Id(scope),
+            ty: "ABOUT".into(),
+            from: a,
+            to: b,
+            props: Default::default(),
+            valid_from: None,
+        },
+        // Embeddings are host-computed and submitted as ops (engine, not policy).
+        Op::SetEmbedding { id: a, model: "my-embedder".into(), vector: vec![0.1, 0.2, 0.3] },
+    ])?;
 
-// Every read is scoped — there is no unscoped read path.
-let scopes = ScopeSet::of(&[scope]).with_shared();
-let sub = db.traverse(&TraversalQuery {
-    scopes, seeds: vec![a], max_hops: 2,
-    edge_types: None, direction: Direction::Out, as_of: None,
-})?;
+    // Every read is scoped — there is no unscoped read path.
+    let scopes = ScopeSet::of(&[scope]).with_shared();
+
+    // BM25 full-text recall.
+    let _hits = db.search_text(&scopes, "first program", 10)?;
+
+    // Vector recall, scoped, under the same model namespace.
+    let _near = db.search_vector(&VectorQuery {
+        scopes: scopes.clone(),
+        model: "my-embedder".into(),
+        vector: vec![0.1, 0.2, 0.3],
+        k: 10,
+        candidates: None,
+    })?;
+
+    // Scoped k-hop temporal traversal.
+    let _sub = db.traverse(&TraversalQuery {
+        scopes,
+        seeds: vec![a],
+        max_hops: 2,
+        edge_types: None,
+        direction: Direction::Out,
+        as_of: None,
+    })?;
+    Ok(())
+}
 ```
 
 ## Design principles

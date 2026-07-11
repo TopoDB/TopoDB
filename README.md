@@ -16,11 +16,12 @@ pure Rust: a property graph with temporal facts (facts supersede, never
 overwrite), scope-aware recall, graph-scoped vector search, and a change feed
 for external consolidation — running in-process, no server.
 
-Status: **early development (0.0.x)** — the engine core works (op-log write
-path, single-applier concurrency, scoped k-hop temporal traversal,
-replay-determinism property tests), and so does the recall layer: BM25
-full-text search, graph-scoped cosine vector search, and the change feed all
-ship today, exposed by both front ends. API not yet stable.
+Status: **early development (0.0.x)** — the engine core **and the recall
+layer** are implemented: op-log write path, single-applier concurrency,
+scoped k-hop temporal traversal, BM25 full-text search, graph-scoped vector
+search, access stats, change feed, and replay-determinism property tests.
+API not yet stable — pin exact versions. See
+[implemented vs planned](#implemented-vs-planned).
 
 First consumer: Atlas (agentic OS desktop app).
 
@@ -31,6 +32,70 @@ First consumer: Atlas (agentic OS desktop app).
 3. Honest benchmarks from day one
 4. Engine, not policy — no LLM calls inside the database, ever
 5. Embedded-first — servers and sync are future layers, never prerequisites
+
+Principle 4 is a hard boundary, not a preference: anything LLM-driven —
+summarization, reflection, consolidation — is a **layer built on the
+engine**, never a feature inside it. The engine's job is to hand those
+layers the primitives they need: the change feed, temporal history, and
+scoped recall.
+
+## Five-minute quick start
+
+The fastest path is the CLI (installs a binary named `topodb`):
+
+```bash
+cargo install topodb-cli
+
+# Create a database, an entity, and a memory — then link and search them.
+topodb --db agent.redb create-entity --name ada
+# → {"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+topodb --db agent.redb create-memory --content "ada wrote the first program"
+# → {"id":"01BX5ZZKBKACTAV9WEVGEMMVRZ"}
+topodb --db agent.redb link --from 01BX5ZZKBKACTAV9WEVGEMMVRZ --to 01ARZ3NDEKTSV4RRFFQ69G5FAV --type ABOUT
+topodb --db agent.redb search "first program"
+topodb --db agent.redb traverse 01BX5ZZKBKACTAV9WEVGEMMVRZ --max-hops 2
+```
+
+(Substitute the ids your own `create-*` calls print.)
+
+To give a coding agent the same database as MCP tools:
+
+```bash
+cargo install topodb-mcp
+claude mcp add topodb --transport stdio -- topodb-mcp --db /path/to/agent.redb
+```
+
+On [Pi](https://pi.dev) it is one command: `pi install npm:@topodb/pi`.
+
+To embed the engine directly in a Rust process, see the
+[`topodb` crate example](crates/topodb/README.md) — the same graph, ops,
+and scoped recall as a library call.
+
+## Implemented vs planned
+
+| Capability | Where | Status |
+|---|---|---|
+| Op-log write path — atomic batches, deterministic replay (property-tested) | engine | ✅ |
+| Single-applier concurrency; lock-free snapshot reads | engine | ✅ |
+| Scoped k-hop temporal traversal (`as_of` history reads) | engine | ✅ |
+| Temporal edges — facts supersede, never overwrite | engine | ✅ |
+| Equality property index | engine | ✅ |
+| BM25 full-text search (per-scope corpus) | engine | ✅ |
+| Graph-scoped vector search (cosine; embeddings host-computed, stored via `SetEmbedding`) | engine | ✅ |
+| Access stats (recall-driven counters) | engine | ✅ |
+| Change feed (`subscribe` / `ops_since`) + op-log compaction | engine | ✅ |
+| Versioned on-disk format ([FORMAT.md](FORMAT.md)) | engine | ✅ |
+| MCP server (16 tools) | `topodb-mcp` | ✅ |
+| CLI (all 17 engine operations) | `topodb-cli` | ✅ v1 |
+| One-command Pi install | `@topodb/pi` | ✅ |
+| Vector search exposed over MCP / CLI | layers | ✅ |
+| `set-props` / `remove-node` / bulk submit over CLI | `topodb-cli` | ✅ |
+| Multi-scope reads (read across a scope *set*) | `topodb-mcp` | ✅ |
+| Multi-scope reads over CLI | `topodb-cli` | Planned |
+| API stabilization (0.1) | engine | Planned |
+| Reproducible benchmarks | repo | Planned |
+| LLM calls inside the engine | — | **Never** (principle 4) |
+| Server process as a prerequisite | — | **Never** (principle 5) |
 
 ## Crates
 
