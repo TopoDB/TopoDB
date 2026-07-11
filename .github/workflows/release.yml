@@ -430,3 +430,24 @@ jobs:
             (cd "$d" && npm publish --access public)
           done
           (cd dist-npm/topodb-mcp && npm publish --access public)
+
+  publish-npm-pi:
+    if: startsWith(github.ref_name, 'topodb-pi-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Build and publish @topodb/pi
+        working-directory: npm/topodb-pi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm publish --access public
