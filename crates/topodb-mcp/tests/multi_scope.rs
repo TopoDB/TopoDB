@@ -21,7 +21,12 @@ fn read_spans_project_scope_and_shared() {
 
     let mut server = Server::spawn(
         &db_path,
-        &["--scope", project.as_str(), "--read-scopes", read_list.as_str()],
+        &[
+            "--scope",
+            project.as_str(),
+            "--read-scopes",
+            read_list.as_str(),
+        ],
     );
     server.initialize(DEFAULT_TIMEOUT);
 
@@ -113,7 +118,12 @@ fn a_shared_edge_is_traversable_from_a_multi_scope_reader() {
 
     let mut server = Server::spawn(
         &db_path,
-        &["--scope", project.as_str(), "--read-scopes", read_list.as_str()],
+        &[
+            "--scope",
+            project.as_str(),
+            "--read-scopes",
+            read_list.as_str(),
+        ],
     );
     server.initialize(DEFAULT_TIMEOUT);
 
@@ -204,7 +214,10 @@ fn empty_scopes_is_rejected_by_every_read_tool() {
     let node_id = topodb::NodeId::new().to_string();
 
     let cases: [(&str, serde_json::Value); 6] = [
-        ("get_node", serde_json::json!({ "id": node_id, "scopes": [] })),
+        (
+            "get_node",
+            serde_json::json!({ "id": node_id, "scopes": [] }),
+        ),
         (
             "find_by_prop",
             serde_json::json!({
@@ -464,10 +477,7 @@ fn get_changes_is_gated_unless_explicitly_allowed() {
     drop(server); // release the db file before reopening it below
 
     // With the flag: it works.
-    let mut server = Server::spawn(
-        &db_path,
-        &["--scope", "shared", "--allow-unscoped-changes"],
-    );
+    let mut server = Server::spawn(&db_path, &["--scope", "shared", "--allow-unscoped-changes"]);
     server.initialize(DEFAULT_TIMEOUT);
     let res = server.call_tool_ok(
         "get_changes",

@@ -333,8 +333,7 @@ mod tests {
 
     #[test]
     fn unscoped_changes_flag_is_a_bare_toggle() {
-        let cfg =
-            Config::from_args(argv(&["--db", "t.redb", "--allow-unscoped-changes"])).unwrap();
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--allow-unscoped-changes"])).unwrap();
         assert!(cfg.allow_unscoped_changes);
     }
 }

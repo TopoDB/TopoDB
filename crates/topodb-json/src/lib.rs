@@ -710,7 +710,10 @@ mod tests {
         let multi = scopes_to_scope_set(&[Scope::Id(a)]);
         let single = scope_to_scope_set(Scope::Id(a));
         assert_eq!(multi.contains(Scope::Id(a)), single.contains(Scope::Id(a)));
-        assert_eq!(multi.contains(Scope::Shared), single.contains(Scope::Shared));
+        assert_eq!(
+            multi.contains(Scope::Shared),
+            single.contains(Scope::Shared)
+        );
 
         let multi_shared = scopes_to_scope_set(&[Scope::Shared]);
         let single_shared = scope_to_scope_set(Scope::Shared);
