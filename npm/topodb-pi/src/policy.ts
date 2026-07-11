@@ -39,7 +39,16 @@ export async function ensurePolicyVersion(
   paths: string[],
 ): Promise<string | undefined> {
   try {
-    const arts = hashArtifacts(paths);
+    // Dedupe by sha256 (keep the first path per hash — hashArtifacts sorts
+    // by path). Everything downstream — the wanted set, the reuse gate, the
+    // create batch, the INCLUDES links — is driven off this deduped list;
+    // duplicate content must map to ONE Artifact node and ONE edge, or the
+    // exact-match reuse check breaks forever after.
+    const bySha = new Map<string, HashedArtifact>();
+    for (const a of hashArtifacts(paths)) {
+      if (!bySha.has(a.sha256)) bySha.set(a.sha256, a);
+    }
+    const arts = [...bySha.values()];
     if (arts.length === 0) return undefined;
     const wanted = new Set(arts.map((a) => a.sha256));
 
