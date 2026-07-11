@@ -36,6 +36,36 @@ use topodb::{IndexSpec, Scope, ScopeId};
 /// keep working unchanged.
 pub use topodb_json::{ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL};
 
+/// A **non-empty** set of scopes a read filters by. The non-empty invariant is
+/// structural rather than conventional: an empty [`ScopeSet`] admits nothing, so
+/// an empty read set would make every default read silently return empty. There
+/// is no unscoped read, and "read nothing" is never what a caller means.
+///
+/// Distinct from [`Config::default_scope`], the single [`Scope`] a *write* is
+/// stamped with. A read filters by a set; a write picks one.
+///
+/// [`ScopeSet`]: topodb::ScopeSet
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadScopes(Vec<Scope>);
+
+impl ReadScopes {
+    /// Rejects an empty list. This is the only constructor.
+    pub fn new(scopes: Vec<Scope>) -> Result<Self, Box<dyn Error>> {
+        if scopes.is_empty() {
+            return Err(
+                "read scope set is empty; expected at least one of \"shared\" or a scope ULID"
+                    .into(),
+            );
+        }
+        Ok(Self(scopes))
+    }
+
+    /// The scopes, in the order given.
+    pub fn as_slice(&self) -> &[Scope] {
+        &self.0
+    }
+}
+
 /// Resolved server configuration (see the module docs for the CLI contract).
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -46,7 +76,7 @@ pub struct Config {
     /// the single-scope behaviour every existing client relies on is preserved
     /// exactly). Distinct from `default_scope`, which is the single scope a
     /// *write* is stamped with — a read filters by a set, a write picks one.
-    pub default_read_scopes: Vec<Scope>,
+    pub default_read_scopes: ReadScopes,
     /// The spec parsed from an explicit `--spec` file, or `None` when the flag
     /// was omitted. `None` means "inherit the db's persisted spec" (see how
     /// `main` opens the db), NOT "use `default_spec()`" — the two diverge for
@@ -92,7 +122,7 @@ fn parse_scope(s: &str) -> Result<Scope, Box<dyn Error>> {
 /// entries, whitespace around each entry ignored. Rejects an empty list — an
 /// empty `ScopeSet` admits nothing, and "read nothing" is never what a caller
 /// means (there is no unscoped read).
-fn parse_read_scopes(s: &str) -> Result<Vec<Scope>, Box<dyn Error>> {
+fn parse_read_scopes(s: &str) -> Result<ReadScopes, Box<dyn Error>> {
     let scopes = s
         .split(',')
         .map(str::trim)
@@ -105,7 +135,7 @@ fn parse_read_scopes(s: &str) -> Result<Vec<Scope>, Box<dyn Error>> {
         )
         .into());
     }
-    Ok(scopes)
+    ReadScopes::new(scopes)
 }
 
 impl Config {
@@ -164,7 +194,7 @@ impl Config {
         };
         let default_read_scopes = match read_scopes {
             Some(s) => parse_read_scopes(&s)?,
-            None => vec![default_scope],
+            None => ReadScopes::new(vec![default_scope])?,
         };
         let spec = match spec_path {
             Some(p) => {
@@ -271,13 +301,13 @@ mod tests {
         let id = ScopeId::new();
         let s = id.to_string();
         let cfg = Config::from_args(argv(&["--db", "t.redb", "--scope", &s])).unwrap();
-        assert_eq!(cfg.default_read_scopes, vec![Scope::Id(id)]);
+        assert_eq!(cfg.default_read_scopes.as_slice(), &[Scope::Id(id)]);
     }
 
     #[test]
     fn read_scopes_defaults_to_shared_when_scope_omitted() {
         let cfg = Config::from_args(argv(&["--db", "t.redb"])).unwrap();
-        assert_eq!(cfg.default_read_scopes, vec![Scope::Shared]);
+        assert_eq!(cfg.default_read_scopes.as_slice(), &[Scope::Shared]);
     }
 
     #[test]
@@ -293,7 +323,10 @@ mod tests {
             &list,
         ]))
         .unwrap();
-        assert_eq!(cfg.default_read_scopes, vec![Scope::Id(a), Scope::Shared]);
+        assert_eq!(
+            cfg.default_read_scopes.as_slice(),
+            &[Scope::Id(a), Scope::Shared]
+        );
         // The write scope is untouched by --read-scopes.
         assert!(matches!(cfg.default_scope, Scope::Id(got) if got == a));
     }
@@ -303,7 +336,10 @@ mod tests {
         let a = ScopeId::new();
         let list = format!(" {a} , shared ");
         let cfg = Config::from_args(argv(&["--db", "t.redb", "--read-scopes", &list])).unwrap();
-        assert_eq!(cfg.default_read_scopes, vec![Scope::Id(a), Scope::Shared]);
+        assert_eq!(
+            cfg.default_read_scopes.as_slice(),
+            &[Scope::Id(a), Scope::Shared]
+        );
     }
 
     #[test]
@@ -323,6 +359,23 @@ mod tests {
         // a caller error, not "read everything".
         assert!(Config::from_args(argv(&["--db", "t.redb", "--read-scopes", ""])).is_err());
         assert!(Config::from_args(argv(&["--db", "t.redb", "--read-scopes", " , "])).is_err());
+    }
+
+    #[test]
+    fn read_scopes_type_rejects_an_empty_set() {
+        // The invariant is structural, not a parser convention: even a direct
+        // construction cannot produce an empty read set. An empty ScopeSet
+        // admits nothing, so every default read would silently return empty.
+        assert!(ReadScopes::new(vec![]).is_err());
+        assert!(ReadScopes::new(vec![Scope::Shared]).is_ok());
+        assert!(ReadScopes::new(vec![Scope::Id(ScopeId::new()), Scope::Shared]).is_ok());
+    }
+
+    #[test]
+    fn read_scopes_preserves_order_and_contents() {
+        let a = ScopeId::new();
+        let rs = ReadScopes::new(vec![Scope::Id(a), Scope::Shared]).unwrap();
+        assert_eq!(rs.as_slice(), &[Scope::Id(a), Scope::Shared]);
     }
 
     #[test]

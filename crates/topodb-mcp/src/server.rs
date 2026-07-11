@@ -26,7 +26,8 @@ use topodb::{
 };
 
 use crate::config::{
-    scope_label, Config, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
+    scope_label, Config, ReadScopes, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP,
+    MEMORY_LABEL,
 };
 use topodb_json as convert;
 
@@ -48,7 +49,7 @@ pub struct TopoServer {
     /// `Vec<Scope>` too: `ScopeSet::iter_scopes` is `pub(crate)` to `topodb`,
     /// so `db_info` (Finding 2) renders its reported read set from this list
     /// via `scope_label` rather than from `default_scopes` directly.
-    default_read_scopes: Vec<Scope>,
+    default_read_scopes: ReadScopes,
     /// Rendered db path, reported by `db_info`.
     db_path: String,
     /// See `Config::allow_unscoped_changes`.
@@ -59,7 +60,7 @@ pub struct TopoServer {
 impl TopoServer {
     /// Wraps an open [`Db`] and the resolved [`Config`] into a server handler.
     pub fn new(db: Db, config: &Config) -> Self {
-        let default_scopes = convert::scopes_to_scope_set(&config.default_read_scopes);
+        let default_scopes = convert::scopes_to_scope_set(config.default_read_scopes.as_slice());
         Self {
             db,
             default_scope: config.default_scope,
@@ -658,7 +659,12 @@ impl TopoServer {
             path: self.db_path.clone(),
             current_seq,
             default_scope: scope_label(&self.default_scope),
-            default_read_scopes: self.default_read_scopes.iter().map(scope_label).collect(),
+            default_read_scopes: self
+                .default_read_scopes
+                .as_slice()
+                .iter()
+                .map(scope_label)
+                .collect(),
         }))
     }
 
