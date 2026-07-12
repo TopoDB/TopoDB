@@ -698,6 +698,14 @@ mod tests {
             decode_posting_block(&encode_posting_block(&max_slot).unwrap()).unwrap(),
             max_slot
         );
+
+        // Equal adjacent slots: the encoder only requires non-decreasing, so
+        // a repeated slot (delta 0 between equals) must round-trip exactly.
+        let equal_slots = vec![(5u64, 1u32), (5, 2)];
+        assert_eq!(
+            decode_posting_block(&encode_posting_block(&equal_slots).unwrap()).unwrap(),
+            equal_slots
+        );
     }
 
     #[test]
@@ -740,6 +748,18 @@ mod tests {
             let decoded = decode_posting_block(&payload).unwrap();
             assert_eq!(count, decoded.len() as u64);
         }
+
+        // The fast path must fail the same way decode does on an empty
+        // payload and an unknown format byte — pinned independently, so a
+        // refactor moving the format check after the count read is caught.
+        assert!(
+            posting_block_count(&[]).is_err(),
+            "empty payload must be rejected by the count fast path"
+        );
+        assert!(
+            posting_block_count(&[0xFF]).is_err(),
+            "unknown block format must be rejected by the count fast path"
+        );
     }
 
     /// "ab" vs "abc" under one scope: the trailing fixed 4-byte chunk field
