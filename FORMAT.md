@@ -247,11 +247,19 @@ file itself is damaged, and that must surface loudly.
 every table this document calls *derived* — then replays `OPS` from seq 1
 through the same `apply_op` the normal write path (`apply_batch`) uses, so
 there is no parallel mutation logic to drift out of sync. `COUNTERS` is
-deliberately left untouched: access statistics are auxiliary telemetry outside
-the op log, never appended to `OPS`, so a rebuild must preserve them rather
-than reset them to zero. Refuses with `TopoError::Compacted { oldest }` once
-`oldest_seq > 1`, since a compacted log is no longer a full history and replay
-from genesis is impossible by definition.
+preserved across the rebuild — access statistics are auxiliary telemetry
+outside the op log, never appended to `OPS`, so a rebuild must not reset them
+to zero — but preservation is keyed by **node identity (ULID)**, not by slot
+number: replay reassigns dense slots in *op-log* order, which need not match
+the slot order a table was in before the rebuild (a migrated v2 file assigns
+slots in v2-ULID iteration order, for one). `COUNTERS` is snapshotted by
+resolving each row's slot to its node's ULID through the OLD `NODE_IDS`
+mapping before anything is drained, then every surviving counter is
+re-inserted under that same node's NEW slot once replay completes; a counter
+whose ULID no longer exists after replay is dropped. Refuses with
+`TopoError::Compacted { oldest }` once `oldest_seq > 1`, since a compacted log
+is no longer a full history and replay from genesis is impossible by
+definition.
 
 ## Evolution policy
 
