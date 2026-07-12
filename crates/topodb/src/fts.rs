@@ -10,16 +10,34 @@
 //! very same function during replay (after draining POSTINGS/FTS_DOCS/
 //! FTS_STATS).
 //!
-//! v3 layout (re-keyed from the ULID/`Scope`-keyed v2 layout by W2b):
-//! Postings are keyed by `scope_id.to_be_bytes() ++ term` (`scope_id` is the
-//! [`crate::scopes::ScopeRegistry`]-interned `u32`, fixed-width so no term
-//! can ever straddle two scopes' key ranges) and corpus stats live in
-//! FTS_STATS keyed by that same 4-byte `scope_id`, so a document in one scope
-//! never shifts another scope's df/avgdl. FTS_DOCS is keyed by the node's
-//! 8-byte BE dense slot (matching NODES/EDGES/EMBEDDINGS/COUNTERS). Postings
-//! values are delta-varint `(slot_delta, tf)` pairs, ascending by slot,
-//! wrapped in the same `codec::frame_value` framing as other v3 values;
-//! FTS_DOCS/FTS_STATS values are unchanged plain-postcard payloads.
+//! FTS_DOCS/FTS_STATS layout (unchanged since v3, re-keyed from the ULID/
+//! `Scope`-keyed v2 layout by W2b): FTS_DOCS is keyed by the node's 8-byte BE
+//! dense slot (matching NODES/EDGES/EMBEDDINGS/COUNTERS); FTS_STATS is keyed
+//! by the [`crate::scopes::ScopeRegistry`]-interned 4-byte `scope_id`, so a
+//! document in one scope never shifts another scope's df/avgdl. Both hold
+//! plain-postcard payloads.
+//!
+//! POSTINGS layout (v4, chunked — Task 6 of the storage-format-v4 plan;
+//! `FORMAT_VERSION` still reads 3 until Task 7 flips it, so this is a
+//! mid-branch on-disk state no released build can read): a term's postings
+//! are split across one or more chunk keys `scope_id.to_be_bytes() ++
+//! term-UTF-8 ++ chunk.to_be_bytes()` (`chunked_posting_key`) rather than one
+//! unbounded row — a single hot term's postings can no longer grow into one
+//! value that must be fully rewritten on every touch, which is what made
+//! incremental maintenance quadratic at scale (see BENCHMARKS.md's v3
+//! escalation finding). Each chunk's value is a `POSTINGS_BLOCK_FORMAT_V0`
+//! framed block of delta-varint `(slot_delta, tf)` pairs, ascending by slot
+//! (`encode_posting_block`/`decode_posting_block`), wrapped in the same
+//! `codec::frame_value` framing as other values. `set_posting` maintains
+//! this via one bounded prefix range scan for the term's chunk keys, then
+//! either a last-chunk append (new highest-slot doc; split at
+//! `POSTINGS_CHUNK_TARGET` if needed) or a covering-chunk decode/mutate/
+//! rewrite (update, remove, or an out-of-order new slot) — see its doc
+//! comment. `read_posting` decodes and concatenates every chunk (used by
+//! scoring, which needs every entry regardless); `posting_df` sums each
+//! chunk's `posting_block_count` header without decoding entries — the df
+//! fast path `search_text` uses before deciding whether df is even nonzero.
+//!
 //! `search_text` reads the committed tables through a fresh read
 //! transaction, scores BM25 within each requested scope's own corpus, then
 //! resolves the winning slots straight to `NodeRecord`s from the SAME
@@ -86,110 +104,6 @@ fn term_freqs(tokens: &[String]) -> BTreeMap<&str, u32> {
     m
 }
 
-/// Encodes a postings list as `[count varint]` then per entry, ascending by
-/// slot, `[slot_delta varint][tf varint]` (first delta relative to 0).
-/// Reuses `adj.rs`'s general-purpose varint helpers — same trick as the
-/// adjacency block codec (`adj::encode_block`/`decode_block`).
-fn encode_postings(entries: &[(u64, u32)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    write_varint(&mut out, entries.len() as u64);
-    let mut previous = 0u64;
-    for &(slot, tf) in entries {
-        write_varint(&mut out, slot - previous);
-        previous = slot;
-        write_varint(&mut out, tf as u64);
-    }
-    out
-}
-
-/// Inverse of `encode_postings`. Rejects trailing bytes so a truncated or
-/// corrupt value is caught here rather than silently under-reading.
-fn decode_postings(payload: &[u8]) -> Result<Vec<(u64, u32)>, TopoError> {
-    let mut input = payload;
-    let count = usize::try_from(read_varint(&mut input)?)
-        .map_err(|_| TopoError::Encoding("postings count too large".into()))?;
-    let mut entries = Vec::with_capacity(count);
-    let mut slot = 0u64;
-    for _ in 0..count {
-        slot = slot
-            .checked_add(read_varint(&mut input)?)
-            .ok_or_else(|| TopoError::Encoding("postings slot overflow".into()))?;
-        let tf = u32::try_from(read_varint(&mut input)?)
-            .map_err(|_| TopoError::Encoding("postings tf too large".into()))?;
-        entries.push((slot, tf));
-    }
-    if !input.is_empty() {
-        return Err(TopoError::Encoding(
-            "trailing bytes in postings value".into(),
-        ));
-    }
-    Ok(entries)
-}
-
-/// Reads the postings list for `term_key` (empty if absent) as
-/// `Vec<(slot, tf)>`, ascending by slot.
-fn read_posting(
-    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    term_key: &[u8],
-) -> Result<Vec<(u64, u32)>, TopoError> {
-    match postings.get(term_key).map_err(storage_err)? {
-        Some(v) => {
-            let raw = unframe_value(v.value())?;
-            decode_postings(raw.as_ref())
-        }
-        None => Ok(Vec::new()),
-    }
-}
-
-/// Sets `slot`'s term-frequency in `term_key`'s postings to `count`, removing
-/// the node's entry (and the whole postings key, if it becomes empty) when
-/// `count == 0`. Maintained via a `BTreeMap<u64, u32>` so the re-encoded
-/// delta-varint list is always sorted ascending by slot — deterministic on
-/// disk regardless of update order.
-fn set_posting(
-    postings: &mut Table<'_, &'static [u8], &'static [u8]>,
-    term_key: &[u8],
-    slot: u64,
-    count: u32,
-) -> Result<(), TopoError> {
-    let mut map: BTreeMap<u64, u32> = match postings.get(term_key).map_err(storage_err)? {
-        Some(v) => {
-            let raw = unframe_value(v.value())?;
-            decode_postings(raw.as_ref())?.into_iter().collect()
-        }
-        None => BTreeMap::new(),
-    };
-    if count == 0 {
-        map.remove(&slot);
-    } else {
-        map.insert(slot, count);
-    }
-    if map.is_empty() {
-        // Drop empty postings keys (same empty-key doctrine as the prop index).
-        postings.remove(term_key).map_err(storage_err)?;
-    } else {
-        let entries: Vec<(u64, u32)> = map.into_iter().collect();
-        let framed = frame_value(encode_postings(&entries));
-        postings
-            .insert(term_key, framed.as_slice())
-            .map_err(storage_err)?;
-    }
-    Ok(())
-}
-
-/// Postings key for `term` under scope id `scope_id`: `scope_id.to_be_bytes()
-/// ++ term-UTF-8`. The scope-id prefix is fixed-width (4 bytes), so no
-/// separator is needed and no term can collide across scopes — even scope
-/// ids whose BE bytes share a leading byte (e.g. `1` = `00 00 00 01` and
-/// `256` = `00 00 01 00`) never produce overlapping keys, since the prefix
-/// is always exactly 4 bytes before the term starts.
-fn posting_key(scope_id: u32, term: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(4 + term.len());
-    key.extend_from_slice(&scope_id.to_be_bytes());
-    key.extend_from_slice(term.as_bytes());
-    key
-}
-
 /// Reads a scope's `(doc_count, total_len)` corpus stats from FTS_STATS
 /// (`(0, 0)` if absent).
 fn read_stats(
@@ -247,8 +161,9 @@ fn read_doc_len(
 /// term it now contains, rewrites its FTS_DOCS length, and folds `scope_id`'s
 /// corpus stats in FTS_STATS. A no-op when `old_text == new_text`.
 ///
-/// Postings are keyed per scope (`posting_key(scope_id, term)`) and corpus
-/// stats are keyed per scope (`scope_id.to_be_bytes()`), so this node's edits
+/// Postings are keyed per scope (`chunked_posting_key(scope_id, term,
+/// chunk)`) and corpus stats are keyed per scope (`scope_id.to_be_bytes()`),
+/// so this node's edits
 /// touch only its own scope's df/doc-count/total-length — never any other
 /// scope's. A node's scope is immutable, so `scope_id` is the same across an
 /// update.
@@ -309,12 +224,7 @@ pub(crate) fn fts_update(
     terms.extend(new_tf.keys().copied());
     for term in terms {
         let count = new_tf.get(term).copied().unwrap_or(0);
-        set_posting(
-            postings,
-            posting_key(scope_id, term).as_slice(),
-            slot,
-            count,
-        )?;
+        set_posting(postings, scope_id, term, slot, count)?;
     }
 
     let key = slot_key(slot);
@@ -349,35 +259,30 @@ pub(crate) fn fts_update(
     Ok(())
 }
 
-// -- v4 chunked postings block codec (pure, unwired; Task 4) ---------------
+// -- v4 chunked postings block codec + maintenance (Task 4 codec, Task 6 --
+// -- wiring) -----------------------------------------------------------
 //
-// Laid down ahead of the wiring that will replace the single-row-per-term
-// postings above (`posting_key`/`encode_postings`/`decode_postings`/
-// `read_posting`/`set_posting`) with chunked storage, mirroring `adj.rs`'s
+// Replaces the old single-row-per-term postings (`posting_key`/
+// `encode_postings`/`decode_postings`/old `read_posting`/old `set_posting`,
+// all deleted by Task 6) with chunked storage, mirroring `adj.rs`'s
 // `(prefix, chunk)` scheme so a single hot term's postings never grow into
-// one unbounded value. Nothing below has a production caller yet — every
-// item carries `#[allow(dead_code)]` for that reason, same as
-// `vector_store.rs`'s Task 3 items.
+// one unbounded value that must be fully rewritten on every touch.
 
 /// Chunked postings block format tag, byte 0 of every encoded payload.
-#[allow(dead_code)] // consumed by Task 6 (postings wiring)
 pub(crate) const POSTINGS_BLOCK_FORMAT_V0: u8 = 0x00;
 
 /// Target encoded chunk size (bytes) a chunk is split at — re-benchmarked in
 /// Task 9.
-#[allow(dead_code)] // consumed by Task 6 (postings wiring)
 pub(crate) const POSTINGS_CHUNK_TARGET: usize = 8 * 1024;
 
 /// Chunked postings key for `term` under `scope_id`, chunk index `chunk`:
 /// `scope_id.to_be_bytes() ++ term-UTF-8 ++ chunk.to_be_bytes()`. Both the
-/// 4-byte scope prefix and the 4-byte chunk suffix are fixed-width, so —
-/// exactly like `posting_key` above — the only variable-length part is the
-/// term itself, always sandwiched between two fixed-width fields. Two keys
-/// can only be byte-equal if their terms are byte-equal too: a shorter and a
-/// longer term under the same scope produce keys of different total length
-/// (`4 + term.len() + 4`), so no chunk value for either can ever collide
-/// with the other.
-#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+/// 4-byte scope prefix and the 4-byte chunk suffix are fixed-width, so the
+/// only variable-length part is the term itself, always sandwiched between
+/// two fixed-width fields. Two keys can only be byte-equal if their terms
+/// are byte-equal too: a shorter and a longer term under the same scope
+/// produce keys of different total length (`4 + term.len() + 4`), so no
+/// chunk value for either can ever collide with the other.
 pub(crate) fn chunked_posting_key(scope_id: u32, term: &str, chunk: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + term.len() + 4);
     key.extend_from_slice(&scope_id.to_be_bytes());
@@ -394,7 +299,6 @@ pub(crate) fn chunked_posting_key(scope_id: u32, term: &str, chunk: u32) -> Vec<
 /// non-decreasing is enforced here). An empty slice is always an error:
 /// empty chunks are removed rather than ever written, so the encoder never
 /// needs to represent one.
-#[allow(dead_code)] // consumed by Task 6 (postings wiring)
 pub(crate) fn encode_posting_block(entries: &[(u64, u32)]) -> Result<Vec<u8>, TopoError> {
     if entries.is_empty() {
         return Err(TopoError::Encoding(
@@ -426,7 +330,6 @@ pub(crate) fn encode_posting_block(entries: &[(u64, u32)]) -> Result<Vec<u8>, To
 /// Inverse of `encode_posting_block`. Rejects an unrecognised block format
 /// tag and trailing bytes past the last decoded entry — same failure modes
 /// as `adj::decode_block`.
-#[allow(dead_code)] // consumed by Task 6 (postings wiring)
 pub(crate) fn decode_posting_block(payload: &[u8]) -> Result<Vec<(u64, u32)>, TopoError> {
     let Some((&format, mut input)) = payload.split_first() else {
         return Err(TopoError::Encoding("empty postings chunk block".into()));
@@ -460,7 +363,6 @@ pub(crate) fn decode_posting_block(payload: &[u8]) -> Result<Vec<(u64, u32)>, To
 /// any entries. Errors identically to `decode_posting_block` on an empty
 /// payload or an unrecognised format tag, so a corrupt block is caught the
 /// same way regardless of which of the two readers touches it first.
-#[allow(dead_code)] // consumed by Task 6 (postings wiring)
 pub(crate) fn posting_block_count(payload: &[u8]) -> Result<u64, TopoError> {
     let Some((&format, mut input)) = payload.split_first() else {
         return Err(TopoError::Encoding("empty postings chunk block".into()));
@@ -471,6 +373,217 @@ pub(crate) fn posting_block_count(payload: &[u8]) -> Result<u64, TopoError> {
         )));
     }
     read_varint(&mut input)
+}
+
+/// Bounded range scan for `term`'s chunk keys under `scope_id`, returned in
+/// ascending chunk order (the same order the keys sort in, since the chunk
+/// suffix is fixed-width BE) — **never** a table iteration. The scan range
+/// `[chunked_posting_key(scope_id, term, 0), chunked_posting_key(scope_id,
+/// term, u32::MAX)]` can also contain a DIFFERENT term's chunk keys (a
+/// longer or shorter term whose bytes happen to sort inside that byte
+/// range — see `chunked_posting_key`'s key-length argument), so every
+/// candidate key is checked against the exact expected length `4 +
+/// term.len() + 4` before being kept. That length check, not the range
+/// bound alone, is what makes the scan exact.
+fn term_chunk_keys(
+    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope_id: u32,
+    term: &str,
+) -> Result<Vec<Vec<u8>>, TopoError> {
+    let start = chunked_posting_key(scope_id, term, 0);
+    let end = chunked_posting_key(scope_id, term, u32::MAX);
+    let want_len = start.len();
+    let mut keys = Vec::new();
+    for item in postings
+        .range(start.as_slice()..=end.as_slice())
+        .map_err(storage_err)?
+    {
+        let (key, _) = item.map_err(storage_err)?;
+        let k = key.value();
+        if k.len() == want_len {
+            keys.push(k.to_vec());
+        }
+    }
+    Ok(keys)
+}
+
+/// Recovers a chunk key's trailing 4-byte BE chunk index. Safe on any key
+/// `term_chunk_keys` returned (every such key already passed the exact
+/// `4 + term.len() + 4` length check).
+fn chunk_number(key: &[u8]) -> u32 {
+    let n = key.len();
+    u32::from_be_bytes(
+        key[n - 4..]
+            .try_into()
+            .expect("chunk key ends in a 4-byte BE chunk index"),
+    )
+}
+
+/// Decodes one chunk's entries (empty if the key is absent — used only
+/// defensively, since every key `term_chunk_keys` returns is present by
+/// construction).
+fn load_posting_chunk(
+    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key: &[u8],
+) -> Result<Vec<(u64, u32)>, TopoError> {
+    match postings.get(key).map_err(storage_err)? {
+        Some(v) => {
+            let raw = unframe_value(v.value())?;
+            decode_posting_block(raw.as_ref())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Encodes and writes one chunk's entries. `entries` must be non-empty —
+/// callers remove the key instead of storing an empty chunk (the empty-key
+/// doctrine `set_posting` relies on).
+fn store_posting_chunk(
+    postings: &mut Table<'_, &'static [u8], &'static [u8]>,
+    key: &[u8],
+    entries: &[(u64, u32)],
+) -> Result<(), TopoError> {
+    let framed = frame_value(encode_posting_block(entries)?);
+    postings
+        .insert(key, framed.as_slice())
+        .map_err(storage_err)?;
+    Ok(())
+}
+
+/// Reads every chunk of `term`'s postings under `scope_id`, decoded and
+/// concatenated in chunk order — which is also slot-ascending order, since
+/// chunk slot ranges never overlap (each split cuts the sorted list at a
+/// midpoint entry, and `set_posting`'s covering-chunk search relies on the
+/// same non-overlap). Used by BM25 scoring, which needs every `(slot, tf)`
+/// pair regardless of how many chunks they're spread across.
+fn read_posting(
+    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope_id: u32,
+    term: &str,
+) -> Result<Vec<(u64, u32)>, TopoError> {
+    let mut out = Vec::new();
+    for key in term_chunk_keys(postings, scope_id, term)? {
+        out.extend(load_posting_chunk(postings, &key)?);
+    }
+    Ok(out)
+}
+
+/// Document frequency for `term` under `scope_id`: the sum of each chunk's
+/// `posting_block_count` header, across every chunk — the df fast path,
+/// never decoding an entry. `search_text` calls this before `read_posting`
+/// so a term with zero matches in a scope (the common case for most query
+/// terms against most scopes) is recognized without decoding anything.
+fn posting_df(
+    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope_id: u32,
+    term: &str,
+) -> Result<u64, TopoError> {
+    let mut total = 0u64;
+    for key in term_chunk_keys(postings, scope_id, term)? {
+        if let Some(v) = postings.get(key.as_slice()).map_err(storage_err)? {
+            let raw = unframe_value(v.value())?;
+            total += posting_block_count(raw.as_ref())?;
+        }
+    }
+    Ok(total)
+}
+
+/// Sets `slot`'s term-frequency for `term` (under `scope_id`) to `count`,
+/// removing the entry (and its chunk key, if the chunk becomes empty; and
+/// the whole term, if its last chunk does) when `count == 0`.
+///
+/// One bounded range scan locates the term's chunk keys (ascending chunk
+/// order, which is also ascending slot-range order — see `read_posting`'s
+/// doc comment), then this walks them front-to-back, decoding each in turn:
+/// - The first chunk whose last entry's slot is `>= slot` is `slot`'s
+///   **covering chunk** — decoded ONLY once found, mutated in place (update
+///   an existing entry's tf, remove it, or insert a genuinely new slot at
+///   its sorted position — a node's text can be edited to newly include a
+///   term a later-created, higher-slot node already carries, so a new
+///   entry's slot is not always beyond every existing chunk's range), and
+///   rewritten (or its key removed, if now empty). No split check here —
+///   splitting is scoped to the fast path below, matching the design spec;
+///   a covering-chunk insert can grow a chunk slightly past
+///   `POSTINGS_CHUNK_TARGET` without triggering a split, which is an
+///   accepted, deliberate simplification (re-visited if Task 9's
+///   benchmarking says otherwise).
+/// - If no chunk covers `slot` (`slot` is beyond every chunk's max), it
+///   belongs after the LAST chunk — the fast path: append it there, and
+///   split into `(chunk, chunk + 1)` at the midpoint entry if the
+///   re-encoded chunk now exceeds `POSTINGS_CHUNK_TARGET`. This is the
+///   common case, since new documents typically carry the highest slots.
+/// - `count == 0` for a slot that turns out to be absent everywhere (no
+///   covering chunk, and beyond the last chunk's max) is a no-op: there is
+///   nothing to remove.
+fn set_posting(
+    postings: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scope_id: u32,
+    term: &str,
+    slot: u64,
+    count: u32,
+) -> Result<(), TopoError> {
+    let keys = term_chunk_keys(postings, scope_id, term)?;
+
+    if keys.is_empty() {
+        if count == 0 {
+            return Ok(()); // term doesn't exist; nothing to remove.
+        }
+        let key = chunked_posting_key(scope_id, term, 0);
+        return store_posting_chunk(postings, &key, &[(slot, count)]);
+    }
+
+    let last_index = keys.len() - 1;
+    for (i, key) in keys.iter().enumerate() {
+        let mut entries = load_posting_chunk(postings, key)?;
+        let last_slot = entries.last().expect("a stored chunk key is never empty").0;
+
+        if last_slot >= slot {
+            // This is slot's covering chunk (the first one, in ascending
+            // order, whose range reaches slot) — mutate in place.
+            match entries.binary_search_by_key(&slot, |&(s, _)| s) {
+                Ok(at) => {
+                    if count == 0 {
+                        entries.remove(at);
+                    } else {
+                        entries[at].1 = count;
+                    }
+                }
+                Err(at) => {
+                    if count == 0 {
+                        return Ok(()); // absent here; nothing to remove.
+                    }
+                    entries.insert(at, (slot, count));
+                }
+            }
+            if entries.is_empty() {
+                postings.remove(key.as_slice()).map_err(storage_err)?;
+            } else {
+                store_posting_chunk(postings, key, &entries)?;
+            }
+            return Ok(());
+        }
+
+        if i == last_index {
+            // slot is beyond every chunk's range: fast-path append to the
+            // last chunk.
+            if count == 0 {
+                return Ok(()); // absent everywhere; nothing to remove.
+            }
+            entries.push((slot, count));
+            let chunk = chunk_number(key);
+            return if encode_posting_block(&entries)?.len() <= POSTINGS_CHUNK_TARGET {
+                store_posting_chunk(postings, key, &entries)
+            } else {
+                let split = entries.len() / 2;
+                store_posting_chunk(postings, key, &entries[..split])?;
+                let next_key = chunked_posting_key(scope_id, term, chunk + 1);
+                store_posting_chunk(postings, &next_key, &entries[split..])
+            };
+        }
+        // Otherwise this chunk's range ends before `slot` — keep scanning
+        // the next (higher) chunk.
+    }
+    unreachable!("the last chunk always satisfies one of the two branches above");
 }
 
 impl Db {
@@ -542,11 +655,15 @@ impl Db {
             }
             let avgdl = total_len as f32 / n_docs as f32;
             for term in &distinct {
-                let list = read_posting(&postings, posting_key(scope_id, term).as_slice())?;
-                let df = list.len() as f32;
+                // df fast path first: most query terms miss most scopes, and
+                // this sums each chunk's block-count header without
+                // decoding a single entry — skip the full decode below
+                // entirely when there's nothing to score.
+                let df = posting_df(&postings, scope_id, term)? as f32;
                 if df == 0.0 {
                     continue;
                 }
+                let list = read_posting(&postings, scope_id, term)?;
                 let idf = ((n_docs as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
                 for (slot, tf) in list {
                     let len = read_doc_len(&docs, slot)? as f32;
@@ -563,8 +680,8 @@ impl Db {
                 read_node_by_slot(&nodes, &embeddings, &dicts, &scope_registry, slot)?
             {
                 // Defensive only, not load-bearing for isolation: postings
-                // are already scope-prefixed (see `posting_key`), so every
-                // `slot` scored above already comes from a requested scope's
+                // are already scope-prefixed (see `chunked_posting_key`), so
+                // every `slot` scored above already comes from a requested scope's
                 // own postings list. This guards against a slot whose record
                 // is corrupt/desynced from its own postings row, not against
                 // cross-scope leakage.
@@ -655,14 +772,14 @@ mod tests {
             )
             .unwrap();
 
-            let list_1 = read_posting(&postings, posting_key(1, "rust").as_slice()).unwrap();
+            let list_1 = read_posting(&postings, 1, "rust").unwrap();
             assert_eq!(
                 list_1,
                 vec![(2, 2), (5, 1), (9, 1)],
                 "scope 1's postings must round-trip sorted by slot with the correct tf"
             );
 
-            let list_256 = read_posting(&postings, posting_key(256, "rust").as_slice()).unwrap();
+            let list_256 = read_posting(&postings, 256, "rust").unwrap();
             assert_eq!(
                 list_256,
                 vec![(2, 1)],
@@ -672,7 +789,7 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    // -- v4 chunked postings block codec (pure, unwired; Task 4) -----------
+    // -- v4 chunked postings block codec (Task 4) ---------------------------
 
     #[test]
     fn posting_block_roundtrips_boundaries() {
@@ -797,5 +914,239 @@ mod tests {
                 entries
             );
         }
+    }
+
+    // -- Task 6: chunked postings wiring (set_posting/read_posting rework) -
+
+    /// A term with few docs must live entirely in chunk 0 — the common case,
+    /// pinned separately from the split case below.
+    #[test]
+    fn three_docs_sharing_a_term_produce_one_chunk_with_three_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            set_posting(&mut postings, 1, "rust", 2, 1).unwrap();
+            set_posting(&mut postings, 1, "rust", 5, 1).unwrap();
+            set_posting(&mut postings, 1, "rust", 9, 1).unwrap();
+            let keys = term_chunk_keys(&postings, 1, "rust").unwrap();
+            assert_eq!(keys.len(), 1, "3 small docs must fit in a single chunk");
+            assert_eq!(
+                read_posting(&postings, 1, "rust").unwrap(),
+                vec![(2, 1), (5, 1), (9, 1)]
+            );
+            assert_eq!(posting_df(&postings, 1, "rust").unwrap(), 3);
+        }
+        tx.commit().unwrap();
+    }
+
+    /// Sequential inserts on one hot term force a real split at
+    /// `POSTINGS_CHUNK_TARGET` (chosen over a tiny test-only target override
+    /// — see the Task 6 report for the justification). `df` (the
+    /// `posting_block_count`-summed fast path) must equal the total entry
+    /// count across every chunk, and the concatenated read must stay
+    /// slot-ascending even though it now spans >1 chunk.
+    #[test]
+    fn a_hot_term_splits_into_multiple_chunks_and_df_sums_across_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let n: u64 = 5000;
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            for slot in 0..n {
+                set_posting(&mut postings, 1, "hot", slot, 1).unwrap();
+            }
+            let keys = term_chunk_keys(&postings, 1, "hot").unwrap();
+            assert!(
+                keys.len() > 1,
+                "{n} sequential docs on one term must split into >1 chunk, got {}",
+                keys.len()
+            );
+            let df = posting_df(&postings, 1, "hot").unwrap();
+            assert_eq!(df, n, "df must equal the total entry count across chunks");
+            let all = read_posting(&postings, 1, "hot").unwrap();
+            assert_eq!(all.len(), n as usize);
+            assert!(
+                all.windows(2).all(|w| w[0].0 < w[1].0),
+                "concatenation across chunks must stay slot-ascending"
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    /// Updating a doc's tf must rewrite only its own covering chunk — a
+    /// sibling chunk's stored bytes must be byte-identical before and after.
+    #[test]
+    fn updating_one_docs_tf_touches_only_its_covering_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let n: u64 = 5000;
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            for slot in 0..n {
+                set_posting(&mut postings, 1, "hot", slot, 1).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let keys_before = {
+            let tx = db.begin_read().unwrap();
+            let postings = tx.open_table(POSTINGS).unwrap();
+            term_chunk_keys(&postings, 1, "hot").unwrap()
+        };
+        assert!(
+            keys_before.len() > 1,
+            "setup must produce a multi-chunk term"
+        );
+        let first_chunk_bytes_before = {
+            let tx = db.begin_read().unwrap();
+            let postings = tx.open_table(POSTINGS).unwrap();
+            postings
+                .get(keys_before[0].as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec()
+        };
+
+        // Update the highest slot's tf — guaranteed to live in the LAST
+        // chunk, not the first.
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            set_posting(&mut postings, 1, "hot", n - 1, 7).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_read().unwrap();
+        let postings = tx.open_table(POSTINGS).unwrap();
+        let first_chunk_bytes_after = postings
+            .get(keys_before[0].as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        assert_eq!(
+            first_chunk_bytes_before, first_chunk_bytes_after,
+            "a sibling chunk's stored bytes must be untouched by an update to a different chunk"
+        );
+        let all = read_posting(&postings, 1, "hot").unwrap();
+        assert_eq!(
+            all.iter().find(|&&(s, _)| s == n - 1).unwrap().1,
+            7,
+            "the updated slot's tf must actually change"
+        );
+    }
+
+    /// Removing every doc from the term's trailing (smaller) chunk must drop
+    /// exactly that chunk's key, leaving the sibling chunk untouched.
+    #[test]
+    fn removing_a_full_chunks_docs_drops_only_that_chunks_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let n: u64 = 5000;
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            for slot in 0..n {
+                set_posting(&mut postings, 1, "hot", slot, 1).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let keys = {
+            let tx = db.begin_read().unwrap();
+            let postings = tx.open_table(POSTINGS).unwrap();
+            term_chunk_keys(&postings, 1, "hot").unwrap()
+        };
+        assert!(keys.len() > 1, "setup must produce a multi-chunk term");
+        let last_key = keys.last().unwrap().clone();
+        let last_chunk_slots: Vec<u64> = {
+            let tx = db.begin_read().unwrap();
+            let postings = tx.open_table(POSTINGS).unwrap();
+            load_posting_chunk(&postings, last_key.as_slice())
+                .unwrap()
+                .into_iter()
+                .map(|(slot, _)| slot)
+                .collect()
+        };
+        assert!(!last_chunk_slots.is_empty());
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            for slot in &last_chunk_slots {
+                set_posting(&mut postings, 1, "hot", *slot, 0).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_read().unwrap();
+        let postings = tx.open_table(POSTINGS).unwrap();
+        let remaining_keys = term_chunk_keys(&postings, 1, "hot").unwrap();
+        assert_eq!(
+            remaining_keys.len(),
+            keys.len() - 1,
+            "emptying the last chunk must drop exactly its own key"
+        );
+        assert!(
+            !remaining_keys.contains(&last_key),
+            "the emptied chunk's key must be gone"
+        );
+        assert_eq!(
+            read_posting(&postings, 1, "hot").unwrap().len(),
+            (n as usize) - last_chunk_slots.len()
+        );
+    }
+
+    /// Removing every doc from a (single-chunk) term must make the term
+    /// disappear entirely — no chunk keys left (empty-key doctrine).
+    #[test]
+    fn removing_every_doc_drops_the_whole_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            set_posting(&mut postings, 1, "x", 1, 1).unwrap();
+            set_posting(&mut postings, 1, "x", 2, 1).unwrap();
+            set_posting(&mut postings, 1, "x", 3, 1).unwrap();
+            set_posting(&mut postings, 1, "x", 1, 0).unwrap();
+            set_posting(&mut postings, 1, "x", 2, 0).unwrap();
+            assert_eq!(read_posting(&postings, 1, "x").unwrap(), vec![(3, 1)]);
+            set_posting(&mut postings, 1, "x", 3, 0).unwrap();
+            assert!(
+                term_chunk_keys(&postings, 1, "x").unwrap().is_empty(),
+                "the term must fully disappear once its last doc is removed"
+            );
+            assert_eq!(read_posting(&postings, 1, "x").unwrap(), vec![]);
+            assert_eq!(posting_df(&postings, 1, "x").unwrap(), 0);
+        }
+        tx.commit().unwrap();
+    }
+
+    /// A term's max slot doesn't only grow via the fast append path: a node
+    /// created long ago can have its text edited to newly include a term
+    /// that a LATER (higher-slot) node already carries, so `set_posting`
+    /// must route the smaller, brand-new slot into the correct covering
+    /// chunk and keep it sorted — not silently append it out of order.
+    #[test]
+    fn out_of_order_insert_lands_sorted_within_the_covering_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            set_posting(&mut postings, 1, "late", 10, 1).unwrap();
+            set_posting(&mut postings, 1, "late", 3, 2).unwrap();
+            assert_eq!(
+                read_posting(&postings, 1, "late").unwrap(),
+                vec![(3, 2), (10, 1)]
+            );
+        }
+        tx.commit().unwrap();
     }
 }
