@@ -678,14 +678,6 @@ impl Storage {
             let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
             let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
             for op in &resolved {
-                match op {
-                    Op::CreateNode { scope, .. } | Op::CreateEdge { scope, .. } => {
-                        scope_registry.intern(&mut scopes_table, *scope)?;
-                    }
-                    _ => {}
-                }
-            }
-            for op in &resolved {
                 // `pre` carries (id, scope, old_text). For CreateNode the scope
                 // comes from the op; for existing-node ops it comes from the
                 // record read before mutation.
@@ -1097,12 +1089,6 @@ impl Storage {
                 // Same (id, scope, old_text, new_text) derivation as
                 // `apply_batch`: old_text read BEFORE `apply_op` mutates the
                 // record; scope from the op (create) or the pre-mutation record.
-                match &op {
-                    Op::CreateNode { scope, .. } | Op::CreateEdge { scope, .. } => {
-                        scope_registry.intern(&mut scopes_table, *scope)?;
-                    }
-                    _ => {}
-                }
                 let pre: Option<(NodeId, Scope, Option<String>)> = match &op {
                     Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
@@ -1329,9 +1315,15 @@ fn read_node_by_slot(
         }
     }
 }
-/// ULID-keyed NODES fetch: resolves `id` -> slot via `node_slots` first (a
-/// miss here just means the node doesn't exist — same "not found" semantics
-/// as the old direct ULID lookup), then delegates to `read_node_by_slot`.
+/// ULID-keyed NODES fetch with a two-cause miss split:
+/// - no NODE_SLOTS mapping at all → `Ok(None)`, ordinary not-found (callers
+///   surface it as `Rejected`, exactly like a lookup of an id that never
+///   existed);
+/// - a mapping that resolves to a slot whose NODES row is absent →
+///   `Err(TopoError::Encoding)`. The mapping and the record row are written
+///   and removed atomically in every write path, so they can only diverge if
+///   the file is damaged — that is data-integrity corruption and must
+///   surface loudly, never masquerade as a routine "not found".
 fn read_node(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -1343,10 +1335,16 @@ fn read_node(
     let Some(slot) = crate::slots::node_slot(node_slots, id)? else {
         return Ok(None);
     };
-    read_node_by_slot(table, embeddings, dicts, scopes, slot)
+    match read_node_by_slot(table, embeddings, dicts, scopes, slot)? {
+        Some(rec) => Ok(Some(rec)),
+        None => Err(TopoError::Encoding(format!(
+            "node slot mapping without record row: {id}"
+        ))),
+    }
 }
-/// ULID-keyed EDGES fetch: resolves `id` -> slot via `edge_slots` first (a
-/// miss means the edge doesn't exist), then reads by slot key and resolves
+/// ULID-keyed EDGES fetch, same two-cause miss split as `read_node` (via
+/// EDGE_SLOTS/EDGES): no mapping is `Ok(None)` ordinary not-found, a mapping
+/// whose slot has no record row is `Encoding` corruption. Resolves
 /// `from`/`to` back to ULIDs via `node_ids`.
 fn read_edge(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -1361,7 +1359,9 @@ fn read_edge(
     };
     let k = slot_key(slot);
     match table.get(k.as_slice()).map_err(storage_err)? {
-        None => Ok(None),
+        None => Err(TopoError::Encoding(format!(
+            "edge slot mapping without record row: {id}"
+        ))),
         Some(v) => {
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
@@ -1610,7 +1610,12 @@ fn apply_op(
             let to_slot = crate::slots::node_slot(node_slots, *to)?
                 .ok_or_else(|| TopoError::Encoding("missing to slot".into()))?;
             let edge_type = dicts.intern(dict, DictKind::EdgeType, ty)?;
-            let scope_id = scope_registry.id_of(*scope)?; // placeholder
+            // Intern (not `id_of`): an edge's scope can be its first
+            // appearance in the file — e.g. a project-scoped edge between two
+            // Shared nodes — so it may not be registered yet. Idempotent for
+            // already-seen scopes; `put_edge` below re-interns the same scope
+            // internally, also a no-op.
+            let scope_id = scope_registry.intern(scopes_table, *scope)?;
             let rec = EdgeRecord {
                 id: *id,
                 scope: *scope,
@@ -1848,6 +1853,138 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, TopoError::Rejected(_)));
+    }
+
+    /// Pins the two-cause miss split in `read_node`/`read_edge`: a
+    /// NODE_SLOTS/EDGE_SLOTS mapping whose slot has NO record row is
+    /// data-integrity corruption and must surface as `TopoError::Encoding`
+    /// on both the read path and every write-path op that resolves the id —
+    /// never as a routine `Rejected("not found")`. A ULID with no mapping at
+    /// all stays ordinary not-found (`Rejected` / `Ok(None)`).
+    #[test]
+    fn slot_mapping_without_record_row_is_encoding_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let a = NodeId::from_u128(1);
+        let b = NodeId::from_u128(2);
+        let e = EdgeId::from_u128(1);
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id: a,
+                    scope: Scope::Shared,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope: Scope::Shared,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateEdge {
+                    id: e,
+                    scope: Scope::Shared,
+                    ty: "T".into(),
+                    from: a,
+                    to: b,
+                    props: Default::default(),
+                    valid_from: Some(0),
+                },
+            ],
+            0,
+        )
+        .unwrap();
+
+        // Manufacture the corrupt state via raw redb writes, bypassing every
+        // Storage invariant: forward slot mappings pointing at slot 999,
+        // which has no NODES/EDGES row. (Forward-mapping values are u64 LE —
+        // see `slots::alloc`.)
+        let ghost_node = NodeId::from_u128(99);
+        let ghost_edge = EdgeId::from_u128(99);
+        {
+            let tx = s.db.begin_write().unwrap();
+            {
+                let mut node_slots = tx.open_table(NODE_SLOTS).unwrap();
+                node_slots
+                    .insert(
+                        ghost_node.as_u128().to_be_bytes().as_slice(),
+                        999u64.to_le_bytes().as_slice(),
+                    )
+                    .unwrap();
+                let mut edge_slots = tx.open_table(EDGE_SLOTS).unwrap();
+                edge_slots
+                    .insert(
+                        ghost_edge.as_u128().to_be_bytes().as_slice(),
+                        999u64.to_le_bytes().as_slice(),
+                    )
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Read path: storage-level fetches error loudly instead of Ok(None).
+        assert!(
+            matches!(s.load_node(ghost_node), Err(TopoError::Encoding(_))),
+            "corrupt node mapping must read as Encoding"
+        );
+        assert!(
+            matches!(s.load_edge(ghost_edge), Err(TopoError::Encoding(_))),
+            "corrupt edge mapping must read as Encoding"
+        );
+
+        // Write path: ops that resolve the ghost ids report corruption, not
+        // an ordinary rejection.
+        let err = s
+            .apply_batch(
+                vec![Op::SetNodeProps {
+                    id: ghost_node,
+                    props: [(
+                        "k".to_string(),
+                        Some(crate::props::PropValue::Str("v".into())),
+                    )]
+                    .into(),
+                }],
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TopoError::Encoding(_)),
+            "SetNodeProps on corrupt mapping must be Encoding, got {err:?}"
+        );
+        let err = s
+            .apply_batch(
+                vec![Op::CloseEdge {
+                    id: ghost_edge,
+                    valid_to: None,
+                }],
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TopoError::Encoding(_)),
+            "CloseEdge on corrupt mapping must be Encoding, got {err:?}"
+        );
+
+        // A ULID with no mapping at all is still an ordinary not-found.
+        let err = s
+            .apply_batch(
+                vec![Op::SetNodeProps {
+                    id: NodeId::from_u128(1234),
+                    props: Default::default(),
+                }],
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TopoError::Rejected(_)),
+            "absent mapping must stay Rejected, got {err:?}"
+        );
+        assert!(s.load_node(NodeId::from_u128(1234)).unwrap().is_none());
+
+        // The healthy rows are untouched by the corruption probes.
+        assert!(s.load_node(a).unwrap().is_some());
+        assert!(s.load_edge(e).unwrap().is_some());
     }
 
     #[test]

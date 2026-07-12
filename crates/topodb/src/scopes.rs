@@ -86,12 +86,6 @@ impl ScopeRegistry {
         self.by_id.insert(id, scope);
         Ok(id)
     }
-    pub(crate) fn id_of(&self, scope: Scope) -> Result<u32, TopoError> {
-        self.by_scope
-            .get(&scope)
-            .copied()
-            .ok_or_else(|| TopoError::Encoding("scope was not interned".into()))
-    }
     pub(crate) fn resolve(&self, id: u32) -> Result<Scope, TopoError> {
         self.by_id
             .get(&id)
