@@ -18,6 +18,10 @@ pass a scope to read.
 Then `traverse` from a hit to gather what surrounds it. A memory's neighbours
 are usually the reason it mattered.
 
+Report only what the graph actually holds. Do not fill gaps with details from
+the surrounding conversation or your own assumptions — an unstored fact
+presented as recalled is worse than no recall at all.
+
 ## Store what will still be true tomorrow
 
 Store: decisions and the reasoning behind them, constraints, a person's role or
