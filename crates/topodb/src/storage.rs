@@ -1317,25 +1317,24 @@ impl Storage {
                     // the NODE_SLOTS mapping inside `apply_op`, so it's
                     // unrecoverable afterward), left `None` for CreateNode since
                     // the slot isn't allocated until `apply_op` runs.
-                    let pre: Option<(NodeId, Scope, Option<u64>, Option<String>)> =
-                        match &op {
-                            Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
-                            Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => match read_node(
-                                &nodes,
-                                &embeddings,
-                                &dicts,
-                                &scope_registry,
-                                &node_slots,
-                                *id,
-                            )? {
-                                Some(rec) => {
-                                    let slot = crate::slots::node_slot(&node_slots, *id)?;
-                                    Some((*id, rec.scope, slot, doc_text(&self.spec, &rec)))
-                                }
-                                None => None,
-                            },
-                            _ => None,
-                        };
+                    let pre: Option<(NodeId, Scope, Option<u64>, Option<String>)> = match &op {
+                        Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
+                        Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => match read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            *id,
+                        )? {
+                            Some(rec) => {
+                                let slot = crate::slots::node_slot(&node_slots, *id)?;
+                                Some((*id, rec.scope, slot, doc_text(&self.spec, &rec)))
+                            }
+                            None => None,
+                        },
+                        _ => None,
+                    };
                     apply_op(
                         &mut nodes,
                         &mut edges,
