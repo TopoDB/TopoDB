@@ -67,6 +67,19 @@ claude mcp add topodb --transport stdio -- topodb-mcp --db /path/to/agent.redb
 
 On [Pi](https://pi.dev) it is one command: `pi install npm:@topodb/pi`.
 
+Inside Claude Code specifically, skip `cargo` and `claude mcp add` entirely —
+install the plugin, which manages the server (including fetching it) for you:
+
+```
+/plugin marketplace add TopoDB/TopoDB
+/plugin install topodb
+```
+
+See [`plugins/claude-code/README.md`](plugins/claude-code/README.md) for the
+memory model and the risks it accepts (one database shared across every
+project; the scope id is keyed to the absolute project path, so it does not
+follow a repo across clones or machines).
+
 To embed the engine directly in a Rust process, see the
 [`topodb` crate example](crates/topodb/README.md) — the same graph, ops,
 and scoped recall as a library call.
