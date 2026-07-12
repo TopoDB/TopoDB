@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { serverArgs } from "../server-args.js";
+import { readFileSync } from "node:fs";
+import { serverArgs, SERVER_VERSION } from "../server-args.js";
 import { projectScopeId } from "../scope-id.js";
 
 test("reads span the project scope AND shared; writes default to the project", () => {
@@ -31,4 +32,15 @@ test("the db lives in the plugin DATA dir, not the plugin ROOT", () => {
   // would be silently discarded on upgrade.
   const args = serverArgs({ projectDir: "/tmp/proj", dataDir: "/data" });
   assert.equal(args[1], path.join("/data", "memory.redb"));
+});
+
+const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+test("the server the launcher installs is the server the e2e test validates", () => {
+  // SERVER_VERSION (launch.js's pin, via server-args.js) and
+  // devDependencies["@topodb/topodb-mcp"] (what the e2e test actually
+  // exercises) are two hand-synced copies of the same fact. If they drift,
+  // the e2e suite stays green while validating a server version no user ever
+  // launches — exactly the drift that shipped @topodb/pi with a stale 0.0.3
+  // for a week, unnoticed.
+  assert.equal(SERVER_VERSION, pkg.devDependencies["@topodb/topodb-mcp"]);
 });

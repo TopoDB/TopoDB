@@ -97,6 +97,10 @@ test("the ULID this plugin derives is the ULID the Rust server reports back", as
       child.kill();
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    // On Windows, child.kill() is TerminateProcess, which is asynchronous —
+    // the OS can still be releasing redb's handle on memory.redb when this
+    // rmSync runs, racing an EBUSY/EPERM. maxRetries + retryDelay give the
+    // handle time to actually let go instead of flaking the cleanup.
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

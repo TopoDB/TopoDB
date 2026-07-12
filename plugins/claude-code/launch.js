@@ -11,15 +11,19 @@
 // would leave the server silently never starting).
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { serverArgs } from "./server-args.js";
+import { serverArgs, SERVER_VERSION } from "./server-args.js";
 
-// The npm version of the server this plugin is built against. Pinned, not
-// floating: a server whose tool surface moved under us is worse than one that is
-// a version behind. Bump deliberately — and see Task 5 Step 4, this WILL rot.
-const SERVER_VERSION = "0.0.5";
 const SERVER_PKG = "@topodb/topodb-mcp";
+
+const LOCK_STALE_MS = 5 * 60 * 1000; // a lock this old outlived any real npm install; treat it as abandoned by a killed process
+// 30s, not "a few": this install pulls a platform-specific native binary via
+// optionalDependencies, which can take longer than a couple seconds on a cold
+// npm cache or a slow link. Long enough to not false-positive a healthy
+// install, short enough that a genuinely wedged peer still fails fast-ish.
+const LOCK_WAIT_TIMEOUT_MS = 30_000;
+const LOCK_POLL_INTERVAL_MS = 200;
 
 /**
  * Resolve the server's launcher, installing it into the plugin's persistent data
@@ -52,7 +56,92 @@ function resolveServer(dataDir) {
     }
   };
 
+  // npm is not safe against two processes installing into the same --prefix
+  // at once. Two Claude Code sessions launched at the same moment both hit
+  // "nothing installed yet" and would otherwise both run `npm install
+  // --prefix dataDir` concurrently, which can leave a partial/corrupt
+  // node_modules for whichever one loses the race. mkdirSync is atomic
+  // (throws EEXIST if the directory already exists), which is enough to use
+  // as a cross-process lock without a new dependency.
+  const lockDir = path.join(dataDir, ".install.lock");
+
+  // Returns true if we now own the lock, false if someone else legitimately
+  // holds it (caller should wait, not install).
+  const acquireLock = () => {
+    for (;;) {
+      try {
+        mkdirSync(lockDir);
+        return true;
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+        let ageMs;
+        try {
+          ageMs = Date.now() - statSync(lockDir).mtimeMs;
+        } catch {
+          // The lock vanished between our mkdirSync and this stat (the
+          // holder just finished and cleaned up) — retry acquiring it.
+          continue;
+        }
+        if (ageMs > LOCK_STALE_MS) {
+          // A lock this old was almost certainly abandoned by a process that
+          // got killed mid-install, not one still legitimately installing.
+          // Without this, a single killed process would brick first-run for
+          // every future session forever.
+          try {
+            rmdirSync(lockDir);
+          } catch {
+            // Lost the cleanup race to another process doing the same thing;
+            // either way, retry.
+          }
+          continue;
+        }
+        return false;
+      }
+    }
+  };
+
+  // Block (this whole script is synchronous) until the lock holder's install
+  // finishes, one way or another.
+  const waitForInstall = () => {
+    const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      if (installedVersion() === SERVER_VERSION) return;
+      if (!existsSync(lockDir)) {
+        // The holder released the lock — its install finished — but the
+        // pinned version still isn't resolvable, so it failed. Don't sit out
+        // the rest of the timeout waiting on an install that already ended.
+        throw new Error(
+          `a concurrent install of ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir} finished without producing that version; it likely failed (check that session's stderr)`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `timed out after ${LOCK_WAIT_TIMEOUT_MS}ms waiting for a concurrent install of ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir} to finish`,
+        );
+      }
+      // Atomics.wait blocks the calling thread without spinning; Node (unlike
+      // browsers) allows this on the main thread, and there is no async
+      // runtime here to yield to anyway (spawnSync below blocks it too).
+      Atomics.wait(sleeper, 0, 0, LOCK_POLL_INTERVAL_MS);
+    }
+  };
+
   const install = () => {
+    if (!acquireLock()) {
+      waitForInstall();
+      return;
+    }
+    try {
+      installLocked();
+    } finally {
+      // A crash between mkdirSync and here would skip this and wedge the
+      // lock — that's what the staleness check in acquireLock() is for.
+      rmdirSync(lockDir);
+    }
+  };
+
+  const installLocked = () => {
     // First run (or stale version): fetch the pinned server into the data
     // dir. Fail loudly — silently falling back to some other version on the
     // machine is worse than not starting, because the tool surface would be
@@ -109,7 +198,13 @@ function resolveServer(dataDir) {
       res = spawnSync("npm", npmArgs, { stdio });
     }
     if (res.status !== 0) {
-      throw new Error(`failed to install ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir}`);
+      // res.error (e.g. ENOENT when npm itself is missing/not on PATH) is the
+      // only signal a user gets when first-run install fails offline, behind
+      // a proxy, or on a machine without npm — surface it instead of a bare
+      // "it failed" with no cause.
+      throw new Error(
+        `failed to install ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir}: ${res.error?.message ?? `npm exited ${res.status}`}`,
+      );
     }
   };
 
