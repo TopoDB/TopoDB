@@ -1,0 +1,9 @@
+{
+  "name": "@topodb/claude-code-plugin",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}
