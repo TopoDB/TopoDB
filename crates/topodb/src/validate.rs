@@ -10,9 +10,9 @@
 //! See `specs/2026-07-11-d3-edge-scope-validation-design.md` §3.
 
 use crate::error::TopoError;
-use crate::graph::Snapshot;
 use crate::ids::{NodeId, Scope};
 use crate::op::Op;
+use crate::state::NodeRecord;
 use std::collections::HashMap;
 
 /// Is `edge` a legal scope for an edge between endpoints scoped `from` and `to`?
@@ -45,8 +45,13 @@ pub(crate) fn edge_scope_is_valid(edge: Scope, from: Scope, to: Scope) -> bool {
 /// Rejects any `CreateEdge` in `ops` whose scope is illegal for its endpoints.
 /// Runs on the applier thread before `apply_batch`, so a violation leaves storage
 /// untouched. An endpoint's scope comes from a same-batch `CreateNode` if present,
-/// otherwise from `cur`; missing endpoints are left for `apply_batch` to reject.
-pub(crate) fn prevalidate_edge_scopes(cur: &Snapshot, ops: &[Op]) -> Result<(), TopoError> {
+/// otherwise from `pre` (a storage read of pre-batch node state taken by the
+/// applier before `apply_batch`, keyed by every id this batch might
+/// reference); missing endpoints are left for `apply_batch` to reject.
+pub(crate) fn prevalidate_edge_scopes(
+    pre: &HashMap<NodeId, NodeRecord>,
+    ops: &[Op],
+) -> Result<(), TopoError> {
     let mut created_scope: HashMap<NodeId, Scope> = HashMap::new();
     for op in ops {
         match op {
@@ -64,7 +69,7 @@ pub(crate) fn prevalidate_edge_scopes(cur: &Snapshot, ops: &[Op]) -> Result<(), 
                     created_scope
                         .get(node)
                         .copied()
-                        .or_else(|| cur.nodes.get(node).map(|record| record.scope))
+                        .or_else(|| pre.get(node).map(|record| record.scope))
                 };
                 let (Some(from_scope), Some(to_scope)) = (scope_of(from), scope_of(to)) else {
                     continue;

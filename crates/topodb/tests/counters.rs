@@ -72,6 +72,16 @@ fn counters_are_outside_log_feed_and_replay() {
     assert_eq!(db.access_stats(&scopes, id).unwrap(), Some(stats));
 }
 
+// NOTE: the I1 counter-identity-across-rebuild regression lives in
+// `src/migrate_v3.rs`'s test mod
+// (`rebuild_after_migration_keeps_counters_with_their_ulid_when_slots_diverge`),
+// not here. The slot divergence it guards against only exists on a MIGRATED
+// v2 file — migration assigns slots in ULID-iteration order while replay
+// assigns them in op order; a pure-v3 database replays every node back to
+// its identical slot, so any test built here passes even against a rebuild
+// that never touches COUNTERS at all. Building a v2 file requires the
+// crate-private frozen v2 encoders, hence the unit-test location.
+
 #[test]
 fn stats_respect_scope_and_reads_of_stats_do_not_bump() {
     let dir = tempfile::tempdir().unwrap();

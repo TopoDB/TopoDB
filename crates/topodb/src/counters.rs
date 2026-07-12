@@ -6,7 +6,9 @@
 //! - a bump is fire-and-forget (a read must never block or fail on a full/closed
 //!   counter channel),
 //! - counter mutations never appear in the change feed,
-//! - `rebuild_state_from_ops` leaves the COUNTERS table untouched, and
+//! - `rebuild_state_from_ops` preserves counters by node identity (ULID)
+//!   across the rebuild, re-keying each surviving row under its node's
+//!   possibly-new slot rather than resetting the table, and
 //! - a `RemoveNode` may leave an orphan counter row behind (benign — reads of
 //!   stats gate on node existence via the scoped snapshot check in
 //!   `access_stats`, which deliberately does not bump).

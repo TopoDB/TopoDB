@@ -60,7 +60,7 @@ impl Dicts {
             Err(e) => Err(storage_err(e)),
         }
     }
-    fn load_from_table(
+    pub(crate) fn load_from_table(
         t: &impl ReadableTable<&'static [u8], &'static str>,
     ) -> Result<Self, TopoError> {
         let mut d = Self::default();
@@ -104,6 +104,9 @@ impl Dicts {
         m.names.insert(n.clone(), id);
         m.ids.insert(id, n);
         Ok(id)
+    }
+    pub(crate) fn id_of(&self, kind: DictKind, value: &str) -> Option<u32> {
+        self.map(kind).names.get(value).copied()
     }
     pub(crate) fn resolve(&self, k: DictKind, id: u32) -> Result<SmolStr, TopoError> {
         self.map(k)

@@ -14,6 +14,37 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Breaking
+
+- **On-disk format v3** ([FORMAT.md](FORMAT.md)): dense slot keys for nodes/edges (ULIDs are no
+  longer the record key), interned scopes (`SCOPES` registry, `ScopeId` -> small integer id),
+  chunked adjacency (`OUT_ADJ`/`IN_ADJ` replace full-scan edge lookup), an on-disk equality index
+  (`PROP_INDEX`, no longer rebuilt in RAM at every open), and a re-keyed FTS layout (postings/doc
+  stats keyed by scope id + dense slot instead of ULID).
+- **Public `Snapshot`/`AdjEntry` types removed.** The in-memory snapshot layer they belonged to is
+  gone; reads now run directly against redb MVCC read transactions instead of a materialized
+  snapshot copy.
+
+#### Added
+
+- **ONE-WAY auto-migration of v1/v2 files on open.** An existing v1 or v2 database file is
+  migrated to v3 automatically the first time it's opened with this version — there is no path
+  back to v1/v2. Migration re-keys `NODES`/`EDGES`/`EMBEDDINGS`/`COUNTERS` to dense slots, rebuilds
+  the FTS tables in the v3 layout, and builds the v3 sidecar tables (slot maps, adjacency, scope
+  registry, prop index) from the migrated rows.
+- **`DbOptions { cache_size_bytes }`** and **`Db::open_with_options`**, threading redb's
+  `Builder::set_cache_size` through to the underlying database.
+
+#### Changed
+
+- Corruption that previously surfaced as silent absence now surfaces loudly: a slot mapping
+  (`NODE_SLOTS`/`EDGE_SLOTS`) with no matching record row is `TopoError::Encoding`, not
+  `Ok(None)`/`Rejected`.
+- Benchmarks are now recorded in [BENCHMARKS.md](BENCHMARKS.md), including the v3 size/throughput
+  gates.
+
 ### 0.0.5
 
 #### Changed

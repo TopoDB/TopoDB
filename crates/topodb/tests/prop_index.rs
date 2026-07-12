@@ -151,6 +151,86 @@ fn float_range_scan_is_scoped() {
         .is_empty());
 }
 
+/// C1 regression: a `(label, prop)` pair declared for the FIRST time on an
+/// open that finds pre-existing nodes must have those nodes reindexed, not
+/// silently missed. In v2 this was free (`graph.rs` rebuilt the equality
+/// index in RAM on every open); v3's PROP_INDEX is an on-disk table
+/// maintained incrementally, so `ensure_index_spec` must notice the
+/// equality-list change and rebuild it from NODES, exactly like it already
+/// does for the text list.
+#[test]
+fn newly_declared_equality_index_finds_preexisting_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let s = ScopeId::new();
+    let a;
+    {
+        // Opened with NO equality declaration: "ada" is written but never
+        // indexed.
+        let db = Db::open_with(&path, IndexSpec::default()).unwrap();
+        let (id, op) = entity("ada", Scope::Id(s));
+        a = id;
+        db.submit(vec![op]).unwrap();
+    }
+    // Reopen declaring the equality index for the first time.
+    let db = Db::open_with(&path, spec()).unwrap();
+    let hits = db
+        .nodes_by_prop(
+            &ScopeSet::of(&[s]),
+            "Entity",
+            "name",
+            &PropValue::Str("ada".into()),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "pre-existing node must be reindexed");
+    assert_eq!(hits[0].id, a);
+}
+
+/// C1 regression: removing a `(label, prop)` equality declaration, mutating
+/// the property while the declaration is absent, then re-declaring it must
+/// NOT resurrect the stale PROP_INDEX row from before the removal — the
+/// re-declare reindex has to reflect current node state, not whatever was on
+/// disk from the last time the pair was declared.
+#[test]
+fn redeclaring_equality_index_does_not_resurrect_stale_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let a;
+    {
+        // Declared: index "ada" under (Entity, name).
+        let db = Db::open_with(&path, spec()).unwrap();
+        let (id, op) = entity("ada", Scope::Id(s));
+        a = id;
+        db.submit(vec![op]).unwrap();
+    }
+    {
+        // Reopen WITHOUT the declaration, then change the value while it's
+        // undeclared — no index maintenance happens for this prop while the
+        // declaration is absent.
+        let db = Db::open_with(&path, IndexSpec::default()).unwrap();
+        db.submit(vec![Op::SetNodeProps {
+            id: a,
+            props: [("name".to_string(), Some(PropValue::Str("grace".into())))].into(),
+        }])
+        .unwrap();
+    }
+    // Re-declare the same (label, prop) pair.
+    let db = Db::open_with(&path, spec()).unwrap();
+    assert!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .is_empty(),
+        "stale row for the old value must not resurface"
+    );
+    let hits = db
+        .nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("grace".into()))
+        .unwrap();
+    assert_eq!(hits.len(), 1, "current value must be indexed on redeclare");
+    assert_eq!(hits[0].id, a);
+}
+
 #[test]
 fn open_with_rejects_float_equality_declaration_and_duplicates() {
     let dir = tempfile::tempdir().unwrap();

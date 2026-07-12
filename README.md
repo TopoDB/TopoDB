@@ -76,7 +76,7 @@ and scoped recall as a library call.
 | Capability | Where | Status |
 |---|---|---|
 | Op-log write path — atomic batches, deterministic replay (property-tested) | engine | ✅ |
-| Single-applier concurrency; lock-free snapshot reads | engine | ✅ |
+| Single-applier concurrency; MVCC reads that never block each other or redb's storage commits (a long-running read can briefly delay the applier's next batch via registry guards) | engine | ✅ |
 | Scoped k-hop temporal traversal (`as_of` history reads) | engine | ✅ |
 | Temporal edges — facts supersede, never overwrite | engine | ✅ |
 | Equality property index | engine | ✅ |
