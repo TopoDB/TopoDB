@@ -102,7 +102,7 @@ fn main() -> Result<(), topodb::TopoError> {
 - **Temporal edges** — facts supersede, never overwrite; `as_of` reads see history
 - **Structural scoping** — every read takes a `ScopeSet`; cross-scope edges require a `Shared` endpoint
 - **Deterministic replay** — the op log stores fully-resolved ops; replaying it reproduces state exactly (property-tested)
-- **Single-applier concurrency** — writers from any thread serialize through one applier; reads run in redb MVCC read transactions and never block the applier (or each other)
+- **Single-applier concurrency** — writers from any thread serialize through one applier; reads run in redb MVCC read transactions, never block each other, and never block redb's storage commits, though a long-running read can briefly delay the applier's next batch while it holds the dicts/scope-registry read guards
 
 License: MIT OR Apache-2.0.
 

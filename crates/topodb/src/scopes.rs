@@ -101,9 +101,6 @@ impl ScopeRegistry {
     pub(crate) fn id_of(&self, scope: Scope) -> Option<u32> {
         self.by_scope.get(&scope).copied()
     }
-    pub(crate) fn clear(&mut self) {
-        *self = Self::default();
-    }
 }
 pub(crate) fn seed_shared(
     t: &mut Table<'_, &'static [u8], &'static [u8]>,

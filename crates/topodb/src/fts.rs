@@ -369,7 +369,7 @@ impl Db {
     /// slot-keyed, so this is a direct `nodes[slot_key]` get — no ULID hop, no
     /// separate snapshot read), sorted by descending score (id as a
     /// deterministic tie-break), truncated to `k`, and bumped (access
-    /// counters, Task 4).
+    /// counters).
     pub fn search_text(
         &self,
         scopes: &ScopeSet,
