@@ -167,6 +167,9 @@ mod reference {
                 if !scopes.contains(node.scope) {
                     continue;
                 }
+                // Per-embedding dim skip; equivalent to the engine's whole-slab
+                // `slab.dim != q.vector.len()` skip only because
+                // `prevalidate_dims` guarantees one dim per live (model, scope) slab.
                 if vector.len() != query.len() {
                     continue;
                 }
@@ -615,6 +618,17 @@ fn reference_model_matches_v2_engine_on_generated_workloads() {
         k: 5,
         candidates: None,
     });
+    // dim mismatch — 4-dim query against the 3-dim "vprobe" corpus, under
+    // the owning scope: expect empty on BOTH sides, not an error (engine
+    // skips the whole slab via `slab.dim != q.vector.len()`; the model
+    // skips per-embedding).
+    probes.push(Probe::Vector {
+        scopes: ScopeSet::of(&[own]),
+        model: "vprobe",
+        query: vec![1.0f32, 0.0, 0.0, 0.0],
+        k: 10,
+        candidates: None,
+    });
     // k larger than corpus — over the workload's bulk "bench-768" embeddings
     probes.push(Probe::Vector {
         scopes: ScopeSet::of(&[own]),
@@ -634,6 +648,29 @@ fn reference_model_matches_v2_engine_on_generated_workloads() {
     });
 
     assert_equivalent(&db, &model, &probes);
+
+    // Literal winner of the k=1 tie, asserted on BOTH sides independently —
+    // differential agreement alone can't rule out engine and model sharing
+    // the same latent tie-break bug; only naming the expected winner can.
+    let tie_scopes = ScopeSet::of(&[own]);
+    let engine_tie = db
+        .search_vector(&VectorQuery {
+            scopes: tie_scopes.clone(),
+            model: "tie-model".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            candidates: None,
+        })
+        .unwrap();
+    assert_eq!(
+        engine_tie[0].0.id, tie_low,
+        "engine k=1 tie must resolve NodeId asc (tie_low), not slot/creation order (tie_high)"
+    );
+    let model_tie = model.search_vector("tie-model", &tie_scopes, &[1.0, 0.0], 1, None);
+    assert_eq!(
+        model_tie[0].0, tie_low,
+        "model k=1 tie must resolve NodeId asc (tie_low), not insertion order"
+    );
 }
 
 fn memory_id(i: usize) -> NodeId {
