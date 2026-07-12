@@ -439,6 +439,102 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// I1 regression, sharpened: counter preservation across
+    /// `rebuild_state_from_ops` must be keyed by node IDENTITY (ULID), not
+    /// slot number. On a pure-v3 database replay reassigns the SAME slots
+    /// (both migration-free creation and replay run in op order), so no
+    /// slot divergence ever occurs and a slot-keyed "preserve by leaving the
+    /// rows alone" strategy passes any test built there. The divergence is
+    /// real only on a MIGRATED v2 file: `migrate_v2_to_v3` assigns slots in
+    /// v2 NODES ULID-iteration order, while replay assigns them in OP-LOG
+    /// order.
+    ///
+    /// Construction: node A gets the numerically LARGER ULID (300) but is
+    /// created FIRST in the op log; node B gets the smaller ULID (100) and
+    /// is created second. Migration slot order: B=0, A=1 (ULID order).
+    /// Replay slot order: A=0, B=1 (op order) — guaranteed swap, asserted
+    /// explicitly below so the premise can't silently rot. Pre-fix
+    /// (COUNTERS untouched across rebuild), A's stats land on B and vice
+    /// versa; post-fix each counter follows its ULID.
+    #[test]
+    fn rebuild_after_migration_keeps_counters_with_their_ulid_when_slots_diverge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let a = NodeId::from_u128(300); // created first, sorts second
+        let b = NodeId::from_u128(100); // created second, sorts first
+        let node = |id: NodeId| NodeRecord {
+            id,
+            scope: Scope::Shared,
+            label: "M".into(),
+            props: Default::default(),
+            embedding: None,
+        };
+        write_v2_fixture(&path, &[node(a), node(b)], &[]);
+
+        // The v2 op log records creation order A then B — the order replay
+        // will assign slots in. (Migration never touches OPS.)
+        {
+            let db = Database::open(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut ops_table = tx.open_table(crate::storage::OPS).unwrap();
+                for (seq, id) in [(1u64, a), (2u64, b)] {
+                    let op = crate::op::Op::CreateNode {
+                        id,
+                        scope: Scope::Shared,
+                        label: "M".into(),
+                        props: Default::default(),
+                    };
+                    ops_table
+                        .insert(seq, postcard::to_allocvec(&op).unwrap().as_slice())
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        // Open -> v2->v3 migration assigns slots in ULID order: B=0, A=1.
+        let s = crate::storage::Storage::open(&path).unwrap();
+        assert_eq!(s.format_version().unwrap(), 3);
+        let slot_of = |s: &crate::storage::Storage, id| {
+            let tx = s.db.begin_read().unwrap();
+            let t = tx.open_table(NODE_SLOTS).unwrap();
+            crate::slots::node_slot(&t, id).unwrap().unwrap()
+        };
+        assert_eq!(
+            slot_of(&s, b),
+            0,
+            "migration must slot B first (ULID order)"
+        );
+        assert_eq!(slot_of(&s, a), 1);
+
+        // Distinct per-node stats, written synchronously via the same seam
+        // the async bumper drains into.
+        s.merge_counter_bumps(&[(a, 1, 10), (b, 3, 20)]).unwrap();
+
+        s.rebuild_state_from_ops().unwrap();
+
+        // Replay reassigned slots in op order — the divergence this test
+        // exists to exercise. If these ever stop swapping, the test's
+        // premise is gone and it must be rebuilt, not weakened.
+        assert_eq!(slot_of(&s, a), 0, "replay must slot A first (op order)");
+        assert_eq!(slot_of(&s, b), 1);
+
+        // Each counter must have followed its ULID, not its old slot number.
+        let a_stats = s.read_counter(a).unwrap().unwrap();
+        let b_stats = s.read_counter(b).unwrap().unwrap();
+        assert_eq!(
+            (a_stats.access_count, a_stats.last_accessed_at),
+            (1, 10),
+            "A's stats must follow A's ULID across the rebuild"
+        );
+        assert_eq!(
+            (b_stats.access_count, b_stats.last_accessed_at),
+            (3, 20),
+            "B's stats must follow B's ULID across the rebuild"
+        );
+    }
+
     /// M6 edge case: an EMPTY v2 file (no nodes, no edges — just the
     /// format_version stamp) must still migrate cleanly rather than tripping
     /// on an empty NODES iteration or similar. Every table stays empty

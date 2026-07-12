@@ -72,69 +72,15 @@ fn counters_are_outside_log_feed_and_replay() {
     assert_eq!(db.access_stats(&scopes, id).unwrap(), Some(stats));
 }
 
-/// I1 regression: `rebuild_state_from_ops` must preserve counters by node
-/// IDENTITY (ULID), not by leaving slot-keyed rows untouched. Op-log
-/// application order — not ULID sort order — is what drives slot
-/// assignment, so A/B/C are deliberately given ULIDs OUT of creation order
-/// (A's numeric ULID is the largest even though it's created, and removed,
-/// first): create A, create B, remove A (burns A's slot — it is never
-/// reused), create C. If a rebuild ever re-keyed counters by slot number
-/// instead of resolving through NODE_IDS, a slot reassignment would
-/// silently transfer one node's access stats onto a different node.
-#[test]
-fn rebuild_preserves_counter_identity_when_op_log_order_diverges_from_ulid_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = Db::open(dir.path().join("t.redb")).unwrap();
-    let s = ScopeId::new();
-    let scopes = ScopeSet::of(&[s]);
-
-    let a = NodeId::from_u128(300);
-    let b = NodeId::from_u128(100);
-    let c = NodeId::from_u128(200);
-
-    db.submit(vec![Op::CreateNode {
-        id: a,
-        scope: Scope::Id(s),
-        label: "M".into(),
-        props: Default::default(),
-    }])
-    .unwrap();
-    db.submit(vec![Op::CreateNode {
-        id: b,
-        scope: Scope::Id(s),
-        label: "M".into(),
-        props: Default::default(),
-    }])
-    .unwrap();
-    db.submit(vec![Op::RemoveNode { id: a }]).unwrap();
-    db.submit(vec![Op::CreateNode {
-        id: c,
-        scope: Scope::Id(s),
-        label: "M".into(),
-        props: Default::default(),
-    }])
-    .unwrap();
-
-    // Distinct bump counts per surviving node, so a swap is detectable.
-    let _ = db.node(&scopes, b);
-    let _ = db.node(&scopes, c);
-    let _ = db.node(&scopes, c);
-    let _ = db.node(&scopes, c);
-    let b_before = wait_for_count(&db, &scopes, b, 1);
-    let c_before = wait_for_count(&db, &scopes, c, 3);
-    assert_eq!(b_before.access_count, 1);
-    assert_eq!(c_before.access_count, 3);
-
-    db.rebuild_state_from_ops().unwrap();
-
-    // Each surviving node's counter must have followed ITS ULID through the
-    // rebuild, not whatever slot number it (or another node) happened to
-    // hold before.
-    assert_eq!(db.access_stats(&scopes, b).unwrap(), Some(b_before));
-    assert_eq!(db.access_stats(&scopes, c).unwrap(), Some(c_before));
-    // The removed node's counter must not resurrect as anything else.
-    assert_eq!(db.access_stats(&scopes, a).unwrap(), None);
-}
+// NOTE: the I1 counter-identity-across-rebuild regression lives in
+// `src/migrate_v3.rs`'s test mod
+// (`rebuild_after_migration_keeps_counters_with_their_ulid_when_slots_diverge`),
+// not here. The slot divergence it guards against only exists on a MIGRATED
+// v2 file — migration assigns slots in ULID-iteration order while replay
+// assigns them in op order; a pure-v3 database replays every node back to
+// its identical slot, so any test built here passes even against a rebuild
+// that never touches COUNTERS at all. Building a v2 file requires the
+// crate-private frozen v2 encoders, hence the unit-test location.
 
 #[test]
 fn stats_respect_scope_and_reads_of_stats_do_not_bump() {

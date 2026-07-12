@@ -2551,27 +2551,37 @@ mod tests {
         assert_eq!(edges_after, 0);
     }
 
-    /// I5 regression: a `rebuild_state_from_ops` that fails mid-transaction
-    /// (a corrupt tail op in the log) must not leave the in-memory
-    /// `dicts`/`scope_registry` mirrors cleared — `dicts.clear()` and the
-    /// scope-registry reload both run BEFORE the ops replay that can itself
-    /// fail, so on error both mirrors must be reloaded from the last
+    /// I5 regression, sharpened: a `rebuild_state_from_ops` that fails
+    /// mid-transaction must not leave the in-memory `dicts`/`scope_registry`
+    /// mirrors holding only the partially-replayed prefix — `dicts.clear()`
+    /// and the scope-registry reload both run BEFORE the ops replay that can
+    /// itself fail, so on error both mirrors must be reloaded from the last
     /// COMMITTED rows (the transaction itself aborts cleanly on disk; only
     /// the in-memory mirrors were at risk of drifting).
+    ///
+    /// The corrupt op sits MID-log, deliberately: with it at the TAIL, the
+    /// partially-replayed mirrors are a complete prefix of the committed
+    /// dictionaries and the pre-fix code passes any read assertion. Here the
+    /// log is [create "Person"] [corrupt RemoveNode] [create "Robot"] —
+    /// replay dies at the corrupt op having interned only "Person", so
+    /// pre-fix the mirrors are MISSING the committed "Robot" dict entry and
+    /// reading the Robot node fails with `Encoding("unknown ... id")`.
+    /// Post-fix the reload restores the full committed dictionaries.
     #[test]
     fn rebuild_error_reloads_dicts_and_scope_registry_mirrors_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path().join("t.redb")).unwrap();
         let scope = Scope::Id(ScopeId::new());
-        let a = NodeId::new();
+        let person = NodeId::new();
         let mut props = crate::props::Props::new();
         props.insert(
             "name".to_string(),
             crate::props::PropValue::Str("ada".into()),
         );
+        // Seq 1: interns label "Person".
         s.apply_batch(
             vec![Op::CreateNode {
-                id: a,
+                id: person,
                 scope,
                 label: "Person".into(),
                 props,
@@ -2580,13 +2590,29 @@ mod tests {
         )
         .unwrap();
 
-        // Manufacture a corrupt tail op directly in the log via the raw
-        // append seam (bypassing `apply_batch`'s own validation): a
-        // `RemoveNode` targeting a ULID that was never created. `apply_op`
-        // rejects this during replay — exactly the mid-transaction failure
-        // `rebuild_state_from_ops` must recover the mirrors from.
+        // Seq 2: a corrupt op MID-log, via the raw append seam (bypassing
+        // `apply_batch`'s own validation): a `RemoveNode` targeting a ULID
+        // that was never created. `apply_op` rejects this during replay —
+        // exactly the mid-transaction failure `rebuild_state_from_ops` must
+        // recover the mirrors from.
         s.append_ops(&[Op::RemoveNode { id: NodeId::new() }])
             .unwrap();
+
+        // Seq 3: a COMMITTED batch after the corrupt op, interning a NEW
+        // label "Robot" the failed replay never reaches. This is the canary:
+        // pre-fix, the post-failure mirrors hold only the replayed prefix
+        // (label "Person"), leaving the Robot node unreadable.
+        let robot = NodeId::new();
+        s.apply_batch(
+            vec![Op::CreateNode {
+                id: robot,
+                scope,
+                label: "Robot".into(),
+                props: Default::default(),
+            }],
+            1,
+        )
+        .unwrap();
 
         let err = s.rebuild_state_from_ops().unwrap_err();
         assert!(
@@ -2594,15 +2620,24 @@ mod tests {
             "expected Rejected, got {err:?}"
         );
 
-        // The failed rebuild must not have left the mirrors cleared: a plain
-        // read of the pre-existing node must still resolve its label/scope
-        // correctly off the RELOADED mirrors.
+        // The canary: "Robot" was interned AFTER the corrupt op, so it is
+        // absent from the partially-replayed mirrors. Only a reload from the
+        // committed rows makes this read succeed.
         let rec = s
-            .load_node(a)
-            .unwrap()
-            .expect("node must still be readable after a failed rebuild");
-        assert_eq!(rec.label, "Person");
+            .load_node(robot)
+            .expect("post-corrupt-op node must be readable after a failed rebuild")
+            .expect("node must still exist");
+        assert_eq!(rec.label, "Robot");
         assert_eq!(rec.scope, scope);
+
+        // The pre-corrupt-op node still reads correctly too (this held even
+        // pre-fix — kept to pin the full committed state, not just the
+        // suffix).
+        let rec = s
+            .load_node(person)
+            .unwrap()
+            .expect("pre-corrupt-op node must still be readable");
+        assert_eq!(rec.label, "Person");
         assert_eq!(
             rec.props.get("name"),
             Some(&crate::props::PropValue::Str("ada".into()))
@@ -2618,7 +2653,7 @@ mod tests {
                 label: "Person".into(),
                 props: Default::default(),
             }],
-            1,
+            2,
         )
         .expect("storage must remain writable after a failed rebuild");
     }
