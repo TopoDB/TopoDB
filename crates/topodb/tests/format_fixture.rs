@@ -8,22 +8,28 @@
 //! `v2-workload.redb` (see `generate_v2_workload.rs`/`v2_workload_fixture.rs`)
 //! is a third FROZEN fixture — a larger v2 corpus used by `migrate_v3.rs`'s
 //! own migration unit tests — whose one-shot `#[ignore]`d generator is
-//! likewise never re-run now that the v3 cutover has happened. `v3.redb` is
-//! the only fixture in this file this build can actually regenerate: it pins
-//! the CURRENT native (un-migrated) v3 layout, still with the pre-Task-6
-//! single-row-per-term POSTINGS shape — `regenerate_v3_fixture` targets a
-//! build whose `FORMAT_VERSION` stops at 3, which no longer exists on this
-//! branch (v4 is native everywhere now), so this test is `#[ignore]`d and
-//! will not be re-run again; `v3.redb` stays frozen at its current content
-//! going forward, same as `v1.redb`/`v2.redb`.
+//! likewise never re-run now that the v3 cutover has happened.
+//!
+//! `v3.redb` was the native (un-migrated) v3 fixture, last regenerated during
+//! Task 5 of the storage-format-v4 plan (pinning THIS branch's v3 layout,
+//! already dual-writing the v4 `vectors`/`embedding_ref` tables — see
+//! `generate_v3_workload.rs`'s doc comment on the same "v3 with v4
+//! dual-writes already present" distinction). It is now a FIFTH frozen
+//! fixture: `FORMAT_VERSION` is 4 everywhere on this branch (Task 7), so no
+//! build here can stamp a fresh file at 3 anymore. Its former generator was
+//! `regenerate_v3_fixture`; that function is gone (repurposed below as
+//! `regenerate_v4_fixture`, targeting `v4.redb` with the identical content
+//! recipe) rather than kept around unreachable — `v3.redb`'s committed bytes
+//! are untouched by this change and stay frozen at their current content
+//! going forward, same as `v1.redb`/`v2.redb`/`v2-workload.redb`.
 //!
 //! `v3-legacy.redb` (Task 7, storage-format-v4 plan amendment 2 — CORPUS
-//! PURITY) is a FOURTH frozen fixture, recovered byte-for-byte from commit
+//! PURITY) is a SIXTH frozen fixture, recovered byte-for-byte from commit
 //! `a3711eb` via `git show a3711eb:crates/topodb/tests/fixtures/v3.redb`
 //! (2760704 bytes — verified at recovery time and re-verifiable any time via
 //! `git show a3711eb:... | wc -c`). It predates Task 3's `vectors`/
-//! `embedding_ref` dual-write entirely, so — unlike every other fixture in
-//! this file — it has NEITHER of those tables NOR `vector_dims` on disk at
+//! `embedding_ref` dual-write entirely, so — unlike every other v3-labeled
+//! fixture — it has NEITHER of those tables NOR `vector_dims` on disk at
 //! all: this is the load-bearing corpus-purity fixture, the only one in the
 //! repo that proves `migrate_v3_to_v4` correctly handles v4 tables that are
 //! ABSENT going in (every other v3-labeled fixture already carries them,
@@ -31,21 +37,41 @@
 //! ALREADY-POPULATED path instead — see `migrate_v4.rs`'s module doc comment
 //! on idempotency). A migration bug that forgot to create/populate those
 //! tables from scratch would pass every other fixture in this file and only
-//! be caught here.
+//! be caught here. Never regenerable (recovered from history, not produced by
+//! any build on this branch) and never to be deleted or byte-modified.
 //!
-//! - `regenerate_v3_fixture` (`#[ignore]`, frozen — see above): historically
-//!   (re)wrote `v3.redb` using the SAME content recipe `v2.redb` was
-//!   originally generated with. Retained for provenance; no longer runnable
-//!   against this branch's `FORMAT_VERSION`.
+//! `v3-workload.redb` (`generate_v3_workload.rs`/`v3_workload_fixture.rs`, a
+//! SEPARATE pair of files from this one) is a SEVENTH frozen fixture — a
+//! larger, 200-memory v3 corpus (also with v4 dual-writes already present,
+//! same distinction as `v3.redb` above) captured before Task 6 rewired
+//! postings maintenance to the chunked v4 layout, so it is the one corpus
+//! that exercises `migrate_v3_to_v4`'s postings-rechunking pass at a scale
+//! where a term's postings split across multiple chunks. Its one-shot
+//! `#[ignore]`d generator (`generate_v3_workload_fixture`) is likewise never
+//! re-run now that no build on this branch can write single-row-per-term v3
+//! postings again.
+//!
+//! `v4.redb` is the ONLY fixture in this file this build can actually
+//! regenerate: it pins the CURRENT native v4 layout (Task 8, storage-format-v4
+//! plan) — `regenerate_v4_fixture` writes it using the SAME content recipe
+//! `v3.redb` was regenerated with (fixed ids, two nodes, one embedding), which
+//! now lands as a native v4 file with no migration involved, since
+//! `Storage::open_with`/`Db::open_with` always stamp a brand-new file at the
+//! current `FORMAT_VERSION` (4).
+//!
+//! - `regenerate_v4_fixture` (`#[ignore]`): (re)writes `v4.redb`. Run with
+//!   `cargo test -p topodb --test format_fixture -- --ignored regenerate`.
 //! - `v1_fixture_opens_and_reads` / `v2_fixture_opens_and_reads` /
-//!   `v3_fixture_opens_and_reads` / `v3_legacy_fixture_migrates_and_reads`
-//!   (run in the normal suite): each copies its committed fixture to a
-//!   tempdir and asserts the documented queries (`nodes_by_prop`,
-//!   `search_text`, `search_vector`, `current_seq`, `format_version`) still
-//!   see the expected content, now migrated all the way to `FORMAT_VERSION
-//!   == 4`. The committed file is NEVER opened read-write in place —
-//!   `open_with` can write to META (format_version/index_spec stamping),
-//!   which would dirty the committed bytes on every test run.
+//!   `v3_fixture_opens_and_reads` / `v3_legacy_fixture_migrates_and_reads` /
+//!   `v4_fixture_opens_and_reads` (run in the normal suite): each copies its
+//!   committed fixture to a tempdir and asserts the documented queries
+//!   (`nodes_by_prop`, `search_text`, `search_vector`, `current_seq`,
+//!   `format_version`) still see the expected content, now (for v1/v2/v3/
+//!   v3-legacy) migrated all the way to `FORMAT_VERSION == 4`, or (for v4)
+//!   opened natively with no migration at all. The committed file is NEVER
+//!   opened read-write in place — `open_with` can write to META
+//!   (format_version/index_spec stamping), which would dirty the committed
+//!   bytes on every test run.
 //!
 //! Task 7 (format v4) landed `migrate_v3_to_v4`: `v3.redb`/`v3-legacy.redb`
 //! now migrate all the way to `FORMAT_VERSION == 4` on open (re-chunking
@@ -72,10 +98,17 @@
 use topodb::*;
 
 /// Regenerate with: cargo test -p topodb --test format_fixture -- --ignored regenerate
+///
+/// Repurposed from the old (Task 5-era) `regenerate_v3_fixture`: same content
+/// recipe, now targeting `v4.redb` instead of `v3.redb` — this build's
+/// `FORMAT_VERSION` is 4 everywhere, so `Db::open_with` below stamps a native
+/// v4 file with no migration involved. `v3.redb` is untouched by this
+/// function and stays frozen at its Task-5 content (see the module doc
+/// comment).
 #[test]
 #[ignore]
-fn regenerate_v3_fixture() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3.redb");
+fn regenerate_v4_fixture() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.redb");
     let _ = std::fs::remove_file(&path);
     let spec = IndexSpec {
         equality: vec![PropIndex {
@@ -138,7 +171,7 @@ fn regenerate_v3_fixture() {
 
     assert!(
         path.exists(),
-        "regenerate_v3_fixture: fixture file was not created at {path:?}"
+        "regenerate_v4_fixture: fixture file was not created at {path:?}"
     );
 }
 
@@ -291,6 +324,54 @@ fn v3_legacy_fixture_migrates_and_reads() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3-legacy.redb");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v3-legacy.redb");
+    std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(&path, spec).unwrap();
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_vector(&VectorQuery {
+            scopes: scopes.clone(),
+            model: "m1".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            candidates: None,
+        })
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(db.current_seq().unwrap(), 3);
+    assert_eq!(db.format_version(), 4);
+}
+
+/// Task 8 (storage-format-v4 plan): the native v4 fixture, written by
+/// `regenerate_v4_fixture` (the SAME content recipe every earlier native
+/// fixture in this file used) directly at the current `FORMAT_VERSION` — no
+/// migration involved on open at all, unlike `v1`/`v2`/`v3`/`v3-legacy` above.
+/// Same standard query set as `v3_fixture_opens_and_reads`, so a regression
+/// that only breaks a freshly-created v4 file (as opposed to one reached via
+/// migration) has a fixture that would catch it.
+#[test]
+fn v4_fixture_opens_and_reads() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.redb");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v4.redb");
     std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
     let spec = IndexSpec {
         equality: vec![PropIndex {

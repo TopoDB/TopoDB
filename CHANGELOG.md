@@ -14,6 +14,46 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Breaking
+
+- **On-disk format v4** ([FORMAT.md](FORMAT.md)): clustered vector storage — `vectors`/`embedding_ref`/
+  `vector_dims` replace the old slot-keyed `embeddings` cold table — and a chunked full-text postings
+  layout (`postings` re-keyed from one row per term to `[scope][term][chunk]`, ~8 KiB per chunk). See
+  "Fixed" below for why the postings change matters in practice.
+- **ONE-WAY auto-migration of v1/v2/v3 files on open, now chained all the way through v4.** An
+  existing v1, v2, or v3 database file is migrated to v4 automatically the first time it's opened
+  with this version — there is no path back, same one-way contract 0.0.6 established for v1/v2 → v3,
+  extended one hop further. A v3 file whose `embeddings` table happens to record one embedding model
+  at two different dimensions across two different scopes — legal under the old per-`(model, scope)`
+  dimension rule — now fails migration outright with `TopoError::Rejected`, naming the model and both
+  dimensions, rather than silently picking one. Back up the `.redb` file first if you may need to roll
+  back.
+
+#### Changed
+
+- **Embedding dimension is now pinned per model, permanently — not per `(model, scope)`.** Previously
+  the same model name could carry different vector dimensions in different scopes. As of this version,
+  a model's first `SetEmbedding` anywhere pins its dimension for good: a later `SetEmbedding` under the
+  same model with a different dimension, in ANY scope, rejects the whole batch. **If you embedded the
+  same model name at different dimensions in different scopes, those writes will start failing** —
+  rename one of the models. A zero-dimension embedding is still rejected up front, before it can pin
+  anything.
+- The in-RAM per-`(model, scope)` vector index ("the slab") and its locking machinery are removed —
+  internal only, no public API change. `search_vector` now reads the on-disk `vectors`/`embedding_ref`
+  tables directly, so there is no in-memory index to warm, poison, or rebuild on open.
+
+#### Fixed
+
+- **Full-text posting maintenance was quadratic in corpus size.** Every touch to a term's posting list
+  used to rewrite that term's ENTIRE row (read-decode-insert-encode-write the whole thing), so indexing
+  cost per document grew with how much of the corpus already shared that document's vocabulary — a
+  250k-memory build projected to hours (see [BENCHMARKS.md](BENCHMARKS.md)'s "FTS posting maintenance
+  is quadratic" finding). Postings are now split into ~8 KiB chunks; a new document's posting update
+  touches, and decodes, exactly one chunk regardless of how large the term's posting list has grown.
+  Before/after throughput numbers: **(numbers: Task 9)**.
+
 ### 0.0.6
 
 #### Breaking
