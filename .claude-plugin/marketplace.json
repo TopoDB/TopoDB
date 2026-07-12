@@ -1,0 +1,12 @@
+{
+  "name": "topodb",
+  "owner": { "name": "TopoDB" },
+  "description": "Persistent agent memory for Claude Code: a temporal property graph, scoped per project with a shared layer.",
+  "plugins": [
+    {
+      "name": "topodb",
+      "source": "./plugins/claude-code",
+      "description": "Persistent agent memory: a temporal property graph, scoped per project with a shared layer."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "topodb",
+  "displayName": "topodb memory",
+  "version": "0.1.0",
+  "description": "Persistent agent memory: a temporal property graph, scoped per project with a shared layer for lessons that generalize.",
+  "author": { "name": "TopoDB" },
+  "repository": "https://github.com/TopoDB/TopoDB",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["memory", "mcp", "graph", "recall"]
+}
