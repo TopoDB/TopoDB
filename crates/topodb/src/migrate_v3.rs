@@ -4,16 +4,22 @@
 //! layout, so the chained migration tests can read a real v2 file even after
 //! the live disk structs move on.
 
+use crate::adj::{adj_insert, AdjEntryDisk};
 use crate::codec::unframe_value;
-use crate::dict::Dicts;
-use crate::disk::{edge_from_disk, node_from_disk};
+use crate::dict::{DictKind, Dicts};
 use crate::error::{storage_err, TopoError};
 use crate::ids::{EdgeId, NodeId, Scope};
+use crate::prop_index::index_node;
 use crate::props::PropValue;
+use crate::scopes::{seed_shared, ScopeRegistry};
+use crate::slots::{alloc_edge_slot, alloc_node_slot, node_slot};
 use crate::state::{EdgeRecord, NodeRecord};
-use redb::ReadableTable;
+#[cfg(test)]
+use crate::storage::{EDGES, META, NODES};
+use redb::{ReadableTable, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct NodeRecordDiskV2 {
@@ -39,34 +45,37 @@ pub(crate) fn decode_v2_node(bytes: &[u8], dicts: &Dicts) -> Result<NodeRecord, 
     let raw = unframe_value(bytes)?;
     let disk: NodeRecordDiskV2 =
         postcard::from_bytes(raw.as_ref()).map_err(|e| TopoError::Encoding(e.to_string()))?;
-    node_from_disk(
-        crate::disk::NodeRecordDisk {
-            id: disk.id,
-            scope: disk.scope,
-            label: disk.label,
-            props: disk.props,
-        },
-        dicts,
-    )
+    let mut props = crate::props::Props::new();
+    for (key, value) in disk.props {
+        props.insert(dicts.resolve(DictKind::PropKey, key)?.to_string(), value);
+    }
+    Ok(NodeRecord {
+        id: disk.id,
+        scope: disk.scope,
+        label: dicts.resolve(DictKind::Label, disk.label)?,
+        props,
+        embedding: None,
+    })
 }
 
 pub(crate) fn decode_v2_edge(bytes: &[u8], dicts: &Dicts) -> Result<EdgeRecord, TopoError> {
     let raw = unframe_value(bytes)?;
     let disk: EdgeRecordDiskV2 =
         postcard::from_bytes(raw.as_ref()).map_err(|e| TopoError::Encoding(e.to_string()))?;
-    edge_from_disk(
-        crate::disk::EdgeRecordDisk {
-            id: disk.id,
-            scope: disk.scope,
-            ty: disk.ty,
-            from: disk.from,
-            to: disk.to,
-            props: disk.props,
-            valid_from: disk.valid_from,
-            valid_to: disk.valid_to,
-        },
-        dicts,
-    )
+    let mut props = crate::props::Props::new();
+    for (key, value) in disk.props {
+        props.insert(dicts.resolve(DictKind::PropKey, key)?.to_string(), value);
+    }
+    Ok(EdgeRecord {
+        id: disk.id,
+        scope: disk.scope,
+        ty: dicts.resolve(DictKind::EdgeType, disk.ty)?,
+        from: disk.from,
+        to: disk.to,
+        props,
+        valid_from: disk.valid_from,
+        valid_to: disk.valid_to,
+    })
 }
 
 pub(crate) fn collect_v2_rows(
@@ -87,11 +96,93 @@ pub(crate) fn collect_v2_rows(
     Ok((node_rows, edge_rows))
 }
 
+/// Transitional v2 -> v3 migration used by the staged branch: build every v3
+/// sidecar table from the committed v2 rows, then stamp format 3. The live row
+/// re-keying lands later in the branch; this keeps migration semantics testable
+/// meanwhile.
+#[allow(clippy::too_many_arguments)] // staged migration writes sidecar tables before the full row re-keying lands.
+pub(crate) fn migrate_v2_to_v3(
+    spec: Arc<crate::index::IndexSpec>,
+    meta: &mut Table<'_, &'static str, &'static [u8]>,
+    nodes: &mut Table<'_, &'static [u8], &'static [u8]>,
+    edges: &mut Table<'_, &'static [u8], &'static [u8]>,
+    dicts: &Dicts,
+    scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    node_slots: &mut Table<'_, &'static [u8], &'static [u8]>,
+    node_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
+    edge_slots: &mut Table<'_, &'static [u8], &'static [u8]>,
+    edge_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
+    out_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
+    in_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
+    prop_index: &mut Table<'_, &'static [u8], &'static [u8]>,
+) -> Result<(), TopoError> {
+    let (node_rows, edge_rows) = collect_v2_rows(nodes, edges, dicts)?;
+    node_slots.retain(|_, _| false).map_err(storage_err)?;
+    node_ids.retain(|_, _| false).map_err(storage_err)?;
+    edge_slots.retain(|_, _| false).map_err(storage_err)?;
+    edge_ids.retain(|_, _| false).map_err(storage_err)?;
+    out_adj.retain(|_, _| false).map_err(storage_err)?;
+    in_adj.retain(|_, _| false).map_err(storage_err)?;
+    prop_index.retain(|_, _| false).map_err(storage_err)?;
+    scopes_table.retain(|_, _| false).map_err(storage_err)?;
+    seed_shared(scopes_table)?;
+    meta.remove("next_node_slot").map_err(storage_err)?;
+    meta.remove("next_edge_slot").map_err(storage_err)?;
+    let mut scopes = ScopeRegistry::load_table_for_rebuild(scopes_table)?;
+    for node in &node_rows {
+        alloc_node_slot(meta, node_slots, node_ids, node.id)?;
+        scopes.intern(scopes_table, node.scope)?;
+        let slot = node_slot(node_slots, node.id)?
+            .ok_or_else(|| TopoError::Encoding("missing migrated node slot".into()))?;
+        index_node(prop_index, &spec, dicts, node, slot)?;
+    }
+    for edge in &edge_rows {
+        let edge_slot = alloc_edge_slot(meta, edge_slots, edge_ids, edge.id)?;
+        let from_slot = node_slot(node_slots, edge.from)?
+            .ok_or_else(|| TopoError::Encoding("missing migrated from slot".into()))?;
+        let to_slot = node_slot(node_slots, edge.to)?
+            .ok_or_else(|| TopoError::Encoding("missing migrated to slot".into()))?;
+        let edge_type = dicts
+            .id_of(DictKind::EdgeType, edge.ty.as_str())
+            .ok_or_else(|| TopoError::Encoding("missing migrated edge type id".into()))?;
+        let scope_id = scopes.intern(scopes_table, edge.scope)?;
+        adj_insert(
+            out_adj,
+            from_slot,
+            edge_type,
+            AdjEntryDisk {
+                target: to_slot,
+                edge: edge_slot,
+                scope: scope_id,
+                valid_from: edge.valid_from,
+                valid_to: edge.valid_to,
+            },
+        )?;
+        adj_insert(
+            in_adj,
+            to_slot,
+            edge_type,
+            AdjEntryDisk {
+                target: from_slot,
+                edge: edge_slot,
+                scope: scope_id,
+                valid_from: edge.valid_from,
+                valid_to: edge.valid_to,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adj::{IN_ADJ, OUT_ADJ};
     use crate::dict::Dicts;
-    use crate::storage::{EDGES, NODES};
+    use crate::index::{IndexSpec, PropIndex};
+    use crate::prop_index::PROP_INDEX;
+    use crate::scopes::SCOPES;
+    use crate::slots::{EDGE_IDS, EDGE_SLOTS, NODE_IDS, NODE_SLOTS};
     use redb::Database;
 
     #[test]
@@ -113,5 +204,62 @@ mod tests {
         assert!(nodes.iter().any(|node| node.label == "Memory"));
         assert!(!edges.is_empty());
         assert!(edges.iter().all(|edge| edge.valid_from > 0));
+    }
+
+    #[test]
+    fn sidecar_migration_populates_slot_and_adjacency_tables() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/v2-workload.redb");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.redb");
+        std::fs::copy(source, &path).unwrap();
+        let db = Database::open(&path).unwrap();
+        let tx = db.begin_write().unwrap();
+        let dicts = {
+            let read = db.begin_read().unwrap();
+            Dicts::load(&read).unwrap()
+        };
+        {
+            let mut meta = tx.open_table(META).unwrap();
+            let mut nodes = tx.open_table(NODES).unwrap();
+            let mut edges = tx.open_table(EDGES).unwrap();
+            let mut scopes = tx.open_table(SCOPES).unwrap();
+            let mut node_slots = tx.open_table(NODE_SLOTS).unwrap();
+            let mut node_ids = tx.open_table(NODE_IDS).unwrap();
+            let mut edge_slots = tx.open_table(EDGE_SLOTS).unwrap();
+            let mut edge_ids = tx.open_table(EDGE_IDS).unwrap();
+            let mut out_adj = tx.open_table(OUT_ADJ).unwrap();
+            let mut in_adj = tx.open_table(IN_ADJ).unwrap();
+            let mut prop_index = tx.open_table(PROP_INDEX).unwrap();
+            migrate_v2_to_v3(
+                Arc::new(IndexSpec {
+                    equality: vec![PropIndex {
+                        label: "Entity".into(),
+                        prop: "name".into(),
+                    }],
+                    text: vec![PropIndex {
+                        label: "Memory".into(),
+                        prop: "content".into(),
+                    }],
+                }),
+                &mut meta,
+                &mut nodes,
+                &mut edges,
+                &dicts,
+                &mut scopes,
+                &mut node_slots,
+                &mut node_ids,
+                &mut edge_slots,
+                &mut edge_ids,
+                &mut out_adj,
+                &mut in_adj,
+                &mut prop_index,
+            )
+            .unwrap();
+            assert!(node_ids.iter().unwrap().next().is_some());
+            assert!(edge_ids.iter().unwrap().next().is_some());
+            assert!(out_adj.iter().unwrap().next().is_some());
+            assert!(prop_index.iter().unwrap().next().is_some());
+        }
     }
 }

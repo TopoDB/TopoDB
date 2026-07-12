@@ -59,12 +59,12 @@ impl Db {
     /// timing/shape).
     #[must_use]
     pub fn node(&self, scopes: &ScopeSet, id: NodeId) -> Option<NodeRecord> {
-        let snap = self.snapshot();
-        let hit = snap
-            .nodes
-            .get(&id)
-            .filter(|n| scopes.contains(n.scope))
-            .cloned();
+        let hit = self
+            .storage()
+            .load_node(id)
+            .ok()
+            .flatten()
+            .filter(|node| scopes.contains(node.scope));
         if hit.is_some() {
             self.bump([id]);
         }
@@ -99,12 +99,11 @@ impl Db {
         prop: &str,
         value: &PropValue,
     ) -> Result<Vec<NodeRecord>, TopoError> {
-        let snap = self.snapshot();
-        if !snap
-            .spec
+        let spec = &self.storage().spec;
+        if !spec
             .equality
             .iter()
-            .any(|p| p.label == label && p.prop == prop)
+            .any(|candidate| candidate.label == label && candidate.prop == prop)
         {
             return Err(TopoError::Rejected(format!(
                 "({label}, {prop}) is not equality-indexed"
@@ -115,16 +114,30 @@ impl Db {
                 "Float values are not equality-indexable".into(),
             ));
         };
-        let hits: Vec<NodeRecord> = snap
-            .prop_index
-            .get(&(SmolStr::new(label), prop.to_string(), iv))
-            .into_iter()
-            .flat_map(|set| set.iter())
-            .filter_map(|id| snap.nodes.get(id))
-            .filter(|n| scopes.contains(n.scope))
-            .cloned()
-            .collect();
-        self.bump(hits.iter().map(|n| n.id));
+        let dicts = self.storage().dicts.read().expect("dict lock poisoned");
+        let Some(prop_key) = dicts.id_of(crate::dict::DictKind::PropKey, prop) else {
+            return Ok(Vec::new());
+        };
+        let tx = self
+            .storage()
+            .db
+            .begin_read()
+            .map_err(crate::error::storage_err)?;
+        let index = tx
+            .open_table(crate::prop_index::PROP_INDEX)
+            .map_err(crate::error::storage_err)?;
+        let slots = crate::prop_index::lookup(&index, prop_key, &iv)?;
+        drop(index);
+        drop(tx);
+        let mut hits = Vec::new();
+        for slot in slots {
+            if let Some(node) = self.storage().load_node_by_slot(slot)? {
+                if node.label == label && scopes.contains(node.scope) {
+                    hits.push(node);
+                }
+            }
+        }
+        self.bump(hits.iter().map(|node| node.id));
         Ok(hits)
     }
 

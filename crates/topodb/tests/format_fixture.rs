@@ -134,7 +134,7 @@ fn v1_fixture_opens_and_reads() {
         1
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 2);
+    assert_eq!(db.format_version(), 3);
     drop(db);
     // The second open takes the v2 fast path; migration is idempotent.
     let reopened = Db::open_with(
@@ -180,5 +180,5 @@ fn v2_fixture_opens_and_reads() {
     );
     assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 2);
+    assert_eq!(db.format_version(), 3);
 }

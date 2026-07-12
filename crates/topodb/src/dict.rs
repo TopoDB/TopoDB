@@ -60,7 +60,7 @@ impl Dicts {
             Err(e) => Err(storage_err(e)),
         }
     }
-    fn load_from_table(
+    pub(crate) fn load_from_table(
         t: &impl ReadableTable<&'static [u8], &'static str>,
     ) -> Result<Self, TopoError> {
         let mut d = Self::default();

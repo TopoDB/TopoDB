@@ -43,7 +43,7 @@ pub(crate) const COUNTERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// Cold vector rows: node key -> framed postcard (model, vector).
 pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("embeddings");
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -86,7 +86,7 @@ impl Storage {
         let db = Database::create(path).map_err(storage_err)?;
         let s = Self {
             db,
-            spec,
+            spec: spec.clone(),
             dicts: RwLock::new(Dicts::default()),
             scope_registry: RwLock::new(ScopeRegistry::default()),
         };
@@ -129,7 +129,39 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(2) => {}
+            Some(3) => {}
+            Some(2) => {
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
+                let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
+                let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+                let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+                let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+                let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+                let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+                let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+                let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                let dict = tx.open_table(DICT).map_err(storage_err)?;
+                let dicts = Dicts::load_from_table(&dict)?;
+                crate::migrate_v3::migrate_v2_to_v3(
+                    spec.clone(),
+                    &mut meta,
+                    &mut nodes,
+                    &mut edges,
+                    &dicts,
+                    &mut scopes,
+                    &mut node_slots,
+                    &mut node_ids,
+                    &mut edge_slots,
+                    &mut edge_ids,
+                    &mut out_adj,
+                    &mut in_adj,
+                    &mut prop_index,
+                )?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(1) => {
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
@@ -144,6 +176,37 @@ impl Storage {
                 drop(emb);
                 drop(dict);
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
+                meta.insert("format_version", 2u32.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+                drop(meta);
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
+                let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
+                let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+                let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+                let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+                let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+                let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+                let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+                let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                let dict = tx.open_table(DICT).map_err(storage_err)?;
+                let dicts = Dicts::load_from_table(&dict)?;
+                crate::migrate_v3::migrate_v2_to_v3(
+                    spec.clone(),
+                    &mut meta,
+                    &mut nodes,
+                    &mut edges,
+                    &dicts,
+                    &mut scopes,
+                    &mut node_slots,
+                    &mut node_ids,
+                    &mut edge_slots,
+                    &mut edge_ids,
+                    &mut out_adj,
+                    &mut in_adj,
+                    &mut prop_index,
+                )?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -723,6 +786,20 @@ impl Storage {
             last_seq,
             resolved,
         })
+    }
+
+    pub(crate) fn load_node_by_slot(&self, slot: u64) -> Result<Option<NodeRecord>, TopoError> {
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+        match crate::slots::node_ulid(&node_ids, slot)? {
+            Some(id) => {
+                let table = tx.open_table(NODES).map_err(storage_err)?;
+                let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                let dicts = self.dicts.read().expect("dict lock poisoned");
+                read_node(&table, &embeddings, &dicts, id)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Same rationale/`#[allow(dead_code)]` as `format_version` above:
@@ -1439,7 +1516,7 @@ mod tests {
         let read = s.read_ops(1).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].1, ops[0]);
-        assert_eq!(s.format_version().unwrap(), 2);
+        assert_eq!(s.format_version().unwrap(), 3);
     }
 
     #[test]
@@ -1456,7 +1533,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             {
                 let mut meta = tx.open_table(META).unwrap();
-                meta.insert("format_version", 3u32.to_le_bytes().as_slice())
+                meta.insert("format_version", 4u32.to_le_bytes().as_slice())
                     .unwrap();
             }
             tx.commit().unwrap();
@@ -1467,11 +1544,11 @@ mod tests {
         let err = Storage::open(&path).err().expect("reopen must be rejected");
         match err {
             TopoError::UnsupportedFormat {
-                found: 3,
-                supported: 2,
+                found: 4,
+                supported: 3,
             } => {}
             other => {
-                panic!("expected UnsupportedFormat {{ found: 3, supported: 2 }}, got {other:?}")
+                panic!("expected UnsupportedFormat {{ found: 4, supported: 3 }}, got {other:?}")
             }
         }
     }
