@@ -23,18 +23,20 @@ pub(crate) const OPS: TableDefinition<u64, &[u8]> = TableDefinition::new("ops");
 pub(crate) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 pub(crate) const NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
 pub(crate) const EDGES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edges");
-/// Inverted index: UTF-8 term bytes → postcard `Vec<(NodeId, u32)>` (doc, term
-/// frequency), maintained transactionally by `fts_update`. Opened in
-/// `open_with`.
+/// Inverted index: `scope_id.to_be_bytes() ++ term` UTF-8 bytes → framed
+/// delta-varint `(slot_delta, tf)` pairs (ascending by node slot), maintained
+/// transactionally by `fts_update`. Opened in `open_with`. Re-keyed from the
+/// v2 `scope_key(scope) ++ term` / postcard `Vec<(NodeId, u32)>` layout by
+/// W2b (v3 spec §3, FTS rows) — see `fts.rs`'s module doc comment.
 pub(crate) const POSTINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("postings");
-/// Per-document token length: node key → postcard `u32`. Opened in
-/// `open_with`.
+/// Per-document token length: 8-byte BE node slot → postcard `u32`. Opened in
+/// `open_with`. Re-keyed from the v2 ULID node key by W2b.
 pub(crate) const FTS_DOCS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fts_docs");
-/// Per-scope corpus statistics: `scope_key(scope)` → postcard `(u64, u64)` =
-/// `(doc_count, total_len)`. Opened in `open_with`, maintained transactionally
-/// by `fts_update`. Replaces the old global `"fts_doc_count"` / `"fts_total_len"`
-/// META counters — corpus stats are now sourced per scope so that documents in
-/// one scope never shift another scope's BM25 df/avgdl.
+/// Per-scope corpus statistics: `scope_id.to_be_bytes()` (4-byte u32 BE) →
+/// postcard `(u64, u64)` = `(doc_count, total_len)`. Opened in `open_with`,
+/// maintained transactionally by `fts_update`. Re-keyed from the v2
+/// `scope_key(scope)` layout by W2b; corpus stats are sourced per scope so
+/// that documents in one scope never shift another scope's BM25 df/avgdl.
 pub(crate) const FTS_STATS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fts_stats");
 /// Auxiliary per-node access statistics, keyed by the same 16-byte node key as
 /// NODES. Deliberately *outside* the op log: never appended to OPS, never
@@ -146,6 +148,14 @@ impl Storage {
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
                 let mut dict = tx.open_table(DICT).map_err(storage_err)?;
                 let mut dicts = Dicts::load_from_table(&dict)?;
+                // FTS tables re-keyed by this migration too (v3 spec §3, FTS
+                // rows): a v2 file's postings/fts_docs/fts_stats are still
+                // ULID/`scope_key`-keyed (pre-W2b layout), byte-incompatible
+                // with the interned-scope-id/dense-slot layout `fts.rs` reads
+                // post-migration. See `migrate_v2_to_v3`'s doc comment.
+                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+                let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+                let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
                 crate::migrate_v3::migrate_v2_to_v3(
                     spec.clone(),
                     &mut meta,
@@ -163,6 +173,9 @@ impl Storage {
                     &mut out_adj,
                     &mut in_adj,
                     &mut prop_index,
+                    &mut postings,
+                    &mut docs,
+                    &mut stats,
                 )?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
@@ -199,6 +212,14 @@ impl Storage {
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
                 let mut dict = tx.open_table(DICT).map_err(storage_err)?;
                 let mut dicts = Dicts::load_from_table(&dict)?;
+                // FTS tables re-keyed by this migration too (v3 spec §3, FTS
+                // rows): a v2 file's postings/fts_docs/fts_stats are still
+                // ULID/`scope_key`-keyed (pre-W2b layout), byte-incompatible
+                // with the interned-scope-id/dense-slot layout `fts.rs` reads
+                // post-migration. See `migrate_v2_to_v3`'s doc comment.
+                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+                let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+                let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
                 crate::migrate_v3::migrate_v2_to_v3(
                     spec.clone(),
                     &mut meta,
@@ -216,6 +237,9 @@ impl Storage {
                     &mut out_adj,
                     &mut in_adj,
                     &mut prop_index,
+                    &mut postings,
+                    &mut docs,
+                    &mut stats,
                 )?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
@@ -265,8 +289,9 @@ impl Storage {
     ///   non-empty (nothing was ever indexed).
     ///
     /// A reindex drains POSTINGS/FTS_DOCS/FTS_STATS and rebuilds by scanning
-    /// NODES through `fts_update` (threading each node's immutable scope), so
-    /// the new postings are scope-prefixed and FTS_STATS is per-scope.
+    /// NODES through `fts_update` (threading each node's slot and its already-
+    /// interned scope id, read straight off the row — see the loop below), so
+    /// the new postings are scope-id-prefixed and FTS_STATS is per-scope-id.
     fn ensure_index_spec(&self) -> Result<(), TopoError> {
         let incoming = normalized_spec(&self.spec);
         let incoming_bytes =
@@ -312,8 +337,14 @@ impl Storage {
                     .map_err(|_| TopoError::Encoding("bad node slot key".into()))?;
                 let slot = u64::from_be_bytes(key);
                 let raw = crate::codec::unframe_value(value_guard.value())?;
-                let disk = postcard::from_bytes(raw.as_ref())
+                let disk: crate::disk::NodeRecordDiskV3 = postcard::from_bytes(raw.as_ref())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                // The row's scope id is already the interned v3 id — no need
+                // to re-resolve/re-intern through `ScopeRegistry`, so this
+                // loop stays read-only on `scopes` (matches the `Some(2)`/
+                // `Some(1)` migration call sites, which never need a `&mut
+                // ScopeRegistry` here either).
+                let scope_id = disk.scope;
                 let mut rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
                 rec.embedding = read_embedding(&embeddings, slot)?;
                 let new_text = doc_text(&self.spec, &rec);
@@ -321,8 +352,8 @@ impl Storage {
                     &mut postings,
                     &mut docs,
                     &mut stats,
-                    rec.scope,
-                    rec.id,
+                    scope_id,
+                    slot,
                     None,
                     new_text.as_deref(),
                 )?;
@@ -660,9 +691,10 @@ impl Storage {
         // ride the batch's atomicity (a later failing op aborts the whole txn,
         // leaving the index untouched). `old_text` is captured BEFORE `apply_op`
         // mutates the record.
-        // Each edit also carries the node's scope (immutable — old and new
-        // scope are always identical), needed to key per-scope postings/stats.
-        let mut fts_edits: Vec<(Scope, NodeId, Option<String>, Option<String>)> = Vec::new();
+        // Each edit also carries the node's interned scope id and dense slot
+        // (immutable — old and new scope/slot are always identical), needed to
+        // key per-scope-id, per-slot postings/stats/docs (v3 FTS layout).
+        let mut fts_edits: Vec<(u32, u64, Option<String>, Option<String>)> = Vec::new();
         {
             let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
@@ -678,11 +710,15 @@ impl Storage {
             let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
             let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
             for op in &resolved {
-                // `pre` carries (id, scope, old_text). For CreateNode the scope
-                // comes from the op; for existing-node ops it comes from the
-                // record read before mutation.
-                let pre: Option<(NodeId, Scope, Option<String>)> = match op {
-                    Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
+                // `pre` carries (id, scope, pre_slot, old_text). For CreateNode
+                // the scope comes from the op and the slot isn't allocated yet
+                // (resolved after `apply_op` below); for existing-node ops
+                // scope/slot come from the record/mapping read before mutation
+                // — captured HERE for RemoveNode specifically, because
+                // `apply_op` erases the NODE_SLOTS mapping as part of removal,
+                // so the slot is unrecoverable afterward.
+                let pre: Option<(NodeId, Scope, Option<u64>, Option<String>)> = match op {
+                    Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
                         match read_node(
                             &nodes,
@@ -692,7 +728,10 @@ impl Storage {
                             &node_slots,
                             *id,
                         )? {
-                            Some(rec) => Some((*id, rec.scope, doc_text(&self.spec, &rec))),
+                            Some(rec) => {
+                                let slot = crate::slots::node_slot(&node_slots, *id)?;
+                                Some((*id, rec.scope, slot, doc_text(&self.spec, &rec)))
+                            }
                             None => None,
                         }
                     }
@@ -752,7 +791,7 @@ impl Storage {
                         }
                     }
                 }
-                if let Some((id, scope, old_text)) = pre {
+                if let Some((id, scope, pre_slot, old_text)) = pre {
                     let new_text = match op {
                         Op::RemoveNode { .. } => None,
                         _ => read_node(
@@ -765,7 +804,26 @@ impl Storage {
                         )?
                         .and_then(|rec| doc_text(&self.spec, &rec)),
                     };
-                    fts_edits.push((scope, id, old_text, new_text));
+                    // CreateNode's slot is allocated inside `apply_op` above,
+                    // so it only resolves now; every other op captured its
+                    // slot pre-mutation (see the `pre` comment above).
+                    let slot = match pre_slot {
+                        Some(s) => s,
+                        None => crate::slots::node_slot(&node_slots, id)?.ok_or_else(|| {
+                            TopoError::Encoding(
+                                "fts edit: node slot missing after CreateNode".into(),
+                            )
+                        })?,
+                    };
+                    // Idempotent: CreateNode/SetNodeProps already interned
+                    // this exact scope via `put_node` a few lines up (inside
+                    // `apply_op`), so this is a HashMap lookup, not a fresh
+                    // allocation — except for RemoveNode, where it's the
+                    // scope's only remaining reference in this op, but the
+                    // scope was necessarily interned when the node was
+                    // created, so it still resolves to the same id.
+                    let scope_id = scope_registry.intern(&mut scopes_table, scope)?;
+                    fts_edits.push((scope_id, slot, old_text, new_text));
                 }
             }
         }
@@ -773,13 +831,13 @@ impl Storage {
             let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
             let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
             let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
-            for (scope, id, old_text, new_text) in &fts_edits {
+            for (scope_id, slot, old_text, new_text) in &fts_edits {
                 fts_update(
                     &mut postings,
                     &mut docs,
                     &mut stats,
-                    *scope,
-                    *id,
+                    *scope_id,
+                    *slot,
                     old_text.as_deref(),
                     new_text.as_deref(),
                 )?;
@@ -1086,11 +1144,15 @@ impl Storage {
                 let (_, v) = entry.map_err(storage_err)?;
                 let op: Op = postcard::from_bytes(v.value())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                // Same (id, scope, old_text, new_text) derivation as
+                // Same (id, scope, pre_slot, old_text) derivation as
                 // `apply_batch`: old_text read BEFORE `apply_op` mutates the
-                // record; scope from the op (create) or the pre-mutation record.
-                let pre: Option<(NodeId, Scope, Option<String>)> = match &op {
-                    Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
+                // record; scope from the op (create) or the pre-mutation
+                // record; slot captured pre-mutation too (RemoveNode erases
+                // the NODE_SLOTS mapping inside `apply_op`, so it's
+                // unrecoverable afterward), left `None` for CreateNode since
+                // the slot isn't allocated until `apply_op` runs.
+                let pre: Option<(NodeId, Scope, Option<u64>, Option<String>)> = match &op {
+                    Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
                         match read_node(
                             &nodes,
@@ -1100,7 +1162,10 @@ impl Storage {
                             &node_slots,
                             *id,
                         )? {
-                            Some(rec) => Some((*id, rec.scope, doc_text(&self.spec, &rec))),
+                            Some(rec) => {
+                                let slot = crate::slots::node_slot(&node_slots, *id)?;
+                                Some((*id, rec.scope, slot, doc_text(&self.spec, &rec)))
+                            }
                             None => None,
                         }
                     }
@@ -1143,7 +1208,7 @@ impl Storage {
                         }
                     }
                 }
-                if let Some((id, scope, old_text)) = pre {
+                if let Some((id, scope, pre_slot, old_text)) = pre {
                     let new_text = match &op {
                         Op::RemoveNode { .. } => None,
                         _ => read_node(
@@ -1156,12 +1221,24 @@ impl Storage {
                         )?
                         .and_then(|rec| doc_text(&self.spec, &rec)),
                     };
+                    let slot = match pre_slot {
+                        Some(s) => s,
+                        None => crate::slots::node_slot(&node_slots, id)?.ok_or_else(|| {
+                            TopoError::Encoding(
+                                "fts replay: node slot missing after CreateNode".into(),
+                            )
+                        })?,
+                    };
+                    // Idempotent re-intern — see `apply_batch`'s identical
+                    // comment; the scope was already interned when the node
+                    // was created (or an earlier op on the same node).
+                    let scope_id = scope_registry.intern(&mut scopes_table, scope)?;
                     fts_update(
                         &mut postings,
                         &mut docs,
                         &mut stats,
-                        scope,
-                        id,
+                        scope_id,
+                        slot,
                         old_text.as_deref(),
                         new_text.as_deref(),
                     )?;
@@ -1219,9 +1296,10 @@ pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
 }
 
 /// 8-byte BE dense-slot key used by the v3 record/sidecar tables (NODES,
-/// EDGES, EMBEDDINGS, COUNTERS). `node_key`/`edge_key` (ULID keys, above/
-/// below) remain in use by `migrate.rs` (v1->v2, frozen) and `fts.rs`'s
-/// FTS_DOCS (not re-keyed by this task).
+/// EDGES, EMBEDDINGS, COUNTERS, and — as of W2b — `fts.rs`'s FTS_DOCS).
+/// `node_key` (ULID key, above) remains in use only by `migrate.rs` (v1->v2,
+/// frozen) and `migrate_v3.rs` (reading OLD v2-keyed EMBEDDINGS/COUNTERS rows
+/// before they're re-keyed).
 pub(crate) fn slot_key(slot: u64) -> [u8; 8] {
     slot.to_be_bytes()
 }
@@ -1293,9 +1371,11 @@ fn read_embedding(
     }
 }
 /// Direct slot-keyed NODES fetch — used once the caller already has the slot
-/// (e.g. from a PROP_INDEX lookup), skipping the ULID->slot resolution that
-/// `read_node` performs.
-fn read_node_by_slot(
+/// (e.g. from a PROP_INDEX lookup, or `search_text`'s postings), skipping the
+/// ULID->slot resolution that `read_node` performs. `pub(crate)` so `fts.rs`
+/// can resolve `search_text` hits straight from the read transaction it
+/// already has open, with no separate snapshot hop.
+pub(crate) fn read_node_by_slot(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     dicts: &Dicts,

@@ -92,6 +92,15 @@ impl ScopeRegistry {
             .copied()
             .ok_or_else(|| TopoError::Encoding(format!("unknown scope id {id}")))
     }
+    /// Read-only inverse of `resolve`: `scope`'s interned id, or `None` if
+    /// this scope has never had a node/edge written under it (nothing to
+    /// intern yet). Used by `search_text`'s read-only path, which cannot
+    /// allocate a fresh scope id via `intern` (no write transaction) — a
+    /// never-interned scope has no FTS rows either, so `None` is exactly the
+    /// "skip this scope" signal callers need.
+    pub(crate) fn id_of(&self, scope: Scope) -> Option<u32> {
+        self.by_scope.get(&scope).copied()
+    }
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }

@@ -8,6 +8,7 @@ use crate::adj::{adj_insert, AdjEntryDisk};
 use crate::codec::unframe_value;
 use crate::dict::{DictKind, Dicts};
 use crate::error::{storage_err, TopoError};
+use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::prop_index::index_node;
 use crate::props::PropValue;
@@ -104,6 +105,24 @@ pub(crate) fn collect_v2_rows(
 /// by their old ULID key BEFORE any table is drained, then re-inserted under
 /// each node's freshly-assigned slot key — a node with no pre-existing
 /// embedding/counter row simply gets none in v3 either.
+///
+/// Also re-keys the three FTS tables (POSTINGS/FTS_DOCS/FTS_STATS, v3 spec
+/// §3 FTS rows): a v2 file's postings are `scope_key(scope) ++ term` keyed
+/// with ULID-scoped ids and postcard `Vec<(NodeId, u32)>` values, FTS_DOCS is
+/// ULID-node-keyed, and FTS_STATS is `scope_key(scope)` keyed — none of which
+/// `fts.rs` can read post-migration (it expects `scope_id` (u32, interned)
+/// and dense node slots). Rather than transcode those old rows in place, this
+/// drains all three tables and rebuilds them via `fts_update` — the SAME
+/// function `apply_batch`/`rebuild_state_from_ops`/`ensure_index_spec`'s own
+/// reindex use — called once per node with `(None, new_text)`, right in the
+/// per-node loop below where the node's freshly-assigned slot and freshly-
+/// interned scope id are already on hand. Because `fts_update`'s postings
+/// encoding is a canonical, order-independent function of "which terms does
+/// this node's final text contain, at what frequency" (a `BTreeMap` rebuilt
+/// per term), the result here is byte-identical to what incremental
+/// maintenance would produce for the same final node set, in any order —
+/// this is not a separate reindex algorithm, it's the identical building
+/// block invoked once per node.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn migrate_v2_to_v3(
     spec: Arc<crate::index::IndexSpec>,
@@ -122,6 +141,9 @@ pub(crate) fn migrate_v2_to_v3(
     out_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
     in_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
     prop_index: &mut Table<'_, &'static [u8], &'static [u8]>,
+    postings: &mut Table<'_, &'static [u8], &'static [u8]>,
+    docs: &mut Table<'_, &'static [u8], &'static [u8]>,
+    stats: &mut Table<'_, &'static [u8], &'static [u8]>,
 ) -> Result<(), TopoError> {
     let (node_rows, edge_rows) = collect_v2_rows(nodes, edges, dicts)?;
 
@@ -149,6 +171,11 @@ pub(crate) fn migrate_v2_to_v3(
     out_adj.retain(|_, _| false).map_err(storage_err)?;
     in_adj.retain(|_, _| false).map_err(storage_err)?;
     prop_index.retain(|_, _| false).map_err(storage_err)?;
+    // Old (v2, pre-W2b) FTS rows are byte-incompatible with the v3 layout —
+    // see the function doc comment. Rebuilt below, in the per-node loop.
+    postings.retain(|_, _| false).map_err(storage_err)?;
+    docs.retain(|_, _| false).map_err(storage_err)?;
+    stats.retain(|_, _| false).map_err(storage_err)?;
     scopes_table.retain(|_, _| false).map_err(storage_err)?;
     seed_shared(scopes_table)?;
     meta.remove("next_node_slot").map_err(storage_err)?;
@@ -160,18 +187,32 @@ pub(crate) fn migrate_v2_to_v3(
             .ok_or_else(|| TopoError::Encoding("missing migrated node slot".into()))?;
         index_node(prop_index, &spec, dicts, node, slot)?;
 
-        let raw = postcard::to_allocvec(&crate::disk::node_to_disk_v3(
-            node,
-            dict_table,
-            dicts,
-            scopes_table,
-            &mut scopes,
-        )?)
-        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        let disk_node =
+            crate::disk::node_to_disk_v3(node, dict_table, dicts, scopes_table, &mut scopes)?;
+        // `node_to_disk_v3` just interned `node.scope` (idempotent past the
+        // first node in this scope) — reuse that same id for the FTS rebuild
+        // below rather than resolving it a second time.
+        let scope_id = disk_node.scope;
+        let raw =
+            postcard::to_allocvec(&disk_node).map_err(|e| TopoError::Encoding(e.to_string()))?;
         let framed = crate::codec::frame_value(raw);
         nodes
             .insert(crate::storage::slot_key(slot).as_slice(), framed.as_slice())
             .map_err(storage_err)?;
+
+        // Rebuild this node's FTS rows in the target v3 layout — see the
+        // function doc comment for why this (not a byte-transcode of the old
+        // rows) is the migration route.
+        let new_text = doc_text(&spec, node);
+        fts_update(
+            postings,
+            docs,
+            stats,
+            scope_id,
+            slot,
+            None,
+            new_text.as_deref(),
+        )?;
 
         let old_key = crate::storage::node_key(node.id);
         if let Some(bytes) = old_embeddings.get(old_key.as_slice()) {
@@ -300,6 +341,9 @@ mod tests {
             let mut in_adj = tx.open_table(IN_ADJ).unwrap();
             let mut prop_index = tx.open_table(PROP_INDEX).unwrap();
             let mut dict_table = tx.open_table(crate::dict::DICT).unwrap();
+            let mut postings = tx.open_table(crate::storage::POSTINGS).unwrap();
+            let mut docs = tx.open_table(crate::storage::FTS_DOCS).unwrap();
+            let mut stats = tx.open_table(crate::storage::FTS_STATS).unwrap();
             migrate_v2_to_v3(
                 Arc::new(IndexSpec {
                     equality: vec![PropIndex {
@@ -326,12 +370,30 @@ mod tests {
                 &mut out_adj,
                 &mut in_adj,
                 &mut prop_index,
+                &mut postings,
+                &mut docs,
+                &mut stats,
             )
             .unwrap();
             assert!(node_ids.iter().unwrap().next().is_some());
             assert!(edge_ids.iter().unwrap().next().is_some());
             assert!(out_adj.iter().unwrap().next().is_some());
             assert!(prop_index.iter().unwrap().next().is_some());
+            // W2b: the v2 fixture declares a `Memory.content` text index, so
+            // migration must have rebuilt real postings, not just left the
+            // tables empty.
+            assert!(
+                postings.iter().unwrap().next().is_some(),
+                "migrate_v2_to_v3 must rebuild POSTINGS in the v3 scope-id/slot layout"
+            );
+            assert!(
+                docs.iter().unwrap().next().is_some(),
+                "migrate_v2_to_v3 must rebuild FTS_DOCS in the v3 slot-keyed layout"
+            );
+            assert!(
+                stats.iter().unwrap().next().is_some(),
+                "migrate_v2_to_v3 must rebuild FTS_STATS in the v3 scope-id-keyed layout"
+            );
         }
     }
 }
