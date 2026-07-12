@@ -349,6 +349,130 @@ pub(crate) fn fts_update(
     Ok(())
 }
 
+// -- v4 chunked postings block codec (pure, unwired; Task 4) ---------------
+//
+// Laid down ahead of the wiring that will replace the single-row-per-term
+// postings above (`posting_key`/`encode_postings`/`decode_postings`/
+// `read_posting`/`set_posting`) with chunked storage, mirroring `adj.rs`'s
+// `(prefix, chunk)` scheme so a single hot term's postings never grow into
+// one unbounded value. Nothing below has a production caller yet — every
+// item carries `#[allow(dead_code)]` for that reason, same as
+// `vector_store.rs`'s Task 3 items.
+
+/// Chunked postings block format tag, byte 0 of every encoded payload.
+#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+pub(crate) const POSTINGS_BLOCK_FORMAT_V0: u8 = 0x00;
+
+/// Target encoded chunk size (bytes) a chunk is split at — re-benchmarked in
+/// Task 9.
+#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+pub(crate) const POSTINGS_CHUNK_TARGET: usize = 8 * 1024;
+
+/// Chunked postings key for `term` under `scope_id`, chunk index `chunk`:
+/// `scope_id.to_be_bytes() ++ term-UTF-8 ++ chunk.to_be_bytes()`. Both the
+/// 4-byte scope prefix and the 4-byte chunk suffix are fixed-width, so —
+/// exactly like `posting_key` above — the only variable-length part is the
+/// term itself, always sandwiched between two fixed-width fields. Two keys
+/// can only be byte-equal if their terms are byte-equal too: a shorter and a
+/// longer term under the same scope produce keys of different total length
+/// (`4 + term.len() + 4`), so no chunk value for either can ever collide
+/// with the other.
+#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+pub(crate) fn chunked_posting_key(scope_id: u32, term: &str, chunk: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + term.len() + 4);
+    key.extend_from_slice(&scope_id.to_be_bytes());
+    key.extend_from_slice(term.as_bytes());
+    key.extend_from_slice(&chunk.to_be_bytes());
+    key
+}
+
+/// Encodes one postings chunk's `(slot, tf)` entries, ascending by slot, as
+/// `[block_format][count varint]` then per entry `[slot_delta
+/// varint][tf varint]` (first delta relative to 0) — the same delta-varint
+/// shape as `adj::encode_block`. `entries` must be non-decreasing by slot
+/// (slots are unique per term in practice, so strictly increasing, but only
+/// non-decreasing is enforced here). An empty slice is always an error:
+/// empty chunks are removed rather than ever written, so the encoder never
+/// needs to represent one.
+#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+pub(crate) fn encode_posting_block(entries: &[(u64, u32)]) -> Result<Vec<u8>, TopoError> {
+    if entries.is_empty() {
+        return Err(TopoError::Encoding(
+            "cannot encode an empty postings chunk (empty chunks are removed, never written)"
+                .into(),
+        ));
+    }
+    if entries.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+        return Err(TopoError::Encoding(
+            "postings chunk entries are not slot-sorted".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    out.push(POSTINGS_BLOCK_FORMAT_V0);
+    write_varint(&mut out, entries.len() as u64);
+    let mut previous = 0u64;
+    for &(slot, tf) in entries {
+        write_varint(
+            &mut out,
+            slot.checked_sub(previous)
+                .ok_or_else(|| TopoError::Encoding("postings chunk slot underflow".into()))?,
+        );
+        previous = slot;
+        write_varint(&mut out, tf as u64);
+    }
+    Ok(out)
+}
+
+/// Inverse of `encode_posting_block`. Rejects an unrecognised block format
+/// tag and trailing bytes past the last decoded entry — same failure modes
+/// as `adj::decode_block`.
+#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+pub(crate) fn decode_posting_block(payload: &[u8]) -> Result<Vec<(u64, u32)>, TopoError> {
+    let Some((&format, mut input)) = payload.split_first() else {
+        return Err(TopoError::Encoding("empty postings chunk block".into()));
+    };
+    if format != POSTINGS_BLOCK_FORMAT_V0 {
+        return Err(TopoError::Encoding(format!(
+            "unknown postings block format 0x{format:02X}"
+        )));
+    }
+    let count = usize::try_from(read_varint(&mut input)?)
+        .map_err(|_| TopoError::Encoding("postings chunk count too large".into()))?;
+    let mut entries = Vec::with_capacity(count);
+    let mut slot = 0u64;
+    for _ in 0..count {
+        slot = slot
+            .checked_add(read_varint(&mut input)?)
+            .ok_or_else(|| TopoError::Encoding("postings chunk slot overflow".into()))?;
+        let tf = u32::try_from(read_varint(&mut input)?)
+            .map_err(|_| TopoError::Encoding("postings chunk tf too large".into()))?;
+        entries.push((slot, tf));
+    }
+    if !input.is_empty() {
+        return Err(TopoError::Encoding(
+            "trailing bytes in postings chunk block".into(),
+        ));
+    }
+    Ok(entries)
+}
+
+/// Reads just `[block_format][count]` — the df fast path — without decoding
+/// any entries. Errors identically to `decode_posting_block` on an empty
+/// payload or an unrecognised format tag, so a corrupt block is caught the
+/// same way regardless of which of the two readers touches it first.
+#[allow(dead_code)] // consumed by Task 6 (postings wiring)
+pub(crate) fn posting_block_count(payload: &[u8]) -> Result<u64, TopoError> {
+    let Some((&format, mut input)) = payload.split_first() else {
+        return Err(TopoError::Encoding("empty postings chunk block".into()));
+    };
+    if format != POSTINGS_BLOCK_FORMAT_V0 {
+        return Err(TopoError::Encoding(format!(
+            "unknown postings block format 0x{format:02X}"
+        )));
+    }
+    read_varint(&mut input)
+}
+
 impl Db {
     /// Scoped BM25 full-text search over the declared text index.
     ///
@@ -463,6 +587,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use redb::Database;
 
     /// Pins the new postings value codec (delta-varint `(slot, tf)` pairs,
@@ -545,5 +670,112 @@ mod tests {
             );
         }
         tx.commit().unwrap();
+    }
+
+    // -- v4 chunked postings block codec (pure, unwired; Task 4) -----------
+
+    #[test]
+    fn posting_block_roundtrips_boundaries() {
+        assert!(
+            encode_posting_block(&[]).is_err(),
+            "encoding an empty entry list must be an error — empty chunks are removed, never written"
+        );
+
+        let one = vec![(5u64, 3u32)];
+        assert_eq!(
+            decode_posting_block(&encode_posting_block(&one).unwrap()).unwrap(),
+            one
+        );
+
+        let tf_gt_one = vec![(0u64, 1u32), (10, 7)];
+        assert_eq!(
+            decode_posting_block(&encode_posting_block(&tf_gt_one).unwrap()).unwrap(),
+            tf_gt_one
+        );
+
+        let max_slot = vec![(u64::MAX, 1u32)];
+        assert_eq!(
+            decode_posting_block(&encode_posting_block(&max_slot).unwrap()).unwrap(),
+            max_slot
+        );
+    }
+
+    #[test]
+    fn posting_block_rejects_bad_payloads() {
+        assert!(
+            encode_posting_block(&[(2, 1), (1, 1)]).is_err(),
+            "decreasing slots must be rejected"
+        );
+        assert!(
+            decode_posting_block(&[]).is_err(),
+            "empty payload must be rejected"
+        );
+        assert!(
+            decode_posting_block(&[0xFF]).is_err(),
+            "unknown block format must be rejected"
+        );
+
+        let full = encode_posting_block(&[(0, 1), (5, 2), (9, 1)]).unwrap();
+        for cut in 1..full.len() {
+            assert!(
+                decode_posting_block(&full[..cut]).is_err(),
+                "truncation at byte {cut} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn posting_block_count_matches_decode_len_without_full_decode() {
+        let blocks: Vec<Vec<(u64, u32)>> = vec![
+            vec![(0, 1)],
+            vec![(0, 1), (3, 5), (100, 2)],
+            vec![(u64::MAX, u32::MAX)],
+            (0..50)
+                .map(|i| (i as u64 * 2, (i % 7) as u32 + 1))
+                .collect(),
+        ];
+        for entries in blocks {
+            let payload = encode_posting_block(&entries).unwrap();
+            let count = posting_block_count(&payload).unwrap();
+            let decoded = decode_posting_block(&payload).unwrap();
+            assert_eq!(count, decoded.len() as u64);
+        }
+    }
+
+    /// "ab" vs "abc" under one scope: the trailing fixed 4-byte chunk field
+    /// means the two keys' lengths (`4 + term_len + 4`) always differ, so no
+    /// chunk value for either term can ever produce the other's key. Scope 1
+    /// (BE `00 00 00 01`) and scope 256 (BE `00 00 01 00`) share their first
+    /// two bytes but must still disambiguate under the same term. Chunk 0's
+    /// key must sort strictly before chunk 1's under the same `(scope,
+    /// term)`, so a bounded range scan returns chunks in order.
+    #[test]
+    fn chunked_posting_key_disambiguates_terms_scopes_and_chunks() {
+        let ab = chunked_posting_key(1, "ab", 0);
+        let abc = chunked_posting_key(1, "abc", 0);
+        assert_eq!(ab.len(), 4 + "ab".len() + 4);
+        assert_eq!(abc.len(), 4 + "abc".len() + 4);
+        assert_ne!(ab, abc);
+
+        let scope1 = chunked_posting_key(1, "rust", 0);
+        let scope256 = chunked_posting_key(256, "rust", 0);
+        assert_ne!(scope1, scope256);
+
+        let chunk0 = chunked_posting_key(1, "rust", 0);
+        let chunk1 = chunked_posting_key(1, "rust", 1);
+        assert!(chunk0 < chunk1);
+    }
+
+    proptest! {
+        #[test]
+        fn sorted_posting_block_entries_roundtrip(
+            mut entries in proptest::collection::vec((0u64..10_000, any::<u32>()), 1..64)
+        ) {
+            entries.sort_by_key(|entry| entry.0);
+            prop_assert_eq!(
+                decode_posting_block(&encode_posting_block(&entries).unwrap()).unwrap(),
+                entries
+            );
+        }
     }
 }
