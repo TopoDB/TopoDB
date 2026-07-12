@@ -287,15 +287,21 @@ impl Storage {
         Ok(s)
     }
 
-    /// Reconciles the on-disk text index with the `IndexSpec` this storage was
-    /// opened with, and persists the full spec under META `"index_spec"`.
+    /// Reconciles the on-disk text AND equality indexes with the `IndexSpec`
+    /// this storage was opened with, and persists the full spec under META
+    /// `"index_spec"`.
     ///
     /// The stored spec has BOTH its `equality` and `text` lists sorted by
     /// `(label, prop)` before encoding, so a mere reordering of declarations
-    /// never looks like a change. Only the **text** portion drives reindexing:
-    /// the equality index is rebuilt in memory at every open from NODES (see
-    /// `graph.rs`), so a changed equality list needs no storage work — it is
-    /// persisted here purely for FORMAT.md introspection/tooling.
+    /// never looks like a change. A change in EITHER list triggers a reindex:
+    /// unlike v2 (where `graph.rs` rebuilt the equality index in RAM on every
+    /// open — that module is gone), v3's PROP_INDEX is an on-disk table that
+    /// is only ever maintained incrementally by the write path
+    /// (`apply_batch`/`rebuild_state_from_ops`), so a newly declared
+    /// `(label, prop)` pair has no rows for pre-existing nodes until this
+    /// reconciliation rebuilds it, and a removed-then-reintroduced
+    /// declaration must have its stale rows (written while the declaration
+    /// was absent and props kept changing) purged rather than resurrected.
     ///
     /// Reindex decision (one write transaction):
     /// - Legacy Plan-2 layout (`"fts_spec"` present): the on-disk postings are
@@ -304,14 +310,18 @@ impl Storage {
     ///   the per-scope layout. Always drain + full reindex, and delete the three
     ///   legacy keys.
     /// - New layout (`"index_spec"` present): reindex iff the stored text list
-    ///   differs from the incoming one.
+    ///   OR the stored equality list differs from the incoming one.
     /// - Plan-1 file (neither key): reindex iff the incoming text list is
     ///   non-empty (nothing was ever indexed).
     ///
-    /// A reindex drains POSTINGS/FTS_DOCS/FTS_STATS and rebuilds by scanning
-    /// NODES through `fts_update` (threading each node's slot and its already-
+    /// A reindex drains POSTINGS/FTS_DOCS/FTS_STATS/PROP_INDEX and rebuilds by
+    /// scanning NODES: FTS rows via `fts_update` and PROP_INDEX rows via
+    /// `prop_index::index_node` (threading each node's slot and its already-
     /// interned scope id, read straight off the row — see the loop below), so
-    /// the new postings are scope-id-prefixed and FTS_STATS is per-scope-id.
+    /// the new postings are scope-id-prefixed, FTS_STATS is per-scope-id, and
+    /// PROP_INDEX reflects exactly the current spec against current node
+    /// state (no stale rows survive a remove-then-reintroduce cycle, since the
+    /// whole table is drained first).
     fn ensure_index_spec(&self) -> Result<(), TopoError> {
         let incoming = normalized_spec(&self.spec);
         let incoming_bytes =
@@ -327,7 +337,10 @@ impl Storage {
                     Some(v) => {
                         let stored: IndexSpec = postcard::from_bytes(v.value())
                             .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                        (stored.text != incoming.text, false)
+                        (
+                            stored.text != incoming.text || stored.equality != incoming.equality,
+                            false,
+                        )
                     }
                     None => (!incoming.text.is_empty(), false),
                 }
@@ -338,9 +351,11 @@ impl Storage {
             let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
             let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
             let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+            let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
             postings.retain(|_, _| false).map_err(storage_err)?;
             docs.retain(|_, _| false).map_err(storage_err)?;
             stats.retain(|_, _| false).map_err(storage_err)?;
+            prop_index.retain(|_, _| false).map_err(storage_err)?;
 
             let nodes = tx.open_table(NODES).map_err(storage_err)?;
             let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
@@ -377,6 +392,7 @@ impl Storage {
                     None,
                     new_text.as_deref(),
                 )?;
+                index_node(&mut prop_index, &self.spec, &dicts, &rec, slot)?;
             }
         }
 
