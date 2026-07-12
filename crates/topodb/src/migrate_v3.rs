@@ -96,17 +96,24 @@ pub(crate) fn collect_v2_rows(
     Ok((node_rows, edge_rows))
 }
 
-/// Transitional v2 -> v3 migration used by the staged branch: build every v3
-/// sidecar table from the committed v2 rows, then stamp format 3. The live row
-/// re-keying lands later in the branch; this keeps migration semantics testable
-/// meanwhile.
-#[allow(clippy::too_many_arguments)] // staged migration writes sidecar tables before the full row re-keying lands.
+/// v2 -> v3 migration: builds every v3 sidecar table from the committed v2
+/// rows (as before) AND re-keys the four record tables (NODES, EDGES,
+/// EMBEDDINGS, COUNTERS) from their v2 ULID keys into the v3 dense-slot
+/// layout (v3 spec §3), assigning slots in the same v2 ULID iteration order
+/// `collect_v2_rows` has always used. EMBEDDINGS/COUNTERS rows are snapshotted
+/// by their old ULID key BEFORE any table is drained, then re-inserted under
+/// each node's freshly-assigned slot key — a node with no pre-existing
+/// embedding/counter row simply gets none in v3 either.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn migrate_v2_to_v3(
     spec: Arc<crate::index::IndexSpec>,
     meta: &mut Table<'_, &'static str, &'static [u8]>,
     nodes: &mut Table<'_, &'static [u8], &'static [u8]>,
     edges: &mut Table<'_, &'static [u8], &'static [u8]>,
-    dicts: &Dicts,
+    embeddings: &mut Table<'_, &'static [u8], &'static [u8]>,
+    counters: &mut Table<'_, &'static [u8], &'static [u8]>,
+    dict_table: &mut Table<'_, &'static [u8], &'static str>,
+    dicts: &mut Dicts,
     scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
     node_slots: &mut Table<'_, &'static [u8], &'static [u8]>,
     node_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -117,6 +124,24 @@ pub(crate) fn migrate_v2_to_v3(
     prop_index: &mut Table<'_, &'static [u8], &'static [u8]>,
 ) -> Result<(), TopoError> {
     let (node_rows, edge_rows) = collect_v2_rows(nodes, edges, dicts)?;
+
+    // Snapshot the old ULID-keyed EMBEDDINGS/COUNTERS rows before anything is
+    // drained — both tables are still v2-keyed (by node ULID) at this point.
+    let mut old_embeddings = std::collections::HashMap::new();
+    for item in embeddings.iter().map_err(storage_err)? {
+        let (k, v) = item.map_err(storage_err)?;
+        old_embeddings.insert(k.value().to_vec(), v.value().to_vec());
+    }
+    let mut old_counters = std::collections::HashMap::new();
+    for item in counters.iter().map_err(storage_err)? {
+        let (k, v) = item.map_err(storage_err)?;
+        old_counters.insert(k.value().to_vec(), v.value().to_vec());
+    }
+
+    nodes.retain(|_, _| false).map_err(storage_err)?;
+    edges.retain(|_, _| false).map_err(storage_err)?;
+    embeddings.retain(|_, _| false).map_err(storage_err)?;
+    counters.retain(|_, _| false).map_err(storage_err)?;
     node_slots.retain(|_, _| false).map_err(storage_err)?;
     node_ids.retain(|_, _| false).map_err(storage_err)?;
     edge_slots.retain(|_, _| false).map_err(storage_err)?;
@@ -131,10 +156,34 @@ pub(crate) fn migrate_v2_to_v3(
     let mut scopes = ScopeRegistry::load_table_for_rebuild(scopes_table)?;
     for node in &node_rows {
         alloc_node_slot(meta, node_slots, node_ids, node.id)?;
-        scopes.intern(scopes_table, node.scope)?;
         let slot = node_slot(node_slots, node.id)?
             .ok_or_else(|| TopoError::Encoding("missing migrated node slot".into()))?;
         index_node(prop_index, &spec, dicts, node, slot)?;
+
+        let raw = postcard::to_allocvec(&crate::disk::node_to_disk_v3(
+            node,
+            dict_table,
+            dicts,
+            scopes_table,
+            &mut scopes,
+        )?)
+        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        let framed = crate::codec::frame_value(raw);
+        nodes
+            .insert(crate::storage::slot_key(slot).as_slice(), framed.as_slice())
+            .map_err(storage_err)?;
+
+        let old_key = crate::storage::node_key(node.id);
+        if let Some(bytes) = old_embeddings.get(old_key.as_slice()) {
+            embeddings
+                .insert(crate::storage::slot_key(slot).as_slice(), bytes.as_slice())
+                .map_err(storage_err)?;
+        }
+        if let Some(bytes) = old_counters.get(old_key.as_slice()) {
+            counters
+                .insert(crate::storage::slot_key(slot).as_slice(), bytes.as_slice())
+                .map_err(storage_err)?;
+        }
     }
     for edge in &edge_rows {
         let edge_slot = alloc_edge_slot(meta, edge_slots, edge_ids, edge.id)?;
@@ -170,6 +219,23 @@ pub(crate) fn migrate_v2_to_v3(
                 valid_to: edge.valid_to,
             },
         )?;
+
+        let raw = postcard::to_allocvec(&crate::disk::edge_to_disk_v3(
+            edge,
+            dict_table,
+            dicts,
+            scopes_table,
+            &mut scopes,
+            node_slots,
+        )?)
+        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        let framed = crate::codec::frame_value(raw);
+        edges
+            .insert(
+                crate::storage::slot_key(edge_slot).as_slice(),
+                framed.as_slice(),
+            )
+            .map_err(storage_err)?;
     }
     Ok(())
 }
@@ -215,7 +281,7 @@ mod tests {
         std::fs::copy(source, &path).unwrap();
         let db = Database::open(&path).unwrap();
         let tx = db.begin_write().unwrap();
-        let dicts = {
+        let mut dicts = {
             let read = db.begin_read().unwrap();
             Dicts::load(&read).unwrap()
         };
@@ -223,6 +289,8 @@ mod tests {
             let mut meta = tx.open_table(META).unwrap();
             let mut nodes = tx.open_table(NODES).unwrap();
             let mut edges = tx.open_table(EDGES).unwrap();
+            let mut embeddings = tx.open_table(crate::storage::EMBEDDINGS).unwrap();
+            let mut counters = tx.open_table(crate::storage::COUNTERS).unwrap();
             let mut scopes = tx.open_table(SCOPES).unwrap();
             let mut node_slots = tx.open_table(NODE_SLOTS).unwrap();
             let mut node_ids = tx.open_table(NODE_IDS).unwrap();
@@ -231,6 +299,7 @@ mod tests {
             let mut out_adj = tx.open_table(OUT_ADJ).unwrap();
             let mut in_adj = tx.open_table(IN_ADJ).unwrap();
             let mut prop_index = tx.open_table(PROP_INDEX).unwrap();
+            let mut dict_table = tx.open_table(crate::dict::DICT).unwrap();
             migrate_v2_to_v3(
                 Arc::new(IndexSpec {
                     equality: vec![PropIndex {
@@ -245,7 +314,10 @@ mod tests {
                 &mut meta,
                 &mut nodes,
                 &mut edges,
-                &dicts,
+                &mut embeddings,
+                &mut counters,
+                &mut dict_table,
+                &mut dicts,
                 &mut scopes,
                 &mut node_slots,
                 &mut node_ids,

@@ -134,6 +134,8 @@ impl Storage {
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
                 let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
                 let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
@@ -142,14 +144,17 @@ impl Storage {
                 let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
                 let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
-                let dict = tx.open_table(DICT).map_err(storage_err)?;
-                let dicts = Dicts::load_from_table(&dict)?;
+                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
+                let mut dicts = Dicts::load_from_table(&dict)?;
                 crate::migrate_v3::migrate_v2_to_v3(
                     spec.clone(),
                     &mut meta,
                     &mut nodes,
                     &mut edges,
-                    &dicts,
+                    &mut embeddings,
+                    &mut counters,
+                    &mut dict,
+                    &mut dicts,
                     &mut scopes,
                     &mut node_slots,
                     &mut node_ids,
@@ -182,6 +187,8 @@ impl Storage {
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
                 let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
                 let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
@@ -190,14 +197,17 @@ impl Storage {
                 let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
                 let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
-                let dict = tx.open_table(DICT).map_err(storage_err)?;
-                let dicts = Dicts::load_from_table(&dict)?;
+                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
+                let mut dicts = Dicts::load_from_table(&dict)?;
                 crate::migrate_v3::migrate_v2_to_v3(
                     spec.clone(),
                     &mut meta,
                     &mut nodes,
                     &mut edges,
-                    &dicts,
+                    &mut embeddings,
+                    &mut counters,
+                    &mut dict,
+                    &mut dicts,
                     &mut scopes,
                     &mut node_slots,
                     &mut node_ids,
@@ -288,17 +298,24 @@ impl Storage {
             stats.retain(|_, _| false).map_err(storage_err)?;
 
             let nodes = tx.open_table(NODES).map_err(storage_err)?;
+            let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            let dicts = self.dicts.read().expect("dict lock poisoned");
+            let scopes = self
+                .scope_registry
+                .read()
+                .expect("scope registry lock poisoned");
             for entry in nodes.iter().map_err(storage_err)? {
-                let (key_guard, _) = entry.map_err(storage_err)?;
-                let dicts = self.dicts.read().expect("dict lock poisoned");
-                let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
-                let key: [u8; 16] = key_guard
+                let (key_guard, value_guard) = entry.map_err(storage_err)?;
+                let key: [u8; 8] = key_guard
                     .value()
                     .try_into()
-                    .map_err(|_| TopoError::Encoding("bad node key".into()))?;
-                let id = NodeId::from_u128(u128::from_be_bytes(key));
-                let rec = read_node(&nodes, &embeddings, &dicts, id)?
-                    .ok_or_else(|| TopoError::Encoding("missing node during reindex".into()))?;
+                    .map_err(|_| TopoError::Encoding("bad node slot key".into()))?;
+                let slot = u64::from_be_bytes(key);
+                let raw = crate::codec::unframe_value(value_guard.value())?;
+                let disk = postcard::from_bytes(raw.as_ref())
+                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                let mut rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
+                rec.embedding = read_embedding(&embeddings, slot)?;
                 let new_text = doc_text(&self.spec, &rec);
                 fts_update(
                     &mut postings,
@@ -675,7 +692,14 @@ impl Storage {
                 let pre: Option<(NodeId, Scope, Option<String>)> = match op {
                     Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
-                        match read_node(&nodes, &embeddings, &dicts, *id)? {
+                        match read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            *id,
+                        )? {
                             Some(rec) => Some((*id, rec.scope, doc_text(&self.spec, &rec))),
                             None => None,
                         }
@@ -684,9 +708,14 @@ impl Storage {
                     _ => None,
                 };
                 let old_index_node = match op {
-                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
-                        read_node(&nodes, &embeddings, &dicts, *id)?
-                    }
+                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => read_node(
+                        &nodes,
+                        &embeddings,
+                        &dicts,
+                        &scope_registry,
+                        &node_slots,
+                        *id,
+                    )?,
                     _ => None,
                 };
                 if let Some(node) = &old_index_node {
@@ -707,7 +736,8 @@ impl Storage {
                     &mut edge_ids,
                     &mut out_adj,
                     &mut in_adj,
-                    &scope_registry,
+                    &mut scopes_table,
+                    &mut scope_registry,
                     op,
                 )?;
                 if !matches!(op, Op::RemoveNode { .. }) {
@@ -716,7 +746,14 @@ impl Storage {
                         _ => None,
                     };
                     if let Some(id) = id {
-                        if let Some(node) = read_node(&nodes, &embeddings, &dicts, id)? {
+                        if let Some(node) = read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            id,
+                        )? {
                             if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
                                 index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
                             }
@@ -726,8 +763,15 @@ impl Storage {
                 if let Some((id, scope, old_text)) = pre {
                     let new_text = match op {
                         Op::RemoveNode { .. } => None,
-                        _ => read_node(&nodes, &embeddings, &dicts, id)?
-                            .and_then(|rec| doc_text(&self.spec, &rec)),
+                        _ => read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            id,
+                        )?
+                        .and_then(|rec| doc_text(&self.spec, &rec)),
                     };
                     fts_edits.push((scope, id, old_text, new_text));
                 }
@@ -801,16 +845,17 @@ impl Storage {
         let index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
         let slots = crate::prop_index::lookup(&index, prop_key, value)?;
         drop(index);
-        let node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
         let nodes = tx.open_table(NODES).map_err(storage_err)?;
         let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
         let mut out = Vec::new();
         for slot in slots {
-            if let Some(id) = crate::slots::node_ulid(&node_ids, slot)? {
-                if let Some(rec) = read_node(&nodes, &embeddings, &dicts, id)? {
-                    out.push(rec);
-                }
+            if let Some(rec) = read_node_by_slot(&nodes, &embeddings, &dicts, &scopes, slot)? {
+                out.push(rec);
             }
         }
         Ok(out)
@@ -824,8 +869,13 @@ impl Storage {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
         let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
-        read_node(&table, &embeddings, &dicts, id)
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        read_node(&table, &embeddings, &dicts, &scopes, &node_slots, id)
     }
 
     /// See `load_node`.
@@ -833,8 +883,14 @@ impl Storage {
     pub fn load_edge(&self, id: EdgeId) -> Result<Option<EdgeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(EDGES).map_err(storage_err)?;
+        let edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+        let node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
-        read_edge(&table, &dicts, id)
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        read_edge(&table, &dicts, &scopes, &edge_slots, &node_ids, id)
     }
 
     /// Crate-internal full scan — used to rebuild in-memory adjacency. Not
@@ -844,21 +900,24 @@ impl Storage {
         let table = tx.open_table(NODES).map_err(storage_err)?;
         let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
         let mut out = Vec::new();
         for entry in table.iter().map_err(storage_err)? {
-            let (k, _) = entry.map_err(storage_err)?;
-            let key: [u8; 16] = k
+            let (k, v) = entry.map_err(storage_err)?;
+            let key: [u8; 8] = k
                 .value()
                 .try_into()
-                .map_err(|_| TopoError::Encoding("bad node key".into()))?;
-            if let Some(rec) = read_node(
-                &table,
-                &embeddings,
-                &dicts,
-                NodeId::from_u128(u128::from_be_bytes(key)),
-            )? {
-                out.push(rec);
-            }
+                .map_err(|_| TopoError::Encoding("bad node slot key".into()))?;
+            let slot = u64::from_be_bytes(key);
+            let raw = crate::codec::unframe_value(v.value())?;
+            let disk = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let mut rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
+            rec.embedding = read_embedding(&embeddings, slot)?;
+            out.push(rec);
         }
         Ok(out)
     }
@@ -866,19 +925,21 @@ impl Storage {
     pub(crate) fn all_edges(&self) -> Result<Vec<EdgeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(EDGES).map_err(storage_err)?;
+        let node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
         let mut out = Vec::new();
         for entry in table.iter().map_err(storage_err)? {
-            let (k, _) = entry.map_err(storage_err)?;
-            let key: [u8; 16] = k
-                .value()
-                .try_into()
-                .map_err(|_| TopoError::Encoding("bad edge key".into()))?;
-            if let Some(rec) =
-                read_edge(&table, &dicts, EdgeId::from_u128(u128::from_be_bytes(key)))?
-            {
-                out.push(rec);
-            }
+            let (_, v) = entry.map_err(storage_err)?;
+            let raw = crate::codec::unframe_value(v.value())?;
+            let disk = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            out.push(crate::disk::edge_from_disk_v3(
+                disk, &dicts, &scopes, &node_ids,
+            )?);
         }
         Ok(out)
     }
@@ -900,8 +961,16 @@ impl Storage {
         let tx = self.db.begin_write().map_err(storage_err)?;
         {
             let mut table = tx.open_table(COUNTERS).map_err(storage_err)?;
+            let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
             for (id, n, ts) in bumps {
-                let key = node_key(*id);
+                // The bump channel still carries ULIDs; a ULID that no longer
+                // resolves (node removed since the bump was queued) is
+                // silently dropped — no orphan COUNTERS row under a slot that
+                // was never (re-)assigned to this ULID.
+                let Some(slot) = crate::slots::node_slot(&node_slots, *id)? else {
+                    continue;
+                };
+                let key = slot_key(slot);
                 let existing = match table.get(key.as_slice()).map_err(storage_err)? {
                     Some(v) => postcard::from_bytes::<AccessStats>(v.value())
                         .map_err(|e| TopoError::Encoding(e.to_string()))?,
@@ -923,12 +992,17 @@ impl Storage {
     }
 
     /// Reads the raw counter row for `id`, or `None` if the node has never been
-    /// counted. Scope gating is the caller's responsibility (`Db::access_stats`
-    /// checks node existence/scope first); this is a pure COUNTERS lookup.
+    /// counted (or no longer exists). Scope gating is the caller's
+    /// responsibility (`Db::access_stats` checks node existence/scope first);
+    /// this is a pure COUNTERS lookup.
     pub(crate) fn read_counter(&self, id: NodeId) -> Result<Option<AccessStats>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(COUNTERS).map_err(storage_err)?;
-        let key = node_key(id);
+        let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+        let Some(slot) = crate::slots::node_slot(&node_slots, id)? else {
+            return Ok(None);
+        };
+        let key = slot_key(slot);
         match table.get(key.as_slice()).map_err(storage_err)? {
             None => Ok(None),
             Some(v) => {
@@ -1032,7 +1106,14 @@ impl Storage {
                 let pre: Option<(NodeId, Scope, Option<String>)> = match &op {
                     Op::CreateNode { id, scope, .. } => Some((*id, *scope, None)),
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
-                        match read_node(&nodes, &embeddings, &dicts, *id)? {
+                        match read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            *id,
+                        )? {
                             Some(rec) => Some((*id, rec.scope, doc_text(&self.spec, &rec))),
                             None => None,
                         }
@@ -1052,7 +1133,8 @@ impl Storage {
                     &mut edge_ids,
                     &mut out_adj,
                     &mut in_adj,
-                    &scope_registry,
+                    &mut scopes_table,
+                    &mut scope_registry,
                     &op,
                 )?;
                 if !matches!(op, Op::RemoveNode { .. }) {
@@ -1061,7 +1143,14 @@ impl Storage {
                         _ => None,
                     };
                     if let Some(id) = id {
-                        if let Some(node) = read_node(&nodes, &embeddings, &dicts, id)? {
+                        if let Some(node) = read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            id,
+                        )? {
                             if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
                                 index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
                             }
@@ -1071,8 +1160,15 @@ impl Storage {
                 if let Some((id, scope, old_text)) = pre {
                     let new_text = match &op {
                         Op::RemoveNode { .. } => None,
-                        _ => read_node(&nodes, &embeddings, &dicts, id)?
-                            .and_then(|rec| doc_text(&self.spec, &rec)),
+                        _ => read_node(
+                            &nodes,
+                            &embeddings,
+                            &dicts,
+                            &scope_registry,
+                            &node_slots,
+                            id,
+                        )?
+                        .and_then(|rec| doc_text(&self.spec, &rec)),
                     };
                     fts_update(
                         &mut postings,
@@ -1136,6 +1232,14 @@ pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
     id.as_u128().to_be_bytes()
 }
 
+/// 8-byte BE dense-slot key used by the v3 record/sidecar tables (NODES,
+/// EDGES, EMBEDDINGS, COUNTERS). `node_key`/`edge_key` (ULID keys, above/
+/// below) remain in use by `migrate.rs` (v1->v2, frozen) and `fts.rs`'s
+/// FTS_DOCS (not re-keyed by this task).
+pub(crate) fn slot_key(slot: u64) -> [u8; 8] {
+    slot.to_be_bytes()
+}
+
 /// Reads META `"oldest_seq"` (u64 LE) from an already-open META table; an
 /// ABSENT key means the log was never compacted, so the floor is 1. Factored
 /// out so `oldest_seq` (own read txn) and `read_ops` (shares the read txn with
@@ -1187,15 +1291,11 @@ pub(crate) fn scope_key(s: Scope) -> [u8; 17] {
     key
 }
 
-fn edge_key(id: EdgeId) -> [u8; 16] {
-    id.as_u128().to_be_bytes()
-}
-
 fn read_embedding(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    id: NodeId,
+    slot: u64,
 ) -> Result<Option<(String, Vec<f32>)>, TopoError> {
-    let key = node_key(id);
+    let key = slot_key(slot);
     match table.get(key.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
@@ -1206,80 +1306,146 @@ fn read_embedding(
         }
     }
 }
-fn read_node(
+/// Direct slot-keyed NODES fetch — used once the caller already has the slot
+/// (e.g. from a PROP_INDEX lookup), skipping the ULID->slot resolution that
+/// `read_node` performs.
+fn read_node_by_slot(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     dicts: &Dicts,
-    id: NodeId,
+    scopes: &ScopeRegistry,
+    slot: u64,
 ) -> Result<Option<NodeRecord>, TopoError> {
-    let k = node_key(id);
+    let k = slot_key(slot);
     match table.get(k.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            let mut rec = crate::disk::node_from_disk(disk, dicts)?;
-            rec.embedding = read_embedding(embeddings, id)?;
+            let mut rec = crate::disk::node_from_disk_v3(disk, dicts, scopes)?;
+            rec.embedding = read_embedding(embeddings, slot)?;
             Ok(Some(rec))
         }
     }
 }
+/// ULID-keyed NODES fetch: resolves `id` -> slot via `node_slots` first (a
+/// miss here just means the node doesn't exist — same "not found" semantics
+/// as the old direct ULID lookup), then delegates to `read_node_by_slot`.
+fn read_node(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    dicts: &Dicts,
+    scopes: &ScopeRegistry,
+    node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: NodeId,
+) -> Result<Option<NodeRecord>, TopoError> {
+    let Some(slot) = crate::slots::node_slot(node_slots, id)? else {
+        return Ok(None);
+    };
+    read_node_by_slot(table, embeddings, dicts, scopes, slot)
+}
+/// ULID-keyed EDGES fetch: resolves `id` -> slot via `edge_slots` first (a
+/// miss means the edge doesn't exist), then reads by slot key and resolves
+/// `from`/`to` back to ULIDs via `node_ids`.
 fn read_edge(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     dicts: &Dicts,
+    scopes: &ScopeRegistry,
+    edge_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    node_ids: &impl ReadableTable<&'static [u8], &'static [u8]>,
     id: EdgeId,
 ) -> Result<Option<EdgeRecord>, TopoError> {
-    let k = edge_key(id);
+    let Some(slot) = crate::slots::edge_slot(edge_slots, id)? else {
+        return Ok(None);
+    };
+    let k = slot_key(slot);
     match table.get(k.as_slice()).map_err(storage_err)? {
         None => Ok(None),
         Some(v) => {
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            Ok(Some(crate::disk::edge_from_disk(disk, dicts)?))
+            Ok(Some(crate::disk::edge_from_disk_v3(
+                disk, dicts, scopes, node_ids,
+            )?))
         }
     }
 }
+/// Writes `rec` under its own (already-allocated) node slot. The slot must
+/// already exist by the time this is called on every call path (CreateNode
+/// allocates it just above; SetNodeProps/SetEmbedding only reach here after
+/// a successful `read_node`, which itself required the slot to resolve) — a
+/// miss here is corruption, not a "not found" outcome.
+#[allow(clippy::too_many_arguments)]
 fn put_node(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
     dict: &mut Table<'_, &'static [u8], &'static str>,
     dicts: &mut Dicts,
+    scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scopes: &mut ScopeRegistry,
+    node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
     rec: &NodeRecord,
 ) -> Result<(), TopoError> {
-    let raw = postcard::to_allocvec(&crate::disk::node_to_disk(rec, dict, dicts)?)
-        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let slot = crate::slots::node_slot(node_slots, rec.id)?
+        .ok_or_else(|| TopoError::Encoding("put_node: missing node slot".into()))?;
+    let raw = postcard::to_allocvec(&crate::disk::node_to_disk_v3(
+        rec,
+        dict,
+        dicts,
+        scopes_table,
+        scopes,
+    )?)
+    .map_err(|e| TopoError::Encoding(e.to_string()))?;
     let f = crate::codec::frame_value(raw);
     table
-        .insert(node_key(rec.id).as_slice(), f.as_slice())
+        .insert(slot_key(slot).as_slice(), f.as_slice())
         .map_err(storage_err)?;
     Ok(())
 }
+/// See `put_node`; same "slot must already exist" invariant, via `edge_slots`.
+#[allow(clippy::too_many_arguments)]
 fn put_edge(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
     dict: &mut Table<'_, &'static [u8], &'static str>,
     dicts: &mut Dicts,
+    scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scopes: &mut ScopeRegistry,
+    edge_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
     rec: &EdgeRecord,
 ) -> Result<(), TopoError> {
-    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk(rec, dict, dicts)?)
-        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let slot = crate::slots::edge_slot(edge_slots, rec.id)?
+        .ok_or_else(|| TopoError::Encoding("put_edge: missing edge slot".into()))?;
+    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk_v3(
+        rec,
+        dict,
+        dicts,
+        scopes_table,
+        scopes,
+        node_slots,
+    )?)
+    .map_err(|e| TopoError::Encoding(e.to_string()))?;
     let f = crate::codec::frame_value(raw);
     table
-        .insert(edge_key(rec.id).as_slice(), f.as_slice())
+        .insert(slot_key(slot).as_slice(), f.as_slice())
         .map_err(storage_err)?;
     Ok(())
 }
 fn put_embedding(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
     id: NodeId,
     model: &str,
     vector: &[f32],
 ) -> Result<(), TopoError> {
+    let slot = crate::slots::node_slot(node_slots, id)?
+        .ok_or_else(|| TopoError::Encoding("put_embedding: missing node slot".into()))?;
     let raw =
         postcard::to_allocvec(&(model, vector)).map_err(|e| TopoError::Encoding(e.to_string()))?;
     let f = crate::codec::frame_value(raw);
     table
-        .insert(node_key(id).as_slice(), f.as_slice())
+        .insert(slot_key(slot).as_slice(), f.as_slice())
         .map_err(storage_err)?;
     Ok(())
 }
@@ -1303,7 +1469,8 @@ fn apply_op(
     edge_ids: &mut Table<'_, &'static [u8], &'static [u8]>,
     out_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
     in_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
-    scope_registry: &ScopeRegistry,
+    scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    scope_registry: &mut ScopeRegistry,
     op: &Op,
 ) -> Result<(), TopoError> {
     match op {
@@ -1321,12 +1488,21 @@ fn apply_op(
                 props: props.clone(),
                 embedding: None,
             };
-            put_node(nodes, dict, dicts, &rec)
+            put_node(
+                nodes,
+                dict,
+                dicts,
+                scopes_table,
+                scope_registry,
+                node_slots,
+                &rec,
+            )
         }
         Op::SetNodeProps { id, props } => {
-            let mut rec = read_node(nodes, embeddings, dicts, *id)?.ok_or_else(|| {
-                TopoError::Rejected(format!("SetNodeProps: node {id:?} not found"))
-            })?;
+            let mut rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?
+                .ok_or_else(|| {
+                    TopoError::Rejected(format!("SetNodeProps: node {id:?} not found"))
+                })?;
             for (k, v) in props {
                 match v {
                     Some(val) => {
@@ -1337,72 +1513,69 @@ fn apply_op(
                     }
                 }
             }
-            put_node(nodes, dict, dicts, &rec)
+            put_node(
+                nodes,
+                dict,
+                dicts,
+                scopes_table,
+                scope_registry,
+                node_slots,
+                &rec,
+            )
         }
         Op::SetEmbedding { id, model, vector } => {
-            read_node(nodes, embeddings, dicts, *id)?.ok_or_else(|| {
-                TopoError::Rejected(format!("SetEmbedding: node {id:?} not found"))
-            })?;
-            put_embedding(embeddings, *id, model, vector)
+            read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?.ok_or_else(
+                || TopoError::Rejected(format!("SetEmbedding: node {id:?} not found")),
+            )?;
+            put_embedding(embeddings, node_slots, *id, model, vector)
         }
         Op::RemoveNode { id } => {
-            let key = node_key(*id);
+            let removed_slot = crate::slots::node_slot(node_slots, *id)?
+                .ok_or_else(|| TopoError::Rejected(format!("RemoveNode: node {id:?} not found")))?;
+            let key = slot_key(removed_slot);
             let removed = nodes.remove(key.as_slice()).map_err(storage_err)?;
             if removed.is_none() {
-                return Err(TopoError::Rejected(format!(
-                    "RemoveNode: node {id:?} not found"
-                )));
+                return Err(TopoError::Encoding(
+                    "RemoveNode: node slot present but record row missing".into(),
+                ));
             }
 
-            let removed_slot = crate::slots::node_slot(node_slots, *id)?
-                .ok_or_else(|| TopoError::Encoding("missing node slot".into()))?;
             embeddings.remove(key.as_slice()).map_err(storage_err)?;
             adj_remove_all(out_adj, removed_slot)?;
             adj_remove_all(in_adj, removed_slot)?;
             remove_node_mapping(node_slots, node_ids, *id)?;
             // Remove incident edges, both directions. v0.1: linear scan is
-            // acceptable; adjacency-assisted delete arrives with Task 5.
-            let mut incident = Vec::new();
+            // acceptable; adjacency-assisted delete arrives with Task 5. EDGES
+            // rows already carry slot-valued from/to (v3 layout), so this
+            // compares directly against `removed_slot` — no ULID resolution
+            // needed for the scan or the cascade below.
+            let mut incident: Vec<(u64, EdgeId, u32, u64, u64)> = Vec::new();
             for entry in edges.iter().map_err(storage_err)? {
                 let (k, v) = entry.map_err(storage_err)?;
                 let raw = crate::codec::unframe_value(v.value())?;
-                let disk = postcard::from_bytes(raw.as_ref())
+                let disk: crate::disk::EdgeRecordDiskV3 = postcard::from_bytes(raw.as_ref())
                     .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                let rec = crate::disk::edge_from_disk(disk, dicts)?;
-                if rec.from == *id || rec.to == *id {
-                    incident.push(k.value().to_vec());
+                if disk.from == removed_slot || disk.to == removed_slot {
+                    let key_bytes: [u8; 8] = k
+                        .value()
+                        .try_into()
+                        .map_err(|_| TopoError::Encoding("bad edge slot key".into()))?;
+                    incident.push((
+                        u64::from_be_bytes(key_bytes),
+                        disk.id,
+                        disk.ty,
+                        disk.from,
+                        disk.to,
+                    ));
                 }
             }
-            for key in incident {
-                let edge = {
-                    let raw = edges
-                        .get(key.as_slice())
-                        .map_err(storage_err)?
-                        .ok_or_else(|| TopoError::Encoding("incident edge vanished".into()))?;
-                    let payload = crate::codec::unframe_value(raw.value())?;
-                    let disk = postcard::from_bytes(payload.as_ref())
-                        .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                    crate::disk::edge_from_disk(disk, dicts)?
-                };
-                let edge_slot = crate::slots::edge_slot(edge_slots, edge.id)?
-                    .ok_or_else(|| TopoError::Encoding("missing cascade edge slot".into()))?;
-                let from_slot = if edge.from == *id {
-                    removed_slot
-                } else {
-                    crate::slots::node_slot(node_slots, edge.from)?
-                        .ok_or_else(|| TopoError::Encoding("missing cascade from slot".into()))?
-                };
-                let to_slot = if edge.to == *id {
-                    removed_slot
-                } else {
-                    crate::slots::node_slot(node_slots, edge.to)?
-                        .ok_or_else(|| TopoError::Encoding("missing cascade to slot".into()))?
-                };
-                let edge_type = dicts.intern(dict, DictKind::EdgeType, edge.ty.as_str())?;
+            for (edge_slot, edge_id, edge_type, from_slot, to_slot) in incident {
                 adj_remove_edge(out_adj, from_slot, edge_type, edge_slot)?;
                 adj_remove_edge(in_adj, to_slot, edge_type, edge_slot)?;
-                edges.remove(key.as_slice()).map_err(storage_err)?;
-                remove_edge_mapping(edge_slots, edge_ids, edge.id)?;
+                edges
+                    .remove(slot_key(edge_slot).as_slice())
+                    .map_err(storage_err)?;
+                remove_edge_mapping(edge_slots, edge_ids, edge_id)?;
             }
             Ok(())
         }
@@ -1415,12 +1588,14 @@ fn apply_op(
             props,
             valid_from,
         } => {
-            let from_rec = read_node(nodes, embeddings, dicts, *from)?.ok_or_else(|| {
-                TopoError::Rejected(format!("CreateEdge {id:?}: from node {from:?} not found"))
-            })?;
-            let to_rec = read_node(nodes, embeddings, dicts, *to)?.ok_or_else(|| {
-                TopoError::Rejected(format!("CreateEdge {id:?}: to node {to:?} not found"))
-            })?;
+            let from_rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *from)?
+                .ok_or_else(|| {
+                    TopoError::Rejected(format!("CreateEdge {id:?}: from node {from:?} not found"))
+                })?;
+            let to_rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *to)?
+                .ok_or_else(|| {
+                    TopoError::Rejected(format!("CreateEdge {id:?}: to node {to:?} not found"))
+                })?;
             if from_rec.scope != to_rec.scope
                 && from_rec.scope != Scope::Shared
                 && to_rec.scope != Scope::Shared
@@ -1447,7 +1622,16 @@ fn apply_op(
                     .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)"),
                 valid_to: None,
             };
-            put_edge(edges, dict, dicts, &rec)?;
+            put_edge(
+                edges,
+                dict,
+                dicts,
+                scopes_table,
+                scope_registry,
+                edge_slots,
+                node_slots,
+                &rec,
+            )?;
             let entry = AdjEntryDisk {
                 target: to_slot,
                 edge: edge_slot,
@@ -1470,7 +1654,7 @@ fn apply_op(
             )
         }
         Op::CloseEdge { id, valid_to } => {
-            let mut rec = read_edge(edges, dicts, *id)?
+            let mut rec = read_edge(edges, dicts, scope_registry, edge_slots, node_ids, *id)?
                 .ok_or_else(|| TopoError::Rejected(format!("CloseEdge: edge {id:?} not found")))?;
             if rec.valid_to.is_some() {
                 return Err(TopoError::Rejected(format!(
@@ -1481,7 +1665,16 @@ fn apply_op(
                 valid_to
                     .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)"),
             );
-            put_edge(edges, dict, dicts, &rec)?;
+            put_edge(
+                edges,
+                dict,
+                dicts,
+                scopes_table,
+                scope_registry,
+                edge_slots,
+                node_slots,
+                &rec,
+            )?;
             let edge_slot = crate::slots::edge_slot(edge_slots, *id)?
                 .ok_or_else(|| TopoError::Encoding("missing edge slot".into()))?;
             let from_slot = crate::slots::node_slot(node_slots, rec.from)?
