@@ -11,7 +11,7 @@
 // would leave the server silently never starting).
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { serverArgs } from "./server-args.js";
 
@@ -63,11 +63,51 @@ function resolveServer(dataDir) {
     // changes this to "inherit" (to show install progress), npm's chatter
     // would be interleaved into that stream and corrupt the protocol on
     // every first run. stderr is safe to inherit for diagnostics.
-    const res = spawnSync(
-      process.platform === "win32" ? "npm.cmd" : "npm",
-      ["install", "--prefix", dataDir, "--no-audit", "--no-fund", `${SERVER_PKG}@${SERVER_VERSION}`],
-      { stdio: ["ignore", "ignore", "inherit"] },
-    );
+    const npmArgs = ["install", "--prefix", dataDir, "--no-audit", "--no-fund", `${SERVER_PKG}@${SERVER_VERSION}`];
+    const stdio = ["ignore", "ignore", "inherit"];
+    let res;
+    if (process.platform === "win32") {
+      // DO NOT spawn "npm.cmd" directly without shell:true. On Node
+      // 20.12+/22+/24 (the CVE-2024-27980 hardening) spawning a .cmd/.bat
+      // file with an argv array and no shell throws EINVAL — this is exactly
+      // the bug this comment exists to prevent from coming back. Every
+      // Windows user's first-run install broke on this before the fix below.
+      //
+      // The naive counter-fix — just add shell:true — trades EINVAL for a
+      // WORSE, silent bug: with shell:true, Node only *concatenates* argv
+      // into a command string, it does not quote it. CLAUDE_PLUGIN_DATA
+      // resolves under the user's home directory, which routinely contains
+      // spaces (e.g. "C:\Users\Andrew Smith\..."); unquoted, cmd.exe splits
+      // that path into separate words and npm installs into a truncated,
+      // WRONG directory with exit code 0 — no error, just data silently
+      // landing somewhere else. Verified empirically while fixing this: an
+      // unquoted `--prefix "C:\...\space test dir"` landed in
+      // "C:\...\space\node_modules" instead.
+      //
+      // Instead: run node itself against npm's own CLI entry point. This is
+      // NOT a hack — it's the same file npm.cmd itself execs (see npm.cmd's
+      // own `%~dp0\node_modules\npm\bin\npm-cli.js` resolution, where %~dp0
+      // is npm.cmd's own directory, i.e. the same directory as node.exe).
+      // Spawning it via [process.execPath, npmCliJs, ...args] needs no shell
+      // at all, so Node's normal (correct, no-shell) Windows argv escaping
+      // applies and spaced paths just work — verified empirically too.
+      //
+      // Fall back to shell:true with each arg manually double-quoted only if
+      // that bundled npm-cli.js isn't where every standard Windows Node
+      // install (official installer, nvm-windows, volta, scoop, ...) puts
+      // it — i.e. only for a genuinely unusual npm layout.
+      const npmCliJs = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+      if (existsSync(npmCliJs)) {
+        res = spawnSync(process.execPath, [npmCliJs, ...npmArgs], { stdio });
+      } else {
+        const quote = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
+        res = spawnSync("npm.cmd", npmArgs.map(quote), { shell: true, stdio });
+      }
+    } else {
+      // POSIX: "npm" is a plain shebang script, not a .cmd — no EINVAL, no
+      // shell needed, argv spaces are handled correctly by spawnSync as-is.
+      res = spawnSync("npm", npmArgs, { stdio });
+    }
     if (res.status !== 0) {
       throw new Error(`failed to install ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir}`);
     }
