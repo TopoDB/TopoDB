@@ -429,6 +429,17 @@ impl Storage {
             bytes(&tx, FTS_DOCS, "fts_docs")?,
             bytes(&tx, FTS_STATS, "fts_stats")?,
             bytes(&tx, COUNTERS, "counters")?,
+            // v3 tables (chunked adjacency, dense slot maps, prop equality
+            // index, scope registry) — added for the v3 size gate, which
+            // needs edges+out_adj+in_adj split out (see BENCHMARKS.md v3).
+            bytes(&tx, OUT_ADJ, "out_adj")?,
+            bytes(&tx, IN_ADJ, "in_adj")?,
+            bytes(&tx, PROP_INDEX, "prop_index")?,
+            bytes(&tx, NODE_SLOTS, "node_slots")?,
+            bytes(&tx, NODE_IDS, "node_ids")?,
+            bytes(&tx, EDGE_SLOTS, "edge_slots")?,
+            bytes(&tx, EDGE_IDS, "edge_ids")?,
+            bytes(&tx, SCOPES, "scopes")?,
         ];
         let dict = tx.open_table(DICT).map_err(storage_err)?;
         let mut dict_report = TableReport {
