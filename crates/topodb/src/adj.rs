@@ -249,6 +249,39 @@ pub(crate) fn adj_insert(
     }
 }
 
+/// Reads every adjacency entry stored under `slot`, optionally restricted to
+/// `edge_types`, returning `(edge_type, entry)` pairs — the read path
+/// (`read.rs`) needs the type alongside each entry (e.g. to build
+/// `EdgeRecord`-shaped results downstream). With a type filter this is one
+/// bounded range scan per requested type (`type_chunk_keys`, 12-byte
+/// `(slot, type)` prefix); without one, a single bounded scan over the whole
+/// `slot` prefix (`slot_chunk_keys`, 8 bytes), pulling each entry's type back
+/// out of its chunk key via `key_parts`. Never a full-table iteration.
+pub(crate) fn read_adj(
+    table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    slot: u64,
+    edge_types: Option<&[u32]>,
+) -> Result<Vec<(u32, AdjEntryDisk)>, TopoError> {
+    let mut out = Vec::new();
+    match edge_types {
+        Some(types) => {
+            for &edge_type in types {
+                for key in type_chunk_keys(table, slot, edge_type)? {
+                    out.extend(load_chunk(table, key)?.into_iter().map(|e| (edge_type, e)));
+                }
+            }
+        }
+        None => {
+            for key in slot_chunk_keys(table, slot)? {
+                let (_, edge_type, _) = key_parts(&key)
+                    .ok_or_else(|| TopoError::Encoding("bad adjacency key".into()))?;
+                out.extend(load_chunk(table, key)?.into_iter().map(|e| (edge_type, e)));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn adj_close(
     table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     slot: u64,

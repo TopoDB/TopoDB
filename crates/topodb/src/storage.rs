@@ -1422,6 +1422,29 @@ fn read_node(
         ))),
     }
 }
+/// Direct slot-keyed EDGES fetch — mirrors `read_node_by_slot`. Used by the
+/// traversal read path (`read.rs`), which already has the edge's slot from
+/// an adjacency entry and has no ULID to resolve through `EDGE_SLOTS`.
+pub(crate) fn read_edge_by_slot(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    dicts: &Dicts,
+    scopes: &ScopeRegistry,
+    node_ids: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    slot: u64,
+) -> Result<Option<EdgeRecord>, TopoError> {
+    let k = slot_key(slot);
+    match table.get(k.as_slice()).map_err(storage_err)? {
+        None => Ok(None),
+        Some(v) => {
+            let raw = crate::codec::unframe_value(v.value())?;
+            let disk = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            Ok(Some(crate::disk::edge_from_disk_v3(
+                disk, dicts, scopes, node_ids,
+            )?))
+        }
+    }
+}
 /// ULID-keyed EDGES fetch, same two-cause miss split as `read_node` (via
 /// EDGE_SLOTS/EDGES): no mapping is `Ok(None)` ordinary not-found, a mapping
 /// whose slot has no record row is `Encoding` corruption. Resolves
@@ -1437,19 +1460,11 @@ fn read_edge(
     let Some(slot) = crate::slots::edge_slot(edge_slots, id)? else {
         return Ok(None);
     };
-    let k = slot_key(slot);
-    match table.get(k.as_slice()).map_err(storage_err)? {
+    match read_edge_by_slot(table, dicts, scopes, node_ids, slot)? {
+        Some(rec) => Ok(Some(rec)),
         None => Err(TopoError::Encoding(format!(
             "edge slot mapping without record row: {id}"
         ))),
-        Some(v) => {
-            let raw = crate::codec::unframe_value(v.value())?;
-            let disk = postcard::from_bytes(raw.as_ref())
-                .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            Ok(Some(crate::disk::edge_from_disk_v3(
-                disk, dicts, scopes, node_ids,
-            )?))
-        }
     }
 }
 /// Writes `rec` under its own (already-allocated) node slot. The slot must
