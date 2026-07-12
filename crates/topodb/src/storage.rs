@@ -788,18 +788,32 @@ impl Storage {
         })
     }
 
-    pub(crate) fn load_node_by_slot(&self, slot: u64) -> Result<Option<NodeRecord>, TopoError> {
+    /// One-transaction indexed lookup: PROP_INDEX prefix scan + record fetches
+    /// share a single `begin_read`, so the result is one consistent view — a
+    /// node whose indexed prop changed between two separate txns can never be
+    /// returned as a stale match.
+    pub(crate) fn load_nodes_by_index(
+        &self,
+        prop_key: u32,
+        value: &crate::index::IndexValue,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
+        let index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+        let slots = crate::prop_index::lookup(&index, prop_key, value)?;
+        drop(index);
         let node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
-        match crate::slots::node_ulid(&node_ids, slot)? {
-            Some(id) => {
-                let table = tx.open_table(NODES).map_err(storage_err)?;
-                let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
-                let dicts = self.dicts.read().expect("dict lock poisoned");
-                read_node(&table, &embeddings, &dicts, id)
+        let nodes = tx.open_table(NODES).map_err(storage_err)?;
+        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        let mut out = Vec::new();
+        for slot in slots {
+            if let Some(id) = crate::slots::node_ulid(&node_ids, slot)? {
+                if let Some(rec) = read_node(&nodes, &embeddings, &dicts, id)? {
+                    out.push(rec);
+                }
             }
-            None => Ok(None),
         }
+        Ok(out)
     }
 
     /// Same rationale/`#[allow(dead_code)]` as `format_version` above:

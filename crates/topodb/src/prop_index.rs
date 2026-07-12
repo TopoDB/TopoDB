@@ -46,10 +46,20 @@ pub(crate) fn lookup(
     value: &IndexValue,
 ) -> Result<Vec<u64>, TopoError> {
     let prefix = index_prefix(prop_key, value);
+    let mut start = prefix.clone();
+    start.extend_from_slice(&0u64.to_be_bytes());
+    let mut end = prefix.clone();
+    end.extend_from_slice(&u64::MAX.to_be_bytes());
     let mut out = Vec::new();
-    for entry in table.iter().map_err(storage_err)? {
+    for entry in table
+        .range(start.as_slice()..=end.as_slice())
+        .map_err(storage_err)?
+    {
         let (k, _) = entry.map_err(storage_err)?;
         let key = k.value();
+        // Load-bearing: a longer Str/Bytes value sharing `prefix` (e.g. "ab"
+        // vs "abc") produces keys that fall INSIDE this byte range — only the
+        // length check excludes them.
         if key.starts_with(&prefix) && key.len() == prefix.len() + 8 {
             out.push(u64::from_be_bytes(
                 key[prefix.len()..].try_into().expect("slot suffix"),
@@ -116,5 +126,44 @@ mod tests {
     fn signed_keys_sort() {
         assert!(index_key(1, &IndexValue::Int(-1), 0) < index_key(1, &IndexValue::Int(0), 0));
         assert!(index_key(1, &IndexValue::Int(0), 0) < index_key(1, &IndexValue::Int(1), 0));
+    }
+
+    /// Pins that the bounded range scan in `lookup` still excludes a longer
+    /// value sharing the shorter value's byte prefix (e.g. "ab" vs "abc") —
+    /// the `key.len() == prefix.len() + 8` guard is load-bearing, not the
+    /// range bounds alone.
+    #[test]
+    fn lookup_excludes_longer_value_sharing_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("t.redb")).unwrap();
+        let prop_key = 7u32;
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(PROP_INDEX).unwrap();
+            table
+                .insert(
+                    index_key(prop_key, &IndexValue::Str("ab".into()), 1).as_slice(),
+                    &[] as &[u8],
+                )
+                .unwrap();
+            table
+                .insert(
+                    index_key(prop_key, &IndexValue::Str("abc".into()), 2).as_slice(),
+                    &[] as &[u8],
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_read().unwrap();
+        let table = tx.open_table(PROP_INDEX).unwrap();
+        assert_eq!(
+            lookup(&table, prop_key, &IndexValue::Str("ab".into())).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            lookup(&table, prop_key, &IndexValue::Str("abc".into())).unwrap(),
+            vec![2]
+        );
     }
 }

@@ -118,25 +118,12 @@ impl Db {
         let Some(prop_key) = dicts.id_of(crate::dict::DictKind::PropKey, prop) else {
             return Ok(Vec::new());
         };
-        let tx = self
-            .storage()
-            .db
-            .begin_read()
-            .map_err(crate::error::storage_err)?;
-        let index = tx
-            .open_table(crate::prop_index::PROP_INDEX)
-            .map_err(crate::error::storage_err)?;
-        let slots = crate::prop_index::lookup(&index, prop_key, &iv)?;
-        drop(index);
-        drop(tx);
-        let mut hits = Vec::new();
-        for slot in slots {
-            if let Some(node) = self.storage().load_node_by_slot(slot)? {
-                if node.label == label && scopes.contains(node.scope) {
-                    hits.push(node);
-                }
-            }
-        }
+        drop(dicts);
+        let candidates = self.storage().load_nodes_by_index(prop_key, &iv)?;
+        let hits: Vec<NodeRecord> = candidates
+            .into_iter()
+            .filter(|node| node.label == label && scopes.contains(node.scope))
+            .collect();
         self.bump(hits.iter().map(|node| node.id));
         Ok(hits)
     }

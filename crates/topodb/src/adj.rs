@@ -1,6 +1,5 @@
 //! Versioned delta-varint adjacency block payloads for format v3.
 use crate::error::TopoError;
-use redb::ReadableTable;
 
 pub(crate) const ADJ_BLOCK_FORMAT_V0: u8 = 0;
 pub(crate) const CHUNK_SPLIT_TARGET: usize = 8 * 1024;
@@ -151,6 +150,44 @@ fn key_parts(key: &[u8]) -> Option<(u64, u32, u32)> {
     ))
 }
 
+/// Chunk keys under `(slot, edge_type)`, in chunk order — a bounded range scan
+/// over the 12-byte prefix, never a table iteration.
+fn type_chunk_keys(
+    table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    slot: u64,
+    edge_type: u32,
+) -> Result<Vec<[u8; 16]>, TopoError> {
+    let start = out_adj_key(slot, edge_type, 0);
+    let end = out_adj_key(slot, edge_type, u32::MAX);
+    let mut keys = Vec::new();
+    for item in table
+        .range(start.as_slice()..=end.as_slice())
+        .map_err(crate::error::storage_err)?
+    {
+        let (key, _) = item.map_err(crate::error::storage_err)?;
+        keys.push(key.value().try_into().expect("table key width"));
+    }
+    Ok(keys)
+}
+
+/// Chunk keys under `slot` (every edge type) — bounded by the 8-byte prefix.
+fn slot_chunk_keys(
+    table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    slot: u64,
+) -> Result<Vec<[u8; 16]>, TopoError> {
+    let start = out_adj_key(slot, 0, 0);
+    let end = out_adj_key(slot, u32::MAX, u32::MAX);
+    let mut keys = Vec::new();
+    for item in table
+        .range(start.as_slice()..=end.as_slice())
+        .map_err(crate::error::storage_err)?
+    {
+        let (key, _) = item.map_err(crate::error::storage_err)?;
+        keys.push(key.value().try_into().expect("table key width"));
+    }
+    Ok(keys)
+}
+
 fn load_chunk(
     table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
     key: [u8; 16],
@@ -186,16 +223,11 @@ pub(crate) fn adj_insert(
     edge_type: u32,
     entry: AdjEntryDisk,
 ) -> Result<(), TopoError> {
-    let mut last = None;
-    for item in table.iter().map_err(crate::error::storage_err)? {
-        let (key, _) = item.map_err(crate::error::storage_err)?;
-        if let Some((found_slot, found_type, chunk)) = key_parts(key.value()) {
-            if found_slot == slot && found_type == edge_type {
-                last = Some(last.map_or(chunk, |previous: u32| previous.max(chunk)));
-            }
-        }
-    }
-    let chunk = last.unwrap_or(0);
+    let chunk = type_chunk_keys(table, slot, edge_type)?
+        .last()
+        .and_then(|key| key_parts(key))
+        .map(|(_, _, chunk)| chunk)
+        .unwrap_or(0);
     let key = out_adj_key(slot, edge_type, chunk);
     let mut entries = load_chunk(table, key)?;
     let at = entries
@@ -224,15 +256,8 @@ pub(crate) fn adj_close(
     edge_slot: u64,
     valid_to: i64,
 ) -> Result<bool, TopoError> {
-    let mut keys = Vec::new();
-    for item in table.iter().map_err(crate::error::storage_err)? {
-        let (key, _) = item.map_err(crate::error::storage_err)?;
-        if key_parts(key.value()).is_some_and(|(s, ty, _)| s == slot && ty == edge_type) {
-            keys.push(key.value().to_vec());
-        }
-    }
-    for bytes in keys {
-        let key: [u8; 16] = bytes.as_slice().try_into().expect("table key width");
+    let keys = type_chunk_keys(table, slot, edge_type)?;
+    for key in keys {
         let mut entries = load_chunk(table, key)?;
         if let Some(entry) = entries.iter_mut().find(|entry| entry.edge == edge_slot) {
             entry.valid_to = Some(valid_to);
@@ -249,15 +274,8 @@ pub(crate) fn adj_remove_edge(
     edge_type: u32,
     edge_slot: u64,
 ) -> Result<bool, TopoError> {
-    let mut keys = Vec::new();
-    for item in table.iter().map_err(crate::error::storage_err)? {
-        let (key, _) = item.map_err(crate::error::storage_err)?;
-        if key_parts(key.value()).is_some_and(|(s, ty, _)| s == slot && ty == edge_type) {
-            keys.push(key.value().to_vec());
-        }
-    }
-    for bytes in keys {
-        let key: [u8; 16] = bytes.as_slice().try_into().expect("table key width");
+    let keys = type_chunk_keys(table, slot, edge_type)?;
+    for key in keys {
         let mut entries = load_chunk(table, key)?;
         let before = entries.len();
         entries.retain(|entry| entry.edge != edge_slot);
@@ -279,16 +297,9 @@ pub(crate) fn adj_remove_all(
     table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     slot: u64,
 ) -> Result<Vec<AdjEntryDisk>, TopoError> {
-    let mut keys = Vec::new();
-    for item in table.iter().map_err(crate::error::storage_err)? {
-        let (key, _) = item.map_err(crate::error::storage_err)?;
-        if key_parts(key.value()).is_some_and(|(s, _, _)| s == slot) {
-            keys.push(key.value().to_vec());
-        }
-    }
+    let keys = slot_chunk_keys(table, slot)?;
     let mut entries = Vec::new();
-    for bytes in keys {
-        let key: [u8; 16] = bytes.as_slice().try_into().expect("table key width");
+    for key in keys {
         entries.extend(load_chunk(table, key)?);
         table
             .remove(key.as_slice())
@@ -301,6 +312,82 @@ pub(crate) fn adj_remove_all(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn entry(target: u64, edge: u64) -> AdjEntryDisk {
+        AdjEntryDisk {
+            target,
+            edge,
+            scope: 0,
+            valid_from: 0,
+            valid_to: None,
+        }
+    }
+
+    /// Pins prefix isolation for the bounded range scans: `adj_remove_all`
+    /// touches only its slot's chunks, and `adj_close` on one `(slot, type)`
+    /// leaves an unrelated `(slot, type)` chunk's stored bytes untouched.
+    #[test]
+    fn range_scans_are_prefix_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("t.redb")).unwrap();
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(OUT_ADJ).unwrap();
+            adj_insert(&mut table, 1, 1, entry(10, 100)).unwrap();
+            adj_insert(&mut table, 1, 2, entry(20, 200)).unwrap();
+            adj_insert(&mut table, 2, 1, entry(30, 300)).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let before_1_2 = {
+            let tx = db.begin_read().unwrap();
+            let table = tx.open_table(OUT_ADJ).unwrap();
+            load_chunk(&table, out_adj_key(1, 2, 0)).unwrap()
+        };
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(OUT_ADJ).unwrap();
+            assert!(adj_close(&mut table, 1, 1, 100, 999).unwrap());
+        }
+        tx.commit().unwrap();
+
+        let after_1_2 = {
+            let tx = db.begin_read().unwrap();
+            let table = tx.open_table(OUT_ADJ).unwrap();
+            load_chunk(&table, out_adj_key(1, 2, 0)).unwrap()
+        };
+        assert_eq!(
+            before_1_2, after_1_2,
+            "adj_close on (1,1) must not modify (1,2)'s stored bytes"
+        );
+
+        let tx = db.begin_write().unwrap();
+        let removed = {
+            let mut table = tx.open_table(OUT_ADJ).unwrap();
+            adj_remove_all(&mut table, 1).unwrap()
+        };
+        tx.commit().unwrap();
+
+        let mut removed_edges: Vec<u64> = removed.iter().map(|e| e.edge).collect();
+        removed_edges.sort_unstable();
+        assert_eq!(
+            removed_edges,
+            vec![100, 200],
+            "adj_remove_all(slot=1) must return exactly the slot-1 entries, both types"
+        );
+
+        let tx = db.begin_read().unwrap();
+        let table = tx.open_table(OUT_ADJ).unwrap();
+        let slot2_chunk = load_chunk(&table, out_adj_key(2, 1, 0)).unwrap();
+        assert_eq!(
+            slot2_chunk.iter().map(|e| e.edge).collect::<Vec<_>>(),
+            vec![300],
+            "slot-2's chunk must remain present after adj_remove_all(slot=1)"
+        );
+    }
+
     #[test]
     fn roundtrips_boundaries_and_key() {
         let entries = vec![
