@@ -22,8 +22,10 @@ export function encodeUlid(bytes) {
   }
   let n = 0n;
   for (const b of bytes) n = (n << 8n) | BigInt(b);
-  // 26 chars * 5 bits = 130 bits for a 128-bit value: the leading char carries
-  // only the top 2 bits, which is why a max ULID starts at '7' and not 'Z'.
+  // 26 chars * 5 bits = 130 bits for a 128-bit value: 2 of those bits are
+  // structurally always zero, so the leading char carries only 3 significant
+  // data bits (max value 0b00111 = 7), which is why a max ULID starts at '7'
+  // and not 'Z'.
   let out = "";
   for (let i = 25; i >= 0; i--) {
     out = ALPHABET[Number(n & 31n)] + out;
