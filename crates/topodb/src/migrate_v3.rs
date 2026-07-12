@@ -144,6 +144,9 @@ pub(crate) fn migrate_v2_to_v3(
     postings: &mut Table<'_, &'static [u8], &'static [u8]>,
     docs: &mut Table<'_, &'static [u8], &'static [u8]>,
     stats: &mut Table<'_, &'static [u8], &'static [u8]>,
+    vector_dims: &mut Table<'_, &'static [u8], &'static [u8]>,
+    vectors: &mut Table<'_, &'static [u8], &'static [u8]>,
+    embedding_ref: &mut Table<'_, &'static [u8], &'static [u8]>,
 ) -> Result<(), TopoError> {
     let (node_rows, edge_rows) = collect_v2_rows(nodes, edges, dicts)?;
 
@@ -219,6 +222,38 @@ pub(crate) fn migrate_v2_to_v3(
             embeddings
                 .insert(crate::storage::slot_key(slot).as_slice(), bytes.as_slice())
                 .map_err(storage_err)?;
+            // v4 dual-write (Task 5 fix): the old `embeddings` row above is
+            // byte-identical to what `put_embedding` writes on the live path
+            // — `frame_value(postcard(model: String, vector: Vec<f32>))` —
+            // so it decodes the same way `read_embedding` does. Without this,
+            // a migrated file's embeddings would exist only in the
+            // still-authoritative v3 `embeddings` table and never in the v4
+            // `vectors`/`embedding_ref` tables `Db::search_vector` now reads
+            // exclusively (see `tests/format_fixture.rs`, which caught this:
+            // the old RAM-slab read path didn't care, since it scanned
+            // `embeddings` directly at open time regardless of migration
+            // provenance). Mirrors `apply_op`'s `SetEmbedding` arm exactly:
+            // intern the model name, pin/check its dim, then dual-write.
+            let raw = crate::codec::unframe_value(bytes)?;
+            let (model, vector): (String, Vec<f32>) = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let model_id = dicts.intern(dict_table, DictKind::Model, &model)?;
+            crate::storage::check_or_pin_dim(vector_dims, model_id, vector.len()).map_err(|e| {
+                match e {
+                    TopoError::Rejected(msg) => TopoError::Rejected(format!(
+                        "migrating embedding for model {model:?}: {msg}"
+                    )),
+                    other => other,
+                }
+            })?;
+            crate::vector_store::put_vector(
+                vectors,
+                embedding_ref,
+                model_id,
+                scope_id,
+                slot,
+                &vector,
+            )?;
         }
         if let Some(bytes) = old_counters.get(old_key.as_slice()) {
             counters
@@ -344,6 +379,9 @@ mod tests {
             let mut postings = tx.open_table(crate::storage::POSTINGS).unwrap();
             let mut docs = tx.open_table(crate::storage::FTS_DOCS).unwrap();
             let mut stats = tx.open_table(crate::storage::FTS_STATS).unwrap();
+            let mut vector_dims = tx.open_table(crate::storage::VECTOR_DIMS).unwrap();
+            let mut vectors = tx.open_table(crate::vector_store::VECTORS).unwrap();
+            let mut embedding_ref = tx.open_table(crate::vector_store::EMBEDDING_REF).unwrap();
             migrate_v2_to_v3(
                 Arc::new(IndexSpec {
                     equality: vec![PropIndex {
@@ -373,6 +411,9 @@ mod tests {
                 &mut postings,
                 &mut docs,
                 &mut stats,
+                &mut vector_dims,
+                &mut vectors,
+                &mut embedding_ref,
             )
             .unwrap();
             assert!(node_ids.iter().unwrap().next().is_some());

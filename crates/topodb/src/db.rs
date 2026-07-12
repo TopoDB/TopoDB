@@ -100,12 +100,6 @@ struct Inner {
     // applier must never hold a strong ref back to `Inner`, or `Drop` would
     // deadlock.
     subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
-    // Per-(model, scope) f32 embedding slabs. Held behind its own `Arc`
-    // (never captured via `Inner`, same rationale as `storage`/`subs`): the
-    // applier holds a clone and is the sole mutator of the outer slab map
-    // (slab creation, and the wholesale swap on rebuild); searches take short
-    // read locks. See `vector.rs` for the locking contract.
-    vectors: Arc<VectorIndex>,
 }
 
 impl Db {
@@ -351,17 +345,8 @@ impl Db {
                 subs,
                 bump_tx: Mutex::new(Some(bump_tx)),
                 bumper: Mutex::new(Some(bumper)),
-                vectors,
             }),
         })
-    }
-
-    /// The shared vector index. Cheap `Arc` clone; used by `search_vector`
-    /// (in `vector.rs`) to reach the slab map from an `impl Db` block in a
-    /// sibling module that can't touch `self.inner` directly.
-    #[must_use]
-    pub(crate) fn vectors(&self) -> Arc<VectorIndex> {
-        self.inner.vectors.clone()
     }
 
     /// The underlying storage. Used by `search_text` (in `fts.rs`) to open a

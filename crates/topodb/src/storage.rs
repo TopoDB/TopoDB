@@ -192,6 +192,12 @@ impl Storage {
                 let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
                 let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
                 let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+                // v4 dual-write targets for migrated embeddings — see
+                // `migrate_v2_to_v3`'s doc comment on the `old_embeddings`
+                // arm for why this is required, not optional.
+                let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+                let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+                let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
                 crate::migrate_v3::migrate_v2_to_v3(
                     spec.clone(),
                     &mut meta,
@@ -212,6 +218,9 @@ impl Storage {
                     &mut postings,
                     &mut docs,
                     &mut stats,
+                    &mut vector_dims,
+                    &mut vectors,
+                    &mut embedding_ref,
                 )?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
@@ -256,6 +265,12 @@ impl Storage {
                 let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
                 let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
                 let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+                // v4 dual-write targets for migrated embeddings — see
+                // `migrate_v2_to_v3`'s doc comment on the `old_embeddings`
+                // arm for why this is required, not optional.
+                let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+                let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+                let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
                 crate::migrate_v3::migrate_v2_to_v3(
                     spec.clone(),
                     &mut meta,
@@ -276,6 +291,9 @@ impl Storage {
                     &mut postings,
                     &mut docs,
                     &mut stats,
+                    &mut vector_dims,
+                    &mut vectors,
+                    &mut embedding_ref,
                 )?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
@@ -1754,7 +1772,11 @@ fn put_edge(
 /// present and equal -> `Ok`; present and different -> `Rejected` (naming
 /// the model id and both dims), which aborts the whole enclosing batch since
 /// the caller's write transaction never commits on an `Err` return.
-fn check_or_pin_dim(
+/// `pub(crate)` so `migrate_v3.rs`'s v1/v2 -> v3 migration can apply the SAME
+/// dim-pinning invariant while dual-writing historical embeddings into the
+/// v4 `vectors`/`embedding_ref` tables (mirrors `apply_op`'s `SetEmbedding`
+/// arm, which is the only other caller).
+pub(crate) fn check_or_pin_dim(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
     model_id: u32,
     dim: usize,

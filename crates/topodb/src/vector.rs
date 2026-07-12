@@ -1,49 +1,43 @@
-//! Graph-scoped vector search over per-`(model, scope)` contiguous f32 slabs.
+//! Per-`(model, scope)` RAM slab index — write-only as of Task 5.
 //!
 //! Each `(model, scope)` pair owns one [`Slab`]: a flat `Vec<f32>` where row
 //! `i` (`ids[i]`) is the embedding at `data[i*dim .. (i+1)*dim]`. Tombstoned
 //! rows keep their `data` in place (marked `ids[i] == None`) until a
 //! compaction pass rebuilds the slab.
 //!
+//! **Task 5: the read cutover.** `Db::search_vector` (below) no longer reads
+//! this index — it reads the v4 clustered `vectors`/`embedding_ref` tables
+//! via [`crate::vector_store::search_scan`] instead. The slab index stays
+//! alive and is still fully maintained by the applier thread (dim
+//! pre-validation via [`VectorIndex::prevalidate_dims`], and
+//! upsert/tombstone/compact via [`VectorIndex::maintain`]) — it's just no
+//! longer consulted by any read path.
+//!
 //! **Locking.** The [`VectorIndex`] outer map is mutated only by the applier
 //! thread (slab creation and, on rebuild, a wholesale swap). Each slab is
-//! mutated in place under its own `RwLock`; searches take short read locks.
-//! This is the *one* read path that is not lock-free: the spec's lock-free
-//! guarantee covers snapshot/adjacency reads, while slab write locks are held
-//! only for O(dim) per op on the applier, and slab read locks only for the
-//! duration of a single `top_k` scan.
+//! mutated in place under its own `RwLock`, held only for O(dim) per op on
+//! the applier — no read path takes these locks anymore.
 //!
 //! **Poisoned-lock policy.** Std `RwLock`/`Mutex` poisoning can only originate
 //! from a panic on the applier thread — the sole writer of the slabs map, the
 //! per-slab write locks, and the subs registry. After such a panic the engine
 //! is dead: `submit` already returns [`TopoError::Closed`] (its channel is
-//! gone). This module makes the READ paths agree rather than propagating the
-//! panic into the host: search-path lock acquisitions go through
-//! [`read_or_closed`], which maps a poisoned lock to `Err(Closed)`. Applier-side
-//! lock acquisitions keep `unwrap()` (a poison there means THIS thread already
-//! panicked — unreachable). Shutdown (`Drop for Inner` in `db.rs`) recovers
-//! poisoned mutexes via `into_inner` so threads are still joined.
+//! gone). Applier-side lock acquisitions keep `unwrap()` (a poison there
+//! means THIS thread already panicked — unreachable). Shutdown (`Drop for
+//! Inner` in `db.rs`) recovers poisoned mutexes via `into_inner` so threads
+//! are still joined. Now that no read path takes a slab lock, the
+//! `read_or_closed`-maps-poison-to-`Closed` mapping is exercised only by this
+//! module's own tests, below, directly against a bare `VectorIndex`.
 
 use crate::db::Db;
-use crate::error::TopoError;
+use crate::error::{storage_err, TopoError};
 use crate::ids::{NodeId, Scope, ScopeSet};
 use crate::op::Op;
 use crate::state::NodeRecord;
-use crate::storage::Storage;
+use crate::storage::{read_node_by_slot, Storage, EMBEDDINGS, NODES};
+use crate::vector_store::{search_scan, OrderedScore};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-
-/// Acquire a read lock, mapping a poisoned lock to [`TopoError::Closed`].
-///
-/// Poisoning is only reachable if the applier thread panicked while holding the
-/// write lock — at which point the engine is already dead — so on the read path
-/// the correct answer is `Closed`, not a propagated panic. See the module-level
-/// poisoned-lock policy.
-pub(crate) fn read_or_closed<T>(
-    l: &std::sync::RwLock<T>,
-) -> Result<std::sync::RwLockReadGuard<'_, T>, TopoError> {
-    l.read().map_err(|_| TopoError::Closed)
-}
 
 /// A vector-search request: cosine-rank the embeddings under `model` within
 /// `scopes` against `vector`, returning the top `k`.
@@ -143,59 +137,11 @@ impl Slab {
         self.row_of = new_row_of;
         self.dead = 0;
     }
-
-    /// Cosine-score every live row against `query` (skipping zero-norm rows and
-    /// any row filtered out by `filter`), returning the top `k` by descending
-    /// score. Callers guarantee `query.len() == self.dim`.
-    pub(crate) fn top_k(
-        &self,
-        query: &[f32],
-        k: usize,
-        filter: Option<&HashSet<NodeId>>,
-    ) -> Vec<(NodeId, f32)> {
-        let mut hits: Vec<(NodeId, f32)> = Vec::new();
-        for (row, slot) in self.ids.iter().enumerate() {
-            let Some(id) = slot else { continue };
-            if let Some(f) = filter {
-                if !f.contains(id) {
-                    continue;
-                }
-            }
-            let start = row * self.dim;
-            let vec = &self.data[start..start + self.dim];
-            if let Some(score) = cosine(vec, query) {
-                hits.push((*id, score));
-            }
-        }
-        hits.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        hits.truncate(k);
-        hits
-    }
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return None;
-    }
-    Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
 /// All slabs, keyed by (model, scope). Two-level locking: the outer map is
 /// only mutated by the applier (slab creation); each slab is mutated in
-/// place under its own RwLock — searches take short read locks. This is the
-/// one read path that is not lock-free; the spec's lock-free guarantee
-/// covers snapshot/adjacency reads, and slab write locks are held only for
-/// O(dim) per op on the applier.
+/// place under its own RwLock. Write-only as of Task 5 — see the module doc.
 pub(crate) struct VectorIndex {
     // Type shape is fixed by the task spec; the nested locks are the whole
     // point (outer map guards slab creation, inner lock guards each slab).
@@ -443,58 +389,69 @@ impl VectorIndex {
 impl Db {
     /// Cosine vector search under one `model`, scoped to `q.scopes`.
     ///
-    /// `Rejected` if `q.k == 0` or `q.vector` is empty. Collects the slabs
-    /// whose key matches `(q.model, scope ∈ q.scopes)`, skips any whose dim
-    /// differs from the query (defensive — pre-validation keeps a live slab's
-    /// dim uniform), scores each under a short read lock with the optional
-    /// candidate filter, merges, sorts descending, and truncates to `k`. Ids
-    /// are mapped to `NodeRecord` through a single storage read transaction;
-    /// an id storage no longer carries (the slab can be momentarily
-    /// ahead of/behind storage between locks) is dropped — harmless. Result
-    /// nodes are bumped (access counters, Task 4).
+    /// `Rejected` if `q.k == 0` or `q.vector` is empty. Task 5: reads the v4
+    /// clustered `vectors`/`embedding_ref` tables (`vector_store::search_scan`)
+    /// inside ONE `begin_read` transaction that also resolves the winning
+    /// slots straight to `NodeRecord`s via NODES/EMBEDDINGS — mirrors
+    /// `search_text`'s single-hop read (`fts.rs`), no separate snapshot. The
+    /// RAM slab index is write-only now (see the module doc); nothing here
+    /// touches it.
     ///
-    /// Returns [`TopoError::Closed`] if a slab lock is poisoned — reachable only
-    /// after the applier thread has panicked (the engine is already dead); see
-    /// the module-level poisoned-lock policy.
+    /// **Tie-break seam.** `search_scan` bounds each `(model, scope)`
+    /// cluster's scan through a k-heap that conservatively retains ties at
+    /// the boundary score rather than picking a winner by slot (creation)
+    /// order — slot order is NOT `NodeId`/ULID order. This function applies
+    /// the FINAL sort — score desc, `NodeId` asc, matching the old
+    /// `Slab::top_k`'s tie-break — only AFTER every surviving slot has been
+    /// resolved to its `NodeId`, and truncates to `k` only then. Doing the
+    /// tie-break before resolution (i.e. inside the heap, by slot) would risk
+    /// silently keeping the wrong side of a same-score tie.
+    ///
+    /// A resolved id storage no longer carries (removed between the scan and
+    /// the resolve, both inside the same transaction so this is only a
+    /// theoretical race with a concurrent writer's *next* transaction) is
+    /// dropped — harmless. Result nodes are bumped (access counters).
     pub fn search_vector(&self, q: &VectorQuery) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if q.k == 0 || q.vector.is_empty() {
             return Err(TopoError::Rejected(
                 "vector search requires k > 0 and a non-empty query vector".into(),
             ));
         }
-        let filter: Option<HashSet<NodeId>> =
-            q.candidates.as_ref().map(|c| c.iter().copied().collect());
 
-        let vectors = self.vectors();
-        let mut merged: Vec<(NodeId, f32)> = Vec::new();
-        {
-            let slabs = read_or_closed(&vectors.slabs)?;
-            for ((model, scope), arc) in slabs.iter() {
-                if model != &q.model || !q.scopes.contains(*scope) {
-                    continue;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(storage_err)?;
+        let dicts = storage.dicts.read().expect("dict lock poisoned");
+        let scope_registry = storage
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+
+        let hits = search_scan(&tx, &dicts, &scope_registry, q)?;
+
+        let nodes = tx.open_table(NODES).map_err(storage_err)?;
+        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+
+        let mut out: Vec<(NodeRecord, f32)> = Vec::with_capacity(hits.len());
+        for (slot, score) in hits {
+            if let Some(rec) =
+                read_node_by_slot(&nodes, &embeddings, &dicts, &scope_registry, slot)?
+            {
+                // Defensive only, not load-bearing for isolation: `search_scan`
+                // already restricts its scan to `q.scopes`'s own interned
+                // scope ids (and, on the candidates fast path, checks the
+                // resolved scope directly) — mirrors `search_text`'s
+                // identical defensive re-check.
+                if q.scopes.contains(rec.scope) {
+                    out.push((rec, score));
                 }
-                let slab = read_or_closed(arc)?;
-                if slab.dim != q.vector.len() {
-                    continue;
-                }
-                merged.extend(slab.top_k(&q.vector, q.k, filter.as_ref()));
             }
         }
-        merged.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+        out.sort_by(|a, b| {
+            OrderedScore(b.1)
+                .cmp(&OrderedScore(a.1))
+                .then_with(|| a.0.id.cmp(&b.0.id))
         });
-        merged.truncate(q.k);
-
-        let ids: HashSet<NodeId> = merged.iter().map(|(id, _)| *id).collect();
-        let by_id = self.storage().load_nodes(&ids).unwrap_or_default();
-        let mut out: Vec<(NodeRecord, f32)> = Vec::with_capacity(merged.len());
-        for (id, score) in merged {
-            if let Some(rec) = by_id.get(&id) {
-                out.push((rec.clone(), score));
-            }
-        }
+        out.truncate(q.k);
         self.bump(out.iter().map(|(n, _)| n.id));
         Ok(out)
     }
@@ -504,6 +461,17 @@ impl Db {
 mod tests {
     use super::*;
     use crate::ids::ScopeId;
+
+    /// Acquire a read lock, mapping a poisoned lock to [`TopoError::Closed`]
+    /// — the mapping every read path used to apply before Task 5 (see the
+    /// module-level poisoned-lock policy). No production caller anymore
+    /// (nothing reads the slab index), so this now lives here, exercised
+    /// directly against a bare `VectorIndex` by the two tests below.
+    fn read_or_closed<T>(
+        l: &std::sync::RwLock<T>,
+    ) -> Result<std::sync::RwLockReadGuard<'_, T>, TopoError> {
+        l.read().map_err(|_| TopoError::Closed)
+    }
 
     #[test]
     fn poisoned_slab_lock_maps_to_closed_not_panic() {
