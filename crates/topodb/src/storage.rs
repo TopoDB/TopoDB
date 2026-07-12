@@ -15,6 +15,7 @@ use crate::slots::{
     EDGE_SLOTS, NODE_IDS, NODE_SLOTS,
 };
 use crate::state::{EdgeRecord, NodeRecord};
+use crate::vector_store::{self, EMBEDDING_REF, VECTORS};
 use redb::{Database, ReadableTable, Table, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
@@ -135,6 +136,8 @@ impl Storage {
             tx.open_table(FTS_STATS).map_err(storage_err)?;
             tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+            tx.open_table(VECTORS).map_err(storage_err)?;
+            tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
             tx.open_table(DICT).map_err(storage_err)?;
             tx.open_table(NODE_SLOTS).map_err(storage_err)?;
             tx.open_table(NODE_IDS).map_err(storage_err)?;
@@ -454,6 +457,12 @@ impl Storage {
             bytes(&tx, NODES, "nodes")?,
             bytes(&tx, EDGES, "edges")?,
             bytes(&tx, EMBEDDINGS, "embeddings")?,
+            // v4 (Task 3): the new dual-written clustered vector tables —
+            // cold until a later task cuts `search_vector` over to read
+            // them, but tracked in the size report from the moment they
+            // start accumulating rows.
+            bytes(&tx, VECTORS, "vectors")?,
+            bytes(&tx, EMBEDDING_REF, "embedding_ref")?,
             bytes(&tx, POSTINGS, "postings")?,
             bytes(&tx, FTS_DOCS, "fts_docs")?,
             bytes(&tx, FTS_STATS, "fts_stats")?,
@@ -760,6 +769,8 @@ impl Storage {
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
             let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+            let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+            let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
             let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
             let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
             let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
@@ -820,6 +831,8 @@ impl Storage {
                     &mut edges,
                     &mut embeddings,
                     &mut vector_dims,
+                    &mut vectors,
+                    &mut embedding_ref,
                     &mut dict_table,
                     &mut dicts,
                     &mut slot_meta,
@@ -1260,6 +1273,8 @@ impl Storage {
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
                 let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+                let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+                let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
                 let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
                 let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
@@ -1299,6 +1314,8 @@ impl Storage {
                 edges.retain(|_, _| false).map_err(storage_err)?;
                 embeddings.retain(|_, _| false).map_err(storage_err)?;
                 vector_dims.retain(|_, _| false).map_err(storage_err)?;
+                vectors.retain(|_, _| false).map_err(storage_err)?;
+                embedding_ref.retain(|_, _| false).map_err(storage_err)?;
                 dict_table.retain(|_, _| false).map_err(storage_err)?;
                 slot_meta.remove("next_node_slot").map_err(storage_err)?;
                 slot_meta.remove("next_edge_slot").map_err(storage_err)?;
@@ -1353,6 +1370,8 @@ impl Storage {
                         &mut edges,
                         &mut embeddings,
                         &mut vector_dims,
+                        &mut vectors,
+                        &mut embedding_ref,
                         &mut dict_table,
                         &mut dicts,
                         &mut slot_meta,
@@ -1798,6 +1817,8 @@ fn apply_op(
     edges: &mut Table<'_, &'static [u8], &'static [u8]>,
     embeddings: &mut Table<'_, &'static [u8], &'static [u8]>,
     vector_dims: &mut Table<'_, &'static [u8], &'static [u8]>,
+    vectors: &mut Table<'_, &'static [u8], &'static [u8]>,
+    embedding_ref: &mut Table<'_, &'static [u8], &'static [u8]>,
     dict: &mut Table<'_, &'static [u8], &'static str>,
     dicts: &mut Dicts,
     slot_meta: &mut Table<'_, &'static str, &'static [u8]>,
@@ -1862,9 +1883,10 @@ fn apply_op(
             )
         }
         Op::SetEmbedding { id, model, vector } => {
-            read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?.ok_or_else(
-                || TopoError::Rejected(format!("SetEmbedding: node {id:?} not found")),
-            )?;
+            let rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?
+                .ok_or_else(|| {
+                    TopoError::Rejected(format!("SetEmbedding: node {id:?} not found"))
+                })?;
             // Per-model permanent dim (v4): intern the model name to a
             // stable id, then pin/check its dim in VECTOR_DIMS. This is
             // cross-batch AND cross-scope (unlike the RAM slab's
@@ -1884,7 +1906,21 @@ fn apply_op(
                 }
                 other => other,
             })?;
-            put_embedding(embeddings, node_slots, *id, model, vector)
+            put_embedding(embeddings, node_slots, *id, model, vector)?;
+            // Task 3 (v4): dual-write the new clustered `vectors` +
+            // `embedding_ref` tables alongside the still-authoritative
+            // EMBEDDINGS row just written above. Nothing reads these two
+            // tables yet — the in-RAM slab keeps serving `search_vector`
+            // until a later task cuts the read path over. `rec.scope` is
+            // the node's scope, read off the same `read_node` call used for
+            // the existence check above; interning it is idempotent (a
+            // live node's scope was necessarily interned when the node was
+            // created).
+            let slot = crate::slots::node_slot(node_slots, *id)?.ok_or_else(|| {
+                TopoError::Encoding("SetEmbedding: missing node slot after read_node hit".into())
+            })?;
+            let scope_id = scope_registry.intern(scopes_table, rec.scope)?;
+            vector_store::put_vector(vectors, embedding_ref, model_id, scope_id, slot, vector)
         }
         Op::RemoveNode { id } => {
             let removed_slot = crate::slots::node_slot(node_slots, *id)?
@@ -1898,6 +1934,9 @@ fn apply_op(
             }
 
             embeddings.remove(key.as_slice()).map_err(storage_err)?;
+            // Task 3 (v4): mirror the EMBEDDINGS cleanup above into the new
+            // dual-written tables — no-op if the node was never embedded.
+            vector_store::remove_vector(vectors, embedding_ref, removed_slot)?;
 
             // Adjacency-assisted cascade (Task 10): the node's own OUT_ADJ and
             // IN_ADJ chunks under `removed_slot` ARE the incident-edge set —
@@ -3162,5 +3201,116 @@ mod tests {
             3,
         )
         .unwrap();
+    }
+
+    /// Task 3 Step 4 — the oracle-pattern consistency cross-check: a
+    /// 200-memory generated workload (all embedded, so the mutation tail has
+    /// material to act on), then a mutation tail of same-model re-embeds,
+    /// cross-model re-embeds, and removes — exactly the three mutation
+    /// shapes `put_vector`/`remove_vector` branch on. Afterward, for EVERY
+    /// row remaining in the old, still-authoritative `EMBEDDINGS` table,
+    /// `read_vector_by_slot` on the new dual-written tables must return the
+    /// same `(model name via dict, vector)` — and the row COUNTS must agree
+    /// in both directions (no orphans in the new tables, nothing missing
+    /// either).
+    #[test]
+    fn vectors_tables_match_embeddings_after_200_memory_workload_with_reembeds_and_removes() {
+        // Same id scheme as `workload.rs`'s private `memory_id` (duplicated
+        // here rather than exposed — matches the convention already used by
+        // `tests/differential.rs`'s own local `memory_id` helper).
+        fn memory_id(i: usize) -> NodeId {
+            NodeId::from_u128(0x0100_0000_0000_0000_0000_0000_0000_0000 | i as u128)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let spec = crate::workload::WorkloadSpec {
+            memories: 200,
+            embed_dim: 8,
+            embed_pct: 100, // every memory embedded — the mutation tail needs rows to act on
+            ..Default::default()
+        };
+        for batch in crate::workload::batches(&spec) {
+            s.apply_batch(batch, 0).unwrap();
+        }
+
+        // Mutation tail: same-model re-embed (i % 4 == 0), cross-model
+        // re-embed (i % 4 == 1), remove (i % 7 == 0, overlapping both
+        // buckets above for some i — exercises "re-embedded then removed"
+        // too). `workload::batches` hardcodes the model name "bench-768"
+        // regardless of `embed_dim`, so the same-model bucket must reuse it.
+        for i in (0..spec.memories).step_by(4) {
+            s.apply_batch(
+                vec![Op::SetEmbedding {
+                    id: memory_id(i),
+                    model: "bench-768".into(),
+                    vector: vec![9.0; spec.embed_dim],
+                }],
+                1,
+            )
+            .unwrap();
+        }
+        for i in (0..spec.memories).filter(|i| i % 4 == 1) {
+            s.apply_batch(
+                vec![Op::SetEmbedding {
+                    id: memory_id(i),
+                    model: "bench-768-v2".into(),
+                    vector: vec![7.0; spec.embed_dim],
+                }],
+                1,
+            )
+            .unwrap();
+        }
+        for i in (0..spec.memories).filter(|i| i % 7 == 0) {
+            s.apply_batch(vec![Op::RemoveNode { id: memory_id(i) }], 2)
+                .unwrap();
+        }
+
+        let tx = s.db.begin_read().unwrap();
+        let embeddings = tx.open_table(EMBEDDINGS).unwrap();
+        let vectors = tx.open_table(VECTORS).unwrap();
+        let refs = tx.open_table(EMBEDDING_REF).unwrap();
+        let dicts = s.dicts.read().unwrap();
+
+        let mut old_rows = 0u64;
+        for entry in embeddings.iter().unwrap() {
+            let (k, v) = entry.unwrap();
+            let key: [u8; 8] = k.value().try_into().unwrap();
+            let slot = u64::from_be_bytes(key);
+            let raw = crate::codec::unframe_value(v.value()).unwrap();
+            let (model_name, vector): (String, Vec<f32>) = postcard::from_bytes(&raw).unwrap();
+
+            let (model_id, _scope_id, new_vector) =
+                vector_store::read_vector_by_slot(&vectors, &refs, slot)
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "slot {slot}: EMBEDDINGS row has no matching vectors/embedding_ref row"
+                        )
+                    });
+            let resolved_name = dicts.resolve(DictKind::Model, model_id).unwrap();
+            assert_eq!(
+                resolved_name.as_str(),
+                model_name,
+                "slot {slot}: model name mismatch"
+            );
+            assert_eq!(new_vector, vector, "slot {slot}: vector mismatch");
+            old_rows += 1;
+        }
+
+        let vectors_rows = vectors.iter().unwrap().count() as u64;
+        let refs_rows = refs.iter().unwrap().count() as u64;
+        assert!(
+            old_rows > 0,
+            "workload+tail must leave some live embeddings"
+        );
+        assert_eq!(
+            vectors_rows, old_rows,
+            "vectors row count must equal embeddings row count — no orphans"
+        );
+        assert_eq!(
+            refs_rows, old_rows,
+            "embedding_ref row count must equal embeddings row count — no orphans"
+        );
     }
 }

@@ -23,6 +23,7 @@ mod state;
 mod storage;
 mod validate;
 mod vector;
+mod vector_store;
 
 pub use counters::AccessStats;
 pub use db::{Db, DbOptions};
