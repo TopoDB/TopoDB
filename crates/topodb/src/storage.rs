@@ -2376,6 +2376,126 @@ mod tests {
         }
     }
 
+    /// Pins the loud-failure backstop for a CHUNKED-postings file wrongly
+    /// stamped `format_version == 3` (reviewer-required; see `migrate_v4.rs`'s
+    /// module doc). The `Some(3)` arm's "only single-row postings" premise is
+    /// a process/release invariant, not code-enforced — this branch's own
+    /// Task-6 commits (9b3d5a7..70bcd09) stamped 3 while writing chunked
+    /// postings. If such a file reaches migration anyway, safety currently
+    /// rests on a byte-layout coincidence: `decode_v3_posting_value` reads the
+    /// chunked block's leading `POSTINGS_BLOCK_FORMAT_V0` (0x00) tag as varint
+    /// `count == 0` and then rejects the block's remaining bytes as trailing
+    /// garbage — a guaranteed `TopoError::Encoding`, never silent corruption.
+    /// This test pins that: migration must FAIL (loudly, Encoding), and the
+    /// aborted write transaction must leave the file byte-intact (proven by
+    /// re-stamping 4 and reading the postings back unchanged).
+    #[test]
+    fn chunked_postings_under_version_3_fail_migration_loudly_not_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let spec = Arc::new(IndexSpec {
+            equality: vec![],
+            text: vec![crate::index::PropIndex {
+                label: "Memory".into(),
+                prop: "content".into(),
+            }],
+        });
+        let id = NodeId::from_u128(1);
+        {
+            // This build writes CHUNKED postings natively (fts.rs, Task 6).
+            let s = Storage::open_with(&path, spec.clone()).unwrap();
+            let mut props = crate::props::Props::new();
+            props.insert(
+                "content".into(),
+                crate::props::PropValue::Str("chunked postings fixture".into()),
+            );
+            s.apply_batch(
+                vec![Op::CreateNode {
+                    id,
+                    scope: Scope::Shared,
+                    label: "Memory".into(),
+                    props,
+                }],
+                0,
+            )
+            .unwrap();
+            // `s` drops here, closing the file handle for the raw reopen.
+        }
+
+        // Snapshot the chunked POSTINGS rows, then downgrade the version
+        // stamp to 3 via a raw redb write — manufacturing exactly the
+        // chunked-under-3 state the Task-6 mid-branch builds produced.
+        let postings_before: Vec<(Vec<u8>, Vec<u8>)> = {
+            let db = Database::open(&path).unwrap();
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+                let tx = db.begin_read().unwrap();
+                let postings = tx.open_table(POSTINGS).unwrap();
+                postings
+                    .iter()
+                    .unwrap()
+                    .map(|e| {
+                        let (k, v) = e.unwrap();
+                        (k.value().to_vec(), v.value().to_vec())
+                    })
+                    .collect()
+            };
+            assert!(
+                !rows.is_empty(),
+                "setup must produce real chunked postings rows"
+            );
+            let tx = db.begin_write().unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert("format_version", 3u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+            rows
+        };
+
+        // The migrating open must fail LOUDLY with Encoding — the chunked
+        // block's 0x00 format tag decodes as count=0 and the trailing bytes
+        // are rejected. Succeeding here (silent corruption or a silent
+        // no-op) is the failure mode this test exists to catch.
+        let err = Storage::open_with(&path, spec.clone())
+            .err()
+            .expect("migrating chunked postings as v3 single-row must fail, not succeed");
+        assert!(
+            matches!(err, TopoError::Encoding(_)),
+            "expected Encoding (loud backstop), got {err:?}"
+        );
+
+        // File intact: the failed migration's write transaction aborted, so
+        // re-stamping 4 and reopening must find every postings row
+        // byte-identical to the pre-downgrade snapshot.
+        {
+            let db = Database::open(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert("format_version", 4u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let s = Storage::open_with(&path, spec).unwrap();
+        assert_eq!(s.format_version().unwrap(), 4);
+        let tx = s.db.begin_read().unwrap();
+        let postings = tx.open_table(POSTINGS).unwrap();
+        let postings_after: Vec<(Vec<u8>, Vec<u8>)> = postings
+            .iter()
+            .unwrap()
+            .map(|e| {
+                let (k, v) = e.unwrap();
+                (k.value().to_vec(), v.value().to_vec())
+            })
+            .collect();
+        assert_eq!(
+            postings_before, postings_after,
+            "failed migration must leave POSTINGS byte-intact"
+        );
+    }
+
     #[test]
     fn storage_report_counts_v4_vector_tables_and_they_go_cold_on_remove() {
         let dir = tempfile::tempdir().unwrap();

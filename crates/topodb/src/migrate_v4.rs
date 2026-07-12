@@ -35,14 +35,31 @@
 //!   `set_posting` exclusively) → `true`: POSTINGS already holds only
 //!   chunked rows: the postings pass is skipped entirely.
 //!
-//! A real v3-on-disk file can only ever contain ONE of the two shapes at a
-//! time (mixed-shape POSTINGS tables are not a state any code path,
-//! including this one, ever produces), so the caller's arm identity is a
-//! sound, unambiguous discriminant — no per-row sniffing is needed or
-//! attempted. If a future change makes the calling arm's provenance
-//! genuinely ambiguous, this function must not guess; the arm should refuse
-//! to migrate rather than silently mis-decode chunked rows as single-row
-//! ones (which corrupts state instead of merely erroring) or vice versa.
+//! The "a version-3 file holds only single-row postings" premise behind the
+//! `Some(3)` arm is a PROCESS/RELEASE invariant, not a code-enforced one: no
+//! RELEASED build ever writes chunked postings under `format_version == 3`,
+//! but this branch's own history refutes the stronger claim — commits
+//! 9b3d5a7 through 70bcd09 (Task 6, "format flip pending") stamped 3 while
+//! writing CHUNKED postings, so transitional mid-branch files with exactly
+//! that mixed provenance did exist (test-only; regenerated rather than
+//! migrated). Should such a file — or any future chunked-under-3 state —
+//! reach the `Some(3)` arm anyway, the load-bearing backstop is
+//! `decode_v3_posting_value`'s trailing-bytes check: a chunked block's
+//! leading `POSTINGS_BLOCK_FORMAT_V0` (0x00) format byte decodes as varint
+//! `count == 0`, the entry loop reads nothing, and the block's remaining
+//! bytes (non-empty for any stored chunk — empty chunks are never written)
+//! trip the trailing-bytes rejection. The migration therefore fails LOUDLY
+//! with `TopoError::Encoding` (aborting the whole open; the file is left
+//! byte-intact, since the write transaction never commits) instead of
+//! silently corrupting the table. That behavior is byte-layout-coincidental
+//! — a future block-codec change (e.g. a nonzero format tag that happens to
+//! decode as a plausible count) could silently flip it to corruption — so
+//! it is PINNED by
+//! `chunked_postings_under_version_3_fail_migration_loudly_not_silently`
+//! (`storage.rs` tests): any codec change that breaks the backstop breaks
+//! that test. If the calling arm's provenance ever becomes genuinely
+//! ambiguous, this function must not guess; the arm should refuse to
+//! migrate rather than rely on the backstop alone.
 //!
 //! ## Idempotency
 //!

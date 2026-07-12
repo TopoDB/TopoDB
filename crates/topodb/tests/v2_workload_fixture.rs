@@ -20,6 +20,8 @@ fn v2_workload_fixture_is_readable_before_cutover() {
     };
     let db = Db::open_with(&path, spec).unwrap();
     let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    // The full v2 -> v3 -> v4 chain runs on open (Task 7's format flip).
+    assert_eq!(db.format_version(), 4);
     assert_eq!(db.current_seq().unwrap(), 772);
     assert!(!db
         .search_text(&scopes, "agent memory", 10)
