@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.6
 
 #### Breaking
 
@@ -94,6 +94,19 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.3
+
+#### Added
+
+- **`create_node` batch command** — creates nodes with arbitrary labels for host-defined schemas
+  (the episode-recorder's `Episode`/`PolicyVersion` nodes are the first consumer). Reserved labels
+  (`Memory`, `Entity`) are rejected — use `create_memory`/`create_entity` for those.
+
+#### Changed
+
+- Engine dependency moved to `topodb` 0.0.6 (on-disk **format v3**). See the engine's 0.0.6 entry —
+  in particular the **one-way auto-migration** of existing database files on first open.
+
 ### 0.0.2
 
 > **Read this if you depend on `topodb-json` 0.0.1 from crates.io.** As with the engine, the
@@ -115,6 +128,22 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### 0.0.5
+
+> **Opening a database with this version migrates it, one-way.** This release embeds `topodb`
+> 0.0.6, whose on-disk format is v3. The first time this server opens an existing v1/v2 database
+> file it is auto-migrated to v3, and older builds can no longer read it. Back up the `.redb` file
+> first if you may need to roll back.
+
+#### Changed
+
+- Embeds `topodb` 0.0.6 (format v3) and `topodb-json` 0.0.3.
+- **Engine storage/encoding failures on `find_by_prop` and `traverse` are now reported as
+  `internal_error`, not `invalid_params`.** These paths read from disk in v3 and can genuinely fail
+  for reasons that are not the caller's; only `Rejected` (caller-fixable) maps to `invalid_params`,
+  matching `search_memories`' existing contract. **If a client special-cases `invalid_params` from
+  these two tools, note the narrowed meaning.**
 
 ### 0.0.4
 
@@ -169,6 +198,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-cli`
+
+### 0.0.3
+
+> **Opening a database with this version migrates it, one-way.** This release embeds `topodb`
+> 0.0.6, whose on-disk format is v3. The first `topodb` command against an existing v1/v2 database
+> file auto-migrates it to v3, and older builds can no longer read it. Back up the `.redb` file
+> first if you may need to roll back.
+
+#### Changed
+
+- Embeds `topodb` 0.0.6 (format v3) and `topodb-json` 0.0.3. No CLI surface changes.
 
 ### 0.0.2
 
