@@ -47,6 +47,10 @@ pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::ne
 
 pub const FORMAT_VERSION: u32 = 3;
 
+/// One EMBEDDINGS row joined with its node's id/scope: `(model, scope, id,
+/// vector)`. See `Storage::all_embeddings_with_scope`.
+pub(crate) type EmbeddingRow = (String, Scope, NodeId, Vec<f32>);
+
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
 pub struct TableReport {
@@ -61,9 +65,8 @@ pub struct Storage {
     /// The index configuration this storage was opened with. Read by
     /// `apply_batch`/`rebuild_state_from_ops`/`ensure_index_spec` (via
     /// `doc_text(&self.spec, ...)`) on every write-path mutation and full
-    /// rebuild. Held here (not just threaded through `Snapshot`) precisely so
-    /// that write-path access is possible without going through the
-    /// in-memory snapshot.
+    /// rebuild, and by `Db::index_spec` — the single source of truth for the
+    /// declared spec (there is no separate in-memory copy).
     pub(crate) spec: Arc<IndexSpec>,
     pub(crate) dicts: RwLock<Dicts>,
     pub(crate) scope_registry: RwLock<ScopeRegistry>,
@@ -85,7 +88,24 @@ impl Storage {
         path: impl AsRef<Path>,
         spec: Arc<IndexSpec>,
     ) -> Result<Self, TopoError> {
-        let db = Database::create(path).map_err(storage_err)?;
+        Self::open_with_options(path, spec, crate::db::DbOptions::default())
+    }
+
+    /// Like `open_with`, but threads `options` to the underlying redb
+    /// `Builder` before the database file is created/opened — currently just
+    /// `cache_size_bytes` -> `Builder::set_cache_size`. `None` leaves redb's
+    /// own default untouched, so `DbOptions::default()` (used by `open_with`)
+    /// behaves identically to the old bare `Database::create(path)` call.
+    pub(crate) fn open_with_options(
+        path: impl AsRef<Path>,
+        spec: Arc<IndexSpec>,
+        options: crate::db::DbOptions,
+    ) -> Result<Self, TopoError> {
+        let mut builder = Database::builder();
+        if let Some(bytes) = options.cache_size_bytes {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder.create(path).map_err(storage_err)?;
         let s = Self {
             db,
             spec: spec.clone(),
@@ -911,10 +931,9 @@ impl Storage {
         Ok(out)
     }
 
-    /// Same rationale/`#[allow(dead_code)]` as `format_version` above:
-    /// crate-internal only (`Storage` isn't re-exported), exercised only by
-    /// unit tests today.
-    #[allow(dead_code)]
+    /// Crate-internal only (`Storage` isn't re-exported); this `pub` is inert
+    /// outside the crate. Used by the scoped point-lookup read path
+    /// (`Db::node`, `Db::access_stats`) and exercised directly by unit tests.
     pub fn load_node(&self, id: NodeId) -> Result<Option<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
@@ -968,6 +987,80 @@ impl Storage {
             let mut rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
             rec.embedding = read_embedding(&embeddings, slot)?;
             out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Scans EMBEDDINGS and joins each row with its node's id/scope (read off
+    /// the NODES row at the same slot). This is the ONLY remaining open-time
+    /// scan the engine performs (SP2 removes it too) — `VectorIndex::from_storage`
+    /// uses it to seed the in-RAM slab index at `Db::open` and on explicit
+    /// rebuild. Bounded by the EMBEDDINGS table's size, not NODES' — cheaper
+    /// than a full node scan whenever embeddings are a minority of nodes. An
+    /// EMBEDDINGS row whose NODES row is missing (should not happen — the two
+    /// are maintained together) is silently skipped rather than surfaced as
+    /// corruption, matching this being a best-effort index-seeding scan.
+    // SP2: last open-time scan
+    pub(crate) fn all_embeddings_with_scope(&self) -> Result<Vec<EmbeddingRow>, TopoError> {
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let nodes = tx.open_table(NODES).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        let mut out = Vec::new();
+        for entry in embeddings.iter().map_err(storage_err)? {
+            let (k, v) = entry.map_err(storage_err)?;
+            let key: [u8; 8] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad embedding slot key".into()))?;
+            let slot = u64::from_be_bytes(key);
+            let raw = crate::codec::unframe_value(v.value())?;
+            let (model, vector): (String, Vec<f32>) =
+                postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let Some(node_v) = nodes.get(slot_key(slot).as_slice()).map_err(storage_err)? else {
+                continue;
+            };
+            let raw_node = crate::codec::unframe_value(node_v.value())?;
+            let disk: crate::disk::NodeRecordDiskV3 = postcard::from_bytes(raw_node.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
+            out.push((model, rec.scope, rec.id, vector));
+        }
+        Ok(out)
+    }
+
+    /// Bulk point lookup: every id in `ids` that currently resolves to a live
+    /// node, in one read transaction (a missing id is simply absent from the
+    /// result, not an error). Used by the applier to capture pre-batch node
+    /// state (scope, embedding) for dim/edge-scope pre-validation and vector
+    /// slab maintenance — reading it BEFORE `apply_batch` runs, since storage
+    /// holds only the post-batch state once `apply_batch` has committed — and
+    /// by `search_vector` to resolve slab hits back to `NodeRecord`s.
+    pub(crate) fn load_nodes(
+        &self,
+        ids: &std::collections::HashSet<NodeId>,
+    ) -> Result<std::collections::HashMap<NodeId, NodeRecord>, TopoError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(NODES).map_err(storage_err)?;
+        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scopes = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(rec) = read_node(&table, &embeddings, &dicts, &scopes, &node_slots, id)? {
+                out.insert(id, rec);
+            }
         }
         Ok(out)
     }

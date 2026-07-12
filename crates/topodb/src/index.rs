@@ -1,7 +1,8 @@
 //! Declarative index configuration (`IndexSpec`) plus the hashable subset of
 //! `PropValue` (`IndexValue`) used as the equality-index key. `IndexSpec` is
-//! supplied at `Db::open_with` time and carried in `Storage`/`Snapshot`;
-//! `graph.rs` is the only place that reads it to maintain `Snapshot::prop_index`.
+//! supplied at `Db::open_with` time and carried in `Storage`; `storage.rs`'s
+//! `apply_batch`/`rebuild_state_from_ops` are what read it to maintain the
+//! on-disk PROP_INDEX table (see `prop_index.rs`).
 
 use crate::error::TopoError;
 use crate::props::PropValue;

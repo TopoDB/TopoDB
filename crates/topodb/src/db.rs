@@ -1,22 +1,29 @@
 use crate::counters::AccessStats;
 use crate::error::TopoError;
 use crate::feed::ChangeEvent;
-use crate::graph::Snapshot;
 use crate::ids::{EdgeId, NodeId, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
 use crate::vector::VectorIndex;
-use arc_swap::ArcSwap;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Tuning knobs for [`Db::open_with_options`]. Additive: every field
+/// defaults to `None`, under which redb's own default is used, so a fresh
+/// `DbOptions::default()` behaves identically to `Db::open`/`Db::open_with`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbOptions {
+    /// Threaded straight to `redb::Builder::set_cache_size`. `None` leaves
+    /// redb's own default (1 GiB, split 90/10 read/write) in place.
+    pub cache_size_bytes: Option<usize>,
+}
+
 /// A unit of work for the single applier thread. Both variants carry a reply
 /// channel so the submitting thread blocks until the applier has finished —
-/// and, crucially, so the *applier* remains the sole writer of the
-/// `ArcSwap<Snapshot>` for both incremental batches and full rebuilds.
+/// and, crucially, so the *applier* remains the sole writer of storage.
 enum Job {
     Apply {
         ops: Vec<Op>,
@@ -51,8 +58,8 @@ pub struct Db {
 }
 
 // Manual (not derived) so this doesn't force `Debug` on every field of
-// `Inner` (several of which — `Storage`, `ArcSwap<Snapshot>` — don't derive
-// it and aren't otherwise worth adding it to). `Db` itself carries no useful
+// `Inner` (several of which — `Storage` among them — don't derive it and
+// aren't otherwise worth adding it to). `Db` itself carries no useful
 // state to print; this exists so `Result<Db, TopoError>` — e.g. in a test's
 // `panic!("{other:?}")` fallback arm — is formattable.
 impl std::fmt::Debug for Db {
@@ -62,20 +69,13 @@ impl std::fmt::Debug for Db {
 }
 
 struct Inner {
-    // Read directly by `rebuild_state_from_ops`/`debug_dump_*`, and kept
-    // alive here so the underlying `redb::Database`'s file handle stays open
-    // for the lifetime of the `Db`, and for the (future) query layer that
-    // will read through it directly.
+    // Read directly by `rebuild_state_from_ops`/`debug_dump_*`/every scoped
+    // read (`node`, `nodes_by_label`, `traverse`, ...), and kept alive here
+    // so the underlying `redb::Database`'s file handle stays open for the
+    // lifetime of the `Db`. The read model is disk-resident: there is no
+    // separate in-memory snapshot to keep in step with it (see FORMAT.md /
+    // the W5 plan task for the snapshot layer this replaced).
     storage: Arc<Storage>,
-    // In-memory adjacency snapshot. The applier thread is the *only* writer
-    // (see `open`'s loop below); readers `load_full()` and never block on
-    // it, and never on each other or on writers. Held behind its own `Arc`
-    // (rather than the thread capturing an `Arc<Inner>`) so the applier
-    // thread never holds a strong reference back to `Inner` itself — that
-    // would create a cycle where `Inner`'s `Drop` (which must run to close
-    // the channel so the thread can exit) never fires because the thread's
-    // own clone keeps the refcount above zero.
-    snap: Arc<ArcSwap<Snapshot>>,
     // `Sender` half of the job channel. Wrapped in `Option` so `Drop` can
     // `take()` it and actually drop it *before* joining the applier thread —
     // otherwise the applier's `rx.recv()` loop would never see the channel
@@ -96,11 +96,12 @@ struct Inner {
     // Both hold the lock only briefly (a push, or one non-blocking drain per
     // batch), and nothing else locks it — so it introduces no lock-ordering
     // hazard against the `tx`/`applier` mutexes. Held behind its own `Arc`
-    // (not captured via `Inner`) for the same reason as `snap`: the applier
-    // must never hold a strong ref back to `Inner`, or `Drop` would deadlock.
+    // (not captured via `Inner`) for the same reason as `storage`: the
+    // applier must never hold a strong ref back to `Inner`, or `Drop` would
+    // deadlock.
     subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
     // Per-(model, scope) f32 embedding slabs. Held behind its own `Arc`
-    // (never captured via `Inner`, same rationale as `snap`/`subs`): the
+    // (never captured via `Inner`, same rationale as `storage`/`subs`): the
     // applier holds a clone and is the sole mutator of the outer slab map
     // (slab creation, and the wholesale swap on rebuild); searches take short
     // read locks. See `vector.rs` for the locking contract.
@@ -136,24 +137,34 @@ impl Db {
     /// Like `open`, but with a declared `IndexSpec` governing which
     /// `(label, prop)` pairs get equality/text-indexed. `spec` is validated
     /// (rejecting duplicate declarations) before anything else happens — an
-    /// invalid spec never touches storage.
+    /// invalid spec never touches storage. Delegates to `open_with_options`
+    /// with `DbOptions::default()`.
     pub fn open_with(path: impl AsRef<Path>, spec: IndexSpec) -> Result<Self, TopoError> {
+        Self::open_with_options(path, spec, DbOptions::default())
+    }
+
+    /// Like `open_with`, but also takes [`DbOptions`] governing storage
+    /// tuning knobs (currently just `cache_size_bytes`, threaded to redb's
+    /// `Builder::set_cache_size`).
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        spec: IndexSpec,
+        options: DbOptions,
+    ) -> Result<Self, TopoError> {
         spec.validate()?;
         let spec = Arc::new(spec);
-        let storage = Arc::new(Storage::open_with(path, spec.clone())?);
-        let initial_snapshot = Snapshot::from_storage(&storage, spec.clone())?;
-        // Build the vector index from the same initial snapshot before it is
-        // moved into the `ArcSwap`. The applier captures a clone below.
-        let vectors = Arc::new(VectorIndex::from_snapshot(&initial_snapshot));
-        let snap = Arc::new(ArcSwap::new(Arc::new(initial_snapshot)));
+        let storage = Arc::new(Storage::open_with_options(path, spec, options)?);
+        // Build the vector index by scanning EMBEDDINGS (the one remaining
+        // open-time scan — see `VectorIndex::from_storage`). The applier
+        // captures a clone below.
+        let vectors = Arc::new(VectorIndex::from_storage(&storage)?);
         let (tx, rx) = bounded::<Job>(256);
 
-        // The thread captures its own clones of `storage`/`snap`/`spec` —
-        // never a clone of `Inner` itself (see the comment on `Inner::snap`
-        // for why).
+        // The thread captures its own clones of `storage`/`vectors`/`subs` —
+        // never a clone of `Inner` itself (see the comment on `Inner::storage`
+        // for why: a strong ref back to `Inner` would create a cycle where
+        // `Inner`'s `Drop` never fires).
         let storage_for_applier = storage.clone();
-        let snap_for_applier = snap.clone();
-        let spec_for_applier = spec.clone();
         let subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>> = Arc::new(Mutex::new(Vec::new()));
         let subs_for_applier = subs.clone();
         let vectors_for_applier = vectors.clone();
@@ -167,44 +178,49 @@ impl Db {
                                 .expect("system clock before UNIX epoch")
                                 .as_millis() as i64
                         });
-                        // Load the pre-batch snapshot ONCE. It anchors three
-                        // things: dim pre-validation (below), slab maintenance
-                        // (old embedding/scope lookups), and the incremental
-                        // `apply` fold. The applier is the sole `ArcSwap`
-                        // writer, so nothing mutates it between here and the
-                        // store.
-                        let cur = snap_for_applier.load_full();
+                        // Read pre-batch node state (scope, embedding) for
+                        // every id this batch might reference — CreateEdge
+                        // endpoints, SetEmbedding targets, RemoveNode
+                        // targets — in ONE storage read, BEFORE `apply_batch`
+                        // runs. This anchors three things: dim pre-validation
+                        // (below), edge-scope pre-validation (below), and
+                        // slab maintenance (after `apply_batch`, which still
+                        // needs the OLD state — storage holds only the
+                        // post-batch state once `apply_batch` has committed).
+                        let pre = match storage_for_applier.load_nodes(&ids_needing_pre_state(&ops))
+                        {
+                            Ok(m) => m,
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                                continue;
+                            }
+                        };
                         // Dim pre-validation runs BEFORE `apply_batch` so a
                         // violation leaves storage untouched — atomic with the
                         // rest of the batch.
-                        if let Err(e) = vectors_for_applier.prevalidate_dims(&cur, &ops) {
+                        if let Err(e) = vectors_for_applier.prevalidate_dims(&pre, &ops) {
                             let _ = reply.send(Err(e));
                             continue;
                         }
                         // Edge-scope pre-validation has the same contract: reject
                         // before `apply_batch` so storage is untouched. It must not
                         // live in `apply_op`, which is shared with op-log replay.
-                        if let Err(e) = crate::validate::prevalidate_edge_scopes(&cur, &ops) {
+                        if let Err(e) = crate::validate::prevalidate_edge_scopes(&pre, &ops) {
                             let _ = reply.send(Err(e));
                             continue;
                         }
                         match storage_for_applier.apply_batch(ops, now) {
                             Ok(batch) => {
                                 // Slab maintenance runs after `apply_batch`
-                                // succeeds and BEFORE the snapshot store, using
-                                // `cur` (pre-batch) for old embedding/scope
+                                // succeeds, using `pre` (read before
+                                // `apply_batch`) for old embedding/scope
                                 // state.
-                                vectors_for_applier.maintain(&cur, &batch.resolved);
-                                // Fold the resolved ops into a new snapshot and
-                                // store it *before* replying, so the submitter is
-                                // guaranteed to observe its own write via
-                                // `Db::snapshot`/the traversal helpers.
-                                let next = cur.apply(&batch.resolved);
-                                snap_for_applier.store(Arc::new(next));
+                                vectors_for_applier.maintain(&pre, &batch.resolved);
                                 // Broadcast the committed ops to live
-                                // subscribers *after* the snapshot store (so a
-                                // subscriber that reacts by reading sees its
-                                // own event's effect) and *before* replying.
+                                // subscribers *after* `apply_batch` has
+                                // committed (so a subscriber that reacts by
+                                // reading sees its own event's effect) and
+                                // *before* replying.
                                 // Best-effort, non-blocking: a full subscriber
                                 // buffer drops the event (the subscriber
                                 // detects the `seq` gap and recovers via
@@ -251,31 +267,17 @@ impl Db {
                         }
                     }
                     Job::Rebuild { reply } => {
-                        // Rebuild runs on the applier thread — the sole
-                        // ArcSwap writer — so it serializes with in-flight
-                        // batch application. Routing it through the channel
-                        // (rather than storing from the caller thread) closes
-                        // the fold-twice race where a caller's fresh snapshot
-                        // and the applier's incremental `apply` could both
-                        // fold the same committed batch.
+                        // Rebuild runs on the applier thread — the sole redb
+                        // writer — so it serializes with in-flight batch
+                        // application: `rebuild_state_from_ops` and
+                        // `apply_batch` can never interleave.
                         let result = match storage_for_applier.rebuild_state_from_ops() {
-                            Ok(()) => match Snapshot::from_storage(
-                                &storage_for_applier,
-                                spec_for_applier.clone(),
-                            ) {
-                                Ok(fresh) => {
-                                    // Rebuild the vector index from the fresh
-                                    // snapshot and swap the inner slab map in
-                                    // place (under the outer write lock) — the
-                                    // applier's `Arc<VectorIndex>` is shared
-                                    // with `Db`, so only its contents may be
-                                    // replaced, not the `Arc`.
-                                    vectors_for_applier.rebuild_from(&fresh);
-                                    snap_for_applier.store(Arc::new(fresh));
-                                    Ok(())
-                                }
-                                Err(e) => Err(e),
-                            },
+                            // Rebuild the vector index from the now-rebuilt
+                            // storage and swap the inner slab map in place
+                            // (under the outer write lock) — the applier's
+                            // `Arc<VectorIndex>` is shared with `Db`, so only
+                            // its contents may be replaced, not the `Arc`.
+                            Ok(()) => vectors_for_applier.rebuild_from(&storage_for_applier),
                             Err(e) => Err(e),
                         };
                         let _ = reply.send(result);
@@ -295,8 +297,8 @@ impl Db {
                         // serializes with batch application: no append can
                         // interleave between the delete and the `oldest_seq`
                         // stamp. Compaction touches only the OPS/META tables —
-                        // never NODES/EDGES or the snapshot — so there is
-                        // nothing to fold and nothing to broadcast.
+                        // never NODES/EDGES — so there is nothing to
+                        // broadcast.
                         let _ = reply.send(storage_for_applier.compact_ops_through(keep_from));
                     }
                 }
@@ -344,7 +346,6 @@ impl Db {
         Ok(Self {
             inner: Arc::new(Inner {
                 storage,
-                snap,
                 tx: Mutex::new(Some(tx)),
                 applier: Mutex::new(Some(applier)),
                 subs,
@@ -353,14 +354,6 @@ impl Db {
                 vectors,
             }),
         })
-    }
-
-    /// Returns the current in-memory adjacency snapshot. Cheap: an `Arc`
-    /// clone via `ArcSwap::load_full` — never blocks on the applier thread
-    /// or on other readers.
-    #[must_use]
-    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
-        self.inner.snap.load_full()
     }
 
     /// The shared vector index. Cheap `Arc` clone; used by `search_vector`
@@ -395,20 +388,11 @@ impl Db {
 
     /// The `IndexSpec` this db is operating under — the one `open_stored`
     /// resolved (or the one passed to `open_with`). Added so `info` can
-    /// report it. A clone of the current snapshot's `spec`.
+    /// report it. A clone of `Storage`'s own copy (the source of truth —
+    /// there is no longer a separate snapshot-carried copy to read instead).
     #[must_use]
     pub fn index_spec(&self) -> IndexSpec {
-        (*self.snapshot().spec).clone()
-    }
-
-    /// Test/inspection seam: the raw (unscoped) snapshot. `#[doc(hidden)]`
-    /// because it bypasses scoping — the supported read APIs are the scoped
-    /// ones (`node`, `nodes_by_label`, `traverse`, ...). Same class as
-    /// `debug_dump_nodes`/`debug_dump_edges`.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn debug_snapshot(&self) -> Arc<Snapshot> {
-        self.inner.snap.load_full()
+        (*self.inner.storage.spec).clone()
     }
 
     /// Per-table logical byte counts; benchmark/inspection seam.
@@ -461,14 +445,14 @@ impl Db {
     ) -> Result<Option<AccessStats>, TopoError> {
         // Gate on scoped existence *without* going through `node()` — reading
         // stats must never bump, and `node()` bumps. We replicate its scope
-        // filter directly against the snapshot: `None` if absent OR out of
-        // scope (indistinguishable, mirroring `node()`).
-        let snap = self.snapshot();
-        if !snap
-            .nodes
-            .get(&id)
-            .is_some_and(|n| scopes.contains(n.scope))
-        {
+        // filter directly against storage: `None` if absent OR out of scope
+        // (indistinguishable, mirroring `node()`).
+        let in_scope = self
+            .inner
+            .storage
+            .load_node(id)?
+            .is_some_and(|n| scopes.contains(n.scope));
+        if !in_scope {
             return Ok(None);
         }
         Ok(Some(
@@ -636,21 +620,14 @@ impl Db {
         reply_rx.recv().map_err(|_| TopoError::Closed)?
     }
 
-    /// Test/inspection helper: every edge `(from, to)` currently in the
-    /// adjacency snapshot, open or closed. `#[doc(hidden)]` — callers should
-    /// prefer the query layer once it exists. Full `EdgeRecord`s (props
-    /// included), read from the snapshot's `edges` map — the source of
-    /// truth, not reconstructed from the lean `AdjEntry`s in `out`/`inn`.
+    /// Test/inspection helper: every edge `(from, to)` currently in storage,
+    /// open or closed. `#[doc(hidden)]` — callers should prefer the query
+    /// layer once it exists. Full `EdgeRecord`s (props included), resolved
+    /// via a bounded OUT_ADJ scan from `from`'s slot (one read transaction) —
+    /// never a full-table scan.
     #[doc(hidden)]
     pub fn all_edges_between(&self, from: NodeId, to: NodeId) -> Vec<crate::state::EdgeRecord> {
-        let snap = self.snapshot();
-        snap.out
-            .get(&from)
-            .into_iter()
-            .flat_map(|entries| entries.iter())
-            .filter(|e| e.other == to)
-            .filter_map(|e| snap.edges.get(&e.edge).cloned())
-            .collect()
+        self.edges_between(from, to).unwrap_or_default()
     }
 
     /// Test/inspection helper: the ids of currently-open edges `(from, to)`
@@ -658,30 +635,80 @@ impl Db {
     /// `all_edges_between`.
     #[doc(hidden)]
     pub fn open_edges_between(&self, from: NodeId, to: NodeId) -> Vec<EdgeId> {
-        let snap = self.snapshot();
-        snap.out
-            .get(&from)
+        self.edges_between(from, to)
+            .unwrap_or_default()
             .into_iter()
-            .flat_map(|entries| entries.iter())
-            .filter(|e| e.other == to && e.valid_to.is_none())
-            .map(|e| e.edge)
+            .filter(|e| e.valid_to.is_none())
+            .map(|e| e.id)
             .collect()
     }
 
-    /// Rebuilds NODES/EDGES from the OPS log (see
-    /// `Storage::rebuild_state_from_ops`) and swaps in a fresh
-    /// `Snapshot::from_storage` so readers observe the rebuilt state — the
-    /// existing snapshot is derived incrementally and would otherwise go
-    /// stale relative to storage the moment the tables are drained.
+    /// Shared implementation for `all_edges_between`/`open_edges_between`: a
+    /// bounded OUT_ADJ scan from `from`'s slot, filtered to entries whose
+    /// target resolves to `to`, then fetched as full `EdgeRecord`s — all in
+    /// one read transaction. A missing `from`/`to` slot (node never existed,
+    /// or was removed) yields an empty result, not an error — mirrors
+    /// `Db::node`'s "absence is absence" treatment of a storage miss.
+    fn edges_between(
+        &self,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
+        let storage = self.storage();
+        let dicts = storage.dicts.read().expect("dict lock poisoned");
+        let scope_registry = storage
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let node_slots = tx
+            .open_table(crate::slots::NODE_SLOTS)
+            .map_err(crate::error::storage_err)?;
+        let Some(from_slot) = crate::slots::node_slot(&node_slots, from)? else {
+            return Ok(Vec::new());
+        };
+        let Some(to_slot) = crate::slots::node_slot(&node_slots, to)? else {
+            return Ok(Vec::new());
+        };
+        let out_adj = tx
+            .open_table(crate::adj::OUT_ADJ)
+            .map_err(crate::error::storage_err)?;
+        let edges_table = tx
+            .open_table(crate::storage::EDGES)
+            .map_err(crate::error::storage_err)?;
+        let node_ids = tx
+            .open_table(crate::slots::NODE_IDS)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for (_ty, entry) in crate::adj::read_adj(&out_adj, from_slot, None)? {
+            if entry.target != to_slot {
+                continue;
+            }
+            if let Some(rec) = crate::storage::read_edge_by_slot(
+                &edges_table,
+                &dicts,
+                &scope_registry,
+                &node_ids,
+                entry.edge,
+            )? {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rebuilds NODES/EDGES (and the adjacency/index tables derived from
+    /// them) from the OPS log — see `Storage::rebuild_state_from_ops`. The
+    /// read model is disk-resident, so readers observe the rebuilt state as
+    /// soon as this returns — there is no separate in-memory snapshot to
+    /// keep in step with it.
     ///
     /// The rebuild is performed *on the applier thread* (via a `Job::Rebuild`
     /// routed through the same channel as `submit`), not on the caller
-    /// thread. The applier is the single designated writer of the
-    /// `ArcSwap<Snapshot>`; doing the rebuild-and-store there serializes it
-    /// with batch application and structurally rules out the race where a
-    /// caller-thread store and an in-flight incremental `apply` both fold the
-    /// same committed batch. Blocks until the applier replies; `Closed` after
-    /// shutdown, same contract as `submit`.
+    /// thread. The applier is the sole redb writer; doing the rebuild there
+    /// serializes it with batch application, so `rebuild_state_from_ops` and
+    /// an in-flight `apply_batch` can never interleave. Blocks until the
+    /// applier replies; `Closed` after shutdown, same contract as `submit`.
     #[doc(hidden)]
     pub fn rebuild_state_from_ops(&self) -> Result<(), TopoError> {
         let (reply_tx, reply_rx) = bounded(1);
@@ -718,6 +745,30 @@ impl Db {
         out.sort_by_key(|e| e.id);
         out
     }
+}
+
+/// The node ids that `VectorIndex::prevalidate_dims`, `validate::prevalidate_edge_scopes`,
+/// and `VectorIndex::maintain` need pre-batch storage state (scope, embedding)
+/// for: `CreateEdge`'s endpoints, `SetEmbedding`'s target, and `RemoveNode`'s
+/// target. A same-batch `CreateNode` for one of these ids is resolved locally
+/// by each of those three functions (via their own scan of `ops`) and needs
+/// no storage lookup — this only has to cover ids that might ALREADY exist in
+/// storage before this batch runs.
+fn ids_needing_pre_state(ops: &[Op]) -> std::collections::HashSet<NodeId> {
+    let mut ids = std::collections::HashSet::new();
+    for op in ops {
+        match op {
+            Op::CreateEdge { from, to, .. } => {
+                ids.insert(*from);
+                ids.insert(*to);
+            }
+            Op::SetEmbedding { id, .. } | Op::RemoveNode { id } => {
+                ids.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    ids
 }
 
 impl Drop for Inner {

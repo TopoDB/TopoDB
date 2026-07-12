@@ -26,10 +26,10 @@
 
 use crate::db::Db;
 use crate::error::TopoError;
-use crate::graph::Snapshot;
 use crate::ids::{NodeId, Scope, ScopeSet};
 use crate::op::Op;
 use crate::state::NodeRecord;
+use crate::storage::Storage;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -210,15 +210,18 @@ impl VectorIndex {
         }
     }
 
-    /// Fold every node with an embedding into a fresh index.
-    pub(crate) fn from_snapshot(snap: &Snapshot) -> VectorIndex {
+    /// Fold every embedded node into a fresh index by scanning the EMBEDDINGS
+    /// table and joining each row's node record for id/scope. Used at `Db`
+    /// open and by [`rebuild_from`](VectorIndex::rebuild_from). This is the
+    /// ONLY remaining open-time scan (SP2 removes it) — see
+    /// `Storage::all_embeddings_with_scope`.
+    // SP2: last open-time scan
+    pub(crate) fn from_storage(storage: &Storage) -> Result<VectorIndex, TopoError> {
         let idx = VectorIndex::new();
-        for n in snap.nodes.values() {
-            if let Some((model, vector)) = &n.embedding {
-                idx.upsert(model, n.scope, n.id, vector);
-            }
+        for (model, scope, id, vector) in storage.all_embeddings_with_scope()? {
+            idx.upsert(&model, scope, id, &vector);
         }
-        idx
+        Ok(idx)
     }
 
     /// The slab dim for `(model, scope)`, but only while the slab holds live
@@ -291,10 +294,16 @@ impl VectorIndex {
     /// For each `SetEmbedding`, the vector must be non-empty, its length must
     /// equal the existing live-slab dim for `(model, node.scope)`, and must be
     /// consistent for that key across the batch itself. The node's scope comes
-    /// from a same-batch `CreateNode` if present, otherwise from `cur`; a
+    /// from a same-batch `CreateNode` if present, otherwise from `pre` (a
+    /// storage read of pre-batch node state taken by the applier before
+    /// `apply_batch`, keyed by every id this batch might reference); a
     /// `SetEmbedding` for a node that exists nowhere is left for `apply_batch`
     /// to reject.
-    pub(crate) fn prevalidate_dims(&self, cur: &Snapshot, ops: &[Op]) -> Result<(), TopoError> {
+    pub(crate) fn prevalidate_dims(
+        &self,
+        pre: &HashMap<NodeId, NodeRecord>,
+        ops: &[Op],
+    ) -> Result<(), TopoError> {
         let mut created_scope: HashMap<NodeId, Scope> = HashMap::new();
         let mut batch_dims: HashMap<(String, Scope), usize> = HashMap::new();
         for op in ops {
@@ -316,7 +325,7 @@ impl VectorIndex {
                     }
                     let scope = match created_scope.get(id) {
                         Some(s) => *s,
-                        None => match cur.nodes.get(id) {
+                        None => match pre.get(id) {
                             Some(n) => n.scope,
                             // Node exists nowhere — apply_batch rejects it.
                             None => continue,
@@ -349,11 +358,12 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Slab maintenance, run by the applier AFTER `apply_batch` succeeds and
-    /// BEFORE the snapshot store, using `cur` (the pre-batch snapshot) for old
-    /// state. The batch's own ops are walked in order so same-batch
-    /// `CreateNode`/`SetEmbedding` chains resolve against each other before
-    /// falling back to `cur`.
+    /// Slab maintenance, run by the applier AFTER `apply_batch` succeeds,
+    /// using `pre` (a storage read of pre-batch node state taken by the
+    /// applier BEFORE `apply_batch` — old state is no longer readable from
+    /// storage once `apply_batch` has committed) for old state. The batch's
+    /// own ops are walked in order so same-batch `CreateNode`/`SetEmbedding`
+    /// chains resolve against each other before falling back to `pre`.
     ///
     /// - `SetEmbedding` → if the node's OLD embedding was under a *different*
     ///   model, tombstone it in that slab; then upsert into `(model, scope)`
@@ -363,9 +373,9 @@ impl VectorIndex {
     ///   in `(m, scope)`.
     ///
     /// After the walk, every touched slab is offered to `maybe_compact`.
-    pub(crate) fn maintain(&self, cur: &Snapshot, resolved: &[Op]) {
+    pub(crate) fn maintain(&self, pre: &HashMap<NodeId, NodeRecord>, resolved: &[Op]) {
         // Per-node evolving `(scope, current embedding model)`, seeded lazily
-        // from `cur` and updated as the batch's ops are replayed.
+        // from `pre` and updated as the batch's ops are replayed.
         let mut local: HashMap<NodeId, (Scope, Option<String>)> = HashMap::new();
         let mut touched: HashSet<(String, Scope)> = HashSet::new();
 
@@ -378,7 +388,7 @@ impl VectorIndex {
                 Op::SetEmbedding { id, model, vector } => {
                     let (scope, old_model) = match local.get(id) {
                         Some(s) => s.clone(),
-                        None => match cur.nodes.get(id) {
+                        None => match pre.get(id) {
                             Some(n) => (n.scope, n.embedding.as_ref().map(|(m, _)| m.clone())),
                             None => continue,
                         },
@@ -396,7 +406,7 @@ impl VectorIndex {
                 Op::RemoveNode { id } => {
                     let (scope, old_model) = match local.get(id) {
                         Some(s) => s.clone(),
-                        None => match cur.nodes.get(id) {
+                        None => match pre.get(id) {
                             Some(n) => (n.scope, n.embedding.as_ref().map(|(m, _)| m.clone())),
                             None => continue,
                         },
@@ -416,16 +426,17 @@ impl VectorIndex {
         }
     }
 
-    /// Rebuild the whole index from `snap`, swapping the inner map in place
-    /// (the applier holds this behind the shared `Arc`, so the `Arc` itself
-    /// must not be replaced — only its contents). Used by the `Job::Rebuild`
-    /// arm after storing the fresh snapshot.
-    pub(crate) fn rebuild_from(&self, snap: &Snapshot) {
-        let fresh = VectorIndex::from_snapshot(snap);
+    /// Rebuild the whole index from `storage`, swapping the inner map in
+    /// place (the applier holds this behind the shared `Arc`, so the `Arc`
+    /// itself must not be replaced — only its contents). Used by the
+    /// `Job::Rebuild` arm after `Storage::rebuild_state_from_ops` completes.
+    pub(crate) fn rebuild_from(&self, storage: &Storage) -> Result<(), TopoError> {
+        let fresh = VectorIndex::from_storage(storage)?;
         // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         let new_map = fresh.slabs.into_inner().unwrap();
         // sole writer — a poisoned lock here means THIS thread already panicked; unreachable.
         *self.slabs.write().unwrap() = new_map;
+        Ok(())
     }
 }
 
@@ -437,10 +448,10 @@ impl Db {
     /// differs from the query (defensive — pre-validation keeps a live slab's
     /// dim uniform), scores each under a short read lock with the optional
     /// candidate filter, merges, sorts descending, and truncates to `k`. Ids
-    /// are mapped to `NodeRecord` through a single snapshot; an id the snapshot
-    /// no longer carries (the slab can be momentarily ahead of/behind the
-    /// snapshot between locks) is dropped — harmless. Result nodes are bumped
-    /// (access counters, Task 4).
+    /// are mapped to `NodeRecord` through a single storage read transaction;
+    /// an id storage no longer carries (the slab can be momentarily
+    /// ahead of/behind storage between locks) is dropped — harmless. Result
+    /// nodes are bumped (access counters, Task 4).
     ///
     /// Returns [`TopoError::Closed`] if a slab lock is poisoned — reachable only
     /// after the applier thread has panicked (the engine is already dead); see
@@ -476,10 +487,11 @@ impl Db {
         });
         merged.truncate(q.k);
 
-        let snap = self.snapshot();
+        let ids: HashSet<NodeId> = merged.iter().map(|(id, _)| *id).collect();
+        let by_id = self.storage().load_nodes(&ids).unwrap_or_default();
         let mut out: Vec<(NodeRecord, f32)> = Vec::with_capacity(merged.len());
         for (id, score) in merged {
-            if let Some(rec) = snap.nodes.get(&id) {
+            if let Some(rec) = by_id.get(&id) {
                 out.push((rec.clone(), score));
             }
         }

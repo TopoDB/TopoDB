@@ -292,10 +292,13 @@ fn temporal_boundaries_inclusive_from_exclusive_to() {
 #[test]
 fn snapshot_is_not_part_of_the_public_read_api() {
     // Compile-time contract: the supported public read APIs are the scoped
-    // ones. This test exercises the debug seam that replaces `snapshot()`
-    // for tests, and asserts it returns a consistent view.
+    // ones. Post-W5 the engine has no separate in-memory snapshot at all —
+    // reads run directly against storage — so this exercises the debug seam
+    // (`debug_dump_nodes`/`debug_dump_edges`) that stands in for the old
+    // `debug_snapshot()`, and asserts it returns a consistent view.
     let f = fixture();
-    let snap = f.db.debug_snapshot();
-    assert!(snap.debug_nodes().contains_key(&f.a));
-    assert!(snap.debug_edges().len() >= 2);
+    let nodes = f.db.debug_dump_nodes();
+    let edges = f.db.debug_dump_edges();
+    assert!(nodes.iter().any(|n| n.id == f.a));
+    assert!(edges.len() >= 2);
 }

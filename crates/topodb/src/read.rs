@@ -40,8 +40,8 @@ pub struct TraversalQuery {
 }
 
 /// Result of a traversal: every in-scope seed plus everything reached,
-/// deduped, with the full edge records (from the snapshot's `edges` map) for
-/// every traversed edge.
+/// deduped, with the full edge records (fetched from the EDGES table by
+/// slot) for every traversed edge.
 #[derive(Debug, Clone, Default)]
 pub struct Subgraph {
     pub nodes: Vec<NodeRecord>,
@@ -75,15 +75,20 @@ impl Db {
     }
 
     /// All nodes with the given `label`, restricted to `scopes`. Order is
-    /// unspecified (snapshot iteration order).
+    /// unspecified (NODES table iteration order). O(scope) by contract — a
+    /// label scan, not an indexed lookup — so this is one of the two places
+    /// (with `nodes_by_float_range`) a full iteration of the slot-keyed
+    /// NODES table (one read transaction, via `Storage::all_nodes`) is
+    /// legitimate. A storage read failure degrades to "no hits", mirroring
+    /// `Db::node`'s `.ok()` treatment of a storage error as absence.
     #[must_use]
     pub fn nodes_by_label(&self, scopes: &ScopeSet, label: &str) -> Vec<NodeRecord> {
-        let snap = self.snapshot();
-        let hits: Vec<NodeRecord> = snap
-            .nodes
-            .values()
+        let hits: Vec<NodeRecord> = self
+            .storage()
+            .all_nodes()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|n| n.label == label && scopes.contains(n.scope))
-            .cloned()
             .collect();
         self.bump(hits.iter().map(|n| n.id));
         hits
@@ -131,10 +136,14 @@ impl Db {
         Ok(hits)
     }
 
-    /// Unindexed scoped snapshot scan for `min <= props[prop] <= max` over
+    /// Unindexed scoped scan for `min <= props[prop] <= max` over
     /// `PropValue::Float` values. O(scope size) — the decay-sweep primitive;
     /// there is no float range index (equality indexing explicitly excludes
-    /// `Float`, see `IndexValue`).
+    /// `Float`, see `IndexValue`). Like `nodes_by_label`, this is a full
+    /// iteration of the slot-keyed NODES table (one read transaction, via
+    /// `Storage::all_nodes`) — legitimate here because the API was always
+    /// O(n) by contract. A storage read failure degrades to "no hits" (see
+    /// `nodes_by_label`'s doc comment).
     /// Does NOT bump access counters, by design: this is the decay-sweep
     /// primitive. A sweep that bumped everything it scanned would overwrite the
     /// very recency signal (`last_accessed_at`) it exists to read.
@@ -146,12 +155,12 @@ impl Db {
         min: f64,
         max: f64,
     ) -> Vec<NodeRecord> {
-        let snap = self.snapshot();
-        snap.nodes
-            .values()
+        self.storage()
+            .all_nodes()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|n| scopes.contains(n.scope))
             .filter(|n| matches!(n.props.get(prop), Some(PropValue::Float(f)) if *f >= min && *f <= max))
-            .cloned()
             .collect()
     }
 
@@ -159,8 +168,7 @@ impl Db {
     /// on-disk chunked adjacency (v3 spec §6). The whole walk runs inside one
     /// `begin_read` transaction — NODE_SLOTS/NODE_IDS/OUT_ADJ/IN_ADJ/NODES/
     /// EDGES/EMBEDDINGS opened once, `dicts`/`scope_registry` read guards
-    /// held for the duration — so the result is one consistent view, exactly
-    /// like the `snapshot()`-based walk it replaces.
+    /// held for the duration — so the result is one consistent view.
     ///
     /// Per hop, prunes on entry-level fields FIRST — edge scope (via
     /// `ScopeRegistry::resolve` + `ScopeSet::contains`), the edge-type filter

@@ -1,7 +1,5 @@
 use proptest::prelude::*;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
-use topodb::AdjEntry;
 use topodb::*;
 
 /// Fixed, distinct vocabulary for `Intent::SetText` — deterministic (no
@@ -221,37 +219,41 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) -> 
     scope_id
 }
 
-/// Projects a `Snapshot`'s `nodes` map into a `BTreeMap` for order-independent
-/// comparison (`im::HashMap` iteration order isn't guaranteed to match
-/// between an incrementally-`apply`'d snapshot and a from-scratch
-/// `Snapshot::from_storage` rebuild, even when the contents are identical).
-fn nodes_map(snap: &Snapshot) -> BTreeMap<NodeId, NodeRecord> {
-    snap.debug_nodes()
-        .iter()
-        .map(|(k, v)| (*k, v.clone()))
-        .collect()
-}
-
-/// Same idea for the full-record `edges` map.
-fn edges_map(snap: &Snapshot) -> BTreeMap<EdgeId, EdgeRecord> {
-    snap.debug_edges()
-        .iter()
-        .map(|(k, v)| (*k, v.clone()))
-        .collect()
-}
-
-/// Same idea for `out`/`inn` adjacency: per-key entry order in the `im`
-/// vectors also isn't guaranteed to match, so each key's entries are sorted
-/// by edge id before comparison (same technique as the `graph` module's own
-/// `incremental_snapshot_equals_rebuild` test).
-fn adj_map(m: &im::HashMap<NodeId, im::Vector<AdjEntry>>) -> BTreeMap<NodeId, Vec<AdjEntry>> {
-    m.iter()
-        .map(|(k, v)| {
-            let mut entries: Vec<AdjEntry> = v.iter().cloned().collect();
-            entries.sort_by_key(|e| e.edge);
-            (*k, entries)
-        })
-        .collect()
+/// Every seed node's full 1-hop neighborhood (both directions, unfiltered by
+/// edge type, `as_of` pinned so the check is insensitive to wall-clock time),
+/// as observed through the public `traverse` read path — which reads
+/// OUT_ADJ/IN_ADJ directly. Keyed by seed node id in a `BTreeMap` for
+/// order-independent comparison; each seed's node/edge id sets are sorted for
+/// the same reason. Used to compare adjacency parity before vs. after
+/// `rebuild_state_from_ops` — the disk-resident equivalent of the old
+/// `Snapshot::debug_out`/`debug_inn` comparison, from before the in-memory
+/// snapshot layer was deleted (the engine's read model is disk-resident now,
+/// so there is no separate adjacency structure to fold/compare directly —
+/// `traverse` IS the read path being guarded).
+fn adjacency_fingerprint(
+    db: &Db,
+    scopes: &ScopeSet,
+    seeds: &[NodeId],
+) -> BTreeMap<NodeId, (Vec<NodeId>, Vec<EdgeId>)> {
+    let mut out = BTreeMap::new();
+    for &seed in seeds {
+        let sub = db
+            .traverse(&TraversalQuery {
+                scopes: scopes.clone(),
+                seeds: vec![seed],
+                max_hops: 1,
+                edge_types: None,
+                direction: Direction::Both,
+                as_of: Some(i64::MAX),
+            })
+            .unwrap();
+        let mut node_ids: Vec<NodeId> = sub.nodes.iter().map(|n| n.id).collect();
+        node_ids.sort();
+        let mut edge_ids: Vec<EdgeId> = sub.edges.iter().map(|e| e.id).collect();
+        edge_ids.sort();
+        out.insert(seed, (node_ids, edge_ids));
+    }
+    out
 }
 
 /// The `IndexSpec` under which the proptest `Db` is opened: equality-indexes
@@ -379,11 +381,11 @@ proptest! {
 
         let live_nodes = db.debug_dump_nodes();
         let live_edges = db.debug_dump_edges();
-        // Captured through the *reader* path (`Db::debug_snapshot`, the
-        // arc-swapped in-memory snapshot readers actually see) — not
-        // storage directly — so this guards the `Db::rebuild_state_from_ops`
-        // snapshot swap specifically, not just `Storage`'s rebuild.
-        let snap_before = db.debug_snapshot();
+        let seeds: Vec<NodeId> = live_nodes.iter().map(|n| n.id).collect();
+        // Captured through the public disk-backed read path (`traverse`) —
+        // the engine's read model is disk-resident, so there is no separate
+        // in-memory snapshot for a reader to observe instead of storage.
+        let adj_before = adjacency_fingerprint(&db, &scopes, &seeds);
 
         // Recall-layer parity, BEFORE rebuild. `text_k` is computed from the
         // pre-rebuild live count (rebuild never changes the live set — that's
@@ -399,23 +401,19 @@ proptest! {
         prop_assert_eq!(live_nodes, db.debug_dump_nodes());
         prop_assert_eq!(live_edges, db.debug_dump_edges());
 
-        let snap_after = db.debug_snapshot();
-        // `Db::rebuild_state_from_ops` must actually swap in a *new*
-        // `Arc<Snapshot>` — not just leave the old one in place. Checking
-        // pointer identity (rather than only content) is what catches a
-        // dropped/forgotten `snap.store(...)` call: since a correct rebuild
-        // reproduces identical content, a content-only comparison would
-        // still pass even if the swap never happened (the stale Arc already
-        // held the same values). This is the reader-facing guard the
-        // reviewer asked for.
-        prop_assert!(
-            !Arc::ptr_eq(&snap_before, &snap_after),
-            "rebuild_state_from_ops must store a fresh Snapshot Arc, not leave the old one in place"
-        );
-        prop_assert_eq!(nodes_map(&snap_before), nodes_map(&snap_after));
-        prop_assert_eq!(edges_map(&snap_before), edges_map(&snap_after));
-        prop_assert_eq!(adj_map(snap_before.debug_out()), adj_map(snap_after.debug_out()));
-        prop_assert_eq!(adj_map(snap_before.debug_inn()), adj_map(snap_after.debug_inn()));
+        // `rebuild_state_from_ops` drains and repopulates NODES/EDGES/
+        // OUT_ADJ/IN_ADJ from the op log in one write transaction. This
+        // re-derives the same fingerprint through `traverse` (the public
+        // disk-backed read path) and asserts it is unchanged — the
+        // disk-resident equivalent of the old `Snapshot::debug_out`/
+        // `debug_inn` parity check, from before the in-memory snapshot layer
+        // (and its `Arc` pointer-identity swap) was deleted. There is no
+        // more separate snapshot to check swap identity on: the read model
+        // IS storage now, so "did the rebuild actually repopulate the
+        // adjacency tables correctly" is exactly what this content
+        // comparison (together with the node/edge dumps above) verifies.
+        let adj_after = adjacency_fingerprint(&db, &scopes, &seeds);
+        prop_assert_eq!(adj_before, adj_after);
 
         // Recall-layer parity, AFTER rebuild. Equality/vector re-assert the
         // same "finds it" property against the rebuilt state; FTS asserts the
