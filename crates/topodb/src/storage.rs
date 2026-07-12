@@ -1873,7 +1873,17 @@ fn apply_op(
             // the whole batch since the caller's write transaction never
             // commits on this `Err`.
             let model_id = dicts.intern(dict, DictKind::Model, model)?;
-            check_or_pin_dim(vector_dims, model_id, vector.len())?;
+            // `check_or_pin_dim` only has the interned id in scope, but the
+            // caller submitted a STRING model name — re-annotate the
+            // rejection with it here, matching `prevalidate_dims`'s
+            // `model {model:?}` wording convention. The interned id stays
+            // in the inner message for on-disk debugging.
+            check_or_pin_dim(vector_dims, model_id, vector.len()).map_err(|e| match e {
+                TopoError::Rejected(msg) => {
+                    TopoError::Rejected(format!("SetEmbedding for model {model:?}: {msg}"))
+                }
+                other => other,
+            })?;
             put_embedding(embeddings, node_slots, *id, model, vector)
         }
         Op::RemoveNode { id } => {
@@ -2778,7 +2788,18 @@ mod tests {
                 3,
             )
             .unwrap_err();
-        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+        // The rejection must name the model by its submitted STRING name
+        // (`model {model:?}` convention, as in `prevalidate_dims`) and both
+        // dims — the interned u32 id alone is meaningless to a caller.
+        match &err {
+            TopoError::Rejected(msg) => {
+                assert!(
+                    msg.contains("\"m1\"") && msg.contains('3') && msg.contains('5'),
+                    "rejection must name the model string and both dims: {msg}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     /// A re-embed at the SAME dim (same node re-embedded, and a different
@@ -3071,5 +3092,75 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+    }
+
+    /// A batch whose EARLY `SetEmbedding` interns a brand-new model (and
+    /// pins its dim) but whose LATER, unrelated op fails must commit
+    /// nothing: the model's dict entry and its `vector_dims` pin both roll
+    /// back with the aborted transaction, and the in-memory `Dicts` mirror
+    /// must not carry the phantom intern into the next batch (`apply_batch`
+    /// reloads the mirror from committed rows on entry — this pins that
+    /// recovery for the NEW `DictKind::Model` kind specifically).
+    #[test]
+    fn vector_dims_failed_batch_rolls_back_phantom_model_intern_and_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let a = NodeId::new();
+        create_node(&s, a, scope, 0);
+
+        // Early op interns "phantom" (would be Model id 0) and pins dim 3;
+        // the later RemoveNode of a never-created id fails the batch.
+        let err = s
+            .apply_batch(
+                vec![
+                    Op::SetEmbedding {
+                        id: a,
+                        model: "phantom".into(),
+                        vector: vec![1.0, 2.0, 3.0],
+                    },
+                    Op::RemoveNode { id: NodeId::new() },
+                ],
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+
+        // Nothing committed: VECTOR_DIMS has no row and no embedding landed.
+        {
+            let tx = s.db.begin_read().unwrap();
+            let dims = tx.open_table(VECTOR_DIMS).unwrap();
+            assert_eq!(dims.iter().unwrap().count(), 0);
+        }
+        assert!(s.load_node(a).unwrap().unwrap().embedding.is_none());
+
+        // A fresh batch interns models FRESH: its model takes id 0 — the id
+        // "phantom" would have retained had its intern survived the abort.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "real".into(),
+                vector: vec![1.0],
+            }],
+            2,
+        )
+        .unwrap();
+        {
+            let dicts = s.dicts.read().unwrap();
+            assert_eq!(dicts.id_of(DictKind::Model, "real"), Some(0));
+            assert_eq!(dicts.id_of(DictKind::Model, "phantom"), None);
+        }
+
+        // And "phantom" carries no pinned dim: re-using the name at a
+        // DIFFERENT dim than the failed batch's 3 succeeds.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "phantom".into(),
+                vector: vec![1.0, 2.0],
+            }],
+            3,
+        )
+        .unwrap();
     }
 }
