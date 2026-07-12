@@ -48,6 +48,14 @@ pub(crate) const FTS_STATS: TableDefinition<&[u8], &[u8]> = TableDefinition::new
 pub(crate) const COUNTERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("counters");
 /// Cold vector rows: node key -> framed postcard (model, vector).
 pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("embeddings");
+/// Per-model permanent embedding dimension: 4-byte BE `DictKind::Model` id ->
+/// 4-byte LE `u32` dim. Pinned by `check_or_pin_dim` on a model's first
+/// `SetEmbedding`; every later `SetEmbedding` under the same model with a
+/// different dim rejects the whole batch (see `check_or_pin_dim` and the v4
+/// design spec's "one deliberate semantics change" — this supersedes the RAM
+/// slab's per-(model, scope) empty-slab re-dimension allowance with a
+/// permanent, per-model-only rule).
+pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_dims");
 
 pub const FORMAT_VERSION: u32 = 3;
 
@@ -126,6 +134,7 @@ impl Storage {
             tx.open_table(FTS_DOCS).map_err(storage_err)?;
             tx.open_table(FTS_STATS).map_err(storage_err)?;
             tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
             tx.open_table(DICT).map_err(storage_err)?;
             tx.open_table(NODE_SLOTS).map_err(storage_err)?;
             tx.open_table(NODE_IDS).map_err(storage_err)?;
@@ -750,6 +759,7 @@ impl Storage {
             let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
             let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
             let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
             let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
             let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
@@ -809,6 +819,7 @@ impl Storage {
                     &mut nodes,
                     &mut edges,
                     &mut embeddings,
+                    &mut vector_dims,
                     &mut dict_table,
                     &mut dicts,
                     &mut slot_meta,
@@ -1248,6 +1259,7 @@ impl Storage {
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
                 let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
                 let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
@@ -1286,6 +1298,7 @@ impl Storage {
                 nodes.retain(|_, _| false).map_err(storage_err)?;
                 edges.retain(|_, _| false).map_err(storage_err)?;
                 embeddings.retain(|_, _| false).map_err(storage_err)?;
+                vector_dims.retain(|_, _| false).map_err(storage_err)?;
                 dict_table.retain(|_, _| false).map_err(storage_err)?;
                 slot_meta.remove("next_node_slot").map_err(storage_err)?;
                 slot_meta.remove("next_edge_slot").map_err(storage_err)?;
@@ -1339,6 +1352,7 @@ impl Storage {
                         &mut nodes,
                         &mut edges,
                         &mut embeddings,
+                        &mut vector_dims,
                         &mut dict_table,
                         &mut dicts,
                         &mut slot_meta,
@@ -1716,6 +1730,45 @@ fn put_edge(
         .map_err(storage_err)?;
     Ok(())
 }
+/// Pins `model_id`'s embedding dimension on its first appearance in
+/// `VECTOR_DIMS`, and enforces it forever after: absent -> insert `dim`;
+/// present and equal -> `Ok`; present and different -> `Rejected` (naming
+/// the model id and both dims), which aborts the whole enclosing batch since
+/// the caller's write transaction never commits on an `Err` return.
+fn check_or_pin_dim(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    model_id: u32,
+    dim: usize,
+) -> Result<(), TopoError> {
+    let key = model_id.to_be_bytes();
+    let dim_u32 = u32::try_from(dim)
+        .map_err(|_| TopoError::Encoding(format!("embedding dim {dim} exceeds u32")))?;
+    // Convert the read to an owned `Option<u32>` FIRST so the `AccessGuard`
+    // borrowing `table` is dropped before the `insert` call below, which
+    // needs `table` mutably — redb's `get`/`insert` can't overlap.
+    let existing: Option<u32> = match table.get(key.as_slice()).map_err(storage_err)? {
+        Some(v) => {
+            let bytes: [u8; 4] = v
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad vector_dims value".into()))?;
+            Some(u32::from_le_bytes(bytes))
+        }
+        None => None,
+    };
+    match existing {
+        Some(existing) if existing == dim_u32 => Ok(()),
+        Some(existing) => Err(TopoError::Rejected(format!(
+            "model id {model_id} embedding dim is pinned at {existing}; got {dim_u32}"
+        ))),
+        None => {
+            table
+                .insert(key.as_slice(), dim_u32.to_le_bytes().as_slice())
+                .map_err(storage_err)?;
+            Ok(())
+        }
+    }
+}
 fn put_embedding(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
     node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -1744,6 +1797,7 @@ fn apply_op(
     nodes: &mut Table<'_, &'static [u8], &'static [u8]>,
     edges: &mut Table<'_, &'static [u8], &'static [u8]>,
     embeddings: &mut Table<'_, &'static [u8], &'static [u8]>,
+    vector_dims: &mut Table<'_, &'static [u8], &'static [u8]>,
     dict: &mut Table<'_, &'static [u8], &'static str>,
     dicts: &mut Dicts,
     slot_meta: &mut Table<'_, &'static str, &'static [u8]>,
@@ -1811,6 +1865,15 @@ fn apply_op(
             read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?.ok_or_else(
                 || TopoError::Rejected(format!("SetEmbedding: node {id:?} not found")),
             )?;
+            // Per-model permanent dim (v4): intern the model name to a
+            // stable id, then pin/check its dim in VECTOR_DIMS. This is
+            // cross-batch AND cross-scope (unlike the RAM slab's
+            // per-(model, scope) check, which stays in place — see
+            // `check_or_pin_dim`'s doc comment) — a mismatch here rejects
+            // the whole batch since the caller's write transaction never
+            // commits on this `Err`.
+            let model_id = dicts.intern(dict, DictKind::Model, model)?;
+            check_or_pin_dim(vector_dims, model_id, vector.len())?;
             put_embedding(embeddings, node_slots, *id, model, vector)
         }
         Op::RemoveNode { id } => {
@@ -2656,5 +2719,357 @@ mod tests {
             2,
         )
         .expect("storage must remain writable after a failed rebuild");
+    }
+
+    // --- vector_dims: per-model permanent dim (v4 Task 2) ---
+    //
+    // All tests below are deliberately black-box (only `apply_batch`/
+    // `load_node`/`rebuild_state_from_ops` — no direct `VECTOR_DIMS`/
+    // `DictKind::Model` reference) so they exercise the write-path
+    // behavior a caller actually observes, and so they were genuinely RED
+    // before `check_or_pin_dim` existed: today's `Storage::apply_batch` has
+    // NO dim enforcement at all (that lived only in the RAM slab's
+    // `prevalidate_dims`, which this task's helper supersedes for
+    // cross-batch permanence), so every "-> Rejected" assertion below fails
+    // (returns `Ok`) against the pre-fix code.
+
+    fn create_node(s: &Storage, id: NodeId, scope: Scope, seq: i64) {
+        s.apply_batch(
+            vec![Op::CreateNode {
+                id,
+                scope,
+                label: "M".into(),
+                props: Default::default(),
+            }],
+            seq,
+        )
+        .unwrap();
+    }
+
+    /// First `SetEmbedding` under a never-seen model pins its dim: proven
+    /// not by the trivially-true first write succeeding, but by a SECOND
+    /// node embedded under the SAME model with a DIFFERENT dim being
+    /// rejected.
+    #[test]
+    fn vector_dims_first_set_embedding_pins_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let a = NodeId::new();
+        let b = NodeId::new();
+        create_node(&s, a, scope, 0);
+        create_node(&s, b, scope, 1);
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![1.0, 2.0, 3.0],
+            }],
+            2,
+        )
+        .unwrap();
+        let err = s
+            .apply_batch(
+                vec![Op::SetEmbedding {
+                    id: b,
+                    model: "m1".into(),
+                    vector: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                }],
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+    }
+
+    /// A re-embed at the SAME dim (same node re-embedded, and a different
+    /// node embedded under the same model at the same dim) always passes.
+    #[test]
+    fn vector_dims_same_dim_reembed_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let a = NodeId::new();
+        let b = NodeId::new();
+        create_node(&s, a, scope, 0);
+        create_node(&s, b, scope, 1);
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![1.0, 2.0, 3.0],
+            }],
+            2,
+        )
+        .unwrap();
+        // Same node, same dim, different values — a re-embed.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![9.0, 8.0, 7.0],
+            }],
+            3,
+        )
+        .unwrap();
+        // Different node, same model, same dim.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: b,
+                model: "m1".into(),
+                vector: vec![0.0, 0.0, 0.0],
+            }],
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            s.load_node(a).unwrap().unwrap().embedding,
+            Some(("m1".to_string(), vec![9.0, 8.0, 7.0]))
+        );
+    }
+
+    /// A different dim under an already-pinned model rejects the WHOLE
+    /// batch — including an earlier op in that same batch that would
+    /// otherwise have committed cleanly on its own.
+    #[test]
+    fn vector_dims_different_dim_rejects_whole_batch_and_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let a = NodeId::new();
+        let b = NodeId::new();
+        create_node(&s, a, scope, 0);
+        create_node(&s, b, scope, 1);
+        // Pin m1's dim at 3.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![1.0, 2.0, 3.0],
+            }],
+            2,
+        )
+        .unwrap();
+
+        let stray = NodeId::new();
+        let err = s
+            .apply_batch(
+                vec![
+                    // Earlier op in the batch — would succeed in isolation.
+                    Op::CreateNode {
+                        id: stray,
+                        scope,
+                        label: "M".into(),
+                        props: Default::default(),
+                    },
+                    // Later op — dim 2 conflicts with m1's pinned dim 3.
+                    Op::SetEmbedding {
+                        id: b,
+                        model: "m1".into(),
+                        vector: vec![1.0, 2.0],
+                    },
+                ],
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+
+        // Nothing from the rejected batch committed: the earlier CreateNode
+        // is absent, and b never got an embedding.
+        assert!(s.load_node(stray).unwrap().is_none());
+        assert!(s.load_node(b).unwrap().unwrap().embedding.is_none());
+    }
+
+    /// Two models pin independent dims — coexistence, not a shared global
+    /// pin — proven both by both dims accepting matching re-embeds and by
+    /// each rejecting the OTHER model's dim.
+    #[test]
+    fn vector_dims_two_models_different_dims_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b, c, d) = (NodeId::new(), NodeId::new(), NodeId::new(), NodeId::new());
+        create_node(&s, a, scope, 0);
+        create_node(&s, b, scope, 1);
+        create_node(&s, c, scope, 2);
+        create_node(&s, d, scope, 3);
+
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![1.0, 2.0],
+            }],
+            4,
+        )
+        .unwrap(); // m1 pinned at dim 2
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: b,
+                model: "m2".into(),
+                vector: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            }],
+            5,
+        )
+        .unwrap(); // m2 pinned at dim 5
+
+        // Matching re-embeds under each model's own pinned dim succeed.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: c,
+                model: "m1".into(),
+                vector: vec![3.0, 4.0],
+            }],
+            6,
+        )
+        .unwrap();
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: d,
+                model: "m2".into(),
+                vector: vec![0.0, 0.0, 0.0, 0.0, 0.0],
+            }],
+            7,
+        )
+        .unwrap();
+
+        // Cross-model dim (m1's dim-2 vector under m2's pin, and vice
+        // versa) rejects — the pins are per-model, not shared.
+        let err = s
+            .apply_batch(
+                vec![Op::SetEmbedding {
+                    id: c,
+                    model: "m2".into(),
+                    vector: vec![1.0, 2.0],
+                }],
+                8,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+    }
+
+    /// The pinned dim persists across a close/reopen of the same file.
+    #[test]
+    fn vector_dims_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let scope = Scope::Id(ScopeId::new());
+        let a = NodeId::new();
+        {
+            let s = Storage::open(&path).unwrap();
+            create_node(&s, a, scope, 0);
+            s.apply_batch(
+                vec![Op::SetEmbedding {
+                    id: a,
+                    model: "m1".into(),
+                    vector: vec![1.0, 2.0, 3.0, 4.0],
+                }],
+                1,
+            )
+            .unwrap();
+        }
+        {
+            let s = Storage::open(&path).unwrap();
+            let b = NodeId::new();
+            let c = NodeId::new();
+            create_node(&s, b, scope, 2);
+            create_node(&s, c, scope, 3);
+            // Matching dim still works post-reopen.
+            s.apply_batch(
+                vec![Op::SetEmbedding {
+                    id: b,
+                    model: "m1".into(),
+                    vector: vec![5.0, 6.0, 7.0, 8.0],
+                }],
+                4,
+            )
+            .unwrap();
+            // Mismatched dim is rejected — the pin survived the reopen.
+            let err = s
+                .apply_batch(
+                    vec![Op::SetEmbedding {
+                        id: c,
+                        model: "m1".into(),
+                        vector: vec![1.0, 2.0],
+                    }],
+                    5,
+                )
+                .unwrap_err();
+            assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+        }
+    }
+
+    /// `rebuild_state_from_ops` replays the op log and must reproduce the
+    /// `vector_dims` table exactly (not leave it empty/stale) — proven by
+    /// re-testing both models' pins post-rebuild.
+    #[test]
+    fn vector_dims_rebuild_state_from_ops_reproduces_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b) = (NodeId::new(), NodeId::new());
+        create_node(&s, a, scope, 0);
+        create_node(&s, b, scope, 1);
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: a,
+                model: "m1".into(),
+                vector: vec![1.0, 2.0, 3.0],
+            }],
+            2,
+        )
+        .unwrap(); // m1 pinned at dim 3
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: b,
+                model: "m2".into(),
+                vector: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            }],
+            3,
+        )
+        .unwrap(); // m2 pinned at dim 6
+
+        s.rebuild_state_from_ops().unwrap();
+
+        let c = NodeId::new();
+        let d = NodeId::new();
+        let e = NodeId::new();
+        create_node(&s, c, scope, 4);
+        create_node(&s, d, scope, 5);
+        create_node(&s, e, scope, 6);
+
+        // m1's pin (dim 3) survived the rebuild.
+        let err = s
+            .apply_batch(
+                vec![Op::SetEmbedding {
+                    id: c,
+                    model: "m1".into(),
+                    vector: vec![9.0, 9.0, 9.0, 9.0],
+                }],
+                7,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
+
+        // m2's pin (dim 6) survived too, and its matching dim still works.
+        s.apply_batch(
+            vec![Op::SetEmbedding {
+                id: d,
+                model: "m2".into(),
+                vector: vec![1.0; 6],
+            }],
+            8,
+        )
+        .unwrap();
+        let err = s
+            .apply_batch(
+                vec![Op::SetEmbedding {
+                    id: e,
+                    model: "m2".into(),
+                    vector: vec![1.0],
+                }],
+                9,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TopoError::Rejected(_)), "got {err:?}");
     }
 }

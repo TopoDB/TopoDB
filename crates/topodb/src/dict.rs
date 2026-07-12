@@ -9,6 +9,10 @@ pub(crate) enum DictKind {
     Label = 0,
     EdgeType = 1,
     PropKey = 2,
+    /// v4: embedding model names, interned so `vector_dims`/`vectors` can key
+    /// by a stable `u32` id rather than the raw string. Append-only registry
+    /// — this kind was added at the END; never reorder or reuse a discriminant.
+    Model = 3,
 }
 impl DictKind {
     fn from_byte(b: u8) -> Option<Self> {
@@ -16,6 +20,7 @@ impl DictKind {
             0 => Some(Self::Label),
             1 => Some(Self::EdgeType),
             2 => Some(Self::PropKey),
+            3 => Some(Self::Model),
             _ => None,
         }
     }
@@ -37,6 +42,7 @@ pub(crate) struct Dicts {
     labels: Map,
     types: Map,
     props: Map,
+    models: Map,
 }
 impl Dicts {
     fn map(&self, k: DictKind) -> &Map {
@@ -44,6 +50,7 @@ impl Dicts {
             DictKind::Label => &self.labels,
             DictKind::EdgeType => &self.types,
             DictKind::PropKey => &self.props,
+            DictKind::Model => &self.models,
         }
     }
     fn map_mut(&mut self, k: DictKind) -> &mut Map {
@@ -51,6 +58,7 @@ impl Dicts {
             DictKind::Label => &mut self.labels,
             DictKind::EdgeType => &mut self.types,
             DictKind::PropKey => &mut self.props,
+            DictKind::Model => &mut self.models,
         }
     }
     pub(crate) fn load(tx: &redb::ReadTransaction) -> Result<Self, TopoError> {
