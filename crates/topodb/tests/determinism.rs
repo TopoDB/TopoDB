@@ -386,6 +386,16 @@ proptest! {
         // the engine's read model is disk-resident, so there is no separate
         // in-memory snapshot for a reader to observe instead of storage.
         let adj_before = adjacency_fingerprint(&db, &scopes, &seeds);
+        // Raw OUT_ADJ/IN_ADJ chunk contents, open AND closed entries. The
+        // traverse fingerprint above cannot observe closed edges (its
+        // temporal filter excludes every entry with `valid_to = Some(_)` at
+        // any `as_of`), so on its own it would miss a rebuild bug that
+        // corrupts a closed edge's `valid_to` — or drops its adjacency entry
+        // outright — while leaving the separate EDGES-table copy (checked
+        // via `debug_dump_edges` below) intact. This raw dump is the
+        // disk-resident equivalent of the old `Snapshot::debug_out`/
+        // `debug_inn` comparison, closed entries included.
+        let adj_raw_before = db.debug_dump_adjacency().unwrap();
 
         // Recall-layer parity, BEFORE rebuild. `text_k` is computed from the
         // pre-rebuild live count (rebuild never changes the live set — that's
@@ -402,16 +412,25 @@ proptest! {
         prop_assert_eq!(live_edges, db.debug_dump_edges());
 
         // `rebuild_state_from_ops` drains and repopulates NODES/EDGES/
-        // OUT_ADJ/IN_ADJ from the op log in one write transaction. This
-        // re-derives the same fingerprint through `traverse` (the public
-        // disk-backed read path) and asserts it is unchanged — the
-        // disk-resident equivalent of the old `Snapshot::debug_out`/
-        // `debug_inn` parity check, from before the in-memory snapshot layer
-        // (and its `Arc` pointer-identity swap) was deleted. There is no
-        // more separate snapshot to check swap identity on: the read model
-        // IS storage now, so "did the rebuild actually repopulate the
-        // adjacency tables correctly" is exactly what this content
-        // comparison (together with the node/edge dumps above) verifies.
+        // OUT_ADJ/IN_ADJ from the op log in one write transaction. Two
+        // adjacency parity checks against the pre-rebuild captures:
+        //
+        // 1. The raw OUT_ADJ/IN_ADJ dump must be entry-for-entry identical —
+        //    including CLOSED entries and their exact `valid_to` — pinning
+        //    that replay reproduces byte-equal adjacency content. This is
+        //    the load-bearing check (the old `debug_out`/`debug_inn`
+        //    comparison's true equivalent); a rebuild that mangled a closed
+        //    edge's `valid_to` in the chunks fails HERE and nowhere else.
+        // 2. The `traverse`-based fingerprint must also be unchanged —
+        //    cheap, and exercises the public read path over the same tables
+        //    (open entries only, by `traverse`'s temporal contract).
+        //
+        // There is no more separate snapshot to check swap identity on: the
+        // read model IS storage now, so "did the rebuild repopulate the
+        // adjacency tables correctly" is exactly what these content
+        // comparisons (with the node/edge dumps above) verify.
+        let adj_raw_after = db.debug_dump_adjacency().unwrap();
+        prop_assert_eq!(adj_raw_before, adj_raw_after);
         let adj_after = adjacency_fingerprint(&db, &scopes, &seeds);
         prop_assert_eq!(adj_before, adj_after);
 

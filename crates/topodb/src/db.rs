@@ -745,7 +745,61 @@ impl Db {
         out.sort_by_key(|e| e.id);
         out
     }
+
+    /// Test/inspection helper: the raw contents of both adjacency tables
+    /// (OUT_ADJ and IN_ADJ), every chunk decoded, **open AND closed entries
+    /// included**, sorted deterministically. `#[doc(hidden)]` — see
+    /// `all_edges_between`. Exists so tests can assert byte-level adjacency
+    /// parity (e.g. that `rebuild_state_from_ops` reproduces identical chunk
+    /// content, including closed edges' `valid_to`, which no `as_of`-filtered
+    /// public read can observe). A full-table iteration — fine here: a debug
+    /// dump is inherently a full scan, not a production read path. Rows are
+    /// plain tuples ([`AdjacencyDumpRow`]) rather than the crate-internal
+    /// `AdjEntryDisk` type.
+    #[doc(hidden)]
+    pub fn debug_dump_adjacency(&self) -> Result<Vec<AdjacencyDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for (is_out, table_def) in [(true, crate::adj::OUT_ADJ), (false, crate::adj::IN_ADJ)] {
+            let table = tx
+                .open_table(table_def)
+                .map_err(crate::error::storage_err)?;
+            for entry in table.iter().map_err(crate::error::storage_err)? {
+                let (k, v) = entry.map_err(crate::error::storage_err)?;
+                let key: [u8; 16] = k
+                    .value()
+                    .try_into()
+                    .map_err(|_| TopoError::Encoding("bad adjacency key".into()))?;
+                let slot = u64::from_be_bytes(key[..8].try_into().expect("8-byte slice"));
+                let edge_type = u32::from_be_bytes(key[8..12].try_into().expect("4-byte slice"));
+                let raw = crate::codec::unframe_value(v.value())?;
+                for e in crate::adj::decode_block(raw.as_ref())? {
+                    out.push((
+                        slot,
+                        edge_type,
+                        is_out,
+                        e.target,
+                        e.edge,
+                        e.scope,
+                        e.valid_from,
+                        e.valid_to,
+                    ));
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
 }
+
+/// One decoded adjacency entry from [`Db::debug_dump_adjacency`]:
+/// `(slot, edge_type, is_out, target_slot, edge_slot, scope_id, valid_from,
+/// valid_to)`. Plain tuples so the crate-internal `AdjEntryDisk` type is not
+/// leaked through this `#[doc(hidden)]` debug seam.
+#[doc(hidden)]
+pub type AdjacencyDumpRow = (u64, u32, bool, u64, u64, u32, i64, Option<i64>);
 
 /// The node ids that `VectorIndex::prevalidate_dims`, `validate::prevalidate_edge_scopes`,
 /// and `VectorIndex::maintain` need pre-batch storage state (scope, embedding)

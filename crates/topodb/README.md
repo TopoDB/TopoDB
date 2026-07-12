@@ -4,7 +4,7 @@
 
 TopoDB is an embedded, local-first memory engine for AI agents, written in
 pure Rust: a scoped temporal property graph on [redb], with an op-log write
-path, lock-free snapshot reads, and k-hop temporal traversal — running
+path, disk-resident MVCC reads, and k-hop temporal traversal — running
 in-process, no server.
 
 Status: **early development (0.0.x)** — the engine core **and the recall
@@ -102,7 +102,7 @@ fn main() -> Result<(), topodb::TopoError> {
 - **Temporal edges** — facts supersede, never overwrite; `as_of` reads see history
 - **Structural scoping** — every read takes a `ScopeSet`; cross-scope edges require a `Shared` endpoint
 - **Deterministic replay** — the op log stores fully-resolved ops; replaying it reproduces state exactly (property-tested)
-- **Single-applier concurrency** — writers from any thread serialize through one applier; readers are lock-free against arc-swapped persistent snapshots
+- **Single-applier concurrency** — writers from any thread serialize through one applier; reads run in redb MVCC read transactions and never block the applier (or each other)
 
 License: MIT OR Apache-2.0.
 
