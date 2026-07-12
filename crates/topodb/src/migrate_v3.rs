@@ -396,4 +396,168 @@ mod tests {
             );
         }
     }
+
+    /// Writes a v2-shaped file directly (no v1 step, no pre-built fixture
+    /// binary): `nodes`/`edges` are encoded through the SAME frozen v2
+    /// encoders (`disk::node_to_disk`/`edge_to_disk`) `migrate.rs`'s v1->v2
+    /// step uses, keyed by v2 ULID keys, then META `"format_version"` is
+    /// stamped `2`. The caller reopens via `Storage::open`/`open_with` to
+    /// exercise the REAL migration cutover in `Storage::open_with_options`
+    /// (the `Some(2)` arm), not `migrate_v2_to_v3` called directly.
+    fn write_v2_fixture(path: &std::path::Path, nodes: &[NodeRecord], edges: &[EdgeRecord]) {
+        let db = Database::create(path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut dict_table = tx.open_table(crate::dict::DICT).unwrap();
+            let mut dicts = Dicts::default();
+            {
+                let mut nodes_table = tx.open_table(NODES).unwrap();
+                for n in nodes {
+                    let disk = crate::disk::node_to_disk(n, &mut dict_table, &mut dicts).unwrap();
+                    let raw = postcard::to_allocvec(&disk).unwrap();
+                    let framed = crate::codec::frame_value(raw);
+                    nodes_table
+                        .insert(crate::storage::node_key(n.id).as_slice(), framed.as_slice())
+                        .unwrap();
+                }
+            }
+            {
+                let mut edges_table = tx.open_table(EDGES).unwrap();
+                for e in edges {
+                    let disk = crate::disk::edge_to_disk(e, &mut dict_table, &mut dicts).unwrap();
+                    let raw = postcard::to_allocvec(&disk).unwrap();
+                    let framed = crate::codec::frame_value(raw);
+                    edges_table
+                        .insert(e.id.as_u128().to_be_bytes().as_slice(), framed.as_slice())
+                        .unwrap();
+                }
+            }
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("format_version", 2u32.to_le_bytes().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// M6 edge case: an EMPTY v2 file (no nodes, no edges — just the
+    /// format_version stamp) must still migrate cleanly rather than tripping
+    /// on an empty NODES iteration or similar. Every table stays empty
+    /// except META (which always carries format_version/index_spec) and
+    /// SCOPES (which always seeds exactly the Shared row).
+    #[test]
+    fn empty_v2_file_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        write_v2_fixture(&path, &[], &[]);
+
+        let s = crate::storage::Storage::open(&path).unwrap();
+        assert_eq!(s.format_version().unwrap(), 3);
+        for report in s.storage_report().unwrap() {
+            match report.table {
+                "meta" => assert!(report.rows >= 1, "meta must retain format_version"),
+                "scopes" => assert_eq!(report.rows, 1, "only the seeded Shared scope"),
+                other => assert_eq!(
+                    report.rows, 0,
+                    "table {other} must be empty after migrating an empty v2 file"
+                ),
+            }
+        }
+    }
+
+    /// M6 edge case: nodes exist but there are zero edges — the edge loop
+    /// (adjacency insertion, edge slot allocation) must handle "nothing to
+    /// do" without erroring, while the node migration still runs normally.
+    #[test]
+    fn v2_file_with_nodes_and_zero_edges_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let id = NodeId::new();
+        let mut props = crate::props::Props::new();
+        props.insert("name".to_string(), PropValue::Str("ada".into()));
+        let node = NodeRecord {
+            id,
+            scope: Scope::Shared,
+            label: "Entity".into(),
+            props,
+            embedding: None,
+        };
+        write_v2_fixture(&path, &[node], &[]);
+
+        let s = crate::storage::Storage::open(&path).unwrap();
+        assert_eq!(s.format_version().unwrap(), 3);
+        let rec = s
+            .load_node(id)
+            .unwrap()
+            .expect("migrated node must be readable");
+        assert_eq!(rec.label, "Entity");
+        assert_eq!(rec.props.get("name"), Some(&PropValue::Str("ada".into())));
+        let edge_rows = s
+            .storage_report()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.table == "edges")
+            .unwrap()
+            .rows;
+        assert_eq!(edge_rows, 0);
+    }
+
+    /// M6 edge case: a v2 file whose op log was already compacted
+    /// (`oldest_seq > 1` in META, so OPS holds only the surviving tail)
+    /// migrates cleanly, and — since the v2->v3 migration only touches
+    /// NODES/EDGES/EMBEDDINGS/COUNTERS/DICT/SCOPES and the v3 sidecar
+    /// tables, never OPS or META `"oldest_seq"` — both survive byte-for-byte
+    /// untouched.
+    #[test]
+    fn v2_file_with_compacted_op_log_migrates_ops_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let id = NodeId::new();
+        write_v2_fixture(&path, &[], &[]);
+
+        // Simulate a compaction that dropped seqs 1..4: OPS holds only the
+        // surviving tail (5, 6), and META "oldest_seq" records the floor.
+        {
+            let db = Database::open(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut ops_table = tx.open_table(crate::storage::OPS).unwrap();
+                let create = crate::op::Op::CreateNode {
+                    id,
+                    scope: Scope::Shared,
+                    label: "Entity".into(),
+                    props: Default::default(),
+                };
+                let set_props = crate::op::Op::SetNodeProps {
+                    id,
+                    props: Default::default(),
+                };
+                ops_table
+                    .insert(5u64, postcard::to_allocvec(&create).unwrap().as_slice())
+                    .unwrap();
+                ops_table
+                    .insert(6u64, postcard::to_allocvec(&set_props).unwrap().as_slice())
+                    .unwrap();
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert("oldest_seq", 5u64.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let s = crate::storage::Storage::open(&path).unwrap();
+        assert_eq!(s.format_version().unwrap(), 3);
+        assert_eq!(
+            s.oldest_seq().unwrap(),
+            5,
+            "compaction floor must survive migration untouched"
+        );
+        let replay = s.read_ops(5).unwrap();
+        assert_eq!(
+            replay.len(),
+            2,
+            "op log rows must survive migration untouched"
+        );
+        assert_eq!(replay[0].0, 5);
+        assert_eq!(replay[1].0, 6);
+    }
 }
