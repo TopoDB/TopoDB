@@ -12,8 +12,12 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
+import net from "node:net";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { serverArgs, SERVER_VERSION } from "./server-args.js";
+import { socketPathFor } from "./ipc.js";
+import { serveDegraded } from "./degraded.js";
 
 const SERVER_PKG = "@topodb/topodb-mcp";
 
@@ -238,16 +242,57 @@ if (!dataDir) {
 // fail to come up in a fresh project. Do not remove.
 mkdirSync(dataDir, { recursive: true });
 
-const child = spawn(
-  process.execPath,
-  [resolveServer(dataDir), ...serverArgs({ projectDir, dataDir })],
-  { stdio: "inherit" }, // this process is a pipe; the server owns the MCP stream
-);
-child.on("exit", (code) => process.exit(code ?? 1));
-child.on("error", (err) => {
-  // Without this, a failed spawn (e.g. a bad resolved path, or node missing
-  // from PATH) fires an unhandled "error" event and crashes with an opaque
-  // stack trace instead of a message that names what failed.
-  console.error(`topodb-mcp failed to start: ${err.message}`);
-  process.exit(1);
-});
+// This process is no longer the server: it is a thin client of the broker
+// that owns memory.redb. See specs/2026-07-12-plugin-broker-design.md.
+const args = serverArgs({ projectDir, dataDir });
+const dbPath = args[args.indexOf("--db") + 1];
+const sock = socketPathFor(dbPath);
+
+const tryConnect = () =>
+  new Promise((res) => {
+    const c = net.connect(sock);
+    c.on("connect", () => res(c));
+    c.on("error", () => res(null));
+  });
+
+/** Once connected, this process is a dumb byte pipe: the broker does the id
+ *  rewriting, so the client's JSON-RPC passes through untouched. */
+function relay(conn) {
+  process.stdin.pipe(conn);
+  conn.pipe(process.stdout);
+  conn.on("close", () => process.exit(0));
+}
+
+let conn = await tryConnect();
+let degradedReason = null;
+
+if (!conn) {
+  // No broker. Become one — or race another shim doing the same. Both spawn;
+  // redb's lock decides which survives (see broker.js). Then connect to the
+  // winner.
+  try {
+    resolveServer(dataDir); // ensure the server is installed BEFORE the broker needs it
+    const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "broker.js");
+    spawn(process.execPath, [brokerPath, ...args], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+
+    for (let i = 0; i < 25 && !conn; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      conn = await tryConnect();
+    }
+    if (!conn) {
+      degradedReason = "could not reach or start the topodb broker; see broker.log in the plugin data dir";
+    }
+  } catch (err) {
+    // resolveServer (install) or the spawn itself failed outright. This must
+    // NOT crash the process: a failed MCP server is nearly invisible in
+    // Claude Code while the skill keeps telling the agent to call memory
+    // tools. Explain the failure instead of dying — see design §5.
+    degradedReason = err.message;
+  }
+}
+
+if (conn) relay(conn);
+else serveDegraded(degradedReason ?? "could not reach or start the topodb broker; see broker.log in the plugin data dir");
