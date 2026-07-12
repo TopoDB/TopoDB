@@ -191,8 +191,10 @@ sorted by `(label, prop)` before encoding so declaration order never looks
 like a spec change); `"next_node_slot"`/`"next_edge_slot"` (8-byte LE `u64`
 monotonic slot counters, `slots.rs`). Legacy Plan-2 keys `"fts_spec"`,
 `"fts_doc_count"`, `"fts_total_len"` are read (and, if present, removed) only
-by `ensure_index_spec` when opening a pre-index-spec Plan-1 file — no live
-write path writes them.
+by `ensure_index_spec` when opening a Plan-2 file (a file with the legacy
+`"fts_spec"` key present — a Plan-1 file has neither `"fts_spec"` nor
+`"index_spec"` and never triggers the removal) — no live write path writes
+them.
 
 ## Records
 
