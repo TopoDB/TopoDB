@@ -15,7 +15,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@topodb/topodb-mcp": "0.0.4",
+    "@topodb/topodb-mcp": "0.0.5",
     "typebox": "1.1.38"
   },
   "devDependencies": {
