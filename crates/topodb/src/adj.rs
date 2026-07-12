@@ -326,14 +326,21 @@ pub(crate) fn adj_remove_edge(
     Ok(false)
 }
 
+/// Drains every chunk stored under `slot` (both tables' 8-byte prefix, all
+/// edge types) and returns each entry paired with its edge type recovered
+/// from the chunk key — mirrors `read_adj`'s `None`-filter branch, since
+/// callers (RemoveNode's cascade) need the type to address the counterpart
+/// entry in the *other* direction table, which is keyed by `(slot, type)`.
 pub(crate) fn adj_remove_all(
     table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     slot: u64,
-) -> Result<Vec<AdjEntryDisk>, TopoError> {
+) -> Result<Vec<(u32, AdjEntryDisk)>, TopoError> {
     let keys = slot_chunk_keys(table, slot)?;
     let mut entries = Vec::new();
     for key in keys {
-        entries.extend(load_chunk(table, key)?);
+        let (_, edge_type, _) =
+            key_parts(&key).ok_or_else(|| TopoError::Encoding("bad adjacency key".into()))?;
+        entries.extend(load_chunk(table, key)?.into_iter().map(|e| (edge_type, e)));
         table
             .remove(key.as_slice())
             .map_err(crate::error::storage_err)?;
@@ -403,7 +410,7 @@ mod tests {
         };
         tx.commit().unwrap();
 
-        let mut removed_edges: Vec<u64> = removed.iter().map(|e| e.edge).collect();
+        let mut removed_edges: Vec<u64> = removed.iter().map(|(_, e)| e.edge).collect();
         removed_edges.sort_unstable();
         assert_eq!(
             removed_edges,

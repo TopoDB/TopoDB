@@ -1636,41 +1636,59 @@ fn apply_op(
             }
 
             embeddings.remove(key.as_slice()).map_err(storage_err)?;
-            adj_remove_all(out_adj, removed_slot)?;
-            adj_remove_all(in_adj, removed_slot)?;
+
+            // Adjacency-assisted cascade (Task 10): the node's own OUT_ADJ and
+            // IN_ADJ chunks under `removed_slot` ARE the incident-edge set —
+            // draining them (bounded range scans, never a full `EDGES` scan)
+            // both discovers every incident edge and removes this node's side
+            // of the adjacency in one step. `out_entries` are edges where
+            // `removed_slot` was `from` (each entry's `target` is the `to`
+            // slot); `in_entries` are edges where `removed_slot` was `to`
+            // (each entry's `target` is the `from` slot).
+            let out_entries = adj_remove_all(out_adj, removed_slot)?;
+            let in_entries = adj_remove_all(in_adj, removed_slot)?;
             remove_node_mapping(node_slots, node_ids, *id)?;
-            // Remove incident edges, both directions. v0.1: linear scan is
-            // acceptable; adjacency-assisted delete arrives with Task 5. EDGES
-            // rows already carry slot-valued from/to (v3 layout), so this
-            // compares directly against `removed_slot` — no ULID resolution
-            // needed for the scan or the cascade below.
-            let mut incident: Vec<(u64, EdgeId, u32, u64, u64)> = Vec::new();
-            for entry in edges.iter().map_err(storage_err)? {
-                let (k, v) = entry.map_err(storage_err)?;
-                let raw = crate::codec::unframe_value(v.value())?;
-                let disk: crate::disk::EdgeRecordDiskV3 = postcard::from_bytes(raw.as_ref())
-                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                if disk.from == removed_slot || disk.to == removed_slot {
-                    let key_bytes: [u8; 8] = k
-                        .value()
-                        .try_into()
-                        .map_err(|_| TopoError::Encoding("bad edge slot key".into()))?;
-                    incident.push((
-                        u64::from_be_bytes(key_bytes),
-                        disk.id,
-                        disk.ty,
-                        disk.from,
-                        disk.to,
-                    ));
+
+            // Cascade: for every incident edge, drop its counterpart entry in
+            // the *other* endpoint's adjacency table, then remove the EDGES
+            // row and the EDGE_SLOTS/EDGE_IDS mapping. Self-loops (from == to
+            // == removed_slot) show up once in each of `out_entries` and
+            // `in_entries`, but both sides of their adjacency were already
+            // erased by the two `adj_remove_all` calls above — the
+            // `target != removed_slot` guards skip the (already-gone)
+            // counterpart lookup, and `removed_edge_slots` dedups the EDGES
+            // row / mapping cleanup so it runs exactly once per edge.
+            let mut removed_edge_slots: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+            for (edge_type, entry) in out_entries {
+                let to_slot = entry.target;
+                let edge_slot = entry.edge;
+                if to_slot != removed_slot {
+                    adj_remove_edge(in_adj, to_slot, edge_type, edge_slot)?;
+                }
+                if removed_edge_slots.insert(edge_slot) {
+                    edges
+                        .remove(slot_key(edge_slot).as_slice())
+                        .map_err(storage_err)?;
+                    if let Some(edge_id) = crate::slots::edge_ulid(edge_ids, edge_slot)? {
+                        remove_edge_mapping(edge_slots, edge_ids, edge_id)?;
+                    }
                 }
             }
-            for (edge_slot, edge_id, edge_type, from_slot, to_slot) in incident {
-                adj_remove_edge(out_adj, from_slot, edge_type, edge_slot)?;
-                adj_remove_edge(in_adj, to_slot, edge_type, edge_slot)?;
-                edges
-                    .remove(slot_key(edge_slot).as_slice())
-                    .map_err(storage_err)?;
-                remove_edge_mapping(edge_slots, edge_ids, edge_id)?;
+            for (edge_type, entry) in in_entries {
+                let from_slot = entry.target;
+                let edge_slot = entry.edge;
+                if from_slot != removed_slot {
+                    adj_remove_edge(out_adj, from_slot, edge_type, edge_slot)?;
+                }
+                if removed_edge_slots.insert(edge_slot) {
+                    edges
+                        .remove(slot_key(edge_slot).as_slice())
+                        .map_err(storage_err)?;
+                    if let Some(edge_id) = crate::slots::edge_ulid(edge_ids, edge_slot)? {
+                        remove_edge_mapping(edge_slots, edge_ids, edge_id)?;
+                    }
+                }
             }
             Ok(())
         }
@@ -2102,5 +2120,245 @@ mod tests {
         }];
         let (first, last) = s.append_ops(&ops).unwrap();
         assert_eq!((first, last), (1, 1));
+    }
+
+    /// Task 10: `RemoveNode`'s cascade is adjacency-assisted (no `EDGES`
+    /// scan). Two high-degree nodes, 500 incident edges apiece, sharing 20
+    /// direct edges between them. Removing one must: erase every one of its
+    /// incident edges (its own leaf edges AND the shared edges), leave the
+    /// survivor's adjacency intact minus exactly the shared edges, leave the
+    /// removed node with zero adjacency chunks in either direction table,
+    /// leave no dangling EDGE_SLOTS/EDGE_IDS rows for its former edges, and
+    /// land an exact `EDGES` row count.
+    #[test]
+    fn remove_node_cascades_via_adjacency_at_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+
+        const A_LEAVES: usize = 480;
+        const B_LEAVES: usize = 480;
+        const SHARED: usize = 20; // direct A -> B edges, incident to both
+
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let a_leaves: Vec<NodeId> = (0..A_LEAVES).map(|_| NodeId::new()).collect();
+        let b_leaves: Vec<NodeId> = (0..B_LEAVES).map(|_| NodeId::new()).collect();
+
+        let mut ops = vec![
+            Op::CreateNode {
+                id: a,
+                scope,
+                label: "Hub".into(),
+                props: Default::default(),
+            },
+            Op::CreateNode {
+                id: b,
+                scope,
+                label: "Hub".into(),
+                props: Default::default(),
+            },
+        ];
+        for &leaf in a_leaves.iter().chain(b_leaves.iter()) {
+            ops.push(Op::CreateNode {
+                id: leaf,
+                scope,
+                label: "Leaf".into(),
+                props: Default::default(),
+            });
+        }
+        let a_leaf_edges: Vec<EdgeId> = a_leaves
+            .iter()
+            .map(|&leaf| {
+                let e = EdgeId::new();
+                ops.push(Op::CreateEdge {
+                    id: e,
+                    scope,
+                    ty: "REL".into(),
+                    from: a,
+                    to: leaf,
+                    props: Default::default(),
+                    valid_from: None,
+                });
+                e
+            })
+            .collect();
+        let b_leaf_edges: Vec<EdgeId> = b_leaves
+            .iter()
+            .map(|&leaf| {
+                let e = EdgeId::new();
+                ops.push(Op::CreateEdge {
+                    id: e,
+                    scope,
+                    ty: "REL".into(),
+                    from: b,
+                    to: leaf,
+                    props: Default::default(),
+                    valid_from: None,
+                });
+                e
+            })
+            .collect();
+        let shared_edges: Vec<EdgeId> = (0..SHARED)
+            .map(|_| {
+                let e = EdgeId::new();
+                ops.push(Op::CreateEdge {
+                    id: e,
+                    scope,
+                    ty: "LINK".into(),
+                    from: a,
+                    to: b,
+                    props: Default::default(),
+                    valid_from: None,
+                });
+                e
+            })
+            .collect();
+
+        s.apply_batch(ops, 0).unwrap();
+
+        let edges_before = {
+            let tx = s.db.begin_read().unwrap();
+            let edges = tx.open_table(EDGES).unwrap();
+            edges.iter().unwrap().count()
+        };
+        assert_eq!(edges_before, A_LEAVES + B_LEAVES + SHARED);
+
+        // Capture raw slots before removal — `a`'s NODE_SLOTS mapping is
+        // erased by `RemoveNode` itself.
+        let (a_slot, b_slot) = {
+            let tx = s.db.begin_read().unwrap();
+            let node_slots = tx.open_table(NODE_SLOTS).unwrap();
+            (
+                crate::slots::node_slot(&node_slots, a).unwrap().unwrap(),
+                crate::slots::node_slot(&node_slots, b).unwrap().unwrap(),
+            )
+        };
+
+        s.apply_batch(vec![Op::RemoveNode { id: a }], 1).unwrap();
+
+        // A is gone, along with every edge it was incident to.
+        assert!(s.load_node(a).unwrap().is_none());
+        for &e in a_leaf_edges.iter().chain(shared_edges.iter()) {
+            assert!(s.load_edge(e).unwrap().is_none());
+        }
+
+        // B survives untouched save for the shared edges.
+        assert!(s.load_node(b).unwrap().is_some());
+        for &e in &b_leaf_edges {
+            assert!(s.load_edge(e).unwrap().is_some());
+        }
+
+        // Exact EDGES row count: only B's own leaf edges remain.
+        let edges_after = {
+            let tx = s.db.begin_read().unwrap();
+            let edges = tx.open_table(EDGES).unwrap();
+            edges.iter().unwrap().count()
+        };
+        assert_eq!(edges_after, B_LEAVES);
+
+        // The removed node leaves NO chunks in either adjacency table.
+        {
+            let tx = s.db.begin_read().unwrap();
+            let out_adj = tx.open_table(OUT_ADJ).unwrap();
+            let in_adj = tx.open_table(IN_ADJ).unwrap();
+            assert!(crate::adj::read_adj(&out_adj, a_slot, None)
+                .unwrap()
+                .is_empty());
+            assert!(crate::adj::read_adj(&in_adj, a_slot, None)
+                .unwrap()
+                .is_empty());
+        }
+
+        // No dangling EDGE_SLOTS rows for any of A's former edges.
+        {
+            let tx = s.db.begin_read().unwrap();
+            let edge_slots = tx.open_table(EDGE_SLOTS).unwrap();
+            for &e in a_leaf_edges.iter().chain(shared_edges.iter()) {
+                assert!(crate::slots::edge_slot(&edge_slots, e).unwrap().is_none());
+            }
+        }
+
+        // B's adjacency is intact minus exactly the shared edges: still has
+        // all B_LEAVES out-edges and no trace of A; its in-adjacency (which
+        // held only the shared A->B edges) is now empty.
+        {
+            let tx = s.db.begin_read().unwrap();
+            let out_adj = tx.open_table(OUT_ADJ).unwrap();
+            let in_adj = tx.open_table(IN_ADJ).unwrap();
+            let out_entries = crate::adj::read_adj(&out_adj, b_slot, None).unwrap();
+            assert_eq!(out_entries.len(), B_LEAVES);
+            assert!(!out_entries.iter().any(|(_, e)| e.target == a_slot));
+            assert!(crate::adj::read_adj(&in_adj, b_slot, None)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    /// A self-loop (`from == to == removed_slot`) shows up once in
+    /// `out_entries` and once in `in_entries` during the cascade. Pins that
+    /// the `target != removed_slot` counterpart-skip and the
+    /// `removed_edge_slots` dedup don't double-remove or error on it, and
+    /// that an ordinary edge sharing the removed node stays correctly
+    /// cascaded alongside it.
+    #[test]
+    fn remove_node_cascades_a_self_loop_without_double_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b, loop_edge, ab_edge) =
+            (NodeId::new(), NodeId::new(), EdgeId::new(), EdgeId::new());
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id: a,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope,
+                    label: "M".into(),
+                    props: Default::default(),
+                },
+                Op::CreateEdge {
+                    id: loop_edge,
+                    scope,
+                    ty: "SELF".into(),
+                    from: a,
+                    to: a,
+                    props: Default::default(),
+                    valid_from: None,
+                },
+                Op::CreateEdge {
+                    id: ab_edge,
+                    scope,
+                    ty: "REL".into(),
+                    from: a,
+                    to: b,
+                    props: Default::default(),
+                    valid_from: None,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+
+        s.apply_batch(vec![Op::RemoveNode { id: a }], 1).unwrap();
+
+        assert!(s.load_node(a).unwrap().is_none());
+        assert!(s.load_node(b).unwrap().is_some());
+        assert!(s.load_edge(loop_edge).unwrap().is_none());
+        assert!(s.load_edge(ab_edge).unwrap().is_none());
+
+        // Exactly the self-loop and the a->b edge are gone; nothing else was
+        // ever created, so EDGES must be empty.
+        let edges_after = {
+            let tx = s.db.begin_read().unwrap();
+            let edges = tx.open_table(EDGES).unwrap();
+            edges.iter().unwrap().count()
+        };
+        assert_eq!(edges_after, 0);
     }
 }
