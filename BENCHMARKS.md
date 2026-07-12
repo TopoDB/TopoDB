@@ -107,18 +107,28 @@ computed from Criterion's per-sample data (`sample.json`).
 | traverse_warm_10k | — | 70.03–70.69 µs (p95 73.0 µs) | new baseline |
 | traverse_cold_10k | — | 33.37–34.59 ms (p95 37.6 ms) | new baseline |
 
+Part of the `submit_1k_workload` speedup (2.71× v2 throughput) reflects the
+Task-11 snapshot-fold deletion (`3aebe76` removed the applier's per-batch
+im-snapshot fold), not the v3 on-disk encoding alone — don't over-credit
+slot keys/chunked adjacency for it.
+
 No comparable v2 traversal benchmark was ever recorded in this file (the v2
 timing table above has only `cold_open_10k` and `submit_1k_workload`), so
-gate 2 records v3 as the baseline rather than inventing a comparison. Cold =
-a fresh `Db::open_with` before every traversal, so it is open-dominated
-(compare `cold_open_10k`); warm = repeated traversals on one live handle.
+gate 2 records v3 as the baseline rather than inventing a comparison. The
+73.0 µs warm-traversal baseline showed ~38% session-to-session drift on
+this machine (112–114 µs in the evening runs vs 70 µs in the morning run —
+both recorded in the chunk-experiment table below); future comparisons
+against it should use paired same-session runs. Cold = a fresh
+`Db::open_with` before every traversal, so it is open-dominated (compare
+`cold_open_10k`); warm = repeated traversals on one live handle.
 
 ### Open time at scale (gate 1, plus the ungated SP2 number)
 
 Method: fixtures built by the resumable `build_open_fixture` test; open
 times are 10 sequential fresh `Db::open_with` calls with a manual `Instant`
 timer in the `open_report` test (release build), after one untimed
-verification open. Both 1M fixtures were built with the text index omitted
+verification open. At n=10 the nearest-rank p95 is simply the max of the 10
+runs. Both 1M fixtures were built with the text index omitted
 (`TOPODB_FIXTURE_SKIP_FTS=1`) — see the finding below for why; the open
 path reads META/DICT/SCOPES/EMBEDDINGS and never touches postings, and the
 full-spec open path is covered by `cold_open_10k` above.
