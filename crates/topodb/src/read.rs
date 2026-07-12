@@ -10,7 +10,8 @@ use crate::ids::{NodeId, ScopeSet};
 use crate::props::PropValue;
 use crate::slots::{node_slot, NODE_IDS, NODE_SLOTS};
 use crate::state::{EdgeRecord, NodeRecord};
-use crate::storage::{read_edge_by_slot, read_node_by_slot, EDGES, EMBEDDINGS, NODES};
+use crate::storage::{read_edge_by_slot, read_node_by_slot, EDGES, NODES};
+use crate::vector_store::{EMBEDDING_REF, VECTORS};
 use smol_str::SmolStr;
 use std::collections::{HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -167,8 +168,8 @@ impl Db {
     /// Bounded (`1..=4` hops), scoped, temporal BFS from `q.seeds` over
     /// on-disk chunked adjacency (v3 spec §6). The whole walk runs inside one
     /// `begin_read` transaction — NODE_SLOTS/NODE_IDS/OUT_ADJ/IN_ADJ/NODES/
-    /// EDGES/EMBEDDINGS opened once, `dicts`/`scope_registry` read guards
-    /// held for the duration — so the result is one consistent view.
+    /// EDGES/VECTORS/EMBEDDING_REF opened once, `dicts`/`scope_registry` read
+    /// guards held for the duration — so the result is one consistent view.
     ///
     /// Per hop, prunes on entry-level fields FIRST — edge scope (via
     /// `ScopeRegistry::resolve` + `ScopeSet::contains`), the edge-type filter
@@ -211,7 +212,8 @@ impl Db {
         let in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
         let nodes = tx.open_table(NODES).map_err(storage_err)?;
         let edges = tx.open_table(EDGES).map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
 
         // Frontier/visited/result sets are slot-keyed throughout the walk —
         // ULIDs are resolved only at the boundary (seeds in, records out).
@@ -223,7 +225,14 @@ impl Db {
             let Some(slot) = node_slot(&node_slots, seed)? else {
                 continue;
             };
-            let Some(rec) = read_node_by_slot(&nodes, &embeddings, &dicts, &scope_registry, slot)?
+            let Some(rec) = read_node_by_slot(
+                &nodes,
+                &vectors,
+                &embedding_ref,
+                &dicts,
+                &scope_registry,
+                slot,
+            )?
             else {
                 continue;
             };
@@ -251,8 +260,14 @@ impl Db {
                 if !(entry.valid_from <= t && entry.valid_to.is_none_or(|vt| t < vt)) {
                     continue;
                 }
-                let Some(other) =
-                    read_node_by_slot(&nodes, &embeddings, &dicts, &scope_registry, entry.target)?
+                let Some(other) = read_node_by_slot(
+                    &nodes,
+                    &vectors,
+                    &embedding_ref,
+                    &dicts,
+                    &scope_registry,
+                    entry.target,
+                )?
                 else {
                     continue;
                 };
@@ -268,9 +283,14 @@ impl Db {
 
         let mut nodes_out = Vec::with_capacity(visited.len());
         for slot in &visited {
-            if let Some(rec) =
-                read_node_by_slot(&nodes, &embeddings, &dicts, &scope_registry, *slot)?
-            {
+            if let Some(rec) = read_node_by_slot(
+                &nodes,
+                &vectors,
+                &embedding_ref,
+                &dicts,
+                &scope_registry,
+                *slot,
+            )? {
                 nodes_out.push(rec);
             }
         }

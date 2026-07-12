@@ -5,7 +5,6 @@ use crate::ids::{EdgeId, NodeId, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::storage::{AppliedBatch, Storage};
-use crate::vector::VectorIndex;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -148,20 +147,15 @@ impl Db {
         spec.validate()?;
         let spec = Arc::new(spec);
         let storage = Arc::new(Storage::open_with_options(path, spec, options)?);
-        // Build the vector index by scanning EMBEDDINGS (the one remaining
-        // open-time scan — see `VectorIndex::from_storage`). The applier
-        // captures a clone below.
-        let vectors = Arc::new(VectorIndex::from_storage(&storage)?);
         let (tx, rx) = bounded::<Job>(256);
 
-        // The thread captures its own clones of `storage`/`vectors`/`subs` —
-        // never a clone of `Inner` itself (see the comment on `Inner::storage`
-        // for why: a strong ref back to `Inner` would create a cycle where
+        // The thread captures its own clones of `storage`/`subs` — never a
+        // clone of `Inner` itself (see the comment on `Inner::storage` for
+        // why: a strong ref back to `Inner` would create a cycle where
         // `Inner`'s `Drop` never fires).
         let storage_for_applier = storage.clone();
         let subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>> = Arc::new(Mutex::new(Vec::new()));
         let subs_for_applier = subs.clone();
-        let vectors_for_applier = vectors.clone();
         let applier = std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 match job {
@@ -172,15 +166,16 @@ impl Db {
                                 .expect("system clock before UNIX epoch")
                                 .as_millis() as i64
                         });
-                        // Read pre-batch node state (scope, embedding) for
-                        // every id this batch might reference — CreateEdge
-                        // endpoints, SetEmbedding targets, RemoveNode
-                        // targets — in ONE storage read, BEFORE `apply_batch`
-                        // runs. This anchors three things: dim pre-validation
-                        // (below), edge-scope pre-validation (below), and
-                        // slab maintenance (after `apply_batch`, which still
-                        // needs the OLD state — storage holds only the
-                        // post-batch state once `apply_batch` has committed).
+                        // Read pre-batch node state (scope) for every
+                        // CreateEdge endpoint this batch might reference, in
+                        // ONE storage read, BEFORE `apply_batch` runs — the
+                        // input `prevalidate_edge_scopes` (below) needs. Dim
+                        // pre-validation and slab maintenance used to need
+                        // this same read too (pre-Task-7); both are gone —
+                        // dim validation now lives entirely inside
+                        // `apply_batch`'s transaction (`storage::apply_op`'s
+                        // `SetEmbedding` arm / `check_or_pin_dim`), so it no
+                        // longer needs a separate pre-read at all.
                         let pre = match storage_for_applier.load_nodes(&ids_needing_pre_state(&ops))
                         {
                             Ok(m) => m,
@@ -189,13 +184,6 @@ impl Db {
                                 continue;
                             }
                         };
-                        // Dim pre-validation runs BEFORE `apply_batch` so a
-                        // violation leaves storage untouched — atomic with the
-                        // rest of the batch.
-                        if let Err(e) = vectors_for_applier.prevalidate_dims(&pre, &ops) {
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
                         // Edge-scope pre-validation has the same contract: reject
                         // before `apply_batch` so storage is untouched. It must not
                         // live in `apply_op`, which is shared with op-log replay.
@@ -205,11 +193,6 @@ impl Db {
                         }
                         match storage_for_applier.apply_batch(ops, now) {
                             Ok(batch) => {
-                                // Slab maintenance runs after `apply_batch`
-                                // succeeds, using `pre` (read before
-                                // `apply_batch`) for old embedding/scope
-                                // state.
-                                vectors_for_applier.maintain(&pre, &batch.resolved);
                                 // Broadcast the committed ops to live
                                 // subscribers *after* `apply_batch` has
                                 // committed (so a subscriber that reacts by
@@ -264,16 +247,12 @@ impl Db {
                         // Rebuild runs on the applier thread — the sole redb
                         // writer — so it serializes with in-flight batch
                         // application: `rebuild_state_from_ops` and
-                        // `apply_batch` can never interleave.
-                        let result = match storage_for_applier.rebuild_state_from_ops() {
-                            // Rebuild the vector index from the now-rebuilt
-                            // storage and swap the inner slab map in place
-                            // (under the outer write lock) — the applier's
-                            // `Arc<VectorIndex>` is shared with `Db`, so only
-                            // its contents may be replaced, not the `Arc`.
-                            Ok(()) => vectors_for_applier.rebuild_from(&storage_for_applier),
-                            Err(e) => Err(e),
-                        };
+                        // `apply_batch` can never interleave. No separate
+                        // vector-index rebuild step anymore (Task 7 deleted
+                        // it) — `rebuild_state_from_ops` already rebuilds
+                        // `vectors`/`embedding_ref` from the replayed ops via
+                        // `apply_op`.
+                        let result = storage_for_applier.rebuild_state_from_ops();
                         let _ = reply.send(result);
                     }
                     Job::BumpCounters { bumps } => {
@@ -786,25 +765,24 @@ impl Db {
 #[doc(hidden)]
 pub type AdjacencyDumpRow = (u64, u32, bool, u64, u64, u32, i64, Option<i64>);
 
-/// The node ids that `VectorIndex::prevalidate_dims`, `validate::prevalidate_edge_scopes`,
-/// and `VectorIndex::maintain` need pre-batch storage state (scope, embedding)
-/// for: `CreateEdge`'s endpoints, `SetEmbedding`'s target, and `RemoveNode`'s
-/// target. A same-batch `CreateNode` for one of these ids is resolved locally
-/// by each of those three functions (via their own scan of `ops`) and needs
-/// no storage lookup — this only has to cover ids that might ALREADY exist in
+/// The node ids that `validate::prevalidate_edge_scopes` needs pre-batch
+/// storage state (scope) for: `CreateEdge`'s endpoints. A same-batch
+/// `CreateNode` for one of these ids is resolved locally by
+/// `prevalidate_edge_scopes` (via its own scan of `ops`) and needs no
+/// storage lookup — this only has to cover ids that might ALREADY exist in
 /// storage before this batch runs.
+///
+/// Through Task 6 this also covered `SetEmbedding`'s target and
+/// `RemoveNode`'s target, for `VectorIndex::prevalidate_dims`/`maintain`
+/// (deleted in Task 7 — dim validation now lives entirely inside
+/// `apply_batch`'s own transaction, and there is no RAM slab left to
+/// maintain), so those two arms are gone from the match below.
 fn ids_needing_pre_state(ops: &[Op]) -> std::collections::HashSet<NodeId> {
     let mut ids = std::collections::HashSet::new();
     for op in ops {
-        match op {
-            Op::CreateEdge { from, to, .. } => {
-                ids.insert(*from);
-                ids.insert(*to);
-            }
-            Op::SetEmbedding { id, .. } | Op::RemoveNode { id } => {
-                ids.insert(*id);
-            }
-            _ => {}
+        if let Op::CreateEdge { from, to, .. } = op {
+            ids.insert(*from);
+            ids.insert(*to);
         }
     }
     ids

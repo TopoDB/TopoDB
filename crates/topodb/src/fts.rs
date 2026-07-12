@@ -52,9 +52,8 @@ use crate::ids::ScopeSet;
 use crate::index::IndexSpec;
 use crate::props::PropValue;
 use crate::state::NodeRecord;
-use crate::storage::{
-    read_node_by_slot, slot_key, EMBEDDINGS, FTS_DOCS, FTS_STATS, NODES, POSTINGS,
-};
+use crate::storage::{read_node_by_slot, slot_key, FTS_DOCS, FTS_STATS, NODES, POSTINGS};
+use crate::vector_store::{EMBEDDING_REF, VECTORS};
 use redb::{ReadableTable, Table};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -456,7 +455,11 @@ fn store_posting_chunk(
 /// midpoint entry, and `set_posting`'s covering-chunk search relies on the
 /// same non-overlap). Used by BM25 scoring, which needs every `(slot, tf)`
 /// pair regardless of how many chunks they're spread across.
-fn read_posting(
+///
+/// `pub(crate)` (like `set_posting`) so `migrate_v4.rs`'s tests can assert
+/// the re-chunked postings round-trip correctly without duplicating a
+/// second reader.
+pub(crate) fn read_posting(
     postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     scope_id: u32,
     term: &str,
@@ -473,7 +476,9 @@ fn read_posting(
 /// never decoding an entry. `search_text` calls this before `read_posting`
 /// so a term with zero matches in a scope (the common case for most query
 /// terms against most scopes) is recognized without decoding anything.
-fn posting_df(
+///
+/// `pub(crate)` — see `read_posting`'s identical visibility rationale.
+pub(crate) fn posting_df(
     postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     scope_id: u32,
     term: &str,
@@ -560,7 +565,13 @@ fn mutate_posting_chunk(
 ///   slot range is only knowable by decoding it — and matches the spec's
 ///   weaker promise for updates ("scan the term's chunk keys, decode only
 ///   the covering chunk" — nothing past the covering chunk is decoded).
-fn set_posting(
+///
+/// `pub(crate)` so `migrate_v4.rs`'s v3 -> v4 postings re-chunking pass can
+/// drive the exact same incremental, tested chunk-splitting logic one old
+/// single-row entry at a time (ascending by slot — the order those old rows
+/// already carried on disk), rather than re-deriving chunk-split points from
+/// scratch.
+pub(crate) fn set_posting(
     postings: &mut Table<'_, &'static [u8], &'static [u8]>,
     scope_id: u32,
     term: &str,
@@ -675,7 +686,8 @@ impl Db {
         let docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
         let stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
         let nodes = tx.open_table(NODES).map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
         let dicts = storage.dicts.read().expect("dict lock poisoned");
         let scope_registry = storage
             .scope_registry
@@ -721,9 +733,14 @@ impl Db {
 
         let mut out: Vec<(NodeRecord, f32)> = Vec::with_capacity(scores.len());
         for (slot, score) in scores {
-            if let Some(rec) =
-                read_node_by_slot(&nodes, &embeddings, &dicts, &scope_registry, slot)?
-            {
+            if let Some(rec) = read_node_by_slot(
+                &nodes,
+                &vectors,
+                &embedding_ref,
+                &dicts,
+                &scope_registry,
+                slot,
+            )? {
                 // Defensive only, not load-bearing for isolation: postings
                 // are already scope-prefixed (see `chunked_posting_key`), so
                 // every `slot` scored above already comes from a requested scope's

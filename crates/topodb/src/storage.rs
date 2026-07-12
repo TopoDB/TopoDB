@@ -47,7 +47,13 @@ pub(crate) const FTS_STATS: TableDefinition<&[u8], &[u8]> = TableDefinition::new
 /// re-key existing rows by node identity; it never resets counts to zero
 /// (see that function's doc comment).
 pub(crate) const COUNTERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("counters");
-/// Cold vector rows: node key -> framed postcard (model, vector).
+/// Cold vector rows: node key -> framed postcard (model, vector). v3-and-
+/// earlier only — Task 7 (format v4) deleted this table from the live
+/// schema; it survives here ONLY as the table definition `migrate_v4.rs`'s
+/// vectors pass reads (and `Storage::open_with_options`'s pre-v4 match arms
+/// still write to it mid-chain) before the migrating open deletes it via
+/// `WriteTransaction::delete_table`. A v4-native file never has this table
+/// at all.
 pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("embeddings");
 /// Per-model permanent embedding dimension: 4-byte BE `DictKind::Model` id ->
 /// 4-byte LE `u32` dim. Pinned by `check_or_pin_dim` on a model's first
@@ -58,11 +64,7 @@ pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::ne
 /// permanent, per-model-only rule).
 pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_dims");
 
-pub const FORMAT_VERSION: u32 = 3;
-
-/// One EMBEDDINGS row joined with its node's id/scope: `(model, scope, id,
-/// vector)`. See `Storage::all_embeddings_with_scope`.
-pub(crate) type EmbeddingRow = (String, Scope, NodeId, Vec<f32>);
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -134,7 +136,11 @@ impl Storage {
             tx.open_table(POSTINGS).map_err(storage_err)?;
             tx.open_table(FTS_DOCS).map_err(storage_err)?;
             tx.open_table(FTS_STATS).map_err(storage_err)?;
-            tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+            // NOT `EMBEDDINGS`: that table is v3-and-earlier only (see its
+            // definition's doc comment) — creating it unconditionally here
+            // would resurrect it on every fresh v4 file and every reopen of
+            // an already-migrated v4 file. The pre-v4 version-match arms
+            // below open it themselves, on the files that still have it.
             tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
             tx.open_table(VECTORS).map_err(storage_err)?;
             tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
@@ -167,61 +173,120 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(3) => {}
-            Some(2) => {
+            Some(4) => {}
+            Some(3) => {
+                // A file whose stored format_version is genuinely 3 — either
+                // written by pre-Task-7 code, or by THIS build's
+                // `migrate_v2_to_v3` running under the pre-Task-6 (unchunked)
+                // `fts_update` — carries only single-row POSTINGS: the
+                // postings pass below always runs (`postings_already_chunked
+                // = false`). See `migrate_v4`'s module doc comment for the
+                // discrimination rationale.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
-                let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
-                let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
-                let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
-                let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
-                let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
-                let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
-                let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
-                let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
-                let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
-                let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
-                let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
-                let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
-                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
-                let mut dicts = Dicts::load_from_table(&dict)?;
-                // FTS tables re-keyed by this migration too (v3 spec §3, FTS
-                // rows): a v2 file's postings/fts_docs/fts_stats are still
-                // ULID/`scope_key`-keyed (pre-W2b layout), byte-incompatible
-                // with the interned-scope-id/dense-slot layout `fts.rs` reads
-                // post-migration. See `migrate_v2_to_v3`'s doc comment.
-                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
-                let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
-                let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
-                // v4 dual-write targets for migrated embeddings — see
-                // `migrate_v2_to_v3`'s doc comment on the `old_embeddings`
-                // arm for why this is required, not optional.
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
                 let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
-                crate::migrate_v3::migrate_v2_to_v3(
-                    spec.clone(),
-                    &mut meta,
-                    &mut nodes,
-                    &mut edges,
-                    &mut embeddings,
-                    &mut counters,
-                    &mut dict,
-                    &mut dicts,
-                    &mut scopes,
-                    &mut node_slots,
-                    &mut node_ids,
-                    &mut edge_slots,
-                    &mut edge_ids,
-                    &mut out_adj,
-                    &mut in_adj,
-                    &mut prop_index,
-                    &mut postings,
-                    &mut docs,
-                    &mut stats,
+                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
+                let mut dicts = Dicts::load_from_table(&dict)?;
+                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+                {
+                    let nodes = tx.open_table(NODES).map_err(storage_err)?;
+                    let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                    crate::migrate_v4::migrate_v3_to_v4(
+                        &embeddings,
+                        &nodes,
+                        &mut vector_dims,
+                        &mut vectors,
+                        &mut embedding_ref,
+                        &mut dict,
+                        &mut dicts,
+                        &mut postings,
+                        false,
+                    )?;
+                } // `nodes`/`embeddings` guards drop here, before delete_table.
+                tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
+            Some(2) => {
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                let nodes;
+                let embeddings;
+                let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+                let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+                let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
+                let mut dicts = Dicts::load_from_table(&dict)?;
+                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+                {
+                    let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                    let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
+                    let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
+                    let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+                    let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+                    let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+                    let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+                    let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+                    let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+                    let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                    // FTS tables re-keyed by this migration too (v3 spec §3,
+                    // FTS rows): a v2 file's postings/fts_docs/fts_stats are
+                    // still ULID/`scope_key`-keyed (pre-W2b layout),
+                    // byte-incompatible with the interned-scope-id/dense-slot
+                    // layout `fts.rs` reads post-migration. See
+                    // `migrate_v2_to_v3`'s doc comment.
+                    let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+                    let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+                    let mut nodes_t = tx.open_table(NODES).map_err(storage_err)?;
+                    let mut embeddings_t = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                    // v4 dual-write targets for migrated embeddings — see
+                    // `migrate_v2_to_v3`'s doc comment on the `old_embeddings`
+                    // arm for why this is required, not optional. This
+                    // migration also chains straight into `migrate_v3_to_v4`
+                    // below in the SAME open — `postings_already_chunked =
+                    // true`, since `fts_update` here runs under THIS build's
+                    // current (chunked) `set_posting`.
+                    crate::migrate_v3::migrate_v2_to_v3(
+                        spec.clone(),
+                        &mut meta,
+                        &mut nodes_t,
+                        &mut edges,
+                        &mut embeddings_t,
+                        &mut counters,
+                        &mut dict,
+                        &mut dicts,
+                        &mut scopes,
+                        &mut node_slots,
+                        &mut node_ids,
+                        &mut edge_slots,
+                        &mut edge_ids,
+                        &mut out_adj,
+                        &mut in_adj,
+                        &mut prop_index,
+                        &mut postings,
+                        &mut docs,
+                        &mut stats,
+                        &mut vector_dims,
+                        &mut vectors,
+                        &mut embedding_ref,
+                    )?;
+                    nodes = nodes_t;
+                    embeddings = embeddings_t;
+                }
+                crate::migrate_v4::migrate_v3_to_v4(
+                    &embeddings,
+                    &nodes,
                     &mut vector_dims,
                     &mut vectors,
                     &mut embedding_ref,
+                    &mut dict,
+                    &mut dicts,
+                    &mut postings,
+                    true,
                 )?;
+                drop(nodes);
+                drop(embeddings);
+                tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -243,58 +308,79 @@ impl Storage {
                     .map_err(storage_err)?;
                 drop(meta);
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
-                let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
-                let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
-                let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
-                let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
-                let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
-                let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
-                let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
-                let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
-                let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
-                let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
-                let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
-                let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
-                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
-                let mut dicts = Dicts::load_from_table(&dict)?;
-                // FTS tables re-keyed by this migration too (v3 spec §3, FTS
-                // rows): a v2 file's postings/fts_docs/fts_stats are still
-                // ULID/`scope_key`-keyed (pre-W2b layout), byte-incompatible
-                // with the interned-scope-id/dense-slot layout `fts.rs` reads
-                // post-migration. See `migrate_v2_to_v3`'s doc comment.
-                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
-                let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
-                let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
-                // v4 dual-write targets for migrated embeddings — see
-                // `migrate_v2_to_v3`'s doc comment on the `old_embeddings`
-                // arm for why this is required, not optional.
+                let nodes;
+                let embeddings;
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
                 let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
-                crate::migrate_v3::migrate_v2_to_v3(
-                    spec.clone(),
-                    &mut meta,
-                    &mut nodes,
-                    &mut edges,
-                    &mut embeddings,
-                    &mut counters,
-                    &mut dict,
-                    &mut dicts,
-                    &mut scopes,
-                    &mut node_slots,
-                    &mut node_ids,
-                    &mut edge_slots,
-                    &mut edge_ids,
-                    &mut out_adj,
-                    &mut in_adj,
-                    &mut prop_index,
-                    &mut postings,
-                    &mut docs,
-                    &mut stats,
+                let mut dict = tx.open_table(DICT).map_err(storage_err)?;
+                let mut dicts = Dicts::load_from_table(&dict)?;
+                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+                {
+                    let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                    let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
+                    let mut scopes = tx.open_table(SCOPES).map_err(storage_err)?;
+                    let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+                    let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+                    let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+                    let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+                    let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+                    let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+                    let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                    // FTS tables re-keyed by this migration too (v3 spec §3,
+                    // FTS rows): a v2 file's postings/fts_docs/fts_stats are
+                    // still ULID/`scope_key`-keyed (pre-W2b layout),
+                    // byte-incompatible with the interned-scope-id/dense-slot
+                    // layout `fts.rs` reads post-migration. See
+                    // `migrate_v2_to_v3`'s doc comment.
+                    let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+                    let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+                    let mut nodes_t = tx.open_table(NODES).map_err(storage_err)?;
+                    let mut embeddings_t = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+                    // v4 dual-write targets for migrated embeddings, and the
+                    // v2->v3->v4 chain — see the `Some(2)` arm's identical
+                    // comment.
+                    crate::migrate_v3::migrate_v2_to_v3(
+                        spec.clone(),
+                        &mut meta,
+                        &mut nodes_t,
+                        &mut edges,
+                        &mut embeddings_t,
+                        &mut counters,
+                        &mut dict,
+                        &mut dicts,
+                        &mut scopes,
+                        &mut node_slots,
+                        &mut node_ids,
+                        &mut edge_slots,
+                        &mut edge_ids,
+                        &mut out_adj,
+                        &mut in_adj,
+                        &mut prop_index,
+                        &mut postings,
+                        &mut docs,
+                        &mut stats,
+                        &mut vector_dims,
+                        &mut vectors,
+                        &mut embedding_ref,
+                    )?;
+                    nodes = nodes_t;
+                    embeddings = embeddings_t;
+                }
+                crate::migrate_v4::migrate_v3_to_v4(
+                    &embeddings,
+                    &nodes,
                     &mut vector_dims,
                     &mut vectors,
                     &mut embedding_ref,
+                    &mut dict,
+                    &mut dicts,
+                    &mut postings,
+                    true,
                 )?;
+                drop(nodes);
+                drop(embeddings);
+                tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -392,7 +478,6 @@ impl Storage {
             prop_index.retain(|_, _| false).map_err(storage_err)?;
 
             let nodes = tx.open_table(NODES).map_err(storage_err)?;
-            let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             let dicts = self.dicts.read().expect("dict lock poisoned");
             let scopes = self
                 .scope_registry
@@ -414,8 +499,11 @@ impl Storage {
                 // `Some(1)` migration call sites, which never need a `&mut
                 // ScopeRegistry` here either).
                 let scope_id = disk.scope;
-                let mut rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
-                rec.embedding = read_embedding(&embeddings, slot)?;
+                // `rec.embedding` stays `None` here: neither `doc_text` (text
+                // index) nor `index_node` (equality index) below ever reads
+                // it — a reindex has no reason to touch the vectors tables at
+                // all.
+                let rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
                 let new_text = doc_text(&self.spec, &rec);
                 fts_update(
                     &mut postings,
@@ -474,11 +562,10 @@ impl Storage {
         let mut out = vec![
             bytes(&tx, NODES, "nodes")?,
             bytes(&tx, EDGES, "edges")?,
-            bytes(&tx, EMBEDDINGS, "embeddings")?,
-            // v4 (Task 3): the new dual-written clustered vector tables —
-            // cold until a later task cuts `search_vector` over to read
-            // them, but tracked in the size report from the moment they
-            // start accumulating rows.
+            // No "embeddings" row: that table was deleted by the v4 format
+            // flip (Task 7) — a v4-native file never has it, so an
+            // unconditional `open_table` here would error post-migration.
+            // `vectors`/`embedding_ref` are the live vector storage now.
             bytes(&tx, VECTORS, "vectors")?,
             bytes(&tx, EMBEDDING_REF, "embedding_ref")?,
             bytes(&tx, POSTINGS, "postings")?,
@@ -785,7 +872,6 @@ impl Storage {
         {
             let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
             let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
-            let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
             let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
             let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
             let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
@@ -812,7 +898,8 @@ impl Storage {
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
                         match read_node(
                             &nodes,
-                            &embeddings,
+                            &vectors,
+                            &embedding_ref,
                             &dicts,
                             &scope_registry,
                             &node_slots,
@@ -831,7 +918,8 @@ impl Storage {
                 let old_index_node = match op {
                     Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => read_node(
                         &nodes,
-                        &embeddings,
+                        &vectors,
+                        &embedding_ref,
                         &dicts,
                         &scope_registry,
                         &node_slots,
@@ -847,7 +935,6 @@ impl Storage {
                 apply_op(
                     &mut nodes,
                     &mut edges,
-                    &mut embeddings,
                     &mut vector_dims,
                     &mut vectors,
                     &mut embedding_ref,
@@ -872,7 +959,8 @@ impl Storage {
                     if let Some(id) = id {
                         if let Some(node) = read_node(
                             &nodes,
-                            &embeddings,
+                            &vectors,
+                            &embedding_ref,
                             &dicts,
                             &scope_registry,
                             &node_slots,
@@ -889,7 +977,8 @@ impl Storage {
                         Op::RemoveNode { .. } => None,
                         _ => read_node(
                             &nodes,
-                            &embeddings,
+                            &vectors,
+                            &embedding_ref,
                             &dicts,
                             &scope_registry,
                             &node_slots,
@@ -989,7 +1078,8 @@ impl Storage {
         let slots = crate::prop_index::lookup(&index, prop_key, value)?;
         drop(index);
         let nodes = tx.open_table(NODES).map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
         let scopes = self
             .scope_registry
@@ -997,7 +1087,7 @@ impl Storage {
             .expect("scope registry lock poisoned");
         let mut out = Vec::new();
         for slot in slots {
-            if let Some(rec) = read_node_by_slot(&nodes, &embeddings, &dicts, &scopes, slot)? {
+            if let Some(rec) = read_node_by_slot(&nodes, &vectors, &refs, &dicts, &scopes, slot)? {
                 out.push(rec);
             }
         }
@@ -1010,14 +1100,15 @@ impl Storage {
     pub fn load_node(&self, id: NodeId) -> Result<Option<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
         let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
         let scopes = self
             .scope_registry
             .read()
             .expect("scope registry lock poisoned");
-        read_node(&table, &embeddings, &dicts, &scopes, &node_slots, id)
+        read_node(&table, &vectors, &refs, &dicts, &scopes, &node_slots, id)
     }
 
     /// See `load_node`.
@@ -1040,7 +1131,8 @@ impl Storage {
     pub(crate) fn all_nodes(&self) -> Result<Vec<NodeRecord>, TopoError> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
         let scopes = self
             .scope_registry
@@ -1058,50 +1150,8 @@ impl Storage {
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
             let mut rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
-            rec.embedding = read_embedding(&embeddings, slot)?;
+            rec.embedding = read_embedding_by_slot(&vectors, &refs, &dicts, slot)?;
             out.push(rec);
-        }
-        Ok(out)
-    }
-
-    /// Scans EMBEDDINGS and joins each row with its node's id/scope (read off
-    /// the NODES row at the same slot). This is the ONLY remaining open-time
-    /// scan the engine performs (SP2 removes it too) — `VectorIndex::from_storage`
-    /// uses it to seed the in-RAM slab index at `Db::open` and on explicit
-    /// rebuild. Bounded by the EMBEDDINGS table's size, not NODES' — cheaper
-    /// than a full node scan whenever embeddings are a minority of nodes. An
-    /// EMBEDDINGS row whose NODES row is missing (should not happen — the two
-    /// are maintained together) is silently skipped rather than surfaced as
-    /// corruption, matching this being a best-effort index-seeding scan.
-    // SP2: last open-time scan
-    pub(crate) fn all_embeddings_with_scope(&self) -> Result<Vec<EmbeddingRow>, TopoError> {
-        let tx = self.db.begin_read().map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
-        let nodes = tx.open_table(NODES).map_err(storage_err)?;
-        let dicts = self.dicts.read().expect("dict lock poisoned");
-        let scopes = self
-            .scope_registry
-            .read()
-            .expect("scope registry lock poisoned");
-        let mut out = Vec::new();
-        for entry in embeddings.iter().map_err(storage_err)? {
-            let (k, v) = entry.map_err(storage_err)?;
-            let key: [u8; 8] = k
-                .value()
-                .try_into()
-                .map_err(|_| TopoError::Encoding("bad embedding slot key".into()))?;
-            let slot = u64::from_be_bytes(key);
-            let raw = crate::codec::unframe_value(v.value())?;
-            let (model, vector): (String, Vec<f32>) =
-                postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
-            let Some(node_v) = nodes.get(slot_key(slot).as_slice()).map_err(storage_err)? else {
-                continue;
-            };
-            let raw_node = crate::codec::unframe_value(node_v.value())?;
-            let disk: crate::disk::NodeRecordDiskV3 = postcard::from_bytes(raw_node.as_ref())
-                .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            let rec = crate::disk::node_from_disk_v3(disk, &dicts, &scopes)?;
-            out.push((model, rec.scope, rec.id, vector));
         }
         Ok(out)
     }
@@ -1109,10 +1159,9 @@ impl Storage {
     /// Bulk point lookup: every id in `ids` that currently resolves to a live
     /// node, in one read transaction (a missing id is simply absent from the
     /// result, not an error). Used by the applier to capture pre-batch node
-    /// state (scope, embedding) for dim/edge-scope pre-validation and vector
-    /// slab maintenance — reading it BEFORE `apply_batch` runs, since storage
-    /// holds only the post-batch state once `apply_batch` has committed — and
-    /// by `search_vector` to resolve slab hits back to `NodeRecord`s.
+    /// state (scope, embedding) for edge-scope pre-validation — reading it
+    /// BEFORE `apply_batch` runs, since storage holds only the post-batch
+    /// state once `apply_batch` has committed.
     pub(crate) fn load_nodes(
         &self,
         ids: &std::collections::HashSet<NodeId>,
@@ -1122,7 +1171,8 @@ impl Storage {
         }
         let tx = self.db.begin_read().map_err(storage_err)?;
         let table = tx.open_table(NODES).map_err(storage_err)?;
-        let embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
         let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
         let dicts = self.dicts.read().expect("dict lock poisoned");
         let scopes = self
@@ -1131,7 +1181,8 @@ impl Storage {
             .expect("scope registry lock poisoned");
         let mut out = std::collections::HashMap::with_capacity(ids.len());
         for &id in ids {
-            if let Some(rec) = read_node(&table, &embeddings, &dicts, &scopes, &node_slots, id)? {
+            if let Some(rec) = read_node(&table, &vectors, &refs, &dicts, &scopes, &node_slots, id)?
+            {
                 out.insert(id, rec);
             }
         }
@@ -1289,7 +1340,6 @@ impl Storage {
             {
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
-                let mut embeddings = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
                 let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
@@ -1330,7 +1380,6 @@ impl Storage {
 
                 nodes.retain(|_, _| false).map_err(storage_err)?;
                 edges.retain(|_, _| false).map_err(storage_err)?;
-                embeddings.retain(|_, _| false).map_err(storage_err)?;
                 vector_dims.retain(|_, _| false).map_err(storage_err)?;
                 vectors.retain(|_, _| false).map_err(storage_err)?;
                 embedding_ref.retain(|_, _| false).map_err(storage_err)?;
@@ -1369,7 +1418,8 @@ impl Storage {
                         Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
                         Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => match read_node(
                             &nodes,
-                            &embeddings,
+                            &vectors,
+                            &embedding_ref,
                             &dicts,
                             &scope_registry,
                             &node_slots,
@@ -1386,7 +1436,6 @@ impl Storage {
                     apply_op(
                         &mut nodes,
                         &mut edges,
-                        &mut embeddings,
                         &mut vector_dims,
                         &mut vectors,
                         &mut embedding_ref,
@@ -1411,7 +1460,8 @@ impl Storage {
                         if let Some(id) = id {
                             if let Some(node) = read_node(
                                 &nodes,
-                                &embeddings,
+                                &vectors,
+                                &embedding_ref,
                                 &dicts,
                                 &scope_registry,
                                 &node_slots,
@@ -1428,7 +1478,8 @@ impl Storage {
                             Op::RemoveNode { .. } => None,
                             _ => read_node(
                                 &nodes,
-                                &embeddings,
+                                &vectors,
+                                &embedding_ref,
                                 &dicts,
                                 &scope_registry,
                                 &node_slots,
@@ -1595,18 +1646,25 @@ pub(crate) fn scope_key(s: Scope) -> [u8; 17] {
     key
 }
 
-fn read_embedding(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+/// A node's current embedding by slot, resolved via the v4 `vectors`/
+/// `embedding_ref` join (`vector_store::read_vector_by_slot`) plus a
+/// `DictKind::Model` id -> name resolve — the Task 7 replacement for the old
+/// `EMBEDDINGS`-table direct read. `Ok(None)` covers both "never embedded"
+/// and an unknown model id... except an unknown model id is corruption
+/// (`dicts.resolve` errors loudly), not a miss — a slot that resolves in
+/// `embedding_ref`/`vectors` always carries a model id this same open's
+/// `Dicts` interned, by construction.
+fn read_embedding_by_slot(
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    dicts: &Dicts,
     slot: u64,
 ) -> Result<Option<(String, Vec<f32>)>, TopoError> {
-    let key = slot_key(slot);
-    match table.get(key.as_slice()).map_err(storage_err)? {
+    match vector_store::read_vector_by_slot(vectors, refs, slot)? {
         None => Ok(None),
-        Some(v) => {
-            let raw = crate::codec::unframe_value(v.value())?;
-            postcard::from_bytes(&raw)
-                .map(Some)
-                .map_err(|e| TopoError::Encoding(e.to_string()))
+        Some((model_id, _scope_id, vector)) => {
+            let model = dicts.resolve(DictKind::Model, model_id)?;
+            Ok(Some((model.to_string(), vector)))
         }
     }
 }
@@ -1617,7 +1675,8 @@ fn read_embedding(
 /// already has open, with no separate snapshot hop.
 pub(crate) fn read_node_by_slot(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     dicts: &Dicts,
     scopes: &ScopeRegistry,
     slot: u64,
@@ -1630,7 +1689,7 @@ pub(crate) fn read_node_by_slot(
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
             let mut rec = crate::disk::node_from_disk_v3(disk, dicts, scopes)?;
-            rec.embedding = read_embedding(embeddings, slot)?;
+            rec.embedding = read_embedding_by_slot(vectors, refs, dicts, slot)?;
             Ok(Some(rec))
         }
     }
@@ -1644,9 +1703,11 @@ pub(crate) fn read_node_by_slot(
 ///   and removed atomically in every write path, so they can only diverge if
 ///   the file is damaged — that is data-integrity corruption and must
 ///   surface loudly, never masquerade as a routine "not found".
+#[allow(clippy::too_many_arguments)]
 fn read_node(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    embeddings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     dicts: &Dicts,
     scopes: &ScopeRegistry,
     node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -1655,7 +1716,7 @@ fn read_node(
     let Some(slot) = crate::slots::node_slot(node_slots, id)? else {
         return Ok(None);
     };
-    match read_node_by_slot(table, embeddings, dicts, scopes, slot)? {
+    match read_node_by_slot(table, vectors, refs, dicts, scopes, slot)? {
         Some(rec) => Ok(Some(rec)),
         None => Err(TopoError::Encoding(format!(
             "node slot mapping without record row: {id}"
@@ -1772,10 +1833,11 @@ fn put_edge(
 /// present and equal -> `Ok`; present and different -> `Rejected` (naming
 /// the model id and both dims), which aborts the whole enclosing batch since
 /// the caller's write transaction never commits on an `Err` return.
-/// `pub(crate)` so `migrate_v3.rs`'s v1/v2 -> v3 migration can apply the SAME
-/// dim-pinning invariant while dual-writing historical embeddings into the
-/// v4 `vectors`/`embedding_ref` tables (mirrors `apply_op`'s `SetEmbedding`
-/// arm, which is the only other caller).
+/// `pub(crate)` so `migrate_v3.rs`'s v1/v2 -> v3 migration AND
+/// `migrate_v4.rs`'s v3 -> v4 migration can apply the SAME dim-pinning
+/// invariant while folding historical embeddings into the v4
+/// `vectors`/`embedding_ref` tables — mirrors `apply_op`'s `SetEmbedding`
+/// arm, the live write-path caller.
 pub(crate) fn check_or_pin_dim(
     table: &mut Table<'_, &'static [u8], &'static [u8]>,
     model_id: u32,
@@ -1810,24 +1872,6 @@ pub(crate) fn check_or_pin_dim(
         }
     }
 }
-fn put_embedding(
-    table: &mut Table<'_, &'static [u8], &'static [u8]>,
-    node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    id: NodeId,
-    model: &str,
-    vector: &[f32],
-) -> Result<(), TopoError> {
-    let slot = crate::slots::node_slot(node_slots, id)?
-        .ok_or_else(|| TopoError::Encoding("put_embedding: missing node slot".into()))?;
-    let raw =
-        postcard::to_allocvec(&(model, vector)).map_err(|e| TopoError::Encoding(e.to_string()))?;
-    let f = crate::codec::frame_value(raw);
-    table
-        .insert(slot_key(slot).as_slice(), f.as_slice())
-        .map_err(storage_err)?;
-    Ok(())
-}
-
 /// Applies a single (already-resolved) op to the NODES/EDGES tables,
 /// validating against the current table state — which, mid-batch, already
 /// reflects every earlier op in the same batch since we mutate the tables
@@ -1837,7 +1881,6 @@ fn put_embedding(
 fn apply_op(
     nodes: &mut Table<'_, &'static [u8], &'static [u8]>,
     edges: &mut Table<'_, &'static [u8], &'static [u8]>,
-    embeddings: &mut Table<'_, &'static [u8], &'static [u8]>,
     vector_dims: &mut Table<'_, &'static [u8], &'static [u8]>,
     vectors: &mut Table<'_, &'static [u8], &'static [u8]>,
     embedding_ref: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -1880,10 +1923,16 @@ fn apply_op(
             )
         }
         Op::SetNodeProps { id, props } => {
-            let mut rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?
-                .ok_or_else(|| {
-                    TopoError::Rejected(format!("SetNodeProps: node {id:?} not found"))
-                })?;
+            let mut rec = read_node(
+                nodes,
+                vectors,
+                embedding_ref,
+                dicts,
+                scope_registry,
+                node_slots,
+                *id,
+            )?
+            .ok_or_else(|| TopoError::Rejected(format!("SetNodeProps: node {id:?} not found")))?;
             for (k, v) in props {
                 match v {
                     Some(val) => {
@@ -1905,39 +1954,54 @@ fn apply_op(
             )
         }
         Op::SetEmbedding { id, model, vector } => {
-            let rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *id)?
-                .ok_or_else(|| {
-                    TopoError::Rejected(format!("SetEmbedding: node {id:?} not found"))
-                })?;
+            // A zero-dim embedding is meaningless on its own AND would
+            // permanently poison the model's `VECTOR_DIMS` pin at 0 (after
+            // which every REAL embedding under that model is rejected as a
+            // dim conflict, forever — the pin is per-model, not per-batch).
+            // Reject before it can ever reach `check_or_pin_dim` — symmetric
+            // with `search_vector`, which already refuses an empty query
+            // vector. This was formerly `VectorIndex::prevalidate_dims`'s
+            // job (deleted with the rest of the slab apparatus in Task 7);
+            // it lives here now, inline in the one write path that can pin a
+            // dim.
+            if vector.is_empty() {
+                return Err(TopoError::Rejected(format!(
+                    "embedding for model {model:?} must have at least one dimension"
+                )));
+            }
+            let rec = read_node(
+                nodes,
+                vectors,
+                embedding_ref,
+                dicts,
+                scope_registry,
+                node_slots,
+                *id,
+            )?
+            .ok_or_else(|| TopoError::Rejected(format!("SetEmbedding: node {id:?} not found")))?;
             // Per-model permanent dim (v4): intern the model name to a
             // stable id, then pin/check its dim in VECTOR_DIMS. This is
-            // cross-batch AND cross-scope (unlike the RAM slab's
-            // per-(model, scope) check, which stays in place — see
-            // `check_or_pin_dim`'s doc comment) — a mismatch here rejects
-            // the whole batch since the caller's write transaction never
-            // commits on this `Err`.
+            // cross-batch AND cross-scope (unlike the old RAM slab's
+            // per-(model, scope) check) — a mismatch here rejects the whole
+            // batch since the caller's write transaction never commits on
+            // this `Err`.
             let model_id = dicts.intern(dict, DictKind::Model, model)?;
             // `check_or_pin_dim` only has the interned id in scope, but the
             // caller submitted a STRING model name — re-annotate the
-            // rejection with it here, matching `prevalidate_dims`'s
-            // `model {model:?}` wording convention. The interned id stays
-            // in the inner message for on-disk debugging.
+            // rejection with it here. The interned id stays in the inner
+            // message for on-disk debugging.
             check_or_pin_dim(vector_dims, model_id, vector.len()).map_err(|e| match e {
                 TopoError::Rejected(msg) => {
                     TopoError::Rejected(format!("SetEmbedding for model {model:?}: {msg}"))
                 }
                 other => other,
             })?;
-            put_embedding(embeddings, node_slots, *id, model, vector)?;
-            // Task 3 (v4): dual-write the new clustered `vectors` +
-            // `embedding_ref` tables alongside the still-authoritative
-            // EMBEDDINGS row just written above. Nothing reads these two
-            // tables yet — the in-RAM slab keeps serving `search_vector`
-            // until a later task cuts the read path over. `rec.scope` is
-            // the node's scope, read off the same `read_node` call used for
-            // the existence check above; interning it is idempotent (a
-            // live node's scope was necessarily interned when the node was
-            // created).
+            // v4: `vectors`/`embedding_ref` are the ONLY embedding storage —
+            // the old `EMBEDDINGS` table was deleted by the format v4 flip
+            // (Task 7). `rec.scope` is the node's scope, read off the same
+            // `read_node` call used for the existence check above; interning
+            // it is idempotent (a live node's scope was necessarily interned
+            // when the node was created).
             let slot = crate::slots::node_slot(node_slots, *id)?.ok_or_else(|| {
                 TopoError::Encoding("SetEmbedding: missing node slot after read_node hit".into())
             })?;
@@ -1955,9 +2019,7 @@ fn apply_op(
                 ));
             }
 
-            embeddings.remove(key.as_slice()).map_err(storage_err)?;
-            // Task 3 (v4): mirror the EMBEDDINGS cleanup above into the new
-            // dual-written tables — no-op if the node was never embedded.
+            // v4: no-op if the node was never embedded.
             vector_store::remove_vector(vectors, embedding_ref, removed_slot)?;
 
             // Adjacency-assisted cascade (Task 10): the node's own OUT_ADJ and
@@ -2024,14 +2086,30 @@ fn apply_op(
             props,
             valid_from,
         } => {
-            let from_rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *from)?
-                .ok_or_else(|| {
-                    TopoError::Rejected(format!("CreateEdge {id:?}: from node {from:?} not found"))
-                })?;
-            let to_rec = read_node(nodes, embeddings, dicts, scope_registry, node_slots, *to)?
-                .ok_or_else(|| {
-                    TopoError::Rejected(format!("CreateEdge {id:?}: to node {to:?} not found"))
-                })?;
+            let from_rec = read_node(
+                nodes,
+                vectors,
+                embedding_ref,
+                dicts,
+                scope_registry,
+                node_slots,
+                *from,
+            )?
+            .ok_or_else(|| {
+                TopoError::Rejected(format!("CreateEdge {id:?}: from node {from:?} not found"))
+            })?;
+            let to_rec = read_node(
+                nodes,
+                vectors,
+                embedding_ref,
+                dicts,
+                scope_registry,
+                node_slots,
+                *to,
+            )?
+            .ok_or_else(|| {
+                TopoError::Rejected(format!("CreateEdge {id:?}: to node {to:?} not found"))
+            })?;
             if from_rec.scope != to_rec.scope
                 && from_rec.scope != Scope::Shared
                 && to_rec.scope != Scope::Shared
@@ -2164,7 +2242,7 @@ mod tests {
         let read = s.read_ops(1).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].1, ops[0]);
-        assert_eq!(s.format_version().unwrap(), 3);
+        assert_eq!(s.format_version().unwrap(), 4);
     }
 
     #[test]
@@ -2181,7 +2259,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             {
                 let mut meta = tx.open_table(META).unwrap();
-                meta.insert("format_version", 4u32.to_le_bytes().as_slice())
+                meta.insert("format_version", 5u32.to_le_bytes().as_slice())
                     .unwrap();
             }
             tx.commit().unwrap();
@@ -2192,17 +2270,114 @@ mod tests {
         let err = Storage::open(&path).err().expect("reopen must be rejected");
         match err {
             TopoError::UnsupportedFormat {
-                found: 4,
-                supported: 3,
+                found: 5,
+                supported: 4,
             } => {}
             other => {
-                panic!("expected UnsupportedFormat {{ found: 4, supported: 3 }}, got {other:?}")
+                panic!("expected UnsupportedFormat {{ found: 5, supported: 4 }}, got {other:?}")
             }
         }
     }
 
+    /// Amendment 3 (controller-adjudicated, storage-format-v4 plan Task 7):
+    /// a v3 file with one model recorded at TWO different dims across two
+    /// different scopes is LEGAL v3 state — the old RAM slab pinned dims
+    /// per-`(model, scope)`, not per-model, so this could genuinely happen
+    /// on a real pre-v4 database — hitting the v4 per-model-only policy on
+    /// migration. That must fail the whole open with `Rejected` (naming the
+    /// model and both dims), NOT `Encoding`: this is legal upstream data
+    /// meeting a new policy, not file corruption. The state is manufactured
+    /// via raw redb writes (bypassing `check_or_pin_dim`, which the live
+    /// `SetEmbedding` write path — and thus `Storage::apply_batch` — would
+    /// never allow to exist in the first place) into a file whose META is
+    /// then downgraded to `format_version = 3`, so reopening exercises the
+    /// REAL `Some(3)` migration arm end to end, not `migrate_v4` in
+    /// isolation (see `migrate_v4.rs`'s own unit test of the same scenario,
+    /// called directly against the migration function).
     #[test]
-    fn storage_report_counts_v2_tables_and_embeddings_are_cold() {
+    fn v3_file_with_one_model_two_dims_across_scopes_rejects_migration_not_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let a = NodeId::from_u128(1);
+        let b = NodeId::from_u128(2);
+        let scope_a = Scope::Id(ScopeId::from_u128(10));
+        let scope_b = Scope::Id(ScopeId::from_u128(20));
+        let (slot_a, slot_b);
+        {
+            let s = Storage::open(&path).unwrap();
+            s.apply_batch(
+                vec![
+                    Op::CreateNode {
+                        id: a,
+                        scope: scope_a,
+                        label: "M".into(),
+                        props: Default::default(),
+                    },
+                    Op::CreateNode {
+                        id: b,
+                        scope: scope_b,
+                        label: "M".into(),
+                        props: Default::default(),
+                    },
+                ],
+                0,
+            )
+            .unwrap();
+            let tx = s.db.begin_read().unwrap();
+            let node_slots = tx.open_table(NODE_SLOTS).unwrap();
+            slot_a = crate::slots::node_slot(&node_slots, a).unwrap().unwrap();
+            slot_b = crate::slots::node_slot(&node_slots, b).unwrap().unwrap();
+            // `s` drops here, closing the file handle before the raw reopen
+            // below.
+        }
+
+        {
+            let db = Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut embeddings = tx.open_table(EMBEDDINGS).unwrap();
+                for (slot, dim) in [(slot_a, 2usize), (slot_b, 3usize)] {
+                    let raw =
+                        postcard::to_allocvec(&("shared-model".to_string(), vec![1.0f32; dim]))
+                            .unwrap();
+                    let framed = crate::codec::frame_value(raw);
+                    embeddings
+                        .insert(slot_key(slot).as_slice(), framed.as_slice())
+                        .unwrap();
+                }
+                // Downgrade: a genuine pre-v4 v3 file never had this batch's
+                // CreateNodes migrated past v3 in the first place — simulate
+                // that by rewinding the stamp `Storage::open` above advanced
+                // to 4.
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert("format_version", 3u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let err = Storage::open(&path)
+            .err()
+            .expect("migration must fail, not silently succeed");
+        match &err {
+            TopoError::Rejected(msg) => {
+                assert!(
+                    msg.contains("shared-model"),
+                    "message must name the model, got {msg:?}"
+                );
+                assert!(
+                    msg.contains('2') && msg.contains('3'),
+                    "message must name both dims, got {msg:?}"
+                );
+            }
+            other => panic!(
+                "expected Rejected (legal v3 state hitting a v4 policy, not corruption), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn storage_report_counts_v4_vector_tables_and_they_go_cold_on_remove() {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path().join("t.redb")).unwrap();
         let id = NodeId::from_u128(1);
@@ -2224,28 +2399,26 @@ mod tests {
         )
         .unwrap();
         let report = s.storage_report().unwrap();
-        assert_eq!(
-            report
-                .iter()
-                .find(|r| r.table == "embeddings")
-                .unwrap()
-                .rows,
-            1
-        );
+        for table in ["vectors", "embedding_ref"] {
+            assert_eq!(
+                report.iter().find(|r| r.table == table).unwrap().rows,
+                1,
+                "{table} must carry exactly the one embedding just written"
+            );
+        }
         assert_eq!(
             s.load_node(id).unwrap().unwrap().embedding.unwrap().1.len(),
             64
         );
         s.apply_batch(vec![Op::RemoveNode { id }], 1).unwrap();
-        assert_eq!(
-            s.storage_report()
-                .unwrap()
-                .iter()
-                .find(|r| r.table == "embeddings")
-                .unwrap()
-                .rows,
-            0
-        );
+        let report = s.storage_report().unwrap();
+        for table in ["vectors", "embedding_ref"] {
+            assert_eq!(
+                report.iter().find(|r| r.table == table).unwrap().rows,
+                0,
+                "{table} must go cold once the only embedded node is removed"
+            );
+        }
     }
 
     #[test]
@@ -3225,18 +3398,21 @@ mod tests {
         .unwrap();
     }
 
-    /// Task 3 Step 4 — the oracle-pattern consistency cross-check: a
-    /// 200-memory generated workload (all embedded, so the mutation tail has
-    /// material to act on), then a mutation tail of same-model re-embeds,
-    /// cross-model re-embeds, and removes — exactly the three mutation
-    /// shapes `put_vector`/`remove_vector` branch on. Afterward, for EVERY
-    /// row remaining in the old, still-authoritative `EMBEDDINGS` table,
-    /// `read_vector_by_slot` on the new dual-written tables must return the
-    /// same `(model name via dict, vector)` — and the row COUNTS must agree
-    /// in both directions (no orphans in the new tables, nothing missing
-    /// either).
+    /// Task 3 Step 4 originally cross-checked the new `vectors`/
+    /// `embedding_ref` tables against the then-still-authoritative
+    /// `EMBEDDINGS` table — that table is gone as of Task 7 (format v4;
+    /// `vectors`/`embedding_ref` are now the ONLY embedding storage, so
+    /// there is no second source left to cross-check against). Repurposed:
+    /// after a 200-memory generated workload (all embedded) plus a mutation
+    /// tail of same-model re-embeds, cross-model re-embeds, and removes —
+    /// exactly the three mutation shapes `put_vector`/`remove_vector` branch
+    /// on — the `vectors`/`embedding_ref` row counts must equal the number
+    /// of currently-live nodes that actually carry an embedding (no orphans
+    /// left behind by a re-embed or a remove), and every live embedded
+    /// node's `read_node`-resolved embedding must round-trip through a
+    /// direct `read_vector_by_slot` call for that same slot.
     #[test]
-    fn vectors_tables_match_embeddings_after_200_memory_workload_with_reembeds_and_removes() {
+    fn vectors_tables_have_no_orphans_after_200_memory_workload_with_reembeds_and_removes() {
         // Same id scheme as `workload.rs`'s private `memory_id` (duplicated
         // here rather than exposed — matches the convention already used by
         // `tests/differential.rs`'s own local `memory_id` helper).
@@ -3261,6 +3437,7 @@ mod tests {
         // buckets above for some i — exercises "re-embedded then removed"
         // too). `workload::batches` hardcodes the model name "bench-768"
         // regardless of `embed_dim`, so the same-model bucket must reuse it.
+        let mut removed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for i in (0..spec.memories).step_by(4) {
             s.apply_batch(
                 vec![Op::SetEmbedding {
@@ -3286,53 +3463,69 @@ mod tests {
         for i in (0..spec.memories).filter(|i| i % 7 == 0) {
             s.apply_batch(vec![Op::RemoveNode { id: memory_id(i) }], 2)
                 .unwrap();
+            removed.insert(i);
         }
 
-        let tx = s.db.begin_read().unwrap();
-        let embeddings = tx.open_table(EMBEDDINGS).unwrap();
-        let vectors = tx.open_table(VECTORS).unwrap();
-        let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        let dicts = s.dicts.read().unwrap();
+        // Independent oracle: every SURVIVING memory (embed_pct: 100, so
+        // every one of the 200 started embedded) still carries an
+        // embedding — the mutation tail only ever re-embeds or removes,
+        // never clears one outright.
+        let mut expected_live_embeddings = 0u64;
+        for i in 0..spec.memories {
+            if removed.contains(&i) {
+                continue;
+            }
+            let rec = s
+                .load_node(memory_id(i))
+                .unwrap()
+                .unwrap_or_else(|| panic!("memory {i} must survive (not in `removed`)"));
+            let (model, vector) = rec
+                .embedding
+                .unwrap_or_else(|| panic!("memory {i} must still carry an embedding"));
+            expected_live_embeddings += 1;
 
-        let mut old_rows = 0u64;
-        for entry in embeddings.iter().unwrap() {
-            let (k, v) = entry.unwrap();
-            let key: [u8; 8] = k.value().try_into().unwrap();
-            let slot = u64::from_be_bytes(key);
-            let raw = crate::codec::unframe_value(v.value()).unwrap();
-            let (model_name, vector): (String, Vec<f32>) = postcard::from_bytes(&raw).unwrap();
-
-            let (model_id, _scope_id, new_vector) =
+            // Round-trip: `read_node`'s resolved embedding must match a
+            // direct `read_vector_by_slot` call for the same slot.
+            let tx = s.db.begin_read().unwrap();
+            let node_slots = tx.open_table(NODE_SLOTS).unwrap();
+            let slot = crate::slots::node_slot(&node_slots, memory_id(i))
+                .unwrap()
+                .unwrap();
+            let vectors = tx.open_table(VECTORS).unwrap();
+            let refs = tx.open_table(EMBEDDING_REF).unwrap();
+            let (model_id, _scope_id, raw_vector) =
                 vector_store::read_vector_by_slot(&vectors, &refs, slot)
                     .unwrap()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "slot {slot}: EMBEDDINGS row has no matching vectors/embedding_ref row"
-                        )
-                    });
+                    .unwrap_or_else(|| panic!("memory {i} (slot {slot}): no vectors row"));
+            let dicts = s.dicts.read().unwrap();
             let resolved_name = dicts.resolve(DictKind::Model, model_id).unwrap();
             assert_eq!(
                 resolved_name.as_str(),
-                model_name,
-                "slot {slot}: model name mismatch"
+                model,
+                "memory {i}: model name mismatch between read_node and read_vector_by_slot"
             );
-            assert_eq!(new_vector, vector, "slot {slot}: vector mismatch");
-            old_rows += 1;
+            assert_eq!(
+                raw_vector, vector,
+                "memory {i}: vector mismatch between read_node and read_vector_by_slot"
+            );
         }
 
+        let tx = s.db.begin_read().unwrap();
+        let vectors = tx.open_table(VECTORS).unwrap();
+        let refs = tx.open_table(EMBEDDING_REF).unwrap();
         let vectors_rows = vectors.iter().unwrap().count() as u64;
         let refs_rows = refs.iter().unwrap().count() as u64;
         assert!(
-            old_rows > 0,
+            expected_live_embeddings > 0,
             "workload+tail must leave some live embeddings"
         );
         assert_eq!(
-            vectors_rows, old_rows,
-            "vectors row count must equal embeddings row count — no orphans"
+            vectors_rows, expected_live_embeddings,
+            "vectors row count must equal the number of currently-live embedded nodes — no orphans"
         );
         assert_eq!(
-            refs_rows, old_rows,
-            "embedding_ref row count must equal embeddings row count — no orphans"
+            refs_rows, expected_live_embeddings,
+            "embedding_ref row count must equal the number of currently-live embedded nodes — no orphans"
         );
     }
 }

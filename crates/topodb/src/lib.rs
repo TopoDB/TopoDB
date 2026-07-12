@@ -13,6 +13,7 @@ mod ids;
 mod index;
 mod migrate;
 mod migrate_v3;
+mod migrate_v4;
 mod op;
 mod prop_index;
 mod props;
