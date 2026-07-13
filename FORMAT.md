@@ -423,6 +423,11 @@ maintenance quadratic at scale.
   never assume density. None of this changes the stored format — the split
   policy is maintenance behavior; on-disk keys and blocks are exactly the
   shapes above, and v4 files written before this policy need no migration.
+  `fts::read_posting` (used by scoring, which needs every entry) decodes and
+  concatenates every chunk in ascending order; `fts::posting_df` (the
+  document-frequency fast path `search_text` uses before deciding whether a
+  term has any hits at all) sums each chunk's `count` header without decoding
+  any entries.
 - `fts_docs` (node slot → plain postcard `u32` token count) and `fts_stats`
   (4-byte BE scope id → plain postcard `(doc_count: u64, total_len: u64)`)
   are unchanged from v3 — unframed, maintained by the same `fts::fts_update`
