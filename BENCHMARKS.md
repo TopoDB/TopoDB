@@ -428,11 +428,11 @@ starts out correctly split into normal-sized chunks). The edit phase then
 adds `"zzmarker"` to the 12,000 low-slot documents that lack it, ascending
 by slot, in batches of 200 `SetNodeProps` ops. Every one of those inserts
 has a slot below the marker's existing minimum, so `fts.rs`'s covering-chunk
-scan routes every single one into the SAME earliest chunk (the first
+scan routed every single one into the SAME earliest chunk (the first
 earlier chunk whose max already exceeds the new — much lower — slot, which
 is trivially every earlier chunk once the new slot precedes the whole
-existing range) — and that chunk never splits, by the deliberate design
-`mutate_posting_chunk`'s doc comment documents ("a covering-chunk insert can
+existing range) — and that chunk never split, by the deliberate design
+`mutate_posting_chunk`'s doc comment documented ("a covering-chunk insert can
 grow a chunk slightly past `POSTINGS_CHUNK_TARGET` without triggering a
 split"). At `POSTINGS_CHUNK_TARGET = 4096`:
 
@@ -491,7 +491,10 @@ Gate 6 (append linearity) re-run at the same commit — the fast path routes
 through the same shared split helper now, so a regression here would mean
 the unification cost something: 10k 0.3561 ms/doc, 100k 0.5200 ms/doc,
 ratio 1.46x (gate: <= 2x AND <= 5 ms; pre-change 0.66 / 1.10 / 1.66x).
-**PASS.**
+**PASS.** The absolute per-doc levels are also well below the pre-change
+baselines (0.66 / 1.10 ms/doc); treat that level shift as run-to-run and
+storage-volume variance, not a claimed speedup — the gate, and the
+like-for-like comparison, is the ratio.
 
 ### Gate 7: open, 1M memories, WITH text index
 

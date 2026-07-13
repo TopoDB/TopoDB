@@ -411,7 +411,9 @@ fn peek_first_slot(payload: &[u8]) -> Result<u64, TopoError> {
 }
 
 /// `peek_first_slot` against a stored chunk key: one value load plus the
-/// header read — never a full decode.
+/// header read — the entries are never walked (an lz4-framed value is
+/// still decompressed by `unframe_value`, so the cost is bounded by the
+/// chunk, not the header).
 fn peek_stored_first_slot(
     postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     key: &[u8],
@@ -1898,8 +1900,8 @@ mod tests {
         /// encoded > one chunk target), then apply random interleaved
         /// inserts / tf-updates / removals (count 0 = remove) across a slot
         /// range spanning below, inside, and beyond the seeded chunks.
-        /// After every op batch the chunk file state must match a BTreeMap
-        /// oracle exactly and hold every structural invariant.
+        /// After the full op sequence the chunk file state must match a
+        /// BTreeMap oracle exactly and hold every structural invariant.
         #[test]
         fn set_posting_matches_oracle_and_holds_chunk_invariants(
             ops in proptest::collection::vec((0u64..6_000, 0u32..3), 1..300)

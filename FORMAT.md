@@ -414,7 +414,10 @@ maintenance quadratic at scale.
   peeked from each block's header (`fts::peek_first_slot` — the first
   entry's delta is relative to 0, so it is the absolute first slot) without
   decoding entries; a slot in the gap between two chunks' ranges lands in
-  the earlier chunk. EVERY rewrite — append or covering mutation — splits
+  the earlier chunk. (A probed chunk's framed value is still loaded — and,
+  if lz4-framed, decompressed — but its entries are never walked; the
+  located covering chunk is then fully decoded and rewritten.) EVERY
+  rewrite — append or covering mutation — splits
   at the midpoint entry when the re-encoded chunk exceeds
   `fts::POSTINGS_CHUNK_TARGET` (4 KiB); a mid-list split shifts the later
   chunk keys up one number each (highest first, raw framed bytes moved
@@ -423,6 +426,11 @@ maintenance quadratic at scale.
   never assume density. None of this changes the stored format — the split
   policy is maintenance behavior; on-disk keys and blocks are exactly the
   shapes above, and v4 files written before this policy need no migration.
+  A file written by an earlier v4 build under an edit-heavy history can
+  already hold a covering chunk beyond the target; each subsequent rewrite
+  of such a chunk splits it once at the midpoint, so oversized legacy
+  chunks converge back under the target incrementally rather than
+  immediately.
   `fts::read_posting` (used by scoring, which needs every entry) decodes and
   concatenates every chunk in ascending order; `fts::posting_df` (the
   document-frequency fast path `search_text` uses before deciding whether a
