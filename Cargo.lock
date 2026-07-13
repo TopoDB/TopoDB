@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-mcp"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "rmcp",
  "schemars",

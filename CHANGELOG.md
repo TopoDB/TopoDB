@@ -190,6 +190,28 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
+### 0.0.8
+
+No engine or tool-surface changes. This release exists to ship a fix in the **npm launcher**
+(`@topodb/topodb-mcp`'s `bin/topodb-mcp.js`), which is what selects and executes the platform binary.
+
+#### Fixed
+
+- **The launcher could execute a `topodb-mcp` binary belonging to a different install — silently.**
+  It located the platform binary with a bare `require.resolve`, and Node's resolution **walks up the
+  directory tree**. On a Windows host where npm had installed the wrong platform's optional
+  dependency (`topodb-mcp-linux-x64` on win32), `topodb-mcp-win32-x64` was absent from the install —
+  so the walk-up continued past it, found a stale `topodb-mcp-win32-x64@0.0.3` elsewhere on the
+  machine, and resolved *successfully*. Because it succeeded, the launcher's "prebuilt binary package
+  is not installed" error — whose entire purpose is that situation — never fired, and a server two
+  on-disk-format generations old was launched while every version check in the stack reported 0.0.7.
+
+  A successful resolve is not proof the binary is ours. `optionalDependencies` pins each platform
+  package to the launcher's exact version, so the launcher now **verifies the resolved package
+  reports that version** and refuses otherwise, naming both the version it found and the path it came
+  from. A wrong binary is now a loud, actionable error instead of a working-looking server with the
+  wrong on-disk format.
+
 ### 0.0.7
 
 #### Added
