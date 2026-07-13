@@ -22,6 +22,9 @@ Report only what the graph actually holds. Do not fill gaps with details from
 the surrounding conversation or your own assumptions — an unstored fact
 presented as recalled is worse than no recall at all.
 
+If the memory tools are not available in this session, say so plainly and
+continue without them — do not pretend the graph is empty or invent recalled facts.
+
 ## Store what will still be true tomorrow
 
 Store: decisions and the reasoning behind them, constraints, a person's role or

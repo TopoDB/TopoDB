@@ -25,6 +25,32 @@ into the plugin's data directory on first run and reuses it after that — no
 `npm`) on `PATH`. This is the same constraint `@topodb/pi` has; if you already
 run Pi extensions, you already satisfy it.
 
+## How it works
+
+redb, the database engine behind `memory.redb`, allows only one process to
+hold the file open at a time. Claude Code runs one `topodb-mcp` per window, so
+without help only the first window to open would get memory — every other
+window's server would fail to open the database, near-silently.
+
+To fix that, this plugin runs a single background **broker** process that
+owns the database; every window's `launch.js` is a thin client that connects
+to the broker over a local socket (a named pipe on Windows) instead of
+opening the database itself. The broker is what makes memory work in every
+window at once, not just the first.
+
+The broker starts on demand — the first session to connect spawns it — and
+exits about 60 seconds after the last window closes, releasing the database.
+You do not start or stop it yourself.
+
+**This means a background `node` process will be running whenever you have a
+Claude Code window open with this plugin installed.** That's the broker; it's
+expected, and it's how cross-window memory works. If you see an unfamiliar
+`node` process in your task manager, this is almost certainly it.
+
+If memory ever fails to come up, the broker's log is at
+`<plugin-data>/broker.log` (the same directory `memory.redb` lives in — see
+below).
+
 ## Memory model
 
 Every session's reads span **this project's scope** plus a **`shared`**
