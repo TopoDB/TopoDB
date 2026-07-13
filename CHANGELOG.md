@@ -190,6 +190,38 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
+### 0.0.7
+
+#### Added
+
+- **Per-request scope overrides via JSON-RPC `_meta`.** A request may now carry `topodb/scope` (a
+  `"shared"`/ULID string) and/or `topodb/read_scopes` (a non-empty array of them) in its `_meta`
+  envelope; they override `--scope` and `--read-scopes` **for that request only**. An explicit
+  `scope`/`scopes` *argument* still wins over both, so nothing about the existing tool surface
+  changes — this replaces the fallback, it does not pin the request. A client that sends no `_meta`
+  is byte-for-byte unaffected.
+
+  This exists because `--scope`/`--read-scopes` are *process-wide*, and that assumption breaks the
+  moment one server process is shared by several clients. redb permits only one process to hold a
+  database, so the Claude Code plugin's broker multiplexes every concurrent session onto a single
+  `topodb-mcp` — and sessions in different projects need different scopes. Scope has to travel with
+  the request, not the process.
+
+  Passing `topodb/scope` **without** `topodb/read_scopes` narrows the read set to that one scope,
+  mirroring how `--read-scopes` defaults to `--scope` when omitted. Inheriting the process-wide read
+  set there would reintroduce exactly the leak this closes.
+
+#### Fixed
+
+- **Cross-project memory leak in the Claude Code plugin (`plugins/claude-code`).** Every project
+  after the first silently read *and wrote* into the first project's scope: the broker is keyed on
+  the database path alone, which is identical for all projects, so whichever session spawned it
+  fixed `--scope` for every session that connected afterwards. A project's agent could recall
+  another project's private memories. Requires the plugin at `SERVER_VERSION` 0.0.7, which now sends
+  each session's scopes per request. Regression tests:
+  `plugins/claude-code/test/broker.test.js` — `each_session_writes_to_its_own_project_scope` and
+  `one_project_cannot_read_another_projects_memory`.
+
 ### 0.0.6
 
 > **Opening a database with this version migrates it, one-way.** This release embeds `topodb`

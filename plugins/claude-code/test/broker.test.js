@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
-import { lineReader, socketPathFor } from "../ipc.js";
+import { lineReader, socketPathFor, helloFrame } from "../ipc.js";
 import { projectScopeId } from "../scope-id.js";
 
 const require = createRequire(import.meta.url);
@@ -252,8 +252,17 @@ function mkFakeCancelServerDataDir(prefix) {
  * to a broker's socket, bypassing launch.js entirely, so a test can act as
  * its own MCP session and choose ITS OWN client-space ids explicitly (needed
  * to construct the exact id collision C2 is about). */
-function socketRpcClient(sock) {
+/** A raw client on the broker's socket, standing in for a session's shim.
+ *
+ * It MUST open with a hello frame, because that is what a real shim does
+ * (`launch.js`'s `relay`) and the broker now refuses to forward a request from a
+ * connection whose scope it does not know — it would otherwise have to run that
+ * request under whatever scope the server happened to be started with, which is
+ * precisely the scope-bleed bug. A test double that skipped the hello would be
+ * testing a client that cannot exist. */
+function socketRpcClient(sock, { scope = "t6scope", readScopes = ["t6scope", "shared"] } = {}) {
   const conn = net.connect(sock);
+  conn.write(helloFrame({ scope, readScopes }));
   const pending = new Map();
   const notifications = [];
   const waiters = [];
@@ -475,6 +484,119 @@ test("startup_race_elects_one_broker", async () => {
     killAll(sessions);
     rmDir(dataDir);
     for (const d of projDirs) rmDir(d);
+  }
+});
+
+test("each_session_writes_to_its_own_project_scope", async () => {
+  const dataDir = mkDataDir("topodb-t3b-data-");
+  const projA = mkdtempSync(path.join(tmpdir(), "topodb-t3b-projA-"));
+  const projB = mkdtempSync(path.join(tmpdir(), "topodb-t3b-projB-"));
+  const sessions = [];
+  try {
+    // THE SCOPE-BLEED REGRESSION TEST. The tests above already prove two
+    // projects SHARE one database and one broker -- which is the whole point.
+    // What none of them assert is which SCOPE each session lands in, and that
+    // omission is exactly why the bug shipped: `serverArgs()` bakes
+    // `--scope <ULID(projectDir)>` into argv, `broker.js` spawns ONE
+    // topodb-mcp with whichever session's argv got there first, and
+    // `socketPathFor(dbPath)` keys the broker on the DB PATH ALONE -- which is
+    // identical for every project. So session B connects to A's broker and
+    // silently inherits A's scope.
+    //
+    // t2 (answers_do_not_cross_between_sessions) PASSES while this is broken:
+    // it writes a marker per session and reads each back, which works fine
+    // when both sessions sit in the same scope. Sharing a scope is invisible
+    // to it. Only asserting the scope itself can see this.
+    const [a, b] = await Promise.all([
+      connectAndInit({ dataDir, projectDir: projA }),
+      connectAndInit({ dataDir, projectDir: projB }),
+    ]);
+    sessions.push(a, b);
+
+    const [infoA, infoB] = await Promise.all([
+      a.rpc("tools/call", { name: "db_info", arguments: {} }),
+      b.rpc("tools/call", { name: "db_info", arguments: {} }),
+    ]);
+    assert.ok(!infoA.error, `session A's db_info errored: ${JSON.stringify(infoA)}`);
+    assert.ok(!infoB.error, `session B's db_info errored: ${JSON.stringify(infoB)}`);
+
+    // Derived independently, from each project's own path -- the value each
+    // session is SUPPOSED to be writing under.
+    const wantA = projectScopeId(projA);
+    const wantB = projectScopeId(projB);
+    assert.notEqual(wantA, wantB, "two different project dirs must derive two different scopes");
+
+    assert.equal(
+      infoA.result.structuredContent.default_scope,
+      wantA,
+      "session A's write scope is not its own project's scope",
+    );
+    assert.equal(
+      infoB.result.structuredContent.default_scope,
+      wantB,
+      `session B inherited another project's scope (scope bleed): expected ${wantB}, got ${infoB.result.structuredContent.default_scope}`,
+    );
+  } finally {
+    killAll(sessions);
+    rmDir(dataDir);
+    rmDir(projA);
+    rmDir(projB);
+  }
+});
+
+test("one_project_cannot_read_another_projects_memory", async () => {
+  const dataDir = mkDataDir("topodb-t3c-data-");
+  const projA = mkdtempSync(path.join(tmpdir(), "topodb-t3c-projA-"));
+  const projB = mkdtempSync(path.join(tmpdir(), "topodb-t3c-projB-"));
+  const sessions = [];
+  try {
+    // The consequence that actually matters to a user. The scope assertion
+    // above is the mechanism; this is the harm: with the scopes collapsed,
+    // project B's agent can recall project A's private memories. The README
+    // promises the opposite ("reads span this project's scope plus shared").
+    const [a, b] = await Promise.all([
+      connectAndInit({ dataDir, projectDir: projA }),
+      connectAndInit({ dataDir, projectDir: projB }),
+    ]);
+    sessions.push(a, b);
+
+    const secretOfA = `project-A-private-${randomUUID()}`;
+    const wrote = await a.rpc("tools/call", {
+      name: "create_memory",
+      arguments: { content: secretOfA },
+    });
+    assert.ok(!wrote.error, `session A's create_memory errored: ${JSON.stringify(wrote)}`);
+
+    // B searches its OWN default read set ({B's project} + shared). A's memory
+    // was written to A's project scope, so it must not appear.
+    const found = await b.rpc("tools/call", {
+      name: "search_memories",
+      arguments: { query: secretOfA },
+    });
+    assert.ok(!found.error, `session B's search_memories errored: ${JSON.stringify(found)}`);
+
+    const body = JSON.stringify(found.result);
+    assert.ok(
+      !body.includes(secretOfA),
+      `project B recalled project A's private memory (scope bleed).\n  secret: ${secretOfA}\n  B saw: ${body.slice(0, 800)}`,
+    );
+
+    // Positive control: without this, the assertion above would also "pass" if
+    // search_memories were simply broken and returned nothing for everyone.
+    const ownHit = await a.rpc("tools/call", {
+      name: "search_memories",
+      arguments: { query: secretOfA },
+    });
+    assert.ok(!ownHit.error, `session A's search_memories errored: ${JSON.stringify(ownHit)}`);
+    assert.ok(
+      JSON.stringify(ownHit.result).includes(secretOfA),
+      "session A could not recall its OWN memory -- the negative assertion above proves nothing",
+    );
+  } finally {
+    killAll(sessions);
+    rmDir(dataDir);
+    rmDir(projA);
+    rmDir(projB);
   }
 });
 
