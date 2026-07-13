@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.7
 
 #### Breaking
 
@@ -147,6 +147,14 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.4
+
+#### Changed
+
+- Engine dependency moved to `topodb` 0.0.7 (on-disk **format v4**). See the engine's 0.0.7 entry —
+  in particular the **one-way auto-migration** of existing v1/v2/v3 database files on first open,
+  and the per-model embedding-dimension rule. No `topodb-json` surface changes.
+
 ### 0.0.3
 
 #### Added
@@ -181,6 +189,22 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### 0.0.6
+
+> **Opening a database with this version migrates it, one-way.** This release embeds `topodb`
+> 0.0.7, whose on-disk format is v4. The first time this server opens an existing v1/v2/v3
+> database file it is auto-migrated to v4, and older builds can no longer read it. Back up the
+> `.redb` file first if you may need to roll back. Additionally: a v3 file holding one embedding
+> model at two different dimensions across scopes (legal under v3's rules) **fails migration**
+> with an error naming the model — re-embed under distinct model names before upgrading.
+
+#### Changed
+
+- Embeds `topodb` 0.0.7 (format v4) and `topodb-json` 0.0.4. Vector search now reads clustered
+  on-disk tables (no in-RAM index to rebuild at open — a 1M-memory database with embeddings opens
+  in ~11 ms instead of ~2.1 s), and full-text indexing cost is flat per document instead of
+  growing with corpus size. No MCP tool-surface changes.
 
 ### 0.0.5
 
@@ -251,6 +275,18 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-cli`
+
+### 0.0.4
+
+> **Opening a database with this version migrates it, one-way.** This release embeds `topodb`
+> 0.0.7, whose on-disk format is v4. The first `topodb` command against an existing v1/v2/v3
+> database file auto-migrates it to v4, and older builds can no longer read it. Back up the
+> `.redb` file first if you may need to roll back. See the `topodb-mcp` 0.0.6 note for the
+> two-dimensions-per-model migration caveat — it applies here identically.
+
+#### Changed
+
+- Embeds `topodb` 0.0.7 (format v4) and `topodb-json` 0.0.4. No CLI surface changes.
 
 ### 0.0.3
 
