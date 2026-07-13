@@ -30,10 +30,14 @@
 //! (`encode_posting_block`/`decode_posting_block`), wrapped in the same
 //! `codec::frame_value` framing as other values. `set_posting` maintains
 //! this via one bounded prefix range scan for the term's chunk keys, then
-//! either a last-chunk append (new highest-slot doc; split at
-//! `POSTINGS_CHUNK_TARGET` if needed) or a covering-chunk decode/mutate/
-//! rewrite (update, remove, or an out-of-order new slot) — see its doc
-//! comment. `read_posting` decodes and concatenates every chunk (used by
+//! either a last-chunk append (new highest-slot doc) or a covering-chunk
+//! decode/mutate/rewrite (update, remove, or an out-of-order new slot),
+//! the covering chunk found by binary-searching header-peeked first slots
+//! (`peek_first_slot` — one full decode per call, ever). EITHER path
+//! splits at the midpoint when the re-encoded chunk exceeds
+//! `POSTINGS_CHUNK_TARGET`; a mid-list split renumber-shifts the chunks
+//! behind it, raw bytes untouched — see `set_posting`'s doc comment.
+//! `read_posting` decodes and concatenates every chunk (used by
 //! scoring, which needs every entry regardless); `posting_df` sums each
 //! chunk's `posting_block_count` header without decoding entries — the df
 //! fast path `search_text` uses before deciding whether df is even nonzero.
@@ -380,6 +384,45 @@ pub(crate) fn posting_block_count(payload: &[u8]) -> Result<u64, TopoError> {
     read_varint(&mut input)
 }
 
+/// The first (lowest) slot of one encoded chunk block, read from the header
+/// alone: `[block_format][count varint][first slot_delta varint]` — and the
+/// first delta is relative to 0, so it IS the absolute first slot. Never
+/// walks the remaining entries; this is what keeps `set_posting`'s
+/// covering-chunk search cheap on every chunk it probes and rejects.
+/// Errors identically to `decode_posting_block` on an empty payload or an
+/// unknown format tag, and rejects a zero-count block (a stored chunk is
+/// never empty, so a zero count means corruption, not absence).
+fn peek_first_slot(payload: &[u8]) -> Result<u64, TopoError> {
+    let Some((&format, mut input)) = payload.split_first() else {
+        return Err(TopoError::Encoding("empty postings chunk block".into()));
+    };
+    if format != POSTINGS_BLOCK_FORMAT_V0 {
+        return Err(TopoError::Encoding(format!(
+            "unknown postings block format 0x{format:02X}"
+        )));
+    }
+    if read_varint(&mut input)? == 0 {
+        return Err(TopoError::Encoding(
+            "zero-count postings chunk block (empty chunks are removed, never written)".into(),
+        ));
+    }
+    read_varint(&mut input)
+}
+
+/// `peek_first_slot` against a stored chunk key: one value load plus the
+/// header read — never a full decode.
+fn peek_stored_first_slot(
+    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    key: &[u8],
+) -> Result<u64, TopoError> {
+    let v = postings
+        .get(key)
+        .map_err(storage_err)?
+        .expect("term_chunk_keys returns only present keys");
+    let raw = unframe_value(v.value())?;
+    peek_first_slot(raw.as_ref())
+}
+
 /// Bounded range scan for `term`'s chunk keys under `scope_id`, returned in
 /// ascending chunk order (the same order the keys sort in, since the chunk
 /// suffix is fixed-width BE) — **never** a table iteration. The scan range
@@ -575,24 +618,36 @@ fn store_posting_chunk_splitting(
 }
 
 /// Index (into `keys`) of the chunk covering `slot`, for a slot strictly
-/// below the last chunk's first entry. Decodes earlier chunks front-to-back
-/// until the first whose max reaches `slot`; if every earlier chunk tops
-/// out below it, the slot falls in the gap before the last chunk's range
-/// and the last chunk covers it. Precondition: `keys.len() >= 2` (the
-/// caller handles single-chunk terms directly).
+/// below the last chunk's first entry: a binary search over the earlier
+/// chunks' peeked first slots for the LAST chunk whose first slot is
+/// `<= slot`, reading each probed chunk's header only — never a full
+/// decode. If every earlier first slot exceeds `slot` (the slot precedes
+/// the term's whole range — the Gate-6b workload shape), chunk 0 covers by
+/// convention.
+///
+/// Gap rule (deliberate, pinned in tests): a slot falling BETWEEN two
+/// chunks' ranges lands in the EARLIER chunk — the rule first-slot search
+/// yields naturally. The pre-peek decode-forward scan picked the later
+/// chunk; both choices preserve non-overlap and global slot order.
+/// Precondition: `keys.len() >= 2` (the caller handles single-chunk terms
+/// directly).
 fn covering_chunk_index(
     postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
     keys: &[Vec<u8>],
     slot: u64,
 ) -> Result<usize, TopoError> {
-    for (i, key) in keys[..keys.len() - 1].iter().enumerate() {
-        let entries = load_posting_chunk(postings, key)?;
-        let chunk_max = entries.last().expect("a stored chunk key is never empty").0;
-        if chunk_max >= slot {
-            return Ok(i);
+    let earlier = &keys[..keys.len() - 1];
+    let mut lo = 0usize;
+    let mut hi = earlier.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if peek_stored_first_slot(postings, &earlier[mid])? <= slot {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    Ok(keys.len() - 1)
+    Ok(lo.saturating_sub(1))
 }
 
 /// Sets `slot`'s term-frequency for `term` (under `scope_id`) to `count`,
@@ -615,8 +670,10 @@ fn covering_chunk_index(
 /// - `slot` below the last chunk's first entry: an update/remove of an
 ///   older document, or an out-of-order insert (a node's text can be
 ///   edited to newly include a term a later-created, higher-slot node
-///   already carries). `covering_chunk_index` finds the covering chunk,
-///   which is then decoded and mutated.
+///   already carries). `covering_chunk_index` binary-searches header-peeked
+///   first slots for the covering chunk — the ONLY chunk fully decoded; a
+///   slot in the gap between two chunks lands in the earlier one (pinned
+///   rule).
 ///
 /// EVERY rewrite — fast-path append or covering-chunk mutation — goes
 /// through `store_posting_chunk_splitting`, which splits at the midpoint
@@ -1653,5 +1710,183 @@ mod tests {
             posting_df(&postings, 1, "hot").unwrap(),
             oracle.len() as u64
         );
+    }
+
+    // -- Peek-based covering search (2026-07-13 design) ---------------------
+
+    /// `peek_first_slot` must agree with the full decoder on the first slot
+    /// across shapes, reading the header only, and must fail the same ways
+    /// `decode_posting_block` does — plus reject a zero-count block, which
+    /// is never stored (empty chunks are removed, never written).
+    #[test]
+    fn peek_first_slot_agrees_with_decode_and_rejects_bad_blocks() {
+        let blocks: Vec<Vec<(u64, u32)>> = vec![
+            vec![(0, 1)],
+            vec![(7, 3)],
+            vec![(3, 2), (5, 1), (9, 4)],
+            vec![(u64::MAX, u32::MAX)],
+            (0..300).map(|i| (i as u64 * 3 + 1, 1)).collect(),
+        ];
+        for entries in blocks {
+            let payload = encode_posting_block(&entries).unwrap();
+            assert_eq!(peek_first_slot(&payload).unwrap(), entries[0].0);
+        }
+        assert!(
+            peek_first_slot(&[]).is_err(),
+            "empty payload must be rejected"
+        );
+        assert!(
+            peek_first_slot(&[0xFF]).is_err(),
+            "unknown block format must be rejected"
+        );
+        assert!(
+            peek_first_slot(&[POSTINGS_BLOCK_FORMAT_V0, 0x00]).is_err(),
+            "a zero-count block is never stored and must be rejected, not misread"
+        );
+    }
+
+    /// The gap rule, pinned: a slot falling in the numbering-free gap
+    /// BETWEEN two chunks' ranges lands in the EARLIER chunk (the rule
+    /// first-slot binary search yields naturally). The old decode-forward
+    /// scan picked the later chunk; either choice preserves non-overlap and
+    /// global order, but the rule must be deterministic and pinned.
+    #[test]
+    fn gap_insert_between_chunks_lands_in_the_earlier_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let n: u64 = 5000; // even slots -> >= 2 chunks
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            for i in 0..n {
+                set_posting(&mut postings, 1, "hot", i * 2, 1).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let (keys, gap_slot, second_bytes_before) = {
+            let tx = db.begin_read().unwrap();
+            let postings = tx.open_table(POSTINGS).unwrap();
+            let keys = term_chunk_keys(&postings, 1, "hot").unwrap();
+            assert!(
+                keys.len() >= 2,
+                "setup must produce >= 2 chunks, got {}",
+                keys.len()
+            );
+            let first = load_posting_chunk(&postings, keys[0].as_slice()).unwrap();
+            let second = load_posting_chunk(&postings, keys[1].as_slice()).unwrap();
+            let first_max = first.last().unwrap().0;
+            assert_eq!(
+                second[0].0,
+                first_max + 2,
+                "even-slot setup: the inter-chunk gap must be exactly the odd slot between"
+            );
+            let bytes = postings
+                .get(keys[1].as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            (keys, first_max + 1, bytes)
+        };
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            set_posting(&mut postings, 1, "hot", gap_slot, 7).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_read().unwrap();
+        let postings = tx.open_table(POSTINGS).unwrap();
+        let second_bytes_after = postings
+            .get(keys[1].as_slice())
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        assert_eq!(
+            second_bytes_before, second_bytes_after,
+            "a gap insert must land in the EARLIER chunk; the later chunk's bytes must not change"
+        );
+        let first_after = load_posting_chunk(&postings, keys[0].as_slice()).unwrap();
+        assert!(
+            first_after.contains(&(gap_slot, 7)),
+            "the gap insert must be present in the earlier chunk"
+        );
+    }
+
+    /// A slot below the term's ENTIRE range (the Gate-6b workload shape)
+    /// must land in chunk 0 with every other chunk's bytes untouched, and a
+    /// gap REMOVAL must be a byte-for-byte no-op everywhere.
+    #[test]
+    fn below_range_insert_hits_chunk_zero_and_gap_removal_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        let n: u64 = 5000; // even slots 4000, 4002, .. (range starts well above 0)
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            for i in 0..n {
+                set_posting(&mut postings, 1, "hot", 4000 + i * 2, 1).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let (keys, later_bytes_before) = {
+            let tx = db.begin_read().unwrap();
+            let postings = tx.open_table(POSTINGS).unwrap();
+            let keys = term_chunk_keys(&postings, 1, "hot").unwrap();
+            assert!(
+                keys.len() >= 2,
+                "setup must produce >= 2 chunks, got {}",
+                keys.len()
+            );
+            let bytes: Vec<Vec<u8>> = keys[1..]
+                .iter()
+                .map(|k| {
+                    postings
+                        .get(k.as_slice())
+                        .unwrap()
+                        .unwrap()
+                        .value()
+                        .to_vec()
+                })
+                .collect();
+            (keys, bytes)
+        };
+
+        // Below-everything insert -> chunk 0.
+        let tx = db.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            set_posting(&mut postings, 1, "hot", 5, 3).unwrap();
+            // Gap removal (odd slot inside the range was never inserted):
+            // must be a no-op, not a rewrite.
+            set_posting(&mut postings, 1, "hot", 4001, 0).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_read().unwrap();
+        let postings = tx.open_table(POSTINGS).unwrap();
+        let first_after = load_posting_chunk(&postings, keys[0].as_slice()).unwrap();
+        assert_eq!(
+            first_after[0],
+            (5, 3),
+            "the below-range insert must land first in chunk 0"
+        );
+        for (key, before) in keys[1..].iter().zip(&later_bytes_before) {
+            let after = postings
+                .get(key.as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            assert_eq!(
+                before, &after,
+                "no chunk other than chunk 0 may change on a below-range insert + gap removal"
+            );
+        }
+        assert_eq!(posting_df(&postings, 1, "hot").unwrap(), n + 1);
     }
 }
