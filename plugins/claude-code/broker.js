@@ -16,7 +16,9 @@ import { appendFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { socketPathFor, lineReader } from "./ipc.js";
 
-const IDLE_EXIT_MS = 60_000;
+// Overridable so tests can prove the idle-exit/lock-release behavior without
+// waiting 60 real seconds for it.
+const IDLE_EXIT_MS = Number(process.env.TOPODB_BROKER_IDLE_MS) || 60_000;
 
 const args = process.argv.slice(2);
 const dbPath = args[args.indexOf("--db") + 1];
