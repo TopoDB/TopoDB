@@ -14,9 +14,13 @@
 use std::str::FromStr;
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, Implementation, Meta, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,7 +61,109 @@ pub struct TopoServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// JSON-RPC `_meta` key carrying a **per-request** default *write* scope,
+/// overriding `--scope` for that one request. Value: `"shared"` or a ULID.
+pub const META_SCOPE: &str = "topodb/scope";
+/// JSON-RPC `_meta` key carrying a **per-request** default *read* scope set,
+/// overriding `--read-scopes` for that one request. Value: a non-empty array of
+/// `"shared"` / ULID strings.
+pub const META_READ_SCOPES: &str = "topodb/read_scopes";
+
 impl TopoServer {
+    /// Returns the handler this request should run against: `self`, but with the
+    /// configured scope defaults replaced by any the request carried in `_meta`.
+    ///
+    /// WHY THIS EXISTS. `--scope`/`--read-scopes` are *process-wide* defaults,
+    /// which is fine when one client owns one server process. The plugin broker
+    /// breaks that assumption: redb lets only ONE process hold the database, so a
+    /// single `topodb-mcp` is multiplexed across every concurrent session — and
+    /// sessions in different projects need *different* scopes. Before this,
+    /// whichever session happened to spawn the broker fixed `--scope` for all of
+    /// them, and every later project silently read and wrote into the first
+    /// project's memory. (`plugins/claude-code/test/broker.test.js`:
+    /// `each_session_writes_to_its_own_project_scope`.)
+    ///
+    /// Scope therefore has to travel with the *request*, not with the process.
+    /// `_meta` is the right carrier: it is the MCP envelope's own extension
+    /// point, so the broker stamps ONE field on every request it forwards and
+    /// needs to know nothing about any tool's arguments. That matters — an
+    /// arguments-rewriting broker would have to know that reads take
+    /// `scope`/`scopes`, writes take `scope`, and `submit_batch` takes neither
+    /// (it defaults *per command*, inside `resolve_batch`), and it would silently
+    /// mis-default the first tool added with a shape it didn't anticipate.
+    ///
+    /// Because the tool router dispatches against the handler reference we hand
+    /// it, EVERY tool — `db_info` and `submit_batch` included — transparently
+    /// sees these values as its defaults. No tool signature changes, and a new
+    /// tool is covered the day it is written.
+    ///
+    /// An explicit `scope`/`scopes` *argument* still wins over these defaults,
+    /// exactly as it wins over the CLI ones: this replaces the fallback, it does
+    /// not pin the request. That is what keeps `scope: "shared"` working as the
+    /// documented way to store a lesson that generalizes beyond one repo.
+    fn for_request(&self, meta: &Meta) -> Result<Self, ErrorData> {
+        let scope_v = meta.get(META_SCOPE);
+        let read_v = meta.get(META_READ_SCOPES);
+        // The overwhelmingly common path (a plain stdio client, no broker):
+        // nothing to override, so don't pay for a clone-and-rebuild.
+        if scope_v.is_none() && read_v.is_none() {
+            return Ok(self.clone());
+        }
+
+        let mut out = self.clone();
+
+        if let Some(v) = scope_v {
+            let s = v.as_str().ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("`{META_SCOPE}` in _meta must be a string (\"shared\" or a ULID)"),
+                    None,
+                )
+            })?;
+            out.default_scope = convert::resolve_scope(Some(s), self.default_scope)
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
+        }
+
+        let read_list: Option<Vec<Scope>> = match read_v {
+            Some(v) => {
+                let arr = v.as_array().ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        format!("`{META_READ_SCOPES}` in _meta must be an array of \"shared\"/ULID strings"),
+                        None,
+                    )
+                })?;
+                let resolved = arr
+                    .iter()
+                    .map(|x| {
+                        let s = x.as_str().ok_or_else(|| {
+                            format!("`{META_READ_SCOPES}` entries must be strings")
+                        })?;
+                        convert::resolve_scope(Some(s), out.default_scope)
+                    })
+                    .collect::<Result<Vec<Scope>, String>>()
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                Some(resolved)
+            }
+            // A request that overrides the write scope but says nothing about
+            // reads must NOT keep the process-wide read set — that set belongs to
+            // whichever session spawned the server, which is the very bug this
+            // exists to close. Fall back the same way `config.rs` does when
+            // `--read-scopes` is omitted: the read set becomes the write scope.
+            None if scope_v.is_some() => Some(vec![out.default_scope]),
+            None => None,
+        };
+
+        if let Some(list) = read_list {
+            // Rejects the empty set, which admits nothing and is never what a
+            // caller means (there is no unscoped read).
+            let rs = ReadScopes::new(list)
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            out.default_scopes = convert::scopes_to_scope_set(rs.as_slice());
+            out.default_read_scopes = rs;
+        }
+
+        Ok(out)
+    }
+
     /// Wraps an open [`Db`] and the resolved [`Config`] into a server handler.
     pub fn new(db: Db, config: &Config) -> Self {
         let default_scopes = convert::scopes_to_scope_set(config.default_read_scopes.as_slice());
@@ -1060,5 +1166,29 @@ impl ServerHandler for TopoServer {
                  scope. Start with db_info to confirm wiring — it reports both defaults \
                  separately.",
             )
+    }
+
+    /// Overrides the `#[tool_handler]`-generated `call_tool` (the macro only
+    /// generates one when the impl does not already define it) so that a request
+    /// carrying scope overrides in `_meta` is dispatched against a handler whose
+    /// *defaults* are that request's — see [`TopoServer::for_request`].
+    ///
+    /// This is the ONLY place the override is applied, deliberately: the router
+    /// hands each tool the `&self` we pass here, so every tool picks the session's
+    /// scope up through the defaults it already reads. Doing it per-tool instead
+    /// would mean 16 signatures to change and a 17th to forget.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // MUST read from `context.meta`, NOT `request.meta`: rmcp's own
+        // `ToolCallContext::new` destructures `CallToolRequestParams { meta: _, .. }`
+        // and throws the request's copy away. The service layer has already swapped
+        // the wire `_meta` into the RequestContext (rmcp `service.rs`), which is the
+        // copy that survives.
+        let session = self.for_request(&context.meta)?;
+        let tcc = ToolCallContext::new(&session, request, context);
+        session.tool_router.call(tcc).await
     }
 }

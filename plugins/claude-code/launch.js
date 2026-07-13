@@ -15,8 +15,8 @@ import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:f
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { serverArgs, SERVER_VERSION } from "./server-args.js";
-import { socketPathFor } from "./ipc.js";
+import { serverArgs, sessionScopes, SERVER_VERSION } from "./server-args.js";
+import { socketPathFor, helloFrame } from "./ipc.js";
 import { serveDegraded } from "./degraded.js";
 
 const SERVER_PKG = "@topodb/topodb-mcp";
@@ -241,8 +241,18 @@ const tryConnect = (sock) =>
   });
 
 /** Once connected, this process is a dumb byte pipe: the broker does the id
- *  rewriting, so the client's JSON-RPC passes through untouched. */
-function relay(conn) {
+ *  rewriting and the scope stamping, so the client's JSON-RPC passes through
+ *  untouched.
+ *
+ *  `hello` is written FIRST, before stdin is piped in. Not cosmetic: stdin is
+ *  already flowing by the time we get here (Claude Code sends `initialize`
+ *  immediately), so piping first would let a real request reach the broker ahead
+ *  of the frame that says which scope this session is — and the broker would have
+ *  to either guess or drop it. Writing hello before the pipe is what makes
+ *  "every request from this connection carries this session's scope" true for the
+ *  FIRST request too, not just the rest. */
+function relay(conn, hello) {
+  conn.write(hello);
   process.stdin.pipe(conn);
   conn.pipe(process.stdout);
   conn.on("close", () => {
@@ -273,6 +283,7 @@ function relay(conn) {
 
 let conn = null;
 let degradedReason = null;
+let hello = null;
 
 // The ENTIRE bootstrap — reading CLAUDE_PLUGIN_DATA, creating the data dir,
 // resolving/installing the server, spawning the broker — is one try/catch.
@@ -297,6 +308,12 @@ try {
   const args = serverArgs({ projectDir, dataDir });
   const dbPath = args[args.indexOf("--db") + 1];
   const sock = socketPathFor(dbPath);
+
+  // The scopes of THIS session, which are not necessarily the ones in `args`:
+  // `args` only take effect if this shim is the one whose broker wins the race,
+  // and one broker serves every project. Sent on connect so the broker can stamp
+  // them onto our requests — see sessionScopes()'s comment.
+  hello = helloFrame(sessionScopes({ projectDir }));
 
   conn = await tryConnect(sock);
 
@@ -328,5 +345,7 @@ try {
   degradedReason = err.message;
 }
 
-if (conn) relay(conn);
+// `hello` is null only if the bootstrap threw before deriving it, in which case
+// `conn` is null too and we degrade — so a connected shim always has one.
+if (conn) relay(conn, hello);
 else serveDegraded(degradedReason ?? "could not reach or start the topodb broker; see broker.log in the plugin data dir");

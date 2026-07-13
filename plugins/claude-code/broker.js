@@ -14,7 +14,7 @@ import net from "node:net";
 import { createRequire } from "node:module";
 import { appendFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
-import { socketPathFor, lineReader } from "./ipc.js";
+import { socketPathFor, lineReader, HELLO_KEY, META_SCOPE, META_READ_SCOPES } from "./ipc.js";
 
 // Overridable so tests can prove the idle-exit/lock-release behavior without
 // waiting 60 real seconds for it.
@@ -199,6 +199,48 @@ function listen() {
     clients.add(conn);
     clearTimeout(idleTimer);
 
+    // THIS connection's scopes, from its hello frame. The server process is
+    // shared by every project (redb allows one holder of the db), so its
+    // `--scope` is only ever the scope of whichever session spawned the broker.
+    // Carrying the scope per-connection — and stamping it onto every request
+    // below — is what stops session B from writing into session A's project.
+    let sessionScope = null;
+
+    /** Forward a client message upstream, stamping this session's scopes into
+     *  `_meta` so the server resolves ITS defaults, not the broker's argv.
+     *
+     *  Merged, never overwritten: `_meta` also carries MCP's own fields (a
+     *  progress token, most importantly), and clobbering the object would drop
+     *  them. We only add our two keys — and only when the client did not set
+     *  them itself, so an explicit override still wins. */
+    const forward = (msg) => {
+      if (!sessionScope) {
+        // A client that never said hello. Forwarding anyway would silently run
+        // its calls under whatever scope the server was started with — the exact
+        // bug this whole mechanism exists to close — so refuse instead. Only an
+        // out-of-date shim can land here, and a loud error beats a quiet
+        // cross-project write.
+        if (msg.id !== undefined) {
+          send(conn, {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: {
+              code: -32002,
+              message:
+                "topodb broker: this session never sent a scope hello; refusing to run the request under another project's scope (restart the session; if it persists, the plugin and broker are out of step)",
+            },
+          });
+        }
+        return;
+      }
+      const params = { ...(msg.params ?? {}) };
+      const meta = { ...(params._meta ?? {}) };
+      if (meta[META_SCOPE] === undefined) meta[META_SCOPE] = sessionScope.scope;
+      if (meta[META_READ_SCOPES] === undefined) meta[META_READ_SCOPES] = sessionScope.read_scopes;
+      params._meta = meta;
+      toServer({ ...msg, params });
+    };
+
     conn.on(
       "data",
       lineReader((line) => {
@@ -206,6 +248,14 @@ function listen() {
         try {
           msg = JSON.parse(line);
         } catch {
+          return;
+        }
+
+        // The hello frame (see ipc.js): this session's scopes. Never forwarded —
+        // it is not JSON-RPC and the server would reject it.
+        if (msg[HELLO_KEY]) {
+          const h = msg[HELLO_KEY];
+          sessionScope = { scope: h.scope, read_scopes: h.read_scopes };
           return;
         }
 
@@ -241,12 +291,12 @@ function listen() {
         }
 
         if (msg.id === undefined) {
-          toServer(msg); // client notification: forward as-is
+          forward(msg); // client notification
           return;
         }
         const up = nextUpstreamId++;
         pending.set(up, { client: conn, originalId: msg.id });
-        toServer({ ...msg, id: up });
+        forward({ ...msg, id: up });
       }),
     );
 
