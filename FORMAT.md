@@ -111,7 +111,14 @@ Migration rewrites are scoped precisely:
     `true`, since `migrate_v2_to_v3`'s FTS rebuild — running earlier in the
     SAME open, under THIS build's current `fts_update` — already wrote
     chunked rows directly, so re-chunking would be not just redundant but
-    would misparse already-chunked bytes as the old unframed shape.
+    would misparse already-chunked bytes as the old unframed shape. **RAM
+    note:** when it runs, this pass first groups every old v3 `POSTINGS`
+    row's decoded entries by `(scope_id, term)` in an in-memory `HashMap`
+    before writing anything back, so it briefly holds the entire old
+    `POSTINGS` table's decoded content in RAM. In practice this is bounded
+    by the same cost v3's own incremental indexing already paid to build
+    that table in the first place; a file with an unusually large or dense
+    vocabulary may see a brief RAM spike during this one-time migration.
 
   **Key-shape discrimination is a process invariant, not a code-enforced
   one.** A v3-native `POSTINGS` row (`scope_id ++ term`, no chunk suffix) and
@@ -401,7 +408,7 @@ maintenance quadratic at scale.
   documents carry the highest slots) hits the fast path: append to the
   already-decoded last chunk, decoding exactly ONE chunk regardless of how
   many the term has — O(1) per new document, versus the v3 layout's O(df). If
-  the re-encoded chunk would exceed `fts::POSTINGS_CHUNK_TARGET` (8 KiB), it
+  the re-encoded chunk would exceed `fts::POSTINGS_CHUNK_TARGET` (4 KiB), it
   splits at the midpoint entry into `(chunk, chunk + 1)`. A slot within the
   last chunk's own range mutates it in place (still one chunk decoded, since
   chunk slot ranges never overlap). A slot below the last chunk's range scans
