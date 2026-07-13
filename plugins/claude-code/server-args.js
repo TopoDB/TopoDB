@@ -11,7 +11,7 @@ import { projectScopeId } from "./scope-id.js";
 // e2e test's devDependency is checked against in test/server-args.test.js — a
 // test fails loudly if the two ever disagree, instead of the e2e suite
 // silently validating a server version no user actually launches.
-export const SERVER_VERSION = "0.0.5";
+export const SERVER_VERSION = "0.0.6";
 
 /**
  * Reads span {project, shared}; writes default to the project scope. The bundled
