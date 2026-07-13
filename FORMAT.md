@@ -407,17 +407,22 @@ maintenance quadratic at scale.
   **last** chunk is decoded first. A new document (the common case — new
   documents carry the highest slots) hits the fast path: append to the
   already-decoded last chunk, decoding exactly ONE chunk regardless of how
-  many the term has — O(1) per new document, versus the v3 layout's O(df). If
-  the re-encoded chunk would exceed `fts::POSTINGS_CHUNK_TARGET` (4 KiB), it
-  splits at the midpoint entry into `(chunk, chunk + 1)`. A slot within the
-  last chunk's own range mutates it in place (still one chunk decoded, since
-  chunk slot ranges never overlap). A slot below the last chunk's range scans
-  earlier chunks front-to-back for the first covering one (an update, a
-  removal, or an out-of-order insert). `fts::read_posting` (used by scoring,
-  which needs every entry) decodes and concatenates every chunk in ascending
-  order; `fts::posting_df` (the document-frequency fast path `search_text`
-  uses before deciding whether a term has any hits at all) sums each chunk's
-  `count` header without decoding any entries.
+  many the term has — O(1) per new document, versus the v3 layout's O(df).
+  A slot within the last chunk's own range mutates it in place; a slot
+  below it (an update, a removal, or an out-of-order insert) finds its
+  covering chunk by binary-searching the earlier chunks' first slots,
+  peeked from each block's header (`fts::peek_first_slot` — the first
+  entry's delta is relative to 0, so it is the absolute first slot) without
+  decoding entries; a slot in the gap between two chunks' ranges lands in
+  the earlier chunk. EVERY rewrite — append or covering mutation — splits
+  at the midpoint entry when the re-encoded chunk exceeds
+  `fts::POSTINGS_CHUNK_TARGET` (4 KiB); a mid-list split shifts the later
+  chunk keys up one number each (highest first, raw framed bytes moved
+  untouched). Chunk numbers are order-bearing, not dense: removing an
+  emptied chunk leaves a numbering gap and never renumbers, and readers
+  never assume density. None of this changes the stored format — the split
+  policy is maintenance behavior; on-disk keys and blocks are exactly the
+  shapes above, and v4 files written before this policy need no migration.
 - `fts_docs` (node slot → plain postcard `u32` token count) and `fts_stats`
   (4-byte BE scope id → plain postcard `(doc_count: u64, total_len: u64)`)
   are unchanged from v3 — unframed, maintained by the same `fts::fts_update`
