@@ -57,10 +57,18 @@ server.stderr.on("data", (d) => (serverErr += d));
 // DatabaseAlreadyOpen — so it exits too, WITHOUT ever binding the socket. The
 // winner binds it and both shims connect to the winner. redb's lock IS the
 // election; we do not implement one.
+//
+// `bound` tracks whether THIS process actually bound `sock`. `sock` is a pure
+// function of the db path -- the SAME path for every broker racing on this
+// db -- so a loser (which never binds) must NEVER unlink it: the loser can
+// exit AFTER the winner has already bound, and an unconditional unlink would
+// delete the WINNER's live socket file out from under it, reintroducing the
+// exact "only the first window gets memory" bug this broker exists to fix.
+let bound = false;
 server.on("exit", (code) => {
   log(`server exited code=${code}: ${serverErr.trim()}`);
   try {
-    if (process.platform !== "win32") unlinkSync(sock);
+    if (bound && process.platform !== "win32") unlinkSync(sock);
   } catch {}
   process.exit(code ?? 1);
 });
@@ -104,6 +112,20 @@ server.stdout.on(
 
 // --- the one upstream handshake, whose result every client gets ---
 const INIT_ID = 0;
+// 15s: generous for a cold server start, but bounded. Without this timeout, an
+// `initialize` ERROR response, or a server that starts but never answers at
+// all, leaves initResult null and listen() never called -- the broker just
+// sits there forever, holding redb's exclusive lock, and memory is dead
+// machine-wide until someone finds and kills it by hand. Every other failure
+// path in this file self-heals (the client polls, gives up, and degrades);
+// this is the one that doesn't, so it gets its own explicit timeout.
+const HANDSHAKE_TIMEOUT_MS = 15_000;
+const handshakeTimer = setTimeout(() => {
+  log(`initialize handshake timed out after ${HANDSHAKE_TIMEOUT_MS}ms; killing server`);
+  server.stdout.off("data", onInit);
+  server.kill();
+}, HANDSHAKE_TIMEOUT_MS);
+
 toServer({
   jsonrpc: "2.0",
   id: INIT_ID,
@@ -122,7 +144,19 @@ const onInit = lineReader((line) => {
   } catch {
     return;
   }
-  if (msg.id === INIT_ID && msg.result) {
+  if (msg.id !== INIT_ID) return;
+  if (msg.error) {
+    // A response arrived, so the server isn't wedged -- but it refused to
+    // initialize. Don't wait out the rest of the timeout for a reply that
+    // will never come; fail now.
+    clearTimeout(handshakeTimer);
+    log(`initialize failed: ${JSON.stringify(msg.error)}; killing server`);
+    server.stdout.off("data", onInit);
+    server.kill();
+    return;
+  }
+  if (msg.result) {
+    clearTimeout(handshakeTimer);
     initResult = msg.result;
     toServer({ jsonrpc: "2.0", method: "notifications/initialized" });
     server.stdout.off("data", onInit);
@@ -131,18 +165,37 @@ const onInit = lineReader((line) => {
 });
 server.stdout.on("data", onInit);
 
+// The net.Server, reachable from armIdleExit so idle-exit can stop accepting
+// connections before deciding to kill the server -- see armIdleExit.
+let srv = null;
+
 function armIdleExit() {
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    if (clients.size === 0) {
+    if (clients.size > 0) return;
+    // Stop ACCEPTING first, then re-check. The bug this closes: checking
+    // clients.size and then calling server.kill() without ever closing the
+    // listening socket leaves it accepting connections through the entire
+    // kill window -- measured 6/24 trials where a connection was accepted and
+    // then yanked out from under a client that believed it had a working
+    // broker. srv.close() stops new accepts synchronously; only once that is
+    // true do we re-check whether someone slipped in before it took effect.
+    log("idle, closing listening socket");
+    srv.close(() => {
+      if (clients.size > 0) {
+        // Someone connected between the check above and close() taking
+        // effect. Reopen and let this connection keep the broker alive.
+        srv.listen(sock);
+        return;
+      }
       log("idle, exiting");
       server.kill();
-    }
+    });
   }, IDLE_EXIT_MS);
 }
 
 function listen() {
-  const srv = net.createServer((conn) => {
+  srv = net.createServer((conn) => {
     clients.add(conn);
     clearTimeout(idleTimer);
 
@@ -163,6 +216,30 @@ function listen() {
           return;
         }
         if (msg.method === "notifications/initialized") return; // per-client, no server meaning
+
+        if (msg.method === "notifications/cancelled") {
+          // MUST be handled before the generic `msg.id === undefined` forward
+          // below, and MUST NEVER forward a client-space id upstream. Claude
+          // Code sends this when a user hits Esc, carrying the CLIENT's own
+          // id in params.requestId -- but pending's keys are the broker's
+          // rewritten UPSTREAM ids. If we forwarded params.requestId
+          // untranslated, session A cancelling its own client-side id 7 would
+          // tell the server to cancel whatever UPSTREAM id happens to be 7 --
+          // very possibly session B's in-flight create_memory, whose write
+          // then silently never happens while B's call hangs. Translate
+          // through `pending`, scoped to THIS connection; if no match, the id
+          // is unknown or already resolved, so drop it rather than guess.
+          const rid = msg.params?.requestId;
+          for (const [up, p] of pending) {
+            if (p.client === conn && p.originalId === rid) {
+              pending.delete(up);
+              toServer({ ...msg, params: { ...msg.params, requestId: up } });
+              return;
+            }
+          }
+          return; // unknown/foreign id: DROP. Never forward an untranslated id.
+        }
+
         if (msg.id === undefined) {
           toServer(msg); // client notification: forward as-is
           return;
@@ -197,7 +274,10 @@ function listen() {
   });
 
   srv.listen(sock, () => {
-    log(`listening on ${sock}`);
+    bound = true;
+    // pid included so a human (or a test) reading broker.log can find and, if
+    // truly necessary, kill a wedged broker by hand -- see I4's motivation.
+    log(`listening on ${sock} (pid=${process.pid})`);
     armIdleExit();
   });
 }

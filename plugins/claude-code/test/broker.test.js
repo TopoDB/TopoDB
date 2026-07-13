@@ -16,17 +16,19 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import net from "node:net";
 import path from "node:path";
-import { lineReader } from "../ipc.js";
+import { lineReader, socketPathFor } from "../ipc.js";
 import { projectScopeId } from "../scope-id.js";
 
 const require = createRequire(import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.join(HERE, "..");
 const LAUNCH_JS = path.join(PLUGIN_ROOT, "launch.js");
+const BROKER_JS = path.join(PLUGIN_ROOT, "broker.js");
 
 const DEFAULT_RPC_TIMEOUT_MS = 8000;
 
@@ -178,6 +180,179 @@ function killAndWaitForExit(session) {
     session.child.once("exit", () => resolve());
     session.child.kill();
   });
+}
+
+// --- C2 (notifications/cancelled id-translation) plumbing ----------------
+//
+// Pinning C2 needs an EXACT id collision: session A's own client-chosen id
+// must equal the broker's upstream id for session B's in-flight request. Real
+// timing can't guarantee that deterministically, so this fake server never
+// answers a "hold" call until told to, and echoes back the upstream id the
+// broker assigned each forwarded request (a notification real servers never
+// send -- it exists ONLY so the test can construct the collision on purpose
+// instead of hoping a race lands right).
+const FAKE_CANCEL_SERVER_SRC = `
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin, terminal: false });
+const held = new Map();
+const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+rl.on("line", (line) => {
+  line = line.trim();
+  if (!line) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (msg.method === "initialize") {
+    out({ jsonrpc: "2.0", id: msg.id, result: {
+      protocolVersion: "2024-11-05", capabilities: { tools: {} },
+      serverInfo: { name: "fake-cancel-server", version: "0" },
+    }});
+    return;
+  }
+  if (msg.method === "notifications/initialized") return;
+  if (msg.method === "notifications/cancelled") {
+    const rid = msg.params && msg.params.requestId;
+    if (held.has(rid)) {
+      held.delete(rid);
+      out({ jsonrpc: "2.0", id: rid, error: { code: -32800, message: "cancelled" } });
+    }
+    return;
+  }
+  if (msg.method === "tools/call" && msg.id !== undefined) {
+    out({ jsonrpc: "2.0", method: "notifications/test-received", params: { upstreamId: msg.id, name: msg.params && msg.params.name } });
+    const name = msg.params && msg.params.name;
+    if (name === "hold") { held.set(msg.id, true); return; }
+    if (name === "count_held") {
+      out({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { heldIds: Array.from(held.keys()) } } });
+      return;
+    }
+    if (name === "flush") {
+      for (const id of held.keys()) out({ jsonrpc: "2.0", id, result: { structuredContent: { status: "completed" } } });
+      held.clear();
+      out({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { status: "flushed" } } });
+      return;
+    }
+    out({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { status: "completed" } } });
+  }
+});
+`;
+
+/** A CLAUDE_PLUGIN_DATA dir wired to the fake cancel-tracking server above
+ * instead of the real topodb-mcp, so broker.js's require.resolve finds it at
+ * the exact subpath it expects. */
+function mkFakeCancelServerDataDir(prefix) {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  const pkgDir = path.join(dir, "node_modules", "@topodb", "topodb-mcp");
+  mkdirSync(path.join(pkgDir, "bin"), { recursive: true });
+  writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "@topodb/topodb-mcp", version: "0.0.5", type: "module" }));
+  writeFileSync(path.join(pkgDir, "bin", "topodb-mcp.js"), FAKE_CANCEL_SERVER_SRC);
+  return dir;
+}
+
+/** Newline-delimited JSON-RPC client over a raw socket -- connects DIRECTLY
+ * to a broker's socket, bypassing launch.js entirely, so a test can act as
+ * its own MCP session and choose ITS OWN client-space ids explicitly (needed
+ * to construct the exact id collision C2 is about). */
+function socketRpcClient(sock) {
+  const conn = net.connect(sock);
+  const pending = new Map();
+  const notifications = [];
+  const waiters = [];
+  let dead = null;
+
+  const failAll = (err) => {
+    dead = err;
+    for (const { reject, timer } of pending.values()) {
+      clearTimeout(timer);
+      reject(err);
+    }
+    pending.clear();
+    for (const w of waiters.splice(0)) {
+      clearTimeout(w.timer);
+      w.reject(err);
+    }
+  };
+
+  conn.on(
+    "data",
+    lineReader((line) => {
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (msg.id !== undefined && pending.has(msg.id)) {
+        const entry = pending.get(msg.id);
+        clearTimeout(entry.timer);
+        pending.delete(msg.id);
+        entry.resolve(msg);
+        return;
+      }
+      notifications.push(msg);
+      for (let i = waiters.length - 1; i >= 0; i--) {
+        if (waiters[i].predicate(msg)) {
+          const w = waiters.splice(i, 1)[0];
+          clearTimeout(w.timer);
+          w.resolve(msg);
+        }
+      }
+    }),
+  );
+  conn.on("close", () => failAll(new Error("socket closed before responding")));
+  conn.on("error", (err) => failAll(new Error(`socket error: ${err.message}`)));
+
+  const rpc = (method, params, opts = {}) =>
+    new Promise((resolve, reject) => {
+      if (dead) {
+        reject(dead);
+        return;
+      }
+      const myId = opts.id;
+      const timeoutMs = opts.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+      const timer = setTimeout(() => {
+        pending.delete(myId);
+        reject(new Error(`rpc "${method}" (id=${myId}) timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      pending.set(myId, { resolve, reject, timer });
+      conn.write(JSON.stringify({ jsonrpc: "2.0", id: myId, method, params }) + "\n");
+    });
+
+  const notify = (method, params) => {
+    conn.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+  };
+
+  const waitForNotification = (predicate, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) =>
+    new Promise((resolve, reject) => {
+      const already = notifications.find(predicate);
+      if (already) {
+        resolve(already);
+        return;
+      }
+      const timer = setTimeout(() => {
+        const idx = waiters.findIndex((w) => w.resolve === resolve);
+        if (idx >= 0) waiters.splice(idx, 1);
+        reject(new Error(`timed out after ${timeoutMs}ms waiting for a matching notification`));
+      }, timeoutMs);
+      waiters.push({ predicate, resolve, reject, timer });
+    });
+
+  return { conn, rpc, notify, waitForNotification, close: () => conn.destroy() };
+}
+
+async function connectSocketWithRetry(sock, { retries = 50, intervalMs = 100 } = {}) {
+  for (let i = 0; i < retries; i++) {
+    const ok = await new Promise((res) => {
+      const c = net.connect(sock);
+      c.on("connect", () => {
+        c.destroy();
+        res(true);
+      });
+      c.on("error", () => res(false));
+    });
+    if (ok) return;
+    await sleep(intervalMs);
+  }
+  throw new Error(`could not connect to ${sock} after ${retries * intervalMs}ms`);
 }
 
 // --- tests ---------------------------------------------------------------
@@ -392,6 +567,231 @@ test("degrades_visibly_when_memory_is_unavailable", async () => {
     // the MCP server down with it.
     assert.equal(session.child.exitCode, null, "the shim must still be alive after the handshake");
     assert.equal(session.child.signalCode, null, "the shim must still be alive after the handshake");
+  } finally {
+    if (session) killAll([session]);
+    rmDir(dataDir);
+    rmDir(proj);
+  }
+});
+
+test("cancelling_own_request_does_not_cancel_another_sessions_in_flight_request", async () => {
+  // C2. rmcp (crates/topodb-mcp's MCP runtime) looks up notifications/cancelled's
+  // params.requestId in the UPSTREAM id pool and cancels whatever it finds
+  // there. The broker rewrites every REQUEST's id before forwarding it
+  // upstream -- but before this fix, notifications/cancelled was forwarded
+  // verbatim, carrying the CLIENT's own id straight into upstream id-space.
+  // Two independent sessions routinely reuse the same small integers for
+  // their own ids (most JSON-RPC clients start counting at 1), so session A
+  // cancelling ITS OWN id can, by pure coincidence, equal the broker's
+  // upstream id for session B's unrelated in-flight request -- silently
+  // cancelling B's write. This test manufactures that exact collision on
+  // purpose (a real race can't be guaranteed to reproduce it on demand) using
+  // a fake upstream server (see mkFakeCancelServerDataDir) that never answers
+  // a "hold" call until cancelled or flushed, so both requests are
+  // deterministically still in flight when the cancel is sent.
+  const dataDir = mkFakeCancelServerDataDir("topodb-t6-data-");
+  const dbPath = path.join(dataDir, "memory.redb");
+  const args = ["--db", dbPath, "--scope", "t6scope", "--read-scopes", "t6scope,shared"];
+  const sock = socketPathFor(dbPath);
+
+  let broker = null;
+  let a = null;
+  let b = null;
+  try {
+    broker = spawn(process.execPath, [BROKER_JS, ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, TOPODB_BROKER_IDLE_MS: "2000" },
+    });
+    let brokerErr = "";
+    broker.stderr.on("data", (d) => (brokerErr += d));
+
+    await connectSocketWithRetry(sock);
+
+    a = socketRpcClient(sock);
+    b = socketRpcClient(sock);
+
+    for (const s of [a, b]) {
+      const init = await s.rpc("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "cancel-test", version: "0" },
+      }, { id: "init" });
+      assert.ok(!init.error, `initialize failed: ${JSON.stringify(init)}`);
+      s.notify("notifications/initialized");
+    }
+
+    // B's hold call: whatever upstream id the broker assigns it, we learn via
+    // the fake server's (test-only) echo.
+    const bHoldPromise = b.rpc("tools/call", { name: "hold" }, { id: "b-hold", timeoutMs: 15000 });
+    const bEcho = await b.waitForNotification((n) => n.method === "notifications/test-received" && n.params.name === "hold");
+    const upstreamOfB = bEcho.params.upstreamId;
+
+    // A sends ITS OWN request using, as its own client-space id, the exact
+    // number the broker just assigned to B upstream -- the natural collision
+    // this bug depends on. This becomes a DIFFERENT upstream id (global
+    // counter has moved on), which is exactly the point: A's client-space id
+    // and A's real upstream id now legitimately differ.
+    const aHoldPromise = a.rpc("tools/call", { name: "hold" }, { id: upstreamOfB, timeoutMs: 15000 });
+    // A correctly-fixed broker forgets a cancelled request's pending entry the
+    // moment it translates the cancel (so a stale late response from the
+    // server is never misdelivered to a client that already gave up on it) --
+    // so aHoldPromise is EXPECTED to never resolve. Swallow it here rather
+    // than asserting on it; it gets rejected for real when `a.close()` runs
+    // in `finally`.
+    aHoldPromise.catch(() => {});
+    const aEcho = await a.waitForNotification((n) => n.method === "notifications/test-received" && n.params.name === "hold" && n.params.upstreamId !== upstreamOfB);
+    const upstreamOfA = aEcho.params.upstreamId;
+
+    // A cancels "its own" id -- literally the id it used for the request
+    // above. A correct broker must translate this to A's REAL upstream id and
+    // must NEVER let the raw value (which equals B's real upstream id) reach
+    // the server.
+    a.notify("notifications/cancelled", { requestId: upstreamOfB });
+
+    // Give the (mis)routed cancel time to land, then inspect the fake
+    // server's OWN bookkeeping directly -- proof independent of whether any
+    // response ever reaches a client, which sidesteps the "a correctly
+    // cancelled request gets no further response" behavior above.
+    await sleep(500);
+    const counted = await b.rpc("tools/call", { name: "count_held" }, { id: "count", timeoutMs: 5000 });
+    assert.ok(!counted.error, `count_held errored: ${JSON.stringify(counted)}`);
+    const heldIds = counted.result.structuredContent.heldIds;
+    assert.ok(
+      heldIds.includes(upstreamOfB),
+      `session B's in-flight request was wrongly cancelled by session A's own cancel: held=${JSON.stringify(heldIds)} expected upstreamOfB=${upstreamOfB} still present (stderr: ${brokerErr})`,
+    );
+    assert.ok(
+      !heldIds.includes(upstreamOfA),
+      `session A's own cancel should have cancelled ITS OWN request (translation), not been dropped or misrouted: held=${JSON.stringify(heldIds)} expected upstreamOfA=${upstreamOfA} to be gone`,
+    );
+
+    // End-to-end confirmation: releasing whatever is still genuinely held
+    // must resolve B's original call normally, not with an error.
+    const flush = await b.rpc("tools/call", { name: "flush" }, { id: "flush", timeoutMs: 15000 });
+    assert.ok(!flush.error, `flush errored: ${JSON.stringify(flush)}`);
+    const resB = await bHoldPromise;
+    assert.ok(!resB.error, `session B's in-flight request was wrongly cancelled: ${JSON.stringify(resB)}`);
+    assert.equal(resB.result.structuredContent.status, "completed");
+  } finally {
+    if (a) a.close();
+    if (b) b.close();
+    if (broker) {
+      try {
+        broker.kill();
+      } catch {}
+    }
+    rmDir(dataDir);
+  }
+});
+
+test("broker_stops_accepting_connections_once_idle_exit_begins", async () => {
+  // C3(b). armIdleExit used to check clients.size === 0 and then call
+  // server.kill() WITHOUT ever closing the listening socket -- so the broker
+  // kept ACCEPTING new connections through the entire kill window (measured
+  // 6/24 trials where a connection was accepted and then yanked out from
+  // under the client). This test proves the fix: once the idle timer fires,
+  // the socket stops accepting connections.
+  //
+  // IMPORTANT: this test does NOT poll by repeatedly opening probe
+  // connections to the broker's socket. Every successful connection adds to
+  // `clients` and calls `clearTimeout(idleTimer)` (see listen()'s connection
+  // handler) -- a polling loop built that way perpetually re-arms the very
+  // idle timer it is trying to observe fire, and the timer then NEVER
+  // actually elapses. Instead this polls broker.log (plain file reads, no
+  // socket activity) for the "idle, closing listening socket" line broker.js
+  // logs at the exact point it calls srv.close() -- srv.close() stops
+  // accepting synchronously, so the very next connection attempt after that
+  // line appears must be refused.
+  const dataDir = mkDataDir("topodb-t7-data-");
+  const proj = mkdtempSync(path.join(tmpdir(), "topodb-t7-proj-"));
+  const logFile = path.join(dataDir, "broker.log");
+  let session = null;
+  try {
+    session = await connectAndInit({ dataDir, projectDir: proj, env: { TOPODB_BROKER_IDLE_MS: "600" } });
+    const info = await session.rpc("tools/call", { name: "db_info", arguments: {} });
+    assert.ok(!info.error, `db_info errored: ${JSON.stringify(info)}`);
+
+    const dbPath = path.join(dataDir, "memory.redb");
+    const sock = socketPathFor(dbPath);
+
+    // Disconnect: clients.size drops to 0 and the (shortened) idle timer arms.
+    await killAndWaitForExit(session);
+    session = null;
+
+    const deadline = Date.now() + 8000;
+    let sawCloseLog = false;
+    while (Date.now() < deadline && !sawCloseLog) {
+      try {
+        if (readFileSync(logFile, "utf8").includes("idle, closing listening socket")) {
+          sawCloseLog = true;
+          break;
+        }
+      } catch {
+        // log not written yet
+      }
+      await sleep(20);
+    }
+    assert.ok(sawCloseLog, "expected broker.log to record the idle-exit socket close within 8s");
+
+    // srv.close() stops accepting synchronously (before its callback ever
+    // runs), so a connection attempt made right after we observe the log line
+    // must be refused -- proving accept genuinely stopped, not merely "the
+    // whole process eventually vanished so of course connects fail."
+    const accepted = await new Promise((res) => {
+      const c = net.connect(sock);
+      c.on("connect", () => {
+        c.destroy();
+        res(true);
+      });
+      c.on("error", () => res(false));
+    });
+    assert.equal(accepted, false, "expected the broker to refuse a connection made right after idle-exit's socket close was logged");
+  } finally {
+    if (session) killAll([session]);
+    rmDir(dataDir);
+    rmDir(proj);
+  }
+});
+
+test("shim_degrades_instead_of_exiting_cleanly_when_broker_dies_mid_session", async () => {
+  // C3(a). launch.js's relay() used to do `conn.on("close", () => process.exit(0))`.
+  // Killing the broker mid-session made the shim exit CODE 0 -- which Claude
+  // Code reads as a clean, intentional shutdown: no degraded server, no
+  // explanation, while the skill keeps telling the agent to call
+  // search_memories against a server that no longer exists. This test kills
+  // the REAL broker process out from under a live, already-initialized
+  // session and checks the shim survives and starts answering with an
+  // explanatory error instead of vanishing.
+  const dataDir = mkDataDir("topodb-t8-data-");
+  const proj = mkdtempSync(path.join(tmpdir(), "topodb-t8-proj-"));
+  const logFile = path.join(dataDir, "broker.log");
+  let session = null;
+  try {
+    session = await connectAndInit({ dataDir, projectDir: proj });
+    const info = await session.rpc("tools/call", { name: "db_info", arguments: {} });
+    assert.ok(!info.error, `db_info errored: ${JSON.stringify(info)}`);
+
+    // Find the REAL broker's pid from its own log line (see broker.js's
+    // "listening on ... (pid=...)") -- distinct from `session.child`, which is
+    // launch.js, a thin client of the broker, not the broker itself.
+    const logText = readFileSync(logFile, "utf8");
+    const m = logText.match(/listening on .*\(pid=(\d+)\)/);
+    assert.ok(m, `could not find the broker's pid in broker.log:\n${logText}`);
+    const brokerPid = Number(m[1]);
+
+    process.kill(brokerPid);
+
+    // Give the shim a moment to notice its socket closed, then keep using the
+    // SAME session -- the exact scenario a live Claude Code window is in.
+    await sleep(500);
+    const afterDeath = await session.rpc("tools/call", { name: "db_info", arguments: {} }, { timeoutMs: 5000 });
+
+    // THE assertion: the shim must still be running, not silently exited.
+    assert.equal(session.child.exitCode, null, "the shim must not have exited after the broker died mid-session");
+    assert.equal(session.child.signalCode, null, "the shim must not have exited after the broker died mid-session");
+    // And it must say WHY memory is gone, not pretend the call succeeded.
+    assert.ok(afterDeath.error, `expected an explanatory error after the broker died, got: ${JSON.stringify(afterDeath)}`);
+    assert.match(afterDeath.error.message, /broker/i, "the error should explain the broker is what died");
   } finally {
     if (session) killAll([session]);
     rmDir(dataDir);

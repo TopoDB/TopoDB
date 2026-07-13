@@ -232,23 +232,8 @@ function resolveServer(dataDir) {
 
 // CLAUDE_PROJECT_DIR is the repo root Claude Code is working in.
 const projectDir = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
-const dataDir = process.env.CLAUDE_PLUGIN_DATA;
-if (!dataDir) {
-  throw new Error("CLAUDE_PLUGIN_DATA is not set; refusing to guess where to put the database");
-}
 
-// topodb-mcp creates the .redb file but treats a missing parent directory as an
-// error. This is the exact bug that shipped in @topodb/pi 0.0.1 and made the db
-// fail to come up in a fresh project. Do not remove.
-mkdirSync(dataDir, { recursive: true });
-
-// This process is no longer the server: it is a thin client of the broker
-// that owns memory.redb. See specs/2026-07-12-plugin-broker-design.md.
-const args = serverArgs({ projectDir, dataDir });
-const dbPath = args[args.indexOf("--db") + 1];
-const sock = socketPathFor(dbPath);
-
-const tryConnect = () =>
+const tryConnect = (sock) =>
   new Promise((res) => {
     const c = net.connect(sock);
     c.on("connect", () => res(c));
@@ -260,17 +245,65 @@ const tryConnect = () =>
 function relay(conn) {
   process.stdin.pipe(conn);
   conn.pipe(process.stdout);
-  conn.on("close", () => process.exit(0));
+  conn.on("close", () => {
+    // NOT process.exit(0). If the broker dies mid-session (killed, crashed,
+    // machine put it under memory pressure), the socket closes and this
+    // process is still the MCP server Claude Code is talking to. Exiting 0
+    // here reads to Claude Code as a clean, intentional shutdown -- no
+    // degraded server, no explanation -- while the skill keeps telling the
+    // agent to call search_memories against a server that no longer exists.
+    // Unpipe first: the streams are still wired to a now-dead socket, and
+    // serveDegraded needs stdin free to install its own listener.
+    process.stdin.unpipe(conn);
+    conn.unpipe(process.stdout);
+    // Empirically required, not optional: once a Readable has gone through a
+    // pipe()/unpipe() cycle, merely re-attaching a "data" listener (what
+    // serveDegraded does) is NOT sufficient to keep this process's event loop
+    // alive on this stack -- verified with a minimal net.Server repro. Without
+    // this explicit resume(), the process exits 0 within ~1ms of serveDegraded
+    // returning, silently, with no listener ever having failed and no error
+    // thrown -- an even more misleading variant of the exact bug this whole
+    // fix exists to close. `serveDegraded`'s OWN direct callers (never having
+    // connected to a broker at all) don't need this: that stdin was never
+    // piped anywhere, so Node's normal on("data") auto-resume behavior holds.
+    process.stdin.resume();
+    serveDegraded("the topodb broker exited mid-session; memory is unavailable for the rest of this session (see broker.log)");
+  });
 }
 
-let conn = await tryConnect();
+let conn = null;
 let degradedReason = null;
 
-if (!conn) {
-  // No broker. Become one — or race another shim doing the same. Both spawn;
-  // redb's lock decides which survives (see broker.js). Then connect to the
-  // winner.
-  try {
+// The ENTIRE bootstrap — reading CLAUDE_PLUGIN_DATA, creating the data dir,
+// resolving/installing the server, spawning the broker — is one try/catch.
+// Before this fix, the CLAUDE_PLUGIN_DATA-unset check and mkdirSync sat
+// OUTSIDE any try/catch: an uncaught throw there is exit 1 with a stack
+// trace and no MCP server at all, while the skill still tells the agent to
+// call search_memories. Same silent-failure class serveDegraded exists to
+// prevent everywhere else — every bootstrap failure must land there too.
+try {
+  const dataDir = process.env.CLAUDE_PLUGIN_DATA;
+  if (!dataDir) {
+    throw new Error("CLAUDE_PLUGIN_DATA is not set; refusing to guess where to put the database");
+  }
+
+  // topodb-mcp creates the .redb file but treats a missing parent directory as an
+  // error. This is the exact bug that shipped in @topodb/pi 0.0.1 and made the db
+  // fail to come up in a fresh project. Do not remove.
+  mkdirSync(dataDir, { recursive: true });
+
+  // This process is no longer the server: it is a thin client of the broker
+  // that owns memory.redb. See specs/2026-07-12-plugin-broker-design.md.
+  const args = serverArgs({ projectDir, dataDir });
+  const dbPath = args[args.indexOf("--db") + 1];
+  const sock = socketPathFor(dbPath);
+
+  conn = await tryConnect(sock);
+
+  if (!conn) {
+    // No broker. Become one — or race another shim doing the same. Both spawn;
+    // redb's lock decides which survives (see broker.js). Then connect to the
+    // winner.
     resolveServer(dataDir); // ensure the server is installed BEFORE the broker needs it
     const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "broker.js");
     spawn(process.execPath, [brokerPath, ...args], {
@@ -280,18 +313,19 @@ if (!conn) {
 
     for (let i = 0; i < 25 && !conn; i++) {
       await new Promise((r) => setTimeout(r, 200));
-      conn = await tryConnect();
+      conn = await tryConnect(sock);
     }
     if (!conn) {
       degradedReason = "could not reach or start the topodb broker; see broker.log in the plugin data dir";
     }
-  } catch (err) {
-    // resolveServer (install) or the spawn itself failed outright. This must
-    // NOT crash the process: a failed MCP server is nearly invisible in
-    // Claude Code while the skill keeps telling the agent to call memory
-    // tools. Explain the failure instead of dying — see design §5.
-    degradedReason = err.message;
   }
+} catch (err) {
+  // Anything above — unset CLAUDE_PLUGIN_DATA, a mkdirSync failure,
+  // resolveServer's install, or the broker spawn itself — failed outright.
+  // This must NOT crash the process: a failed MCP server is nearly invisible
+  // in Claude Code while the skill keeps telling the agent to call memory
+  // tools. Explain the failure instead of dying — see design §5.
+  degradedReason = err.message;
 }
 
 if (conn) relay(conn);

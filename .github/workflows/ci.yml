@@ -21,9 +21,13 @@ jobs:
       - run: cargo bench --no-run
         if: matrix.os == 'ubuntu-latest'
   node-test:
-    # Guards the npm distribution layer (npm/ launcher, scripts/ generator).
-    # Runs on Windows too because the generator shells out to `npm pack` and the
-    # Windows npm.cmd/execSync path is exactly what broke during development.
+    # Guards the npm distribution layer (npm/ launcher, scripts/ generator) and
+    # the Claude Code plugin broker. Runs on Windows too because the generator
+    # shells out to `npm pack` and the Windows npm.cmd/execSync path is exactly
+    # what broke during development. The plugin tests ALSO need ubuntu-latest:
+    # the broker's loser-exits-without-unlinking behavior (C1) only exists on
+    # POSIX (`process.platform !== "win32"` guards it) — a Windows-only matrix
+    # would never have caught it, which is exactly what happened.
     strategy:
       fail-fast: false
       matrix:
@@ -33,9 +37,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - run: node --test npm/topodb-mcp/test/launcher.test.js
       - run: node --test scripts/test/build-npm-packages.test.mjs
+      - run: npm install --no-audit --no-fund
+        working-directory: plugins/claude-code
+      - run: npm test
+        working-directory: plugins/claude-code
   msrv:
     runs-on: ubuntu-latest
     steps:
