@@ -1,6 +1,6 @@
 {
   "name": "@topodb/pi",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Pi (pi.dev) extension: topodb agent memory via one install.",
   "type": "module",
   "license": "MIT OR Apache-2.0",
@@ -15,7 +15,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@topodb/topodb-mcp": "0.0.5",
+    "@topodb/topodb-mcp": "0.0.6",
     "typebox": "1.1.38"
   },
   "devDependencies": {
