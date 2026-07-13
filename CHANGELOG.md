@@ -52,7 +52,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
   250k-memory build projected to hours (see [BENCHMARKS.md](BENCHMARKS.md)'s "FTS posting maintenance
   is quadratic" finding). Postings are now split into ~8 KiB chunks; a new document's posting update
   touches, and decodes, exactly one chunk regardless of how large the term's posting list has grown.
-  Before/after throughput numbers: **(numbers: Task 9)**.
+  Before/after throughput numbers (Task 9, full spec — entities, edges, and text — same synthetic
+  agent-memory workload as the rest of [BENCHMARKS.md](BENCHMARKS.md)): **before (v3), measured**:
+  ~37 ms/doc and climbing at a 75k-doc corpus (a 250k build projected to ~3.8 h and never completed).
+  **After (v4), measured**: ~0.66 ms/doc at 10k docs, ~1.10 ms/doc at 100k docs (1.66× the 10k figure,
+  not the unbounded climb v3 showed) — a 100k-doc full-spec build, with the text index enabled, now
+  completes in **106 s** instead of hours. `POSTINGS_CHUNK_TARGET` was also re-tuned from 8 KiB to
+  4 KiB based on this task's chunk-size experiment (4 KiB won on both indexing and edit cost, and tied
+  for best on search latency, at a 10k-doc corpus). One caveat carried forward, not fixed here: a
+  document repeatedly edited to *gain* a term whose covering posting chunk isn't that term's last
+  chunk can still grow that chunk without a split (an accepted, scoped simplification — splitting was
+  only in scope for the append path); see BENCHMARKS.md's "Gate 6b" finding for the measured curve.
 
 ### 0.0.6
 

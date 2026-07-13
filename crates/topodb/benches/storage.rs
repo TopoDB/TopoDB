@@ -8,7 +8,8 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use topodb::workload::{batches, WorkloadSpec};
 use topodb::{
-    Db, Direction, IndexSpec, NodeId, PropIndex, PropValue, ScopeId, ScopeSet, TraversalQuery,
+    Db, Direction, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, ScopeId, ScopeSet,
+    TraversalQuery, VectorQuery,
 };
 fn spec() -> IndexSpec {
     IndexSpec {
@@ -138,5 +139,165 @@ fn traverse_cold(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, cold_open, write, traverse_warm, traverse_cold);
+/// Vectors seeded per `submit` batch while building `vector_fixture` — same
+/// rationale as `recall.rs`'s `SEED_CHUNK`: one transaction per node would be
+/// too slow for 10k nodes, and every embedding in a batch shares `dim`, so
+/// dim pre-validation passes regardless of chunk boundaries.
+const VECTOR_SEED_CHUNK: usize = 500;
+
+/// Deterministic splitmix64, mirroring `topodb::workload`'s private
+/// generator — used here (not that all-zero-but-one-coordinate approach)
+/// specifically so every vector's cosine score against a fixed query is
+/// generically distinct. An earlier version of this fixture used one-hot
+/// vectors (`v[i % DIM] = 1.0`, else 0); with only `DIM` distinct
+/// directions spread across 10k nodes, the vast majority of rows tied
+/// EXACTLY on cosine score, which pathologically inflated
+/// `push_topk`'s tied-group draining path (a ~950ms warm search for
+/// 10k/768-dim, ~100x slower than dense-vector runs) — an artifact of the
+/// fixture, not of `search_vector`. Dense random floats (matching
+/// `workload::batches`' own embedding generator) avoid that degenerate
+/// case and match what a real embedding model actually produces.
+struct VecRng(u64);
+impl VecRng {
+    fn next_f32(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z as f32 / u64::MAX as f32) * 2.0 - 1.0
+    }
+}
+
+/// Task 9 (v4 gates): one scope holding 10k nodes, every one embedded under
+/// model `"bench-768"` at the real 768-dim the design spec's gate table
+/// specifies (`docs/superpowers/specs/2026-07-11-storage-format-v4-vectors-design.md`),
+/// contrasted with `recall.rs`'s pre-existing `search_vector_10k_dim32`
+/// (dim 32, and only some nodes embedded) — that bench predates the v4 gate
+/// and stays as its own, unrelated data point. Returns a specific known
+/// embedded id (`ids[0]`) for `get_node_embedded`, alongside a query vector
+/// (dense, not a fixture member) so `k=10` search does real cosine work
+/// against generically-distinct scores.
+fn vector_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    ScopeSet,
+    NodeId,
+    Vec<f32>,
+) {
+    const DIM: usize = 768;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vec.redb");
+    let db = Db::open_with(&path, spec()).unwrap();
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+    let mut ids = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        ids.push(NodeId::new());
+    }
+    let mut r = VecRng(0xC0FFEE);
+    for chunk in ids.chunks(VECTOR_SEED_CHUNK) {
+        let mut ops = Vec::with_capacity(chunk.len() * 2);
+        for &id in chunk {
+            ops.push(Op::CreateNode {
+                id,
+                scope,
+                label: "Vec".into(),
+                props: Default::default(),
+            });
+            let v: Vec<f32> = (0..DIM).map(|_| r.next_f32()).collect();
+            ops.push(Op::SetEmbedding {
+                id,
+                model: "bench-768".into(),
+                vector: v,
+            });
+        }
+        db.submit(ops).unwrap();
+    }
+    drop(db);
+    let scopes = ScopeSet::of(&[scope_id]);
+    let q: Vec<f32> = (0..DIM).map(|_| r.next_f32()).collect();
+    (dir, path, scopes, ids[0], q)
+}
+
+/// Warm scoped vector search p95 (Task 9 gate 2): repeated `search_vector`
+/// calls on one already-open `Db` handle. Criterion's `sample.json` supplies
+/// the p95 the same way `traverse_warm_10k` does (see that bench's header
+/// comment in BENCHMARKS.md's v3 section).
+fn search_warm_10k_scope(c: &mut Criterion) {
+    let (_dir, path, scopes, _seed, q) = vector_fixture();
+    let db = Db::open_with(&path, spec()).unwrap();
+    let query = VectorQuery {
+        scopes: scopes.clone(),
+        model: "bench-768".into(),
+        vector: q.clone(),
+        k: 10,
+        candidates: None,
+    };
+    let sanity = db.search_vector(&query).unwrap();
+    assert_eq!(
+        sanity.len(),
+        10,
+        "search_warm_10k_scope fixture must return k=10 hits from a 10k-vector scope"
+    );
+    c.bench_function("search_warm_10k_scope", |b| {
+        b.iter(|| db.search_vector(&query).unwrap())
+    });
+}
+
+/// Cold scoped vector search p95 (Task 9 gate 3, ungated/report-only): a
+/// fresh `Db::open_with` immediately before each single search, mirroring
+/// `traverse_cold`'s cold/warm contrast and reduced `sample_size` (a cold
+/// open dominates the per-iteration cost).
+fn search_cold_10k_scope(c: &mut Criterion) {
+    let (_dir, path, scopes, _seed, q) = vector_fixture();
+    let query = VectorQuery {
+        scopes,
+        model: "bench-768".into(),
+        vector: q,
+        k: 10,
+        candidates: None,
+    };
+    let mut group = c.benchmark_group("cold");
+    group.sample_size(30);
+    group.bench_function("search_cold_10k_scope", |b| {
+        b.iter(|| {
+            let db = Db::open_with(&path, spec()).unwrap();
+            db.search_vector(&query).unwrap()
+        })
+    });
+    group.finish();
+}
+
+/// `get_node` on an embedded node (Task 9 gate 4): the v4 read path opens
+/// `VECTORS`/`EMBEDDING_REF` in `Storage::load_node` where v3 only opened
+/// `EMBEDDINGS` — this is the "one extra point read" the design spec's gate
+/// table asks to be checked for a measurable regression. The v3-vs-v4 delta
+/// itself is reported in BENCHMARKS.md/the task report from a matched
+/// manual-timing harness run against both engine versions (criterion
+/// benches aren't comparable across separately-compiled binaries); this
+/// bench is the persisted v4-side number.
+fn get_node_embedded(c: &mut Criterion) {
+    let (_dir, path, scopes, seed, _q) = vector_fixture();
+    let db = Db::open_with(&path, spec()).unwrap();
+    let sanity = db.node(&scopes, seed);
+    assert!(
+        sanity.is_some(),
+        "get_node_embedded fixture's seed id must resolve"
+    );
+    c.bench_function("get_node_embedded", |b| {
+        b.iter(|| db.node(&scopes, seed).unwrap())
+    });
+}
+
+criterion_group!(
+    benches,
+    cold_open,
+    write,
+    traverse_warm,
+    traverse_cold,
+    search_warm_10k_scope,
+    search_cold_10k_scope,
+    get_node_embedded
+);
 criterion_main!(benches);

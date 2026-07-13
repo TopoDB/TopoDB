@@ -272,7 +272,13 @@ pub(crate) const POSTINGS_BLOCK_FORMAT_V0: u8 = 0x00;
 
 /// Target encoded chunk size (bytes) a chunk is split at — re-benchmarked in
 /// Task 9.
-pub(crate) const POSTINGS_CHUNK_TARGET: usize = 8 * 1024;
+// Task 9 chunk-target experiment (BENCHMARKS.md): 4 KiB beat 8/16/32 KiB on
+// BOTH append (~0.43 ms/doc vs 1.0-1.8 ms/doc) and edit-heavy (~445 us/edit
+// vs 760-1160 us/edit) indexing cost at a 10k-doc corpus, and was tied for
+// best (not worst) on search latency — smaller covering/last chunks cost
+// less to decode+re-encode per touch, and this workload's postings never
+// get large enough for the extra chunk-count overhead to dominate reads.
+pub(crate) const POSTINGS_CHUNK_TARGET: usize = 4 * 1024;
 
 /// Chunked postings key for `term` under `scope_id`, chunk index `chunk`:
 /// `scope_id.to_be_bytes() ++ term-UTF-8 ++ chunk.to_be_bytes()`. Both the
