@@ -1890,4 +1890,73 @@ mod tests {
         }
         assert_eq!(posting_df(&postings, 1, "hot").unwrap(), n + 1);
     }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+        /// Differential oracle for the full spec-§4 invariant set: seed a
+        /// multi-chunk term via the fast path (2500 even slots ≈ 5 KiB
+        /// encoded > one chunk target), then apply random interleaved
+        /// inserts / tf-updates / removals (count 0 = remove) across a slot
+        /// range spanning below, inside, and beyond the seeded chunks.
+        /// After every op batch the chunk file state must match a BTreeMap
+        /// oracle exactly and hold every structural invariant.
+        #[test]
+        fn set_posting_matches_oracle_and_holds_chunk_invariants(
+            ops in proptest::collection::vec((0u64..6_000, 0u32..3), 1..300)
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::create(dir.path().join("t.redb")).unwrap();
+            let mut oracle: std::collections::BTreeMap<u64, u32> =
+                (0..2_500u64).map(|i| (i * 2, 1)).collect();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut postings = tx.open_table(POSTINGS).unwrap();
+                for (&slot, &tf) in &oracle {
+                    set_posting(&mut postings, 1, "prop", slot, tf).unwrap();
+                }
+                for &(slot, count) in &ops {
+                    set_posting(&mut postings, 1, "prop", slot, count).unwrap();
+                    if count == 0 {
+                        oracle.remove(&slot);
+                    } else {
+                        oracle.insert(slot, count);
+                    }
+                }
+
+                let keys = term_chunk_keys(&postings, 1, "prop").unwrap();
+                let mut prev_number: Option<u32> = None;
+                let mut prev_max: Option<u64> = None;
+                for key in &keys {
+                    // Invariant 1: strictly increasing chunk numbers.
+                    let number = chunk_number(key);
+                    prop_assert!(prev_number.is_none_or(|p| p < number),
+                        "chunk numbers must strictly increase");
+                    prev_number = Some(number);
+
+                    let v = postings.get(key.as_slice()).unwrap().unwrap();
+                    let raw = unframe_value(v.value()).unwrap();
+                    // Invariant 6: every stored chunk <= target.
+                    prop_assert!(raw.len() <= POSTINGS_CHUNK_TARGET,
+                        "chunk over target: {} bytes", raw.len());
+                    let entries = decode_posting_block(raw.as_ref()).unwrap();
+                    // Invariant 5: never empty.
+                    prop_assert!(!entries.is_empty(), "empty chunk stored");
+                    // Invariant 2: non-overlapping ascending ranges.
+                    prop_assert!(prev_max.is_none_or(|m| m < entries[0].0),
+                        "chunk slot ranges must not overlap");
+                    prev_max = Some(entries.last().unwrap().0);
+                }
+
+                // Invariants 3 + 4: oracle-exact round-trip and df.
+                let expected: Vec<(u64, u32)> =
+                    oracle.iter().map(|(&s, &c)| (s, c)).collect();
+                prop_assert_eq!(read_posting(&postings, 1, "prop").unwrap(), expected);
+                prop_assert_eq!(
+                    posting_df(&postings, 1, "prop").unwrap(),
+                    oracle.len() as u64
+                );
+            }
+            tx.commit().unwrap();
+        }
+    }
 }
