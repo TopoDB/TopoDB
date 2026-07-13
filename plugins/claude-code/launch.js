@@ -131,13 +131,22 @@ function resolveServer(dataDir) {
     }
   };
 
-  const install = () => {
+  // EVERY spec this install should end up with must be passed in ONE call.
+  // `npm install --prefix <dir> <pkg>` does not just add <pkg>: it reconciles
+  // the whole tree against the package.json it maintains in <dir>, and PRUNES
+  // whatever isn't declared there. Installing only the platform package, into a
+  // dir whose package.json doesn't mention the server, made npm report
+  // "added 1 package, and removed 1 package" — the removed one being
+  // @topodb/topodb-mcp itself, the shim the broker resolves. The repair deleted
+  // the thing it was repairing. (Verified empirically; see the repair below.)
+  const install = (...specs) => {
+    const list = specs.length ? specs : [`${SERVER_PKG}@${SERVER_VERSION}`];
     if (!acquireLock()) {
       waitForInstall();
       return;
     }
     try {
-      installLocked();
+      installLocked(list);
     } finally {
       // A crash between mkdirSync and here would skip this and wedge the
       // lock — that's what the staleness check in acquireLock() is for.
@@ -145,7 +154,7 @@ function resolveServer(dataDir) {
     }
   };
 
-  const installLocked = () => {
+  const installLocked = (specs) => {
     // First run (or stale version): fetch the pinned server into the data
     // dir. Fail loudly — silently falling back to some other version on the
     // machine is worse than not starting, because the tool surface would be
@@ -156,7 +165,7 @@ function resolveServer(dataDir) {
     // changes this to "inherit" (to show install progress), npm's chatter
     // would be interleaved into that stream and corrupt the protocol on
     // every first run. stderr is safe to inherit for diagnostics.
-    const npmArgs = ["install", "--prefix", dataDir, "--no-audit", "--no-fund", `${SERVER_PKG}@${SERVER_VERSION}`];
+    const npmArgs = ["install", "--prefix", dataDir, "--no-audit", "--no-fund", ...specs];
     const stdio = ["ignore", "ignore", "inherit"];
     let res;
     if (process.platform === "win32") {
@@ -207,7 +216,7 @@ function resolveServer(dataDir) {
       // a proxy, or on a machine without npm — surface it instead of a bare
       // "it failed" with no cause.
       throw new Error(
-        `failed to install ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir}: ${res.error?.message ?? `npm exited ${res.status}`}`,
+        `failed to install ${specs.join(" ")} into ${dataDir}: ${res.error?.message ?? `npm exited ${res.status}`}`,
       );
     }
   };
@@ -227,7 +236,78 @@ function resolveServer(dataDir) {
     }
   }
 
-  return require.resolve(entry, { paths });
+  const shimPath = require.resolve(entry, { paths });
+
+  // The pinned version of `@topodb/topodb-mcp` being present is NOT proof the
+  // server can start. That package is a JS shim; what actually executes is a
+  // platform binary from an OPTIONAL dependency — and on a real Windows install
+  // npm resolved that optional dependency for the WRONG platform
+  // (`topodb-mcp-linux-x64` on a win32 host). Every check above passed, because
+  // they all look at the shim. Nothing looked at the binary. The install
+  // reported itself healthy and the server could never start.
+  //
+  // So resolve the binary too, and do it through the SHIM'S OWN resolver: it is
+  // the single source of truth for the platform key, and (as of server 0.0.8) it
+  // refuses a platform package whose version isn't its own — which matters,
+  // because `require.resolve` walks UP the directory tree and on that same
+  // machine it found a stale `topodb-mcp-win32-x64@0.0.3` outside this data dir
+  // and ran it, silently, for a plugin that believed it was on 0.0.7.
+  // Where THIS install's platform binary must be — computed, never resolved.
+  //
+  // `require.resolve` is the wrong instrument for this question, twice over.
+  // It walks UP the directory tree, so when the data dir lacks the platform
+  // package it cheerfully returns one from somewhere else — on a real machine, a
+  // stale topodb-mcp-win32-x64@0.0.3 in an ancestor node_modules. Resolution
+  // SUCCEEDED, so the shim's "not installed" error never fired and the broker
+  // ran a server two format generations old while every version check here read
+  // 0.0.7. And it MEMOIZES that answer (Module._pathCache): after reinstalling
+  // the correct package, a second resolve in this process still hands back the
+  // ghost — measured, and it defeated the first version of this repair.
+  //
+  // An existence check at the exact path we own has neither problem. The shim's
+  // own pure helpers give us the platform key, so there is no second copy of
+  // that table to drift. Node's resolution at broker-spawn time (a fresh
+  // process, nearest-wins) then picks this package over any ancestor's.
+  const ownPlatformBinary = () => {
+    const { platformKey, subPackageName, binaryFileName } = require(shimPath);
+    const key = platformKey(process.platform, process.arch);
+    if (!key) {
+      throw new Error(
+        `unsupported platform ${process.platform}/${process.arch}; no prebuilt ${SERVER_PKG} binary exists for it`,
+      );
+    }
+    return {
+      key,
+      path: path.join(dataDir, "node_modules", ...subPackageName(key).split("/"), binaryFileName(process.platform)),
+    };
+  };
+
+  const { key, path: binPath } = ownPlatformBinary();
+  if (!existsSync(binPath)) {
+    // The platform package for THIS host is not in this install. On the machine
+    // that surfaced this, npm had installed a different platform's package
+    // entirely (topodb-mcp-linux-x64 on win32). Whatever the cause — a foreign
+    // lockfile, an .npmrc, npm resolving for another platform — the repair is
+    // the same: name this host's package explicitly. optionalDependencies pin it
+    // to the server's exact version, so there is exactly one right answer.
+    //
+    // BOTH specs, in ONE call, deliberately: npm prunes whatever the prefix's
+    // package.json doesn't declare, so repairing with the platform package alone
+    // DELETES the server shim (measured: "added 1 package, and removed 1
+    // package"). Naming both is what makes this a repair rather than a new way
+    // to break the install.
+    install(`${SERVER_PKG}@${SERVER_VERSION}`, `${SERVER_PKG}-${key}@${SERVER_VERSION}`);
+
+    if (!existsSync(binPath)) {
+      throw new Error(
+        `no ${SERVER_PKG} binary for ${key} in ${dataDir} even after installing ` +
+          `${SERVER_PKG}-${key}@${SERVER_VERSION}: expected it at ${binPath}. ` +
+          `Refusing to start — Node would otherwise resolve some other copy on this machine and run it silently.`,
+      );
+    }
+  }
+
+  return shimPath;
 }
 
 // CLAUDE_PROJECT_DIR is the repo root Claude Code is working in.

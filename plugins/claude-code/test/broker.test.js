@@ -16,15 +16,19 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
 import { lineReader, socketPathFor, helloFrame } from "../ipc.js";
 import { projectScopeId } from "../scope-id.js";
+import { SERVER_VERSION } from "../server-args.js";
 
 const require = createRequire(import.meta.url);
+// The real launcher's own platform-key logic, not a copy of it. A second copy of
+// this table is exactly the kind of drift that produced the bug below.
+const { binaryFileName } = require("@topodb/topodb-mcp/bin/topodb-mcp.js");
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.join(HERE, "..");
 const LAUNCH_JS = path.join(PLUGIN_ROOT, "launch.js");
@@ -47,6 +51,23 @@ function mkDataDir(prefix) {
     process.platform === "win32" ? "junction" : "dir",
   );
   return dir;
+}
+
+/** Like `mkDataDir`, but COPIES the server into the data dir instead of
+ * junctioning it. A test that has to DELETE part of the installed tree cannot
+ * use the junction — it would delete out of this repo's own node_modules and
+ * poison every later test in the run. */
+function mkRealDataDir(prefix) {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  cpSync(path.join(PLUGIN_ROOT, "node_modules", "@topodb"), path.join(dir, "node_modules", "@topodb"), {
+    recursive: true,
+  });
+  return dir;
+}
+
+/** The platform package THIS host needs — the one the shim will look for. */
+function platformPkgDir(dataDir) {
+  return path.join(dataDir, "node_modules", "@topodb", `topodb-mcp-${process.platform}-${process.arch}`);
 }
 
 function rmDir(dir) {
@@ -597,6 +618,156 @@ test("one_project_cannot_read_another_projects_memory", async () => {
     rmDir(dataDir);
     rmDir(projA);
     rmDir(projB);
+  }
+});
+
+test("repairs an install whose platform binary is missing", async () => {
+  // THE GHOST-BINARY BUG, reproduced. On a real Windows install, npm resolved
+  // the WRONG platform's optional dependency (`topodb-mcp-linux-x64` on a win32
+  // host), so this host's platform package was simply absent — while
+  // `@topodb/topodb-mcp` itself sat at exactly the pinned SERVER_VERSION.
+  //
+  // Every check in resolveServer passed, because every one of them looked at the
+  // JS shim. None looked at the BINARY. `require.resolve` then walked up out of
+  // the data dir, found a stale topodb-mcp-win32-x64@0.0.3 elsewhere on the
+  // machine, and ran it: a server two format generations old, launched by a
+  // plugin that believed it was on 0.0.7, with no error anywhere.
+  //
+  // This fixture is that exact state: correct shim, missing platform package.
+  const dataDir = mkRealDataDir("topodb-t7-data-");
+  const proj = mkdtempSync(path.join(tmpdir(), "topodb-t7-proj-"));
+  const pkg = platformPkgDir(dataDir);
+  const sessions = [];
+  try {
+    // Positive control. If the fixture never had the platform package, its
+    // absence below would prove nothing and the repair would have nothing to
+    // repair — the test would "pass" while testing air.
+    assert.ok(existsSync(pkg), `fixture is broken: ${pkg} must exist BEFORE we remove it`);
+    rmSync(pkg, { recursive: true, force: true });
+    assert.ok(!existsSync(pkg), "fixture: platform package should now be gone");
+
+    // The shim must still be at the pinned version — that is what made the old
+    // code believe the install was healthy.
+    const shimPkg = path.join(dataDir, "node_modules", "@topodb", "topodb-mcp", "package.json");
+    assert.equal(JSON.parse(readFileSync(shimPkg, "utf8")).version, SERVER_VERSION);
+
+    // Generous timeouts: the repair is a REAL `npm install` of the platform
+    // package (this is the one test in the suite that genuinely needs the
+    // network — the whole point is the install path the others skip).
+    //
+    // A short idle window because, unlike every other test here, this data dir
+    // holds a real COPY of the server rather than a junction to the repo's — so
+    // the topodb-mcp.exe the broker is running lives INSIDE the directory the
+    // teardown has to delete, and Windows will not delete a running executable.
+    // The broker has to exit before cleanup can succeed.
+    const session = await connectAndInit({
+      dataDir,
+      projectDir: proj,
+      env: { TOPODB_BROKER_IDLE_MS: "500" },
+      initTimeoutMs: 120_000,
+    });
+    sessions.push(session);
+
+    const info = await session.rpc("tools/call", { name: "db_info", arguments: {} }, { timeoutMs: 60_000 });
+    assert.ok(!info.error, `server never came up after repair: ${JSON.stringify(info)}`);
+    assert.equal(info.result.structuredContent.path, path.join(dataDir, "memory.redb"));
+
+    // The repair must have put the RIGHT package in the data dir — not merely
+    // found some binary somewhere. Resolving a binary is exactly what the old
+    // code did successfully, out of a directory it did not own.
+    assert.ok(existsSync(pkg), `launch.js did not reinstall the platform package at ${pkg}`);
+    assert.equal(
+      JSON.parse(readFileSync(path.join(pkg, "package.json"), "utf8")).version,
+      SERVER_VERSION,
+      "the repaired platform package must be the pinned server version, not whatever npm felt like",
+    );
+  } finally {
+    killAll(sessions);
+    // Wait out the (shortened) idle window so the broker exits and releases the
+    // running topodb-mcp.exe that lives inside dataDir — see above.
+    await sleep(3000);
+    rmDir(dataDir);
+    rmDir(proj);
+  }
+});
+
+test("never runs a stale binary resolved from outside its own data dir", async () => {
+  // The bug AS IT ACTUALLY HAPPENED, end to end. Missing platform package in the
+  // data dir + a stale copy of that package in an ANCESTOR node_modules.
+  // `require.resolve` walks up, finds the stale one, and returns it. Resolution
+  // SUCCEEDS -- so the shim's "not installed" error never fires, no repair is
+  // attempted, and the broker executes a topodb-mcp@0.0.3 while SERVER_VERSION,
+  // the installed shim, and npm all say 0.0.7. Nothing anywhere reports a
+  // problem; the tools simply never appear.
+  //
+  // The plugin must not depend on a NEW shim to catch this: the installs that
+  // have the bug are, by definition, the ones running an older shim. Ownership
+  // is checkable here -- a binary we own lives under our own data dir.
+  const root = mkdtempSync(path.join(tmpdir(), "topodb-t8-root-"));
+  const proj = mkdtempSync(path.join(tmpdir(), "topodb-t8-proj-"));
+  const sessions = [];
+  try {
+    // dataDir is nested one level down, so `root/node_modules` is an ANCESTOR of
+    // it -- exactly the position the stale package occupied on the real machine.
+    const dataDir = path.join(root, "data");
+    mkdirSync(dataDir, { recursive: true });
+    cpSync(path.join(PLUGIN_ROOT, "node_modules", "@topodb"), path.join(dataDir, "node_modules", "@topodb"), {
+      recursive: true,
+    });
+
+    const key = `${process.platform}-${process.arch}`;
+    const ours = path.join(dataDir, "node_modules", "@topodb", `topodb-mcp-${key}`);
+    assert.ok(existsSync(ours), `fixture: ${ours} must exist before we remove it`);
+    rmSync(ours, { recursive: true, force: true });
+
+    // THE GHOST: a stale platform package where the tree-walk will find it.
+    const ghost = path.join(root, "node_modules", "@topodb", `topodb-mcp-${key}`);
+    mkdirSync(ghost, { recursive: true });
+    writeFileSync(
+      path.join(ghost, "package.json"),
+      JSON.stringify({ name: `@topodb/topodb-mcp-${key}`, version: "0.0.3" }),
+    );
+    // Deliberately NOT a working server. If the plugin ever executes this, the
+    // test fails -- which is the entire point. On the real machine this was a
+    // genuine 0.0.3 server, which is why it failed silently instead of loudly.
+    writeFileSync(path.join(ghost, binaryFileName(process.platform)), "not a real server\n");
+
+    // Sanity: the ghost really is reachable by Node's resolution from the shim.
+    // Without this, a passing test might just mean the walk-up never found it.
+    const shim = path.join(dataDir, "node_modules", "@topodb", "topodb-mcp", "bin", "topodb-mcp.js");
+    const resolvedGhost = createRequire(shim).resolve(
+      `@topodb/topodb-mcp-${key}/${binaryFileName(process.platform)}`,
+    );
+    assert.equal(
+      path.resolve(resolvedGhost),
+      path.resolve(path.join(ghost, binaryFileName(process.platform))),
+      "fixture is inert: Node did not actually resolve the ghost, so this test proves nothing",
+    );
+
+    const session = await connectAndInit({
+      dataDir,
+      projectDir: proj,
+      env: { TOPODB_BROKER_IDLE_MS: "500" },
+      initTimeoutMs: 120_000,
+    });
+    sessions.push(session);
+
+    const info = await session.rpc("tools/call", { name: "db_info", arguments: {} }, { timeoutMs: 60_000 });
+    assert.ok(!info.error, `server never came up -- the ghost was run, or the repair failed: ${JSON.stringify(info)}`);
+
+    // The real assertion: the plugin repaired its OWN install rather than
+    // adopting the stranger's binary.
+    assert.ok(existsSync(ours), "the platform package was not reinstalled into the plugin's own data dir");
+    assert.equal(
+      JSON.parse(readFileSync(path.join(ours, "package.json"), "utf8")).version,
+      SERVER_VERSION,
+      "the repaired package must be the pinned server version, not the ghost's 0.0.3",
+    );
+  } finally {
+    killAll(sessions);
+    await sleep(3000); // let the broker exit and release the .exe inside dataDir
+    rmDir(root);
+    rmDir(proj);
   }
 });
 
