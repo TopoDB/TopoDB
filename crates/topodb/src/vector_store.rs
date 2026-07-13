@@ -65,7 +65,11 @@ fn encode_ref(model: u32, scope: u32) -> Result<Vec<u8>, TopoError> {
     postcard::to_allocvec(&(model, scope)).map_err(|e| TopoError::Encoding(e.to_string()))
 }
 
-fn decode_ref(bytes: &[u8]) -> Result<(u32, u32), TopoError> {
+/// `pub(crate)` so `db.rs`'s `debug_dump_embedding_ref` seam can decode
+/// `EMBEDDING_REF` rows with the exact same logic `put_vector`/
+/// `remove_vector`/`read_vector_by_slot` use, rather than a second,
+/// possibly-drifting decoder.
+pub(crate) fn decode_ref(bytes: &[u8]) -> Result<(u32, u32), TopoError> {
     postcard::from_bytes(bytes).map_err(|e| TopoError::Encoding(e.to_string()))
 }
 
@@ -97,6 +101,19 @@ pub(crate) fn put_vector(
             vectors
                 .remove(vector_key(old_model, old_scope, slot).as_slice())
                 .map_err(storage_err)?;
+        } else {
+            // Same-model re-embed: must land on the identical `vector_key`
+            // (see this function's doc comment), which is only true if the
+            // node's scope hasn't moved. A node's scope is immutable for its
+            // whole lifetime (no `Op` ever changes it), so this can never
+            // fire outside of a bug that violates that invariant — self-
+            // enforcing rather than merely assumed, so a future regression
+            // trips a debug assert instead of silently leaking an orphan
+            // `vectors` row under the OLD scope.
+            debug_assert_eq!(
+                old_scope, scope,
+                "node scope is immutable; a same-model re-embed can never move scopes"
+            );
         }
     }
     let raw = postcard::to_allocvec(v).map_err(|e| TopoError::Encoding(e.to_string()))?;

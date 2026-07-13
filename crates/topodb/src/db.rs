@@ -756,6 +756,131 @@ impl Db {
         out.sort_unstable();
         Ok(out)
     }
+
+    /// Test/inspection helper: every `POSTINGS` chunk row currently in
+    /// storage — the raw key bytes (`scope_id.to_be_bytes() ++ term-UTF-8 ++
+    /// chunk.to_be_bytes()`, see `fts::chunked_posting_key`) paired with its
+    /// decoded `(slot, tf)` entries, sorted by key bytes. `#[doc(hidden)]` —
+    /// see `all_edges_between`. The key is left as raw bytes rather than
+    /// split into `(scope_id, term, chunk)`: the term's length is variable
+    /// and not self-describing from the key alone, so decomposing it here
+    /// would need the same disambiguation `fts.rs`'s chunk-key scan already
+    /// handles internally — pointless for a byte-parity debug dump, which
+    /// only needs the key to compare equal or not. Exists so tests can
+    /// assert byte-level postings parity across `rebuild_state_from_ops`,
+    /// the same role `debug_dump_adjacency` plays for OUT_ADJ/IN_ADJ.
+    #[doc(hidden)]
+    pub fn debug_dump_postings(&self) -> Result<Vec<PostingsDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::storage::POSTINGS)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key = k.value().to_vec();
+            let raw = crate::codec::unframe_value(v.value())?;
+            let entries = crate::fts::decode_posting_block(raw.as_ref())?;
+            out.push((key, entries));
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// Test/inspection helper: every `VECTORS` row currently in storage,
+    /// decoded as `(model, scope, slot, vector)`, sorted by that same
+    /// `(model, scope, slot)` tuple — the same order `vector_store::vector_key`
+    /// sorts its keys in. `#[doc(hidden)]` — see `all_edges_between`. Sorted
+    /// explicitly (rather than relying on redb's key-order iteration) so the
+    /// dump's ordering guarantee doesn't depend on that implementation
+    /// detail; `Vec<f32>` isn't `Ord`, so the sort compares only the decoded
+    /// key fields, not the vector payload.
+    #[doc(hidden)]
+    pub fn debug_dump_vectors(&self) -> Result<Vec<VectorsDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::vector_store::VECTORS)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key: [u8; 16] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad vectors key".into()))?;
+            let model = u32::from_be_bytes(key[0..4].try_into().expect("4-byte slice"));
+            let scope = u32::from_be_bytes(key[4..8].try_into().expect("4-byte slice"));
+            let slot = u64::from_be_bytes(key[8..16].try_into().expect("8-byte slice"));
+            let raw = crate::codec::unframe_value(v.value())?;
+            let vector: Vec<f32> = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            out.push((model, scope, slot, vector));
+        }
+        out.sort_by_key(|a| (a.0, a.1, a.2));
+        Ok(out)
+    }
+
+    /// Test/inspection helper: every `EMBEDDING_REF` row currently in
+    /// storage, decoded as `(slot, model, scope)` — a node's CURRENT
+    /// embedding pointer (see `vector_store::put_vector`) — sorted by slot.
+    /// `#[doc(hidden)]` — see `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_dump_embedding_ref(&self) -> Result<Vec<EmbeddingRefDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::vector_store::EMBEDDING_REF)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key: [u8; 8] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad embedding_ref key".into()))?;
+            let slot = u64::from_be_bytes(key);
+            let (model, scope) = crate::vector_store::decode_ref(v.value())?;
+            out.push((slot, model, scope));
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// Test/inspection helper: every `VECTOR_DIMS` row currently in storage,
+    /// decoded as `(model_id, dim)` — the per-model pinned embedding
+    /// dimension enforced by `storage::check_or_pin_dim` — sorted by model
+    /// id. `#[doc(hidden)]` — see `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_dump_vector_dims(&self) -> Result<Vec<VectorDimsDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::storage::VECTOR_DIMS)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key: [u8; 4] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad vector_dims key".into()))?;
+            let model_id = u32::from_be_bytes(key);
+            let val: [u8; 4] = v
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad vector_dims value".into()))?;
+            let dim = u32::from_le_bytes(val);
+            out.push((model_id, dim));
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
 }
 
 /// One decoded adjacency entry from [`Db::debug_dump_adjacency`]:
@@ -764,6 +889,26 @@ impl Db {
 /// leaked through this `#[doc(hidden)]` debug seam.
 #[doc(hidden)]
 pub type AdjacencyDumpRow = (u64, u32, bool, u64, u64, u32, i64, Option<i64>);
+
+/// One decoded `POSTINGS` chunk row from [`Db::debug_dump_postings`]: raw key
+/// bytes paired with its decoded `(slot, tf)` entries.
+#[doc(hidden)]
+pub type PostingsDumpRow = (Vec<u8>, Vec<(u64, u32)>);
+
+/// One decoded `VECTORS` row from [`Db::debug_dump_vectors`]: `(model, scope,
+/// slot, vector)`.
+#[doc(hidden)]
+pub type VectorsDumpRow = (u32, u32, u64, Vec<f32>);
+
+/// One decoded `EMBEDDING_REF` row from [`Db::debug_dump_embedding_ref`]:
+/// `(slot, model, scope)`.
+#[doc(hidden)]
+pub type EmbeddingRefDumpRow = (u64, u32, u32);
+
+/// One decoded `VECTOR_DIMS` row from [`Db::debug_dump_vector_dims`]:
+/// `(model_id, dim)`.
+#[doc(hidden)]
+pub type VectorDimsDumpRow = (u32, u32);
 
 /// The node ids that `validate::prevalidate_edge_scopes` needs pre-batch
 /// storage state (scope) for: `CreateEdge`'s endpoints. A same-batch

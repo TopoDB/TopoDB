@@ -568,6 +568,7 @@ impl Storage {
             // `vectors`/`embedding_ref` are the live vector storage now.
             bytes(&tx, VECTORS, "vectors")?,
             bytes(&tx, EMBEDDING_REF, "embedding_ref")?,
+            bytes(&tx, VECTOR_DIMS, "vector_dims")?,
             bytes(&tx, POSTINGS, "postings")?,
             bytes(&tx, FTS_DOCS, "fts_docs")?,
             bytes(&tx, FTS_STATS, "fts_stats")?,

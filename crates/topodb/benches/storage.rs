@@ -142,7 +142,10 @@ fn traverse_cold(c: &mut Criterion) {
 /// Vectors seeded per `submit` batch while building `vector_fixture` — same
 /// rationale as `recall.rs`'s `SEED_CHUNK`: one transaction per node would be
 /// too slow for 10k nodes, and every embedding in a batch shares `dim`, so
-/// dim pre-validation passes regardless of chunk boundaries.
+/// the per-model dimension pin (`storage::check_or_pin_dim`, permanent once
+/// a model's first `SetEmbedding` sets it — there is no RAM-slab
+/// pre-validation left to consult; that machinery was deleted with the v3
+/// index) never rejects a batch, regardless of chunk boundaries.
 const VECTOR_SEED_CHUNK: usize = 500;
 
 /// Deterministic splitmix64, mirroring `topodb::workload`'s private

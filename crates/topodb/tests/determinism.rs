@@ -280,10 +280,13 @@ fn spec() -> IndexSpec {
 /// each time, so a rebuild that silently drops `prop_index` entries or
 /// vector slab rows fails the *second* call even though the *first* passed).
 ///
-/// Falsifiable: comment out `graph.rs`'s `prop_index` maintenance during
-/// `Snapshot::from_storage`, or `vector.rs`'s `VectorIndex::from_snapshot`
-/// seeding, and the post-rebuild call here goes from "finds it" to "doesn't"
-/// while the pre-rebuild call still passes — exactly the drop this guards.
+/// Falsifiable: comment out `apply_op`'s `prop_index::index_node`/
+/// `unindex_node` calls, or its `vector_store::put_vector`/`remove_vector`
+/// calls (`storage.rs`) — both of which `rebuild_state_from_ops` drives via
+/// the SAME `apply_op` replayed per logged op, there being no separate
+/// snapshot-seeding step to disable — and the post-rebuild call here goes
+/// from "finds it" to "doesn't" while the pre-rebuild call still passes —
+/// exactly the drop this guards.
 fn assert_equality_and_vector_parity(db: &Db, scopes: &ScopeSet) {
     let dump = db.debug_dump_nodes();
 
@@ -397,6 +400,19 @@ proptest! {
         // `debug_inn` comparison, closed entries included.
         let adj_raw_before = db.debug_dump_adjacency().unwrap();
 
+        // Raw v4-table dumps, mirroring `adj_raw_before` above: entry-for-
+        // entry byte parity for the recall-layer tables `rebuild_state_from_ops`
+        // drains and repopulates, not just the "finds it" parity
+        // `assert_equality_and_vector_parity`/`fts_hit_ids` check below. A
+        // rebuild that reproduced the same *search results* while silently
+        // reordering postings chunks, dropping a stale `embedding_ref`
+        // pointer, or losing a `vector_dims` pin would sail through the
+        // "finds it" checks but fail here.
+        let postings_raw_before = db.debug_dump_postings().unwrap();
+        let vectors_raw_before = db.debug_dump_vectors().unwrap();
+        let embedding_ref_raw_before = db.debug_dump_embedding_ref().unwrap();
+        let vector_dims_raw_before = db.debug_dump_vector_dims().unwrap();
+
         // Recall-layer parity, BEFORE rebuild. `text_k` is computed from the
         // pre-rebuild live count (rebuild never changes the live set — that's
         // exactly what `live_nodes == db.debug_dump_nodes()` below asserts —
@@ -433,6 +449,21 @@ proptest! {
         prop_assert_eq!(adj_raw_before, adj_raw_after);
         let adj_after = adjacency_fingerprint(&db, &scopes, &seeds);
         prop_assert_eq!(adj_before, adj_after);
+
+        // Raw v4-table parity, AFTER rebuild — entry-for-entry equality
+        // against the pre-rebuild captures above, the same load-bearing
+        // check `adj_raw_before`/`adj_raw_after` performs for adjacency: a
+        // rebuild that mangled a POSTINGS chunk, a VECTORS row, an
+        // EMBEDDING_REF pointer, or a VECTOR_DIMS pin fails HERE even if
+        // every "finds it" query below still happens to pass.
+        let postings_raw_after = db.debug_dump_postings().unwrap();
+        prop_assert_eq!(postings_raw_before, postings_raw_after);
+        let vectors_raw_after = db.debug_dump_vectors().unwrap();
+        prop_assert_eq!(vectors_raw_before, vectors_raw_after);
+        let embedding_ref_raw_after = db.debug_dump_embedding_ref().unwrap();
+        prop_assert_eq!(embedding_ref_raw_before, embedding_ref_raw_after);
+        let vector_dims_raw_after = db.debug_dump_vector_dims().unwrap();
+        prop_assert_eq!(vector_dims_raw_before, vector_dims_raw_after);
 
         // Recall-layer parity, AFTER rebuild. Equality/vector re-assert the
         // same "finds it" property against the rebuilt state; FTS asserts the
