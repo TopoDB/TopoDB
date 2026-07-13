@@ -33,7 +33,8 @@
 //! either a last-chunk append (new highest-slot doc) or a covering-chunk
 //! decode/mutate/rewrite (update, remove, or an out-of-order new slot),
 //! the covering chunk found by binary-searching header-peeked first slots
-//! (`peek_first_slot` — one full decode per call, ever). EITHER path
+//! (the probed chunks are never fully decoded — only the up-front
+//! last-chunk read and the covering chunk itself are). EITHER path
 //! splits at the midpoint when the re-encoded chunk exceeds
 //! `POSTINGS_CHUNK_TARGET`; a mid-list split renumber-shifts the chunks
 //! behind it, raw bytes untouched — see `set_posting`'s doc comment.
@@ -671,9 +672,9 @@ fn covering_chunk_index(
 ///   older document, or an out-of-order insert (a node's text can be
 ///   edited to newly include a term a later-created, higher-slot node
 ///   already carries). `covering_chunk_index` binary-searches header-peeked
-///   first slots for the covering chunk — the ONLY chunk fully decoded; a
-///   slot in the gap between two chunks lands in the earlier one (pinned
-///   rule).
+///   first slots for the covering chunk — the only chunk fully decoded beyond
+///   the always-decoded last chunk; a slot in the gap between two chunks lands
+///   in the earlier one (pinned rule).
 ///
 /// EVERY rewrite — fast-path append or covering-chunk mutation — goes
 /// through `store_posting_chunk_splitting`, which splits at the midpoint
