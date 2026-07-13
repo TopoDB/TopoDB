@@ -1226,11 +1226,14 @@ mod tests {
     /// deterministic, so a redundant rewrite reproduces the same bytes) —
     /// the decode-ONE-chunk guarantee itself is held by `set_posting`'s
     /// structure: only `keys.last()` is decoded before the fast-path branch
-    /// returns. 10_000 sequential 2-byte entries split at
-    /// `POSTINGS_CHUNK_TARGET` (~4095 entries), then every ~2047 more, so
-    /// the setup produces >= 4 chunks with the REAL production target — no
-    /// test-only override, same prod/test-parity rationale as the other
-    /// multi-chunk tests here.
+    /// returns. 10_000 sequential 2-byte entries (consecutive slot deltas
+    /// and tf=1 each encode as 1-byte varints) split first at roughly
+    /// `POSTINGS_CHUNK_TARGET / 2` entries, then every roughly
+    /// `POSTINGS_CHUNK_TARGET / 4` more (each split cuts at the midpoint,
+    /// leaving a half-full last chunk), so the setup produces >= 4 chunks at
+    /// any plausible value of the REAL production target — no test-only
+    /// override, same prod/test-parity rationale as the other multi-chunk
+    /// tests here.
     #[test]
     fn fast_path_insert_leaves_every_non_last_chunks_bytes_untouched() {
         let dir = tempfile::tempdir().unwrap();

@@ -343,9 +343,16 @@ consistent with the manual harness's 3448 ns.
 **This is a measurable regression, not "no measurable regression."** It is
 small in absolute terms (+280 ns) and matches the design's own accounting
 (one extra small-table point read per call), but the gate's literal target
-("must not measurably regress it") is not met by a controlled, low-noise
-(200k-iteration) measurement showing a reproducible +8.9%. Recorded as a
-finding per this task's instructions, not smoothed over.
+("must not measurably regress it") is not met by this measurement. Scope of
+the claim, stated precisely: measured **once** (paired same-machine worktree
+harness, 200k iterations/side); the +280 ns magnitude is smaller than this
+machine's documented session-to-session drift (see the v3 traversal
+baseline's ~38% caveat above); not corroborated by repeat trials. Recorded
+as a finding per this task's instructions, not smoothed over.
+
+**Adjudicated: accepted** — the extra point read is the designed v4 join
+cost; +280 ns absolute is negligible against the gate's intent; revisit only
+if a future paired-run session corroborates a materially larger delta.
 
 ### Gate 5: RAM ceiling vs `cache_size_bytes`, with embeddings
 
@@ -526,7 +533,10 @@ decode+re-encode per touch (the dominant cost on both write paths), and this
 workload's postings never grow large enough for the extra chunk-count
 overhead to dominate reads. A prior, otherwise-identical sweep without the
 search-latency probe showed the same append/edit-heavy ordering (4 KB
-fastest on both), corroborating the choice. This is the first-ever
+fastest on both: 0.3954 ms/doc append, 737.3 µs/edit at the 3,000-edit
+checkpoint; raw output preserved in the Task 9 report,
+`.superpowers/sdd/task-9-report.md`, "First sweep" section), corroborating
+the choice. This is the first-ever
 measurement of `POSTINGS_CHUNK_TARGET`'s impact — it is a distinct constant
 from `adj.rs`'s `CHUNK_SPLIT_TARGET` (adjacency chunking), which v3's
 "Chunk-target experiment" table above measured and left at 8 KB; that
