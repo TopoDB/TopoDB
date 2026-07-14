@@ -11,8 +11,10 @@
 //! v4 additions (Task 9 / BENCHMARKS.md v4): `fts_linearity_append_report`
 //! (gate 6's append-phase per-doc cost at 1k/10k/100k) and
 //! `fts_edit_heavy_report` (the Task-6-reviewer-mandated edit-heavy phase —
-//! re-indexing EXISTING low-slot documents to gain a term, the case
-//! `mutate_posting_chunk`'s doc comment flags as never splitting). Both are
+//! re-indexing EXISTING low-slot documents to gain a term, the case that
+//! `fts.rs`'s old `mutate_posting_chunk` doc comment once flagged as never
+//! splitting; fixed by the 2026-07-13 mid-chunk split, see the Gate 6b
+//! re-run in BENCHMARKS.md). Both are
 //! resumable-in-spirit (single self-contained runs well under the CI-agent
 //! command budget once the append path is O(1)/doc) rather than
 //! checkpoint/resume like `build_open_fixture`, since neither needs it at
@@ -436,9 +438,12 @@ fn fts_linearity_append_report() {
 
 /// Task 9 gate 6 amendment (edit-heavy phase, Task 6 reviewer): re-indexes
 /// EXISTING low-slot documents to GAIN a term that's already hot in the
-/// corpus, the case `fts.rs`'s `mutate_posting_chunk` doc comment names as
-/// deliberately unsplit ("a covering-chunk insert can grow a chunk slightly
-/// past `POSTINGS_CHUNK_TARGET` without triggering a split").
+/// corpus, the case `fts.rs`'s old `mutate_posting_chunk` doc comment once
+/// named as deliberately unsplit ("a covering-chunk insert can grow a chunk
+/// slightly past `POSTINGS_CHUNK_TARGET` without triggering a split").
+/// `mutate_posting_chunk` was replaced by `apply_posting_mutation` +
+/// `store_posting_chunk_splitting` in the 2026-07-13 mid-chunk split, which
+/// closed this gap — see the Gate 6b re-run in BENCHMARKS.md.
 ///
 /// Setup: `BASE_DOCS` documents built low-slot-first; only the HIGH-slot
 /// tail (`MARKER_DOCS`) carries the marker term `"zzmarker"` at creation, so
@@ -450,10 +455,11 @@ fn fts_linearity_append_report() {
 /// the marker's EARLIEST chunk (`fts.rs`'s covering-chunk scan picks the
 /// first earlier chunk whose max already reaches the new slot, which is
 /// trivially true for the first chunk once the new slot is below the
-/// term's entire existing range) — that chunk never splits, by design, so
-/// this is the one scenario that can grow a chunk unboundedly. Report:
-/// per-edit cost across increasing edit counts, so growth (or its absence)
-/// shows as a curve.
+/// term's entire existing range) — before the mid-chunk split, that chunk
+/// never split, so this was the one scenario that could grow a chunk
+/// unboundedly; now it splits like any other over-target chunk (Gate 6b
+/// re-run, BENCHMARKS.md). Report: per-edit cost across increasing edit
+/// counts, so growth (or its absence) shows as a curve.
 ///
 /// `cargo test -p topodb --release --test size_report -- --ignored fts_edit_heavy_report --nocapture`
 #[test]
@@ -523,6 +529,7 @@ fn fts_edit_heavy_report() {
     let mut window_start = 0usize;
     let mut window_time = std::time::Instant::now();
     let mut next_checkpoint = 0usize;
+    let mut checkpoint_per_edit_us: Vec<f64> = Vec::new();
     let mut idx = 0usize;
     while edits_done < total_edits {
         let batch_end = (idx + EDIT_BATCH).min(total_edits);
@@ -556,6 +563,7 @@ fn fts_edit_heavy_report() {
                 window_elapsed.as_secs_f64() * 1000.0,
                 window_elapsed.as_secs_f64() * 1e6 / window_n as f64
             );
+            checkpoint_per_edit_us.push(window_elapsed.as_secs_f64() * 1e6 / window_n as f64);
             next_checkpoint += 1;
             window_start = edits_done;
             window_time = std::time::Instant::now();
@@ -568,6 +576,25 @@ fn fts_edit_heavy_report() {
         after.len(),
         MARKER_DOCS + total_edits,
         "every edited doc must now carry the marker term"
+    );
+
+    // Gate 6b — promoted from FINDING to HARD GATE (mid-chunk-split design,
+    // 2026-07-13): the last checkpoint window's per-edit cost must be within
+    // 1.5x the first window's. Pre-fix this measured 2.79x at chunk target
+    // 4096 and 2.03x at 8192 (BENCHMARKS.md, Gate 6b) — the covering chunk
+    // grew without bound and the covering search decoded forward. Post-fix
+    // both are bounded; the curve must be near-flat.
+    let first = *checkpoint_per_edit_us
+        .first()
+        .expect("checkpoints are non-empty by construction");
+    let last = *checkpoint_per_edit_us
+        .last()
+        .expect("checkpoints are non-empty by construction");
+    let ratio = last / first;
+    println!("GATE6B first_window_per_edit_us={first:.1} last_window_per_edit_us={last:.1} ratio={ratio:.2}");
+    assert!(
+        ratio <= 1.5,
+        "GATE 6b FAIL: per-edit cost grew {ratio:.2}x from the 1k to the 12k checkpoint (gate: <= 1.5x)"
     );
 }
 

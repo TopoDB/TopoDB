@@ -14,6 +14,19 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Fixed
+
+- **Edit-heavy re-indexing no longer grows a covering postings chunk without bound.** Adding a term
+  to many OLD (low-slot) documents — bulk retroactive tagging — routed every insert into one covering
+  chunk that never split, growing per-edit cost 2.8× over 12k edits (BENCHMARKS.md Gate 6b). Covering
+  chunks now split at the same 4 KiB target as the append path (a mid-list split renumbers the chunks
+  behind it; raw bytes move untouched), and the covering chunk is found by binary-searching first
+  slots peeked from chunk headers instead of decoding chunks front-to-back. Gate 6b is now a hard
+  gate (≤ 1.5× growth 1k→12k edits) asserted inside the benchmark itself. **No format change** — v4
+  files need no migration; this is maintenance behavior only.
+
 ### 0.0.7
 
 #### Breaking

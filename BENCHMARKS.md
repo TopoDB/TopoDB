@@ -217,7 +217,9 @@ report: 3,700,291 ops in 131 s (embed_pct=0) and 3,899,242 ops in 144 s
 > old document repeatedly edited to GAIN a term whose covering chunk is
 > not the term's last chunk grows that chunk without ever splitting it
 > (deliberate, scoped simplification per `fts.rs`'s `mutate_posting_chunk`
-> doc comment — the fix scope was the append/fast path only).
+> doc comment — the fix scope was the append/fast path only). That
+> simplification was itself retired by the 2026-07-13 mid-chunk split
+> (Gate 6b re-run section).
 
 ## v4 (format 4: clustered vectors, chunked postings)
 
@@ -426,11 +428,11 @@ starts out correctly split into normal-sized chunks). The edit phase then
 adds `"zzmarker"` to the 12,000 low-slot documents that lack it, ascending
 by slot, in batches of 200 `SetNodeProps` ops. Every one of those inserts
 has a slot below the marker's existing minimum, so `fts.rs`'s covering-chunk
-scan routes every single one into the SAME earliest chunk (the first
+scan routed every single one into the SAME earliest chunk (the first
 earlier chunk whose max already exceeds the new — much lower — slot, which
 is trivially every earlier chunk once the new slot precedes the whole
-existing range) — and that chunk never splits, by the deliberate design
-`mutate_posting_chunk`'s doc comment documents ("a covering-chunk insert can
+existing range) — and that chunk never split, by the deliberate design
+`mutate_posting_chunk`'s doc comment documented ("a covering-chunk insert can
 grow a chunk slightly past `POSTINGS_CHUNK_TARGET` without triggering a
 split"). At `POSTINGS_CHUNK_TARGET = 4096`:
 
@@ -462,7 +464,37 @@ documents (adding a newly-common term across many old rows) at scale; a
 single old document occasionally gaining a term is unaffected in practice
 (the growth is in the SHARED chunk a hot term's low-slot insertions all
 funnel into, not per-document). Recorded here for Plan 5+ to revisit if
-edit-heavy workloads become a real access pattern.
+edit-heavy workloads become a real access pattern. Closed by the mid-chunk
+split — see the re-run section below.
+
+### Gate 6b re-run: mid-chunk split (2026-07-13, hard gate)
+
+The mid-chunk-split change (covering chunks now split at
+`POSTINGS_CHUNK_TARGET` on any over-target rewrite, with the covering chunk
+found by a header-peek binary search — `fts.rs`, no format change) promotes
+this measurement from FINDING to HARD GATE: last-checkpoint per-edit cost
+<= 1.5x the first-checkpoint cost, asserted inside `fts_edit_heavy_report`
+itself, same 15k-corpus / 12k-edit methodology at
+`POSTINGS_CHUNK_TARGET = 4096`.
+
+| edits so far | window per-edit (pre-fix) | window per-edit (post-fix) |
+|---:|---:|---:|
+| 1,000 | 696.3 µs | 568.5 µs |
+| 2,000 | 836.0 µs | 520.8 µs |
+| 4,000 | 1,022.1 µs | 529.0 µs |
+| 8,000 | 1,412.4 µs | 527.2 µs |
+| 12,000 | 1,943.1 µs | 540.7 µs |
+
+Ratio 12k/1k: **0.95x** (gate: <= 1.5x; pre-fix 2.79x). **PASS.**
+
+Gate 6 (append linearity) re-run at the same commit — the fast path routes
+through the same shared split helper now, so a regression here would mean
+the unification cost something: 10k 0.3561 ms/doc, 100k 0.5200 ms/doc,
+ratio 1.46x (gate: <= 2x AND <= 5 ms; pre-change 0.66 / 1.10 / 1.66x).
+**PASS.** The absolute per-doc levels are also well below the pre-change
+baselines (0.66 / 1.10 ms/doc); treat that level shift as run-to-run and
+storage-volume variance, not a claimed speedup — the gate, and the
+like-for-like comparison, is the ratio.
 
 ### Gate 7: open, 1M memories, WITH text index
 
