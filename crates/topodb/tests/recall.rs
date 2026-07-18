@@ -213,3 +213,34 @@ fn graph_boost_surfaces_linked_but_lexically_silent_neighbor() {
         .collect();
     assert!(!ids2.contains(&linked));
 }
+
+#[test]
+fn expansions_surface_synonym_hits_at_a_discount() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (exact, op_e) = memory("auth flow redesign notes", Scope::Id(s));
+    let (syn, op_s) = memory("login page rework details", Scope::Id(s));
+    db.submit(vec![op_e, op_s]).unwrap();
+
+    // Without expansions: "auth" finds only the exact memory.
+    let plain: Vec<NodeId> = db
+        .recall(&text_only(&scopes, "auth", 10))
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert_eq!(plain, vec![exact]);
+
+    // With host-resolved expansion auth->login: both surface, exact first.
+    let mut q = text_only(&scopes, "auth", 10);
+    q.expansions = vec![("auth".into(), vec!["login".into()])];
+    let hits = db.recall(&q).unwrap();
+    let ids: Vec<NodeId> = hits.iter().map(|(n, _)| n.id).collect();
+    assert!(ids.contains(&exact) && ids.contains(&syn));
+    assert_eq!(
+        ids[0], exact,
+        "exact term hit must outrank the discounted expansion"
+    );
+}

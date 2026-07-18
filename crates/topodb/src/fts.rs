@@ -178,6 +178,14 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
+/// The v1 analyzer as a standalone utility for HOSTS that must agree with
+/// the engine's tokenization (e.g. storing synonym terms in stemmed form
+/// so query-time lookup can't miss a morphological variant). Same
+/// pipeline `search_text`/indexing use.
+pub fn analyze(text: &str) -> Vec<String> {
+    tokenize(text)
+}
+
 /// Splits one alphanumeric word at camelCase boundaries: before an uppercase
 /// letter that follows a lowercase letter or digit (`camelCase` →
 /// `camel`/`Case`), and before the last uppercase of an uppercase run that is
@@ -1041,6 +1049,21 @@ impl Db {
         k: usize,
         options: &SearchOptions,
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_text_expanded(scopes, query, k, options, &[])
+    }
+
+    /// [`Db::search_text_with`] plus host-resolved term expansions: each
+    /// expansion of a query term joins scoring as an extra term at
+    /// [`FUZZY_DISCOUNT`], in the scopes where it has postings. Expansions
+    /// never trigger their own fuzzy fallback (depth-1 by contract).
+    pub(crate) fn search_text_expanded(
+        &self,
+        scopes: &ScopeSet,
+        query: &str,
+        k: usize,
+        options: &SearchOptions,
+        expansions: &[(String, Vec<String>)],
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if k == 0 {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
         }
@@ -1106,6 +1129,26 @@ impl Db {
             // later missing terms in the same scope reuse it.
             let mut vocab: Option<Vec<String>> = None;
             for term in &distinct {
+                // Host-resolved expansions for this term (synonyms): extra
+                // discounted terms, tokenized through the same analyzer so
+                // multi-word expansions ("single sign on") contribute each
+                // of their tokens. Runs regardless of whether `term` itself
+                // hits below — an expansion is independent evidence, not a
+                // fallback for a miss.
+                for (expanded_from, terms) in expansions {
+                    if tokenize(expanded_from).first().map(String::as_str) != Some(term.as_str()) {
+                        continue;
+                    }
+                    for raw in terms {
+                        for etoken in tokenize(raw) {
+                            let edf = posting_df(&postings, scope_id, &etoken)? as f32;
+                            if edf > 0.0 {
+                                accumulate(&etoken, edf, FUZZY_DISCOUNT, &mut scores)?;
+                            }
+                        }
+                    }
+                }
+
                 // df fast path first: most query terms miss most scopes, and
                 // this sums each chunk's block-count header without
                 // decoding a single entry — skip the full decode below

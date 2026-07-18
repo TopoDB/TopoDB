@@ -147,7 +147,8 @@ impl Db {
         // Text leg runs recency-free: recency applies once, post-fusion.
         let mut leg_options = q.options.clone();
         leg_options.recency_weight = 0.0;
-        let text_hits = self.search_text_with(&q.scopes, &q.query, depth, &leg_options)?;
+        let text_hits =
+            self.search_text_expanded(&q.scopes, &q.query, depth, &leg_options, &q.expansions)?;
 
         let mut records: std::collections::HashMap<crate::NodeId, NodeRecord> =
             text_hits.iter().map(|(n, _)| (n.id, n.clone())).collect();

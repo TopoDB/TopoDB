@@ -31,6 +31,7 @@ pub use counters::AccessStats;
 pub use db::{Db, DbOptions};
 pub use error::TopoError;
 pub use feed::ChangeEvent;
+pub use fts::analyze;
 pub use fts::SearchOptions;
 pub use ids::{EdgeId, NodeId, Scope, ScopeId, ScopeSet};
 pub use index::{IndexSpec, PropIndex};
