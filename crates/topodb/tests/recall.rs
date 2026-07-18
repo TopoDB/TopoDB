@@ -112,3 +112,56 @@ fn recall_rejects_bad_recency_options_despite_leg_zeroing() {
     q2.options.recency_half_life_ms = 0;
     assert!(matches!(db.recall(&q2), Err(TopoError::Rejected(_))));
 }
+
+#[test]
+fn vector_leg_surfaces_semantic_hit_and_agreement_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    // A: lexical match only. B: vector match only. C: both (agreement).
+    let (a, op_a) = memory("login password rotation policy", Scope::Id(s));
+    let (b, op_b) = memory("credential storage decision", Scope::Id(s));
+    let (c, op_c) = memory("login credentials audit", Scope::Id(s));
+    db.submit(vec![op_a, op_b, op_c]).unwrap();
+    // Hand-built 2d embeddings: query points at [1,0].
+    db.submit(vec![
+        Op::SetEmbedding {
+            id: a,
+            model: "m".into(),
+            vector: vec![0.0, 1.0],
+        },
+        Op::SetEmbedding {
+            id: b,
+            model: "m".into(),
+            vector: vec![0.9, 0.1],
+        },
+        Op::SetEmbedding {
+            id: c,
+            model: "m".into(),
+            vector: vec![1.0, 0.0],
+        },
+    ])
+    .unwrap();
+
+    let mut q = text_only(&scopes, "login", 10);
+    q.vector = Some(("m".into(), vec![1.0, 0.0]));
+    let hits: Vec<NodeId> = db
+        .recall(&q)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+
+    assert_eq!(hits[0], c, "text+vector agreement must rank first");
+    assert!(
+        hits.contains(&b),
+        "vector-only hit must surface despite zero token overlap"
+    );
+
+    // Unknown model = empty leg, not an error; pure text order remains.
+    let mut q2 = text_only(&scopes, "login", 10);
+    q2.vector = Some(("nonexistent-model".into(), vec![1.0, 0.0]));
+    let hits2 = db.recall(&q2).unwrap();
+    assert!(hits2.iter().all(|(n, _)| n.id == a || n.id == c));
+}

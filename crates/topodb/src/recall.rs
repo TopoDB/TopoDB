@@ -109,6 +109,7 @@ pub struct RecallQuery {
 }
 
 pub(crate) const WEIGHT_TEXT: f32 = 1.0;
+pub(crate) const WEIGHT_VECTOR: f32 = 1.0;
 
 impl Db {
     /// Hybrid recall: BM25 text (+ expansions), cosine vector, and 1-hop
@@ -144,7 +145,25 @@ impl Db {
             text_hits.iter().map(|(n, _)| (n.id, n.clone())).collect();
         let text_ids: Vec<crate::NodeId> = text_hits.iter().map(|(n, _)| n.id).collect();
 
-        let lists: Vec<(f32, Vec<crate::NodeId>)> = vec![(WEIGHT_TEXT, text_ids)];
+        // Vector leg: cosine over the scoped clusters for the named model.
+        // An unknown model or a scope with no vectors is an EMPTY leg —
+        // legitimately no data — never an error (contrast the empty-vector
+        // rejection above, which is a host bug).
+        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = vec![(WEIGHT_TEXT, text_ids)];
+        if let Some((model, vector)) = &q.vector {
+            let vhits = self.search_vector(&crate::VectorQuery {
+                scopes: q.scopes.clone(),
+                model: model.clone(),
+                vector: vector.clone(),
+                k: depth,
+                candidates: None,
+            })?;
+            let vids: Vec<crate::NodeId> = vhits.iter().map(|(n, _)| n.id).collect();
+            for (n, _) in vhits {
+                records.entry(n.id).or_insert(n);
+            }
+            lists.push((WEIGHT_VECTOR, vids));
+        }
         let fused = rrf_fuse(&lists);
 
         let mut out: Vec<(NodeRecord, f32)> = fused
