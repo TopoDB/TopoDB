@@ -68,7 +68,17 @@ fn real_model_semantic_recall_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("semantic.redb");
     let scope = topodb::ScopeId::new().to_string();
-    let mut server = Server::spawn(&db_path, &["--scope", scope.as_str()]);
+    // The common helper defaults every test server to `--embeddings off`;
+    // this test opts back in (config parsing is last-wins).
+    let mut server = Server::spawn(
+        &db_path,
+        &[
+            "--scope",
+            scope.as_str(),
+            "--embeddings",
+            "bge-small-en-v1.5",
+        ],
+    );
     server.initialize(DEFAULT_TIMEOUT);
 
     // Wait for the model (download on first ever run; cached after).
@@ -78,6 +88,7 @@ fn real_model_semantic_recall_end_to_end() {
         match info["embeddings"]["status"].as_str().unwrap() {
             "ready" => break,
             "failed" => panic!("model failed to load: {info:#?}"),
+            "off" => panic!("embedder is off — the spawn args failed to override the test default"),
             _ => {
                 assert!(
                     std::time::Instant::now() < deadline,
