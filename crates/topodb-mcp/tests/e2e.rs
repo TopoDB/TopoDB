@@ -45,8 +45,8 @@ fn end_to_end_scenario_over_stdio() {
     let tools = server.tools_list(DEFAULT_TIMEOUT);
     assert_eq!(
         tools.len(),
-        16,
-        "expected exactly 16 tools (db_info + 7 read + 8 write), got: {tools:#?}"
+        17,
+        "expected exactly 17 tools (db_info + 8 read + 8 write), got: {tools:#?}"
     );
     for name in [
         "db_info",
@@ -56,6 +56,7 @@ fn end_to_end_scenario_over_stdio() {
         "traverse",
         "access_stats",
         "get_changes",
+        "get_edges",
         "create_memory",
         "create_entity",
         "link",
@@ -81,16 +82,40 @@ fn end_to_end_scenario_over_stdio() {
     }
 
     // --- Step 2: create_entity {name: "ada"} -> id A -------------------
-    let entity_id = server
-        .call_tool_ok(
-            "create_entity",
-            serde_json::json!({ "name": "ada" }),
-            DEFAULT_TIMEOUT,
-        )
+    let created = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "ada" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        created.get("created"),
+        Some(&serde_json::Value::Bool(true)),
+        "first create_entity for a name must report created:true: {created:#?}"
+    );
+    let entity_id = created
         .get("id")
         .and_then(|v| v.as_str())
         .expect("create_entity should return a structured id")
         .to_string();
+
+    // --- Step 2b: create_entity is find-or-create — a case/whitespace
+    // variant of the same name resolves to the SAME node, created:false.
+    let deduped = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "  Ada " }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        deduped.get("id").and_then(|v| v.as_str()),
+        Some(entity_id.as_str()),
+        "create_entity with a name variant must resolve to the existing \
+         entity, not mint a duplicate: {deduped:#?}"
+    );
+    assert_eq!(
+        deduped.get("created"),
+        Some(&serde_json::Value::Bool(false)),
+        "the deduped create_entity must report created:false: {deduped:#?}"
+    );
 
     // --- Step 3: find_by_prop finds A -----------------------------------
     let found = server.call_tool_ok(
@@ -154,6 +179,43 @@ fn end_to_end_scenario_over_stdio() {
         .and_then(|v| v.as_str())
         .expect("link should return a structured id")
         .to_string();
+
+    // --- Step 6b: link is idempotent per (from, to, type) — repeating the
+    // call (even with a casing/separator variant of the type) reuses the
+    // open edge instead of stacking a parallel duplicate.
+    let relink = server.call_tool_ok(
+        "link",
+        serde_json::json!({
+            "from_id": memory_id,
+            "to_id": entity_id,
+            "edge_type": "Mentions"
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        relink.get("id").and_then(|v| v.as_str()),
+        Some(edge_id.as_str()),
+        "re-linking the same (from, to, type) must return the existing edge: {relink:#?}"
+    );
+    assert_eq!(
+        relink.get("created"),
+        Some(&serde_json::Value::Bool(false)),
+        "the deduped link must report created:false: {relink:#?}"
+    );
+
+    // --- Step 6c: get_edges surfaces the open edge by type ---------------
+    let edges = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": memory_id, "edge_type": "mentions" }),
+        DEFAULT_TIMEOUT,
+    );
+    let edge_rows = edges["edges"].as_array().expect("edges array");
+    assert!(
+        edge_rows
+            .iter()
+            .any(|e| e["id"] == edge_id && e["valid_to"].is_null()),
+        "get_edges should list the open mentions edge: {edges:#?}"
+    );
 
     // --- Step 7: traverse from A (default direction "both") reaches M ---
     let traverse = server.call_tool_ok(

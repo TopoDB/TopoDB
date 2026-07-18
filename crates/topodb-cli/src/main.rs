@@ -45,7 +45,20 @@ fn main() {
     };
 
     let db = if cli.db.exists() {
-        Db::open_stored(&cli.db)
+        // Inherit the persisted spec, but silently upgrade a db still on an
+        // older STOCK default to the current one (`topodb_json::upgraded_spec`
+        // — e.g. adding the (Entity, name) text index); a customized spec is
+        // inherited verbatim. Mirrors topodb-mcp's open path exactly.
+        Db::open_stored(&cli.db).and_then(|db| {
+            let persisted = db.index_spec();
+            let upgraded = topodb_json::upgraded_spec(persisted.clone());
+            if upgraded != persisted {
+                drop(db);
+                Db::open_with(&cli.db, upgraded)
+            } else {
+                Ok(db)
+            }
+        })
     } else {
         Db::open_with(&cli.db, topodb_json::default_spec())
     };
@@ -80,9 +93,20 @@ fn main() {
             cli.pretty,
         ),
         Command::Get { id } => get(&db, default_scope, &id, cli.pretty),
-        Command::Find { label, prop, value } => {
-            find(&db, default_scope, &label, &prop, &value, cli.pretty)
-        }
+        Command::Find {
+            label,
+            prop,
+            value,
+            normalized,
+        } => find(
+            &db,
+            default_scope,
+            &label,
+            &prop,
+            &value,
+            normalized,
+            cli.pretty,
+        ),
         Command::Search { query, k } => search(&db, default_scope, &query, k, cli.pretty),
         Command::Traverse {
             seed,
@@ -165,10 +189,23 @@ fn get(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
     output::ok(&value, pretty);
 }
 
-fn find(db: &Db, scope: Scope, label: &str, prop: &str, value: &str, pretty: bool) -> ! {
+fn find(
+    db: &Db,
+    scope: Scope,
+    label: &str,
+    prop: &str,
+    value: &str,
+    normalized: bool,
+    pretty: bool,
+) -> ! {
     let pv = parse_value_arg(value);
     let scopes = topodb_json::scope_to_scope_set(scope);
-    let hits = match db.nodes_by_prop(&scopes, label, prop, &pv) {
+    let hits = if normalized {
+        db.nodes_by_prop_normalized(&scopes, label, prop, &pv)
+    } else {
+        db.nodes_by_prop(&scopes, label, prop, &pv)
+    };
+    let hits = match hits {
         Ok(hits) => hits,
         Err(e) => output::fail_engine(&e),
     };
@@ -384,6 +421,12 @@ fn link(
             Err(e) => output::fail("rejected", &e, 2),
         },
         None => topodb::Props::new(),
+    };
+    // Same edge-type vocabulary normalization as the MCP `link` tool and the
+    // batch DSL — the three write paths must not fragment the type dict.
+    let ty = match topodb_json::normalize_edge_type(&ty) {
+        Ok(t) => t,
+        Err(e) => output::fail("rejected", &e, 2),
     };
     let id = EdgeId::new();
     let op = Op::CreateEdge {

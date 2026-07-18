@@ -6,11 +6,38 @@ use crate::state::NodeRecord;
 use redb::{ReadableTable, Table, TableDefinition};
 
 pub(crate) const PROP_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("prop_index");
+
+/// Version stamp for the Str-key normalization scheme below, persisted in
+/// META (`"prop_index_norm_version"`) by `ensure_index_spec`. A file whose
+/// stored stamp differs (or is absent — every pre-v5 file) gets its
+/// PROP_INDEX drained and rebuilt on open, so the on-disk keys always match
+/// what `lookup` computes. Bump this if `normalize_str` ever changes.
+pub(crate) const PROP_INDEX_NORM_VERSION: u32 = 1;
+
+/// Canonical form for Str equality-index keys: leading/trailing whitespace
+/// stripped, internal whitespace runs (Unicode) collapsed to a single ASCII
+/// space, then Unicode-lowercased. Index maintenance and lookup both pass
+/// through this, so an index probe is case- and whitespace-insensitive —
+/// "Drew Powell", "drew powell", and " Drew\u{a0}Powell " all share one key.
+/// `Db::nodes_by_prop` restores exact-match semantics with a post-filter on
+/// the fetched records; `Db::nodes_by_prop_normalized` exposes the relaxed
+/// match directly.
+pub(crate) fn normalize_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, part) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out.to_lowercase()
+}
+
 fn value_bytes(value: &IndexValue, out: &mut Vec<u8>) {
     match value {
         IndexValue::Str(value) => {
             out.push(0);
-            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(normalize_str(value).as_bytes());
         }
         IndexValue::Int(value) => {
             out.push(1);

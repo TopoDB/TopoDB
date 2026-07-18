@@ -64,7 +64,7 @@ pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::ne
 /// permanent, per-model-only rule).
 pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_dims");
 
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -173,7 +173,20 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(4) => {}
+            Some(5) => {}
+            Some(4) => {
+                // v4 -> v5 changes no table layout — only the PROP_INDEX key
+                // scheme (Str values are now keyed by `normalize_str`, see
+                // `prop_index.rs`). The rebuild itself is driven by
+                // `ensure_index_spec` below: its `prop_index_norm_version`
+                // check sees a missing stamp on every pre-v5 file and drains +
+                // rebuilds the index. All this arm does is stamp the version
+                // so pre-v5 builds (which compute raw-byte lookup keys)
+                // refuse the file instead of silently missing every Str probe.
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(3) => {
                 // A file whose stored format_version is genuinely 3 — either
                 // written by pre-Task-7 code, or by THIS build's
@@ -450,6 +463,21 @@ impl Storage {
         let tx = self.db.begin_write().map_err(storage_err)?;
         let (needs_reindex, is_legacy_v1) = {
             let meta = tx.open_table(META).map_err(storage_err)?;
+            // The PROP_INDEX key scheme is versioned independently of the
+            // spec: a file whose stored normalization stamp differs from this
+            // build's (or is absent — every pre-v5 file) has Str index keys
+            // this build's `lookup` can't compute, so it must be rebuilt even
+            // when the spec itself is unchanged.
+            let norm_stale = match meta.get("prop_index_norm_version").map_err(storage_err)? {
+                Some(v) => {
+                    let b: [u8; 4] = v
+                        .value()
+                        .try_into()
+                        .map_err(|_| TopoError::Encoding("bad prop_index_norm_version".into()))?;
+                    u32::from_le_bytes(b) != crate::prop_index::PROP_INDEX_NORM_VERSION
+                }
+                None => true,
+            };
             if meta.get("fts_spec").map_err(storage_err)?.is_some() {
                 (true, true)
             } else {
@@ -458,11 +486,13 @@ impl Storage {
                         let stored: IndexSpec = postcard::from_bytes(v.value())
                             .map_err(|e| TopoError::Encoding(e.to_string()))?;
                         (
-                            stored.text != incoming.text || stored.equality != incoming.equality,
+                            norm_stale
+                                || stored.text != incoming.text
+                                || stored.equality != incoming.equality,
                             false,
                         )
                     }
-                    None => (!incoming.text.is_empty(), false),
+                    None => (norm_stale || !incoming.text.is_empty(), false),
                 }
             }
         };
@@ -531,6 +561,17 @@ impl Storage {
             // when they trigger no reindex.
             meta.insert("index_spec", incoming_bytes.as_slice())
                 .map_err(storage_err)?;
+            // Stamp the PROP_INDEX key-scheme version this open leaves the
+            // index in (see the `norm_stale` check above). Unconditional for
+            // the same reason as `index_spec`: a byte-identical rewrite is a
+            // harmless no-op.
+            meta.insert(
+                "prop_index_norm_version",
+                crate::prop_index::PROP_INDEX_NORM_VERSION
+                    .to_le_bytes()
+                    .as_slice(),
+            )
+            .map_err(storage_err)?;
         }
         tx.commit().map_err(storage_err)?;
         Ok(())
@@ -2243,7 +2284,7 @@ mod tests {
         let read = s.read_ops(1).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].1, ops[0]);
-        assert_eq!(s.format_version().unwrap(), 4);
+        assert_eq!(s.format_version().unwrap(), FORMAT_VERSION);
     }
 
     #[test]
@@ -2260,7 +2301,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             {
                 let mut meta = tx.open_table(META).unwrap();
-                meta.insert("format_version", 5u32.to_le_bytes().as_slice())
+                meta.insert("format_version", 999u32.to_le_bytes().as_slice())
                     .unwrap();
             }
             tx.commit().unwrap();
@@ -2271,11 +2312,13 @@ mod tests {
         let err = Storage::open(&path).err().expect("reopen must be rejected");
         match err {
             TopoError::UnsupportedFormat {
-                found: 5,
-                supported: 4,
+                found: 999,
+                supported: FORMAT_VERSION,
             } => {}
             other => {
-                panic!("expected UnsupportedFormat {{ found: 5, supported: 4 }}, got {other:?}")
+                panic!(
+                    "expected UnsupportedFormat {{ found: 999, supported: {FORMAT_VERSION} }}, got {other:?}"
+                )
             }
         }
     }
@@ -2480,7 +2523,7 @@ mod tests {
             tx.commit().unwrap();
         }
         let s = Storage::open_with(&path, spec).unwrap();
-        assert_eq!(s.format_version().unwrap(), 4);
+        assert_eq!(s.format_version().unwrap(), FORMAT_VERSION);
         let tx = s.db.begin_read().unwrap();
         let postings = tx.open_table(POSTINGS).unwrap();
         let postings_after: Vec<(Vec<u8>, Vec<u8>)> = postings

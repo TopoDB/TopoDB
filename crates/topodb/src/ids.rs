@@ -28,6 +28,16 @@ macro_rules! id_type {
             pub fn as_u128(self) -> u128 {
                 self.0 .0
             }
+
+            /// Milliseconds since the Unix epoch encoded in the id's ULID
+            /// timestamp bits — i.e. when the id was minted. This is the
+            /// creation-time signal recency-weighted ranking reads (see
+            /// `SearchOptions`): nodes carry no separate created-at field,
+            /// and an id minted via [`from_u128`](Self::from_u128) with a
+            /// zero timestamp simply reads as maximally old.
+            pub fn timestamp_ms(self) -> u64 {
+                self.0.timestamp_ms()
+            }
         }
         impl Default for $name {
             fn default() -> Self {

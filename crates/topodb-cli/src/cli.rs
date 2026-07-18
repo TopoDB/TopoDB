@@ -105,6 +105,10 @@ pub enum Command {
         /// and `--value '"ada"'` are equivalent).
         #[arg(long)]
         value: String,
+        /// Match string values case- and whitespace-insensitively
+        /// (`"drew powell"` finds `"Drew Powell"`) instead of byte-exactly.
+        #[arg(long)]
+        normalized: bool,
     },
     /// Full-text BM25 search over indexed text properties.
     Search {

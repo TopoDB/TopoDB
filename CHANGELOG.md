@@ -16,6 +16,29 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Added
+
+- **Normalized equality lookup** (`Db::nodes_by_prop_normalized`): case- and whitespace-insensitive
+  matching for `Str` values — the dedup primitive that lets a caller resolve "drew powell" to a
+  stored "Drew Powell" instead of minting a duplicate. `nodes_by_prop` keeps byte-exact semantics
+  via a record-level post-filter.
+- **`Db::edges_from`** — scoped listing of a node's outgoing edges, filterable by target, edge type,
+  and open-only. The supersession primitive: find the open edges a changed fact should close,
+  without a full traverse.
+- **Recency-weighted text search** (`Db::search_text_with` + `SearchOptions`): each hit's BM25 score
+  is multiplied by `(1-w) + w·2^(-age/half_life)`, with age read from the node id's ULID timestamp
+  (also newly exposed as `NodeId::timestamp_ms` etc.). Opt-in; `search_text` is unchanged
+  (weight 0). Applied before top-k truncation, so fresh hits can displace stale ones out of the
+  window, and floored so a strong old match is never erased.
+
+#### Changed
+
+- **Format v5** (`FORMAT_VERSION = 5`): PROP_INDEX `Str` keys are now stored under their normalized
+  form (`prop_index::normalize_str`); no table layout changed. Existing files upgrade on first open
+  — the v4→v5 arm stamps the version and `ensure_index_spec` drains + rebuilds PROP_INDEX, driven
+  by the new `"prop_index_norm_version"` META stamp (pre-v5 files lack it). Pre-v5 builds refuse a
+  v5 file with `UnsupportedFormat` rather than silently missing every `Str` probe. See FORMAT.md.
+
 #### Fixed
 
 - **Edit-heavy re-indexing no longer grows a covering postings chunk without bound.** Adding a term
@@ -160,6 +183,25 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### Unreleased
+
+#### Added
+
+- **`normalize_edge_type`** — the shared edge-type vocabulary normalizer (lowercase; whitespace/
+  hyphen/underscore runs collapse to a single `_`), used by the MCP `link` tool, the batch DSL's
+  `link` command, and `topodb-cli link`, so the three write paths can no longer fragment the edge
+  type dictionary (`works_at` vs `Works At` vs `works-at`).
+- **`upgraded_spec`** — maps a db's persisted spec forward when (and only when) it is exactly a
+  stock default this crate has shipped; customized specs are returned unchanged. Used by
+  `topodb-mcp` and `topodb-cli` to roll the default-spec change below out to existing stock dbs.
+
+#### Changed
+
+- **`default_spec` now text-indexes `(Entity, name)`** in addition to `(Memory, content)`, so
+  `search_memories`/`search-text` can find an entity by name instead of relying solely on
+  exact-match `find_by_prop`. Existing stock-spec dbs pick this up via `upgraded_spec` (one-time
+  reindex on open); batch `link` commands now normalize their `type` field.
+
 ### 0.0.4
 
 #### Changed
@@ -202,6 +244,43 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### Unreleased
+
+#### Added
+
+- **`get_edges` tool** (17 tools now): list a node's outgoing edges, filterable by target/type,
+  open-only by default — how an agent finds the edge id to `close_edge`, and checks what a node is
+  already linked to. Type filters match both the normalized and raw stored forms.
+- **`link` gains `supersede: true`**: atomically closes every other open same-type edge from the
+  source before creating/reusing the new one — the "changed employer/owner/team" flow — reporting
+  the closed ids in `superseded`.
+- **Recency-weighted `search_memories`** (`recency_weight`, default 0.3; `recency_half_life_days`,
+  default 30): fresher memories outrank stale ones at equal BM25 relevance; `recency_weight: 0`
+  restores pure BM25.
+
+#### Changed
+
+- **`create_entity` is now find-or-create.** The name is matched case- and whitespace-insensitively
+  across the read scopes, the write scope, AND `shared`; an existing entity is returned with
+  `created: false` (oldest wins among pre-existing duplicates, so links converge) and new props
+  keys are merged without overwriting. This closes the main duplicate-entity path: an
+  unconditional create guarded only by advisory "check first" prose.
+- **`link` is idempotent per `(from, to, type)`** within the write scope — an identical open edge
+  is reused (`created: false`) instead of stacking a parallel duplicate — and **edge types are
+  normalized** (`Works At` == `works-at` == `works_at`). `traverse`'s `edge_types` filter probes
+  raw and normalized forms.
+- **`find_by_prop` matches strings case/whitespace-insensitively by default**; pass `exact: true`
+  for the old byte-exact behavior.
+- **Temporal-bound sanity guards**: `link.valid_from` / `close_edge.valid_to` reject
+  seconds-since-epoch values (would date the edge to January 1970) and future timestamps (would
+  make the edge invisible to every "now" read) with actionable errors.
+- **Stock-spec auto-upgrade on open**: a db still on an older stock default spec (never
+  `--spec`-customized) is upgraded to the current default — adding the `(Entity, name)` text index
+  so entities are searchable by name — with a one-time reindex. Customized specs are untouched.
+- Tool descriptions and server instructions rewritten around the new semantics: always link what
+  you store, supersede when a to-one fact changes, retry token-variant queries before concluding
+  nothing is stored.
 
 ### 0.0.8
 
@@ -342,6 +421,22 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 ---
 
 ## `topodb-cli`
+
+### Unreleased
+
+#### Added
+
+- **`find --normalized`**: case- and whitespace-insensitive matching for string values
+  (`"drew powell"` finds `"Drew Powell"`) via the engine's new `nodes_by_prop_normalized`;
+  the default stays byte-exact.
+
+#### Changed
+
+- **`link` normalizes edge types** through the shared `topodb_json::normalize_edge_type`
+  (lowercase; whitespace/hyphens collapse to `_`), matching the MCP `link` tool and the batch DSL.
+- **Stock-spec auto-upgrade on open** (same behavior as `topodb-mcp`): a db still on an older stock
+  default spec is upgraded to the current default — adding the `(Entity, name)` text index — with a
+  one-time reindex; customized specs are inherited verbatim.
 
 ### 0.0.4
 

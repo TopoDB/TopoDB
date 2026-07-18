@@ -98,7 +98,7 @@ and scoped recall as a library call.
 | Access stats (recall-driven counters) | engine | ✅ |
 | Change feed (`subscribe` / `ops_since`) + op-log compaction | engine | ✅ |
 | Versioned on-disk format ([FORMAT.md](FORMAT.md)) | engine | ✅ |
-| MCP server (16 tools) | `topodb-mcp` | ✅ |
+| MCP server (17 tools) | `topodb-mcp` | ✅ |
 | CLI (all 17 engine operations) | `topodb-cli` | ✅ v1 |
 | One-command Pi install | `@topodb/pi` | ✅ |
 | Vector search exposed over MCP / CLI | layers | ✅ |

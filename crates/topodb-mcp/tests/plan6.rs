@@ -92,9 +92,16 @@ fn close_edge_closes_an_open_edge() {
         .as_str()
         .unwrap()
         .to_string();
+    // A real ms-since-epoch value: close_edge rejects implausible timestamps
+    // (a bare `1000` reads as a seconds-vs-ms mixup and would date the close
+    // to January 1970).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     let res = server.call_tool_ok(
         "close_edge",
-        serde_json::json!({ "id": e, "valid_to": 1000 }),
+        serde_json::json!({ "id": e, "valid_to": now_ms }),
         DEFAULT_TIMEOUT,
     );
     assert!(res["seq"].as_u64().is_some());
@@ -252,4 +259,125 @@ fn submit_batch_bad_backref_is_tool_error_and_atomic() {
         0,
         "batch must be atomic"
     );
+}
+
+/// `link` with `supersede: true` atomically closes the other open same-type
+/// edges from the source before recording the new fact — the "changed
+/// employer" flow, end to end over MCP.
+#[test]
+fn link_supersede_closes_other_open_same_type_edges() {
+    let (_dir, mut server) = fresh_server();
+    let make_entity = |name: &str, server: &mut Server| {
+        server.call_tool_ok(
+            "create_entity",
+            serde_json::json!({ "name": name }),
+            DEFAULT_TIMEOUT,
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let drew = make_entity("drew", &mut server);
+    let acme = make_entity("acme", &mut server);
+    let globex = make_entity("globex", &mut server);
+
+    let first_edge = server.call_tool_ok(
+        "link",
+        serde_json::json!({ "from_id": drew, "to_id": acme, "edge_type": "works_at" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Drew changes employers: supersede closes the acme edge.
+    let moved = server.call_tool_ok(
+        "link",
+        serde_json::json!({
+            "from_id": drew,
+            "to_id": globex,
+            "edge_type": "works_at",
+            "supersede": true
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(moved["created"], true, "{moved:#?}");
+    let superseded: Vec<&str> = moved["superseded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        superseded,
+        vec![first_edge.as_str()],
+        "the old works_at edge must be closed: {moved:#?}"
+    );
+
+    // Only the new employment is open now; the old edge survives as history.
+    let open = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": drew, "edge_type": "works_at" }),
+        DEFAULT_TIMEOUT,
+    );
+    let open_rows = open["edges"].as_array().unwrap();
+    assert_eq!(open_rows.len(), 1, "{open:#?}");
+    assert_eq!(open_rows[0]["to"].as_str().unwrap(), globex);
+    let all = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": drew, "edge_type": "works_at", "open_only": false }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        all["edges"].as_array().unwrap().len(),
+        2,
+        "the closed edge must remain in history: {all:#?}"
+    );
+}
+
+/// The seconds-vs-milliseconds and future-timestamp guards on `link`.
+#[test]
+fn link_rejects_implausible_valid_from() {
+    let (_dir, mut server) = fresh_server();
+    let a = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "a" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "b" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // Seconds-since-epoch (too small) and far-future (beyond skew slack)
+    // must both be rejected before anything is written.
+    for bad in [now_ms / 1000, now_ms + 3_600_000] {
+        let resp = server.call_tool(
+            "link",
+            serde_json::json!({
+                "from_id": a, "to_id": b, "edge_type": "knows", "valid_from": bad
+            }),
+            DEFAULT_TIMEOUT,
+        );
+        expect_tool_error(&resp);
+    }
+    // A plausible past value is accepted.
+    let ok = server.call_tool_ok(
+        "link",
+        serde_json::json!({
+            "from_id": a, "to_id": b, "edge_type": "knows", "valid_from": now_ms - 1000
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(ok["created"], true);
 }

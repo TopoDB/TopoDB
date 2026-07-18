@@ -51,7 +51,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // and a stdio MCP server is a single writer per db path.
     let db = match &config.spec {
         Some(spec) => Db::open_with(&config.db_path, spec.clone())?,
-        None if config.db_path.exists() => Db::open_stored(&config.db_path)?,
+        None if config.db_path.exists() => {
+            // Inherit the persisted spec — but a db still on an older STOCK
+            // default (never `--spec`-customized) is silently upgraded to the
+            // current default (`topodb_json::upgraded_spec`), e.g. picking up
+            // the (Entity, name) text index so entities are searchable by
+            // name. A one-time reindex on open is the cost. Customized specs
+            // are inherited verbatim, exactly as before.
+            let db = Db::open_stored(&config.db_path)?;
+            let persisted = db.index_spec();
+            let upgraded = topodb_json::upgraded_spec(persisted.clone());
+            if upgraded != persisted {
+                drop(db);
+                Db::open_with(&config.db_path, upgraded)?
+            } else {
+                db
+            }
+        }
         None => Db::open_with(&config.db_path, config::default_spec())?,
     };
     let server = TopoServer::new(db, &config);

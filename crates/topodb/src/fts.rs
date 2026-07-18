@@ -67,6 +67,39 @@ pub(crate) const K1: f32 = 1.2;
 /// BM25 length-normalisation strength.
 pub(crate) const B: f32 = 0.75;
 
+/// Tuning for [`Db::search_text_with`]. `Default` disables every option, so
+/// `search_text_with(scopes, query, k, &SearchOptions::default())` behaves
+/// identically to [`Db::search_text`].
+#[derive(Debug, Clone)]
+pub struct SearchOptions {
+    /// How much recency shifts ranking, in `0.0..=1.0`. At weight `w`, each
+    /// hit's BM25 score is multiplied by `(1 - w) + w * 2^(-age / half_life)`
+    /// — a fresh node keeps its full score, a node much older than the
+    /// half-life bottoms out at `(1 - w)` of it. `0.0` (the default) is pure
+    /// BM25; the floor means recency reorders comparable hits without ever
+    /// erasing a strong old match. Age comes from the node id's ULID
+    /// timestamp ([`crate::NodeId::timestamp_ms`]) — creation time, not last
+    /// access.
+    pub recency_weight: f32,
+    /// The age at which the recency factor has decayed halfway to its floor.
+    /// Must be `> 0` when `recency_weight > 0`.
+    pub recency_half_life_ms: i64,
+    /// The "now" ages are measured against. `None` reads the wall clock once
+    /// per call (this is a read path; only writes must never embed
+    /// wall-clock time). The deterministic seam for tests.
+    pub now_ms: Option<i64>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            recency_weight: 0.0,
+            recency_half_life_ms: 30 * 24 * 60 * 60 * 1000,
+            now_ms: None,
+        }
+    }
+}
+
 /// Lowercase, split on every non-alphanumeric boundary, drop empty tokens.
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
@@ -792,8 +825,36 @@ impl Db {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_text_with(scopes, query, k, &SearchOptions::default())
+    }
+
+    /// [`Db::search_text`] with tuning: currently recency weighting (see
+    /// [`SearchOptions`]). The recency factor is applied to every scored
+    /// candidate BEFORE the sort and top-`k` truncation, so a fresher hit can
+    /// displace a staler one out of the returned window, not merely reorder
+    /// within it. `Rejected` if `recency_weight` is outside `0.0..=1.0`, or
+    /// `recency_half_life_ms <= 0` while the weight is nonzero.
+    pub fn search_text_with(
+        &self,
+        scopes: &ScopeSet,
+        query: &str,
+        k: usize,
+        options: &SearchOptions,
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if k == 0 {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
+        }
+        if !(0.0..=1.0).contains(&options.recency_weight) || !options.recency_weight.is_finite() {
+            return Err(TopoError::Rejected(format!(
+                "recency_weight must be in 0.0..=1.0, got {}",
+                options.recency_weight
+            )));
+        }
+        if options.recency_weight > 0.0 && options.recency_half_life_ms <= 0 {
+            return Err(TopoError::Rejected(format!(
+                "recency_half_life_ms must be > 0, got {}",
+                options.recency_half_life_ms
+            )));
         }
         let tokens = tokenize(query);
         if tokens.is_empty() {
@@ -854,6 +915,18 @@ impl Db {
             }
         }
 
+        // Resolve the recency clock once per call, and only when the factor
+        // is actually in play — pure-BM25 callers never touch the wall clock.
+        let w = options.recency_weight;
+        let recency_now = (w > 0.0).then(|| {
+            options.now_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before UNIX epoch")
+                    .as_millis() as i64
+            })
+        });
+
         let mut out: Vec<(NodeRecord, f32)> = Vec::with_capacity(scores.len());
         for (slot, score) in scores {
             if let Some(rec) = read_node_by_slot(
@@ -871,6 +944,17 @@ impl Db {
                 // is corrupt/desynced from its own postings row, not against
                 // cross-scope leakage.
                 if scopes.contains(rec.scope) {
+                    let score = match recency_now {
+                        None => score,
+                        Some(now) => {
+                            // A node id minted "in the future" relative to
+                            // `now` (clock skew, or a backdated `now_ms`)
+                            // clamps to age 0 — full score, never a boost.
+                            let age = (now - rec.id.timestamp_ms() as i64).max(0) as f32;
+                            let half_life = options.recency_half_life_ms as f32;
+                            score * ((1.0 - w) + w * (-(age / half_life)).exp2())
+                        }
+                    };
                     out.push((rec, score));
                 }
             }

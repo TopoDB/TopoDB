@@ -194,3 +194,89 @@ fn changed_text_spec_reindexes_at_open() {
         1
     );
 }
+
+/// Recency weighting: at equal BM25 relevance, `search_text_with` with a
+/// nonzero `recency_weight` ranks the fresher node (by its id's ULID
+/// timestamp) above the staler one — and with weight 0 the ordering falls
+/// back to the pure-BM25 tie-break (ascending id, i.e. OLDEST first),
+/// proving the reorder really is the recency factor.
+#[test]
+fn recency_weight_prefers_fresher_hit_at_equal_relevance() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+
+    // Controlled creation times via from_u128: a ULID's top 48 bits are its
+    // millisecond timestamp.
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = 1_800_000_000_000; // fixed "now" for determinism
+    let ulid_at = |ts_ms: i64, n: u128| ((ts_ms as u128) << 80) | n;
+    let old_id = NodeId::from_u128(ulid_at(now - 120 * DAY_MS, 1));
+    let new_id = NodeId::from_u128(ulid_at(now - DAY_MS, 2));
+    for id in [old_id, new_id] {
+        let mut props = Props::new();
+        props.insert(
+            "content".into(),
+            PropValue::Str("identical recency probe".into()),
+        );
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }])
+        .unwrap();
+    }
+
+    // Weight 0 (the search_text default): equal scores, tie-break by
+    // ascending id — the OLDER node first.
+    let plain = db.search_text(&scopes, "recency probe", 10).unwrap();
+    assert_eq!(plain.len(), 2);
+    assert_eq!(plain[0].0.id, old_id);
+    assert!((plain[0].1 - plain[1].1).abs() < f32::EPSILON);
+
+    // Weight on: the fresher node must outrank the stale one.
+    let opts = SearchOptions {
+        recency_weight: 0.5,
+        recency_half_life_ms: 30 * DAY_MS,
+        now_ms: Some(now),
+    };
+    let weighted = db
+        .search_text_with(&scopes, "recency probe", 10, &opts)
+        .unwrap();
+    assert_eq!(weighted.len(), 2);
+    assert_eq!(weighted[0].0.id, new_id, "fresher hit must rank first");
+    assert!(weighted[0].1 > weighted[1].1);
+    // The floor guarantees a stale hit keeps at least (1 - w) of its score.
+    assert!(weighted[1].1 >= plain[1].1 * 0.5 - f32::EPSILON);
+}
+
+/// Bad recency tuning is a caller error, not a silent no-op.
+#[test]
+fn search_text_with_rejects_bad_recency_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    for opts in [
+        SearchOptions {
+            recency_weight: -0.1,
+            ..Default::default()
+        },
+        SearchOptions {
+            recency_weight: 1.5,
+            ..Default::default()
+        },
+        SearchOptions {
+            recency_weight: 0.5,
+            recency_half_life_ms: 0,
+            now_ms: None,
+        },
+    ] {
+        assert!(matches!(
+            db.search_text_with(&scopes, "anything", 10, &opts),
+            Err(TopoError::Rejected(_))
+        ));
+    }
+}
