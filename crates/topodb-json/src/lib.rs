@@ -30,13 +30,19 @@ pub const ENTITY_LABEL: &str = "Entity";
 pub const ENTITY_NAME_PROP: &str = "name";
 pub const MEMORY_LABEL: &str = "Memory";
 pub const MEMORY_CONTENT_PROP: &str = "content";
+pub const ALIAS_LABEL: &str = "Alias";
+pub const ALIAS_NAME_PROP: &str = "name";
+pub const ALIAS_EDGE_TYPE: &str = "alias_of";
+pub const SYNONYM_LABEL: &str = "Synonym";
+pub const SYNONYM_TERM_PROP: &str = "term";
+pub const SYNONYM_EXPANSION_PROP: &str = "expansion";
 
 /// The ONE canonical default [`IndexSpec`] for TopoDB's built-in write shapes,
 /// shared by every front end (`topodb-mcp` when `--spec` is omitted;
 /// `topodb-cli` when it creates a brand-new db file). Declares equality on
-/// `(Entity, name)` and text on `(Memory, content)`, using the shared
-/// [`ENTITY_LABEL`]/[`ENTITY_NAME_PROP`]/[`MEMORY_LABEL`]/[`MEMORY_CONTENT_PROP`]
-/// constants.
+/// `(Entity, name)`, `(Alias, name)`, and `(Synonym, term)`, and text on
+/// `(Memory, content)`, `(Entity, name)`, and `(Alias, name)`, using the shared
+/// label and property constants.
 ///
 /// Single-sourcing this is load-bearing: because a CLI-created db and an
 /// MCP-created db are opened with a *byte-identical* persisted `index_spec`,
@@ -47,10 +53,22 @@ pub const MEMORY_CONTENT_PROP: &str = "content";
 /// tool wrote it.
 pub fn default_spec() -> IndexSpec {
     IndexSpec {
-        equality: vec![PropIndex {
-            label: ENTITY_LABEL.into(),
-            prop: ENTITY_NAME_PROP.into(),
-        }],
+        equality: vec![
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+            // Aliases resolve exactly like entity names (upsert/find probe
+            // both); synonym terms are looked up per query word.
+            PropIndex {
+                label: ALIAS_LABEL.into(),
+                prop: ALIAS_NAME_PROP.into(),
+            },
+            PropIndex {
+                label: SYNONYM_LABEL.into(),
+                prop: SYNONYM_TERM_PROP.into(),
+            },
+        ],
         text: vec![
             PropIndex {
                 label: MEMORY_LABEL.into(),
@@ -65,15 +83,21 @@ pub fn default_spec() -> IndexSpec {
                 label: ENTITY_LABEL.into(),
                 prop: ENTITY_NAME_PROP.into(),
             },
+            PropIndex {
+                label: ALIAS_LABEL.into(),
+                prop: ALIAS_NAME_PROP.into(),
+            },
         ],
     }
 }
 
-/// The pre-0.0.9 stock spec: equality on `(Entity, name)`, text on
-/// `(Memory, content)` only. Kept so front ends can recognize a db that is
-/// still on the un-customized default and [`upgraded_spec`] it.
-fn legacy_default_spec() -> IndexSpec {
-    IndexSpec {
+/// Every stock spec generation this crate has ever shipped, oldest first.
+/// A persisted spec equal (order-insensitively) to ANY of them upgrades to
+/// the current `default_spec`; anything else is a customization and is
+/// returned unchanged.
+fn stock_generations() -> Vec<IndexSpec> {
+    // g0 (pre-0.0.9): equality (Entity, name); text (Memory, content).
+    let g0 = IndexSpec {
         equality: vec![PropIndex {
             label: ENTITY_LABEL.into(),
             prop: ENTITY_NAME_PROP.into(),
@@ -82,13 +106,27 @@ fn legacy_default_spec() -> IndexSpec {
             label: MEMORY_LABEL.into(),
             prop: MEMORY_CONTENT_PROP.into(),
         }],
-    }
+    };
+    // g1: g0 + text (Entity, name).
+    let g1 = IndexSpec {
+        equality: g0.equality.clone(),
+        text: vec![
+            PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            },
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+        ],
+    };
+    vec![g0, g1]
 }
 
 /// Maps a db's persisted spec forward when — and only when — it is exactly a
-/// stock default this crate has shipped: the legacy default upgrades to the
-/// current [`default_spec`] (adding `(Entity, name)` to the text index, which
-/// triggers a one-time reindex on open). Any other spec — a `--spec`
+/// stock default this crate has shipped: any recognized stock generation
+/// upgrades to the current [`default_spec`]. Any other spec — a `--spec`
 /// customization, however small — is returned unchanged: silently rewriting a
 /// declared spec would reindex data behind its owner's back. Comparison is
 /// order-insensitive, matching how the engine's `ensure_index_spec` compares
@@ -109,7 +147,8 @@ pub fn upgraded_spec(persisted: IndexSpec) -> IndexSpec {
         text.sort();
         (eq, text)
     };
-    if sorted(&persisted) == sorted(&legacy_default_spec()) {
+    let p = sorted(&persisted);
+    if stock_generations().iter().any(|g| sorted(g) == p) {
         default_spec()
     } else {
         persisted
@@ -931,5 +970,48 @@ mod tests {
     fn f32_vec_rejects_overflow_to_infinity() {
         // Finite as f64 but overflows f32 -> must be rejected, not silently Inf.
         assert!(json_to_f32_vec(&serde_json::json!([1e40])).is_err());
+    }
+
+    #[test]
+    fn default_spec_covers_alias_and_synonym() {
+        let s = default_spec();
+        let has = |list: &[PropIndex], l: &str, p: &str| {
+            list.iter().any(|pi| pi.label == l && pi.prop == p)
+        };
+        assert!(has(&s.equality, ALIAS_LABEL, ALIAS_NAME_PROP));
+        assert!(has(&s.equality, SYNONYM_LABEL, SYNONYM_TERM_PROP));
+        assert!(has(&s.text, ALIAS_LABEL, ALIAS_NAME_PROP));
+    }
+
+    #[test]
+    fn every_stock_generation_upgrades_to_current_default() {
+        // v0 (pre-0.0.9): eq (Entity,name); text (Memory,content).
+        let v0 = IndexSpec {
+            equality: vec![PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            }],
+            text: vec![PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            }],
+        };
+        // v1: v0 + text (Entity,name).
+        let v1 = IndexSpec {
+            equality: v0.equality.clone(),
+            text: vec![
+                PropIndex {
+                    label: MEMORY_LABEL.into(),
+                    prop: MEMORY_CONTENT_PROP.into(),
+                },
+                PropIndex {
+                    label: ENTITY_LABEL.into(),
+                    prop: ENTITY_NAME_PROP.into(),
+                },
+            ],
+        };
+        assert_eq!(upgraded_spec(v0), default_spec());
+        assert_eq!(upgraded_spec(v1), default_spec());
+        assert_eq!(upgraded_spec(default_spec()), default_spec());
     }
 }
