@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod command;
 pub mod mock;
 
 use std::collections::BTreeMap;
