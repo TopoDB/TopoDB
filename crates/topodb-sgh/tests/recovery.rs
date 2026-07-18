@@ -1,0 +1,116 @@
+use topodb::Db;
+use topodb_sgh::executor::Executor;
+use topodb_sgh::recovery::{contract_preserved, Repairer};
+use topodb_sgh::runner::mock::MockRunner;
+use topodb_sgh::runner::NodeOutcome;
+use topodb_sgh::schema::validate::validate;
+use topodb_sgh::schema::{Graph, Node};
+
+fn one_node(retries: u32, repairs: u32) -> Graph {
+    Graph::from_yaml(&format!(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {{id: a, kind: agent, prompt: p, budget: {{retries: {retries}, repairs: {repairs}}}}}\n"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn retries_are_exhausted_before_blocking() {
+    let g = one_node(2, 0);
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    assert_eq!(runner.call_count(), 3, "1 initial + 2 retries");
+}
+
+#[test]
+fn a_retry_that_succeeds_ends_the_ladder() {
+    let g = one_node(2, 0);
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script(
+        "a",
+        vec![
+            NodeOutcome::Failed { error: "flaky".into() },
+            NodeOutcome::Succeeded { output: "{}".into() },
+        ],
+    );
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.succeeded, vec!["a".to_string()]);
+    assert_eq!(runner.call_count(), 2, "stopped as soon as it succeeded");
+}
+
+#[test]
+fn contract_preserving_repair_is_accepted() {
+    let g = one_node(0, 1);
+    let original: &Node = &g.nodes[0];
+    let mut repaired = original.clone();
+    repaired.prompt = Some("a better prompt".into());
+    assert!(contract_preserved(original, &repaired));
+}
+
+#[test]
+fn contract_breaking_repairs_are_rejected() {
+    let g = one_node(0, 1);
+    let original: &Node = &g.nodes[0];
+
+    let mut renamed = original.clone();
+    renamed.id = "b".into();
+    assert!(!contract_preserved(original, &renamed), "id change is not a repair");
+
+    let mut redeped = original.clone();
+    redeped.needs = vec!["z".into()];
+    assert!(!contract_preserved(original, &redeped), "new dependency is not a repair");
+
+    let mut reschema = original.clone();
+    reschema.output = Some(topodb_sgh::schema::OutputSpec {
+        schema: serde_json::json!({"type": "object"}),
+    });
+    assert!(!contract_preserved(original, &reschema), "schema change is not a repair");
+
+    let mut rebudget = original.clone();
+    rebudget.budget.retries = 99;
+    assert!(!contract_preserved(original, &rebudget), "budget change is not a repair");
+}
+
+#[test]
+fn repair_is_attempted_after_retries_and_records_an_attempt() {
+    let g = one_node(1, 1);
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+
+    struct AlwaysRepairs;
+    impl Repairer for AlwaysRepairs {
+        fn repair(&self, node: &Node, _error: &str) -> Option<Node> {
+            let mut n = node.clone();
+            n.prompt = Some("revised".into());
+            Some(n)
+        }
+    }
+
+    let mut ex = Executor::new(store, v, &runner).with_repairer(&AlwaysRepairs);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    // 1 initial + 1 retry + 1 repaired execution
+    assert_eq!(runner.call_count(), 3);
+
+    let attempts = ex.store_ref().attempts("a").unwrap();
+    assert!(attempts.iter().any(|(rung, _)| rung == "retry"));
+    assert!(attempts.iter().any(|(rung, _)| rung == "repair"));
+}
