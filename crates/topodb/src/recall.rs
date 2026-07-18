@@ -107,7 +107,7 @@ pub struct RecallQuery {
     /// legs run recency-free so the decay can't compound). `options.now_ms`
     /// pins BOTH clocks a call needs to be deterministic: the post-fusion
     /// recency decay's "now" (see above), AND the graph leg's `as_of`
-    /// traversal time (`SubgraphQuery::as_of`, passed through verbatim) — a
+    /// traversal time (`TraversalQuery::as_of`, passed through verbatim) — a
     /// test or replay that fixes `now_ms` gets a single consistent instant
     /// for every time-sensitive part of one `recall` call, not two that
     /// could drift apart.
