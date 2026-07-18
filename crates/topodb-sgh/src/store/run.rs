@@ -48,6 +48,11 @@ impl NodeState {
         }
     }
 
+    // Inherent by choice: `Option` return (not `Result<_, Err>`) is the right
+    // shape for a closed vocabulary, and implementing `std::str::FromStr`
+    // would force an error type nobody consumes. CI's clippy 1.97 flags the
+    // name; the ambiguity is acceptable here.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         NodeState::ALL.into_iter().find(|v| v.as_str() == s)
     }
