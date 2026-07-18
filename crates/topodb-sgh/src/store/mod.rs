@@ -23,6 +23,8 @@ pub enum SghError {
     Engine(#[from] topodb::TopoError),
     #[error("supersession lost the race {attempts} times")]
     Contended { attempts: u32 },
+    #[error("endpoint node {node:?} does not exist (or is out of scope)")]
+    MissingEndpoint { node: topodb::NodeId },
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }

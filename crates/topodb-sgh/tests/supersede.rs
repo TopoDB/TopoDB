@@ -1,5 +1,6 @@
 use topodb::{Db, Direction, EdgeRecord, NodeId, Op, Props, Scope, ScopeId, ScopeSet, TraversalQuery};
 use topodb_sgh::store::supersede::link_superseding;
+use topodb_sgh::store::SghError;
 
 fn node(db: &Db, scope: Scope, label: &str, t: i64) -> NodeId {
     let id = NodeId::new();
@@ -103,4 +104,45 @@ fn other_edge_types_are_untouched() {
 
     let deps = open_edges(&db, &scopes, step, "DEPENDS_ON", 12);
     assert_eq!(deps.len(), 1, "DEPENDS_ON survives HAS_STATE supersession");
+}
+
+/// A nonexistent endpoint must fail immediately with `MissingEndpoint`, not
+/// burn all `MAX_ATTEMPTS` retries and report a misleading `Contended`. Before
+/// the endpoint pre-check, `Db::submit_at` would reject the `CreateEdge` (its
+/// `to` doesn't exist) with the same `TopoError::Rejected` used for a lost
+/// race, and the retry loop had no way to tell the two apart — so this would
+/// have looped 16 times and returned `SghError::Contended { attempts: 16 }`.
+#[test]
+fn nonexistent_target_fails_fast_with_missing_endpoint_not_contended() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let sid = ScopeId::new();
+    let scope = Scope::Id(sid);
+
+    let step = node(&db, scope, "SghNode", 1);
+    let ghost = NodeId::new(); // never created
+
+    let err = link_superseding(&db, scope, step, ghost, "HAS_STATE", 10).unwrap_err();
+    match err {
+        SghError::MissingEndpoint { node } => assert_eq!(node, ghost),
+        other => panic!("expected MissingEndpoint {{ node: ghost }}, got {other:?}"),
+    }
+}
+
+/// Same fast-fail behavior when the *source* is the missing endpoint.
+#[test]
+fn nonexistent_source_fails_fast_with_missing_endpoint_not_contended() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let sid = ScopeId::new();
+    let scope = Scope::Id(sid);
+
+    let ghost = NodeId::new(); // never created
+    let running = node(&db, scope, "SghState", 1);
+
+    let err = link_superseding(&db, scope, ghost, running, "HAS_STATE", 10).unwrap_err();
+    match err {
+        SghError::MissingEndpoint { node } => assert_eq!(node, ghost),
+        other => panic!("expected MissingEndpoint {{ node: ghost }}, got {other:?}"),
+    }
 }
