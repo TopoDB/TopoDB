@@ -215,6 +215,46 @@ fn graph_boost_surfaces_linked_but_lexically_silent_neighbor() {
 }
 
 #[test]
+fn recency_applies_once_post_fusion() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = 1_800_000_000_000;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+    let old_id = NodeId::from_u128(ulid_at(now - 120 * DAY_MS, 1));
+    let new_id = NodeId::from_u128(ulid_at(now - DAY_MS, 2));
+    for id in [old_id, new_id] {
+        let mut props = Props::new();
+        props.insert(
+            "content".into(),
+            PropValue::Str("identical fusion probe".into()),
+        );
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }])
+        .unwrap();
+    }
+    let mut q = text_only(&scopes, "fusion probe", 10);
+    q.options = SearchOptions {
+        recency_weight: 0.5,
+        recency_half_life_ms: 30 * DAY_MS,
+        now_ms: Some(now),
+        ..Default::default()
+    };
+    let hits = db.recall(&q).unwrap();
+    assert_eq!(
+        hits[0].0.id, new_id,
+        "fresher node must rank first post-fusion"
+    );
+    assert!(hits[0].1 > hits[1].1);
+}
+
+#[test]
 fn expansions_surface_synonym_hits_at_a_discount() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
