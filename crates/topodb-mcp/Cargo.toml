@@ -1,6 +1,6 @@
 [package]
 name = "topodb-mcp"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -19,6 +19,7 @@ rmcp = { version = "2.2.0", features = ["server", "transport-io"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
 schemars = "1.2.1"
 fastembed = { version = "5.17.3", default-features = false, features = ["hf-hub-native-tls", "ort-load-dynamic"] }
+libloading = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

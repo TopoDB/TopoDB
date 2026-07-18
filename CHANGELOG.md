@@ -287,6 +287,20 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
+### 0.0.10 — 2026-07-18
+
+#### Fixed
+
+- **Servers without an ONNX Runtime library became unkillable zombies holding the database lock.**
+  `ort`'s load-dynamic FAILURE path re-enters its own `OnceLock` while constructing the load error
+  (upstream bug), permanently deadlocking the embedder init thread — and ort's
+  `release_env_on_exit` atexit handler then blocks `exit()` on the mutex that thread holds, so the
+  process survives stdin EOF forever and every later open of the same db fails with
+  `DatabaseAlreadyOpen` (caught by the plugin broker's idle-exit test on Linux CI). The embedder
+  now pre-flights the dylib with `libloading` before any ort call: no loadable ONNX Runtime lands
+  `failed` status cleanly (text+graph-only recall, per the degradation contract) and the process
+  exits normally. Release checklist: bump the plugin's `SERVER_VERSION` pin to 0.0.10.
+
 ### 0.0.9 — 2026-07-18
 
 #### Added

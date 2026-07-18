@@ -57,7 +57,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// scenario.
 pub struct Server {
     child: Child,
-    stdin: std::process::ChildStdin,
+    // Option so `close_stdin_and_wait_exit` can drop it (EOF) while the
+    // Server value stays alive for the exit wait.
+    stdin: Option<std::process::ChildStdin>,
     lines: mpsc::Receiver<String>,
     _reader: thread::JoinHandle<()>,
     next_id: i64,
@@ -68,8 +70,18 @@ impl Server {
     /// piped stdin/stdout and inherited stderr (so a crashing server's panic
     /// message shows up in `cargo test` output instead of being swallowed).
     pub fn spawn(db_path: &Path, extra_args: &[&str]) -> Self {
+        Self::spawn_with_env(db_path, extra_args, &[])
+    }
+
+    /// Like [`Server::spawn`], but with extra environment variables — the seam
+    /// for tests that must control the embedder's ONNX Runtime discovery
+    /// (`ORT_DYLIB_PATH`) without depending on the host machine's state.
+    pub fn spawn_with_env(db_path: &Path, extra_args: &[&str], env: &[(&str, &str)]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_topodb-mcp"));
         cmd.arg("--db").arg(db_path);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         // Keep every test server offline by default: `--embeddings off` goes
         // BEFORE `extra_args` because the config parse loop is last-wins, so
         // a test that wants to exercise the real embedder passes its own
@@ -109,7 +121,7 @@ impl Server {
 
         Server {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines: rx,
             _reader: reader,
             next_id: 0,
@@ -126,8 +138,9 @@ impl Server {
     fn send(&mut self, msg: &serde_json::Value) {
         let mut line = serde_json::to_string(msg).expect("serialize");
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).expect("write stdin");
-        self.stdin.flush().expect("flush stdin");
+        let stdin = self.stdin.as_mut().expect("stdin already closed");
+        stdin.write_all(line.as_bytes()).expect("write stdin");
+        stdin.flush().expect("flush stdin");
     }
 
     /// Reads the next stdout line as JSON, failing if none arrives before
@@ -235,6 +248,30 @@ impl Server {
     ) -> serde_json::Value {
         let resp = self.call_tool(name, arguments, timeout);
         structured_content(&resp)
+    }
+}
+
+impl Server {
+    /// Closes the server's stdin (delivering EOF) and waits up to `timeout`
+    /// for the process to exit; `true` iff it exited. The regression seam
+    /// for "a server whose parent went away must actually terminate" — a
+    /// leaked server holds the redb lock and wedges every later open of the
+    /// same db (the 0.0.9 broker idle-exit failure).
+    pub fn close_stdin_and_wait_exit(&mut self, timeout: std::time::Duration) -> bool {
+        drop(self.stdin.take());
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(_) => return false,
+            }
+        }
     }
 }
 

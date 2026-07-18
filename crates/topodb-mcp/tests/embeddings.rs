@@ -194,3 +194,58 @@ fn dirs_or_home_cache() -> std::path::PathBuf {
         .map(|h| std::path::PathBuf::from(h).join(".cache/topodb/models"))
         .unwrap_or_else(|| std::path::PathBuf::from(".topodb-models"))
 }
+
+/// Regression for the 0.0.9 Linux CI hang: with no loadable ONNX Runtime,
+/// `ort`'s load-dynamic FAILURE path re-enters its own OnceLock (upstream
+/// bug), deadlocking the init thread — which then wedges `exit()` via ort's
+/// `release_env_on_exit` atexit handler, so the process holds the redb lock
+/// forever (the broker idle-exit `DatabaseAlreadyOpen` failure). The fix
+/// pre-flights the dylib with `libloading` BEFORE touching ort: status must
+/// reach `failed` (not hang at `downloading`), and the process must exit
+/// promptly on stdin EOF. `ORT_DYLIB_PATH` pointing nowhere makes the
+/// missing-dylib condition deterministic on every platform.
+#[test]
+fn missing_ort_dylib_fails_fast_and_exit_is_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("noort.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let mut server = common::Server::spawn_with_env(
+        &db_path,
+        // Opt back into embeddings over the test-default off (last-wins).
+        &[
+            "--scope",
+            scope.as_str(),
+            "--embeddings",
+            "bge-small-en-v1.5",
+        ],
+        &[("ORT_DYLIB_PATH", "/nonexistent/libonnxruntime.so")],
+    );
+    server.initialize(DEFAULT_TIMEOUT);
+
+    // Status must become `failed` — pre-fix it wedges at `downloading`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let info = server.call_tool_ok("db_info", serde_json::json!({}), DEFAULT_TIMEOUT);
+        match info["embeddings"]["status"].as_str().unwrap() {
+            "failed" => break,
+            "ready" => {
+                panic!("embedder must not reach ready with a bogus ORT_DYLIB_PATH: {info:#?}")
+            }
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "embedder never reached failed (stuck downloading = the ort \
+                     OnceLock deadlock): {info:#?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
+    // And the process must die on stdin EOF — pre-fix, ort's atexit handler
+    // blocks exit() forever on Linux, leaking a db-lock-holding zombie.
+    assert!(
+        server.close_stdin_and_wait_exit(std::time::Duration::from_secs(5)),
+        "server did not exit within 5s of stdin EOF"
+    );
+}

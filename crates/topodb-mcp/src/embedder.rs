@@ -20,6 +20,41 @@ use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
 
+/// Probes for a loadable ONNX Runtime dynamic library the same way ort's
+/// `load-dynamic` will resolve it next: an explicit `ORT_DYLIB_PATH` wins
+/// outright (and is the ONLY candidate when set — matching ort, which does
+/// not fall back past an explicit override); otherwise the platform's
+/// conventional soname via the system loader search path. `Ok` means ort's
+/// own load should succeed; `Err` carries every candidate's failure.
+fn ort_dylib_available() -> Result<(), String> {
+    let candidates: Vec<String> = match std::env::var("ORT_DYLIB_PATH") {
+        Ok(p) if !p.is_empty() => vec![p],
+        _ => {
+            if cfg!(target_os = "windows") {
+                vec!["onnxruntime.dll".into()]
+            } else if cfg!(target_os = "macos") {
+                vec!["libonnxruntime.dylib".into()]
+            } else {
+                vec!["libonnxruntime.so".into()]
+            }
+        }
+    };
+    let mut errs = Vec::new();
+    for candidate in &candidates {
+        // SAFETY: loading a shared library runs its initializers; this is
+        // the exact load ort itself performs immediately after a successful
+        // probe, so no new code runs that wouldn't have run anyway.
+        match unsafe { libloading::Library::new(candidate) } {
+            Ok(lib) => {
+                drop(lib);
+                return Ok(());
+            }
+            Err(e) => errs.push(format!("{candidate}: {e}")),
+        }
+    }
+    Err(errs.join("; "))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbedderStatus {
@@ -100,6 +135,26 @@ impl Embedder {
         // across this thread boundary — a failed model must degrade to
         // `Failed`, never crash the process.
         std::thread::spawn(move || {
+            // PRE-FLIGHT, load-bearing: confirm an ONNX Runtime dylib is
+            // loadable BEFORE any call into ort. ort's load-dynamic FAILURE
+            // path re-enters its own OnceLock while constructing the error
+            // (upstream bug), permanently deadlocking this thread — and its
+            // `release_env_on_exit` atexit handler then blocks `exit()` on
+            // the mutex that deadlocked thread holds, so the process never
+            // dies and holds the redb lock forever (the 0.0.9 broker
+            // idle-exit `DatabaseAlreadyOpen` CI failure). A failed probe
+            // here lands `Failed` cleanly without ort ever running.
+            if let Err(err) = ort_dylib_available() {
+                *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
+                eprintln!(
+                    "topodb-mcp: embedding model {model_name} unavailable (no loadable \
+                     ONNX Runtime dynamic library: {err}); running text-only. Install \
+                     ONNX Runtime (e.g. `brew install onnxruntime` on macOS, an \
+                     onnxruntime package on Linux) or point ORT_DYLIB_PATH at the \
+                     library."
+                );
+                return;
+            }
             let result = std::panic::catch_unwind(|| {
                 fastembed::TextEmbedding::try_new(
                     fastembed::TextInitOptions::new(known_model).with_cache_dir(cache_dir),
