@@ -2919,6 +2919,7 @@ dependencies = [
  "redb",
  "rust-stemmers",
  "serde",
+ "serde_json",
  "smol_str",
  "tempfile",
  "thiserror 2.0.18",

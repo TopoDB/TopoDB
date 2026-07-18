@@ -125,3 +125,72 @@ fn real_model_semantic_recall_end_to_end() {
         "semantic-only match must surface: {hits:#?}"
     );
 }
+
+/// One-shot generator for the committed golden corpus. Run manually:
+/// cargo test -p topodb-mcp --test embeddings -- --ignored generate_recall_corpus
+/// Reads corpus-src.json (texts + expectations, hand-written), computes
+/// real embeddings for every node text and query, writes
+/// crates/topodb/tests/fixtures/recall-corpus.json. Committed so ENGINE
+/// tests never need the model.
+#[test]
+#[ignore]
+fn generate_recall_corpus() {
+    use std::path::Path;
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Src {
+        nodes: Vec<SrcNode>,
+        synonyms: Vec<serde_json::Value>,
+        queries: Vec<SrcQuery>,
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct SrcNode {
+        key: String,
+        label: String,
+        text: String,
+        links: Vec<String>,
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct SrcQuery {
+        query: String,
+        expect_top3: Vec<String>,
+    }
+
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../topodb/tests/fixtures");
+    let src: Src = serde_json::from_str(
+        &std::fs::read_to_string(fixtures.join("recall-corpus-src.json")).unwrap(),
+    )
+    .unwrap();
+
+    let mut model = fastembed::TextEmbedding::try_new(
+        fastembed::TextInitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
+            .with_cache_dir(dirs_or_home_cache()), // helper below
+    )
+    .expect("model must load (network needed on first run)");
+
+    let node_texts: Vec<&str> = src.nodes.iter().map(|n| n.text.as_str()).collect();
+    let node_vecs = model.embed(node_texts, None).unwrap();
+    let query_texts: Vec<&str> = src.queries.iter().map(|q| q.query.as_str()).collect();
+    let query_vecs = model.embed(query_texts, None).unwrap();
+
+    let out = serde_json::json!({
+        "model": "bge-small-en-v1.5",
+        "nodes": src.nodes.iter().zip(&node_vecs).map(|(n, v)| serde_json::json!({
+            "key": n.key, "label": n.label, "text": n.text, "links": n.links, "vector": v,
+        })).collect::<Vec<_>>(),
+        "synonyms": src.synonyms,
+        "queries": src.queries.iter().zip(&query_vecs).map(|(q, v)| serde_json::json!({
+            "query": q.query, "expect_top3": q.expect_top3, "vector": v,
+        })).collect::<Vec<_>>(),
+    });
+    std::fs::write(
+        fixtures.join("recall-corpus.json"),
+        serde_json::to_string(&out).unwrap(),
+    )
+    .unwrap();
+}
+
+fn dirs_or_home_cache() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/topodb/models"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".topodb-models"))
+}
