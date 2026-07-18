@@ -18,3 +18,7 @@ fullest canonical name you know for each entity.
 If this fact *replaces* an earlier one (a to-one relation changed — new owner,
 new employer), make the entity-to-entity link with `supersede: true` so the old
 edge is closed as history rather than left contradicting the new one.
+
+If the fact includes a second name for an existing entity, `add_alias` it
+instead of creating a new entity; if it defines project vocabulary, `add_synonym`
+the equivalence.

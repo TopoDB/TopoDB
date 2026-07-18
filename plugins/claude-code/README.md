@@ -108,8 +108,16 @@ Two consequences are deliberate and worth knowing before you rely on this:
   (guided by the bundled skill), nothing runs on a session-lifecycle hook.
   (`@topodb/pi`'s episode recorder has since shipped there; whether to bring
   the equivalent here is open, tracked separately from this plugin.)
-- No vector search / embeddings configuration. The server supports it;
-  this plugin does not expose setup for it.
+- No embeddings configuration knob. The server the plugin launches runs
+  embeddings **on by default** (`bge-small-en-v1.5`, downloaded once to
+  `~/.cache/topodb/models`), so `search_memories` gets a semantic-recall leg
+  in addition to text and graph. That requires an ONNX Runtime dynamic
+  library on the host (e.g. `brew install onnxruntime`; the loader honors
+  `ORT_DYLIB_PATH` if you point it at one directly) — without it, `db_info`
+  reports embeddings `status: "failed"` and the plugin runs exactly as before,
+  text+graph-only, with no other change in behavior. This plugin does not
+  expose a way to pass `--embeddings off` or `--model-dir`; if you need that,
+  run `topodb-mcp` yourself (see the main [`topodb-mcp` README](../../crates/topodb-mcp/README.md#cli-reference)).
 - No CLI, no direct file access story beyond what `topodb-mcp` itself gives
   you. For scripting against a `.redb` file directly, see
   [`topodb-cli`](../../crates/topodb-cli/README.md) in the main repo.

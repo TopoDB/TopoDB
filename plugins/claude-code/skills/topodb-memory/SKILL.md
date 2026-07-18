@@ -16,15 +16,19 @@ the conversation alone. Reads already span this project and `shared`; you do not
 pass a scope to read.
 
 Search stems words ("databases" matches "database"), splits camelCase
-identifiers, and recovers typos and prefixes when a term matches nothing — but
-it does **not** understand synonyms: "auth" won't find a memory that only says
-"login". If a query comes back empty or thin, retry with different words and
-raise `k` before concluding nothing is stored. Entity names are searchable
-too, so a person or project name is a good query. Results are recency-weighted
-— fresher memories outrank stale ones at equal relevance.
+identifiers, and recovers typos and prefixes when a term matches nothing.
+Learned synonyms (`add_synonym`) expand a query automatically — but only the
+equivalences someone has taught it; if a query comes back empty or thin, retry
+with different words and raise `k` before concluding nothing is stored. Entity
+names are searchable too, so a person or project name is a good query. Results
+are recency-weighted — fresher memories outrank stale ones at equal relevance
+— and linked context is pulled in automatically (`graph_boost`, on by
+default): a memory's neighbours can surface it even when the query terms only
+match the neighbour, not the memory itself. When embeddings are ready (see
+`db_info`), search also recalls by meaning, not just matching words.
 
-Then `traverse` from a hit to gather what surrounds it. A memory's neighbours
-are usually the reason it mattered. `get_edges` on a node shows its current
+Then `traverse` from a hit to gather more of what surrounds it than the
+automatic graph boost pulled in. `get_edges` on a node shows its current
 relations (and their history, with `open_only: false`).
 
 Report only what the graph actually holds. Do not fill gaps with details from
@@ -79,7 +83,10 @@ inside this repo, and disconnected from every other one.
 
 `create_entity` is find-or-create: it matches names case- and whitespace-
 insensitively across this project, `shared`, and your read scopes, and returns
-the existing node (`created: false`) instead of minting a twin. What it cannot
-catch is a genuinely different name for the same thing — "Drew" vs "Drew
-Powell". Use the fullest canonical name you know, and keep using it: a second
-name makes both halves of the graph half-right.
+the existing node (`created: false`) instead of minting a twin. `create_entity`
+also resolves **aliases**: the moment you learn a second name for something
+("Drew" for "Drew Powell", "the broker" for "launch.js"), call `add_alias` —
+from then on every lookup and search resolves it to the one canonical node.
+When you learn a domain equivalence between *words* rather than names ("auth"
+means "login" here), call `add_synonym` so search expands it automatically.
+Both are ordinary nodes — `remove_node` retires them.
