@@ -835,6 +835,15 @@ test("broker_idle_exits_and_releases_the_lock", async () => {
       diag += "--- topodb processes ---\n" + sh("ps -eo pid,ppid,etime,stat,args | grep -i topodb | grep -v grep");
       diag += "--- db lock holder (lsof) ---\n" + sh(`lsof -- ${dbPath} 2>&1 | head -20`);
       diag += "--- db lock holder (fuser) ---\n" + sh(`fuser -v ${dbPath} 2>&1`);
+      // Deep-dive the holder: is its stdin still open (EOF never delivered?)
+      // and where are its threads parked (mutex? read? atexit?).
+      const holder = sh(`lsof -t -- ${dbPath} 2>/dev/null`).trim().split("\n")[0];
+      if (holder) {
+        diag += `--- holder ${holder}: /proc status ---\n` + sh(`grep -E "State|Threads|PPid" /proc/${holder}/status`);
+        diag += `--- holder ${holder}: fds ---\n` + sh(`ls -l /proc/${holder}/fd 2>&1 | head -12`);
+        diag += `--- holder ${holder}: thread stacks (gdb) ---\n` +
+          sh(`(command -v gdb >/dev/null || sudo apt-get install -y gdb >/dev/null 2>&1); sudo gdb -p ${holder} -batch -ex "set pagination off" -ex "thread apply all bt" 2>&1 | grep -E "^Thread|^#" | head -60`);
+      }
       console.error(diag);
     }
     assert.ok(opened, `expected the db to be openable directly after the broker's idle-exit; last error: ${lastErr?.message}`);
