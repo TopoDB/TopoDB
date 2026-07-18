@@ -37,6 +37,7 @@ pub use index::{IndexSpec, PropIndex};
 pub use op::Op;
 pub use props::{PropValue, Props};
 pub use read::{Direction, Subgraph, TraversalQuery};
+pub use recall::RecallQuery;
 pub use state::{EdgeRecord, NodeRecord};
 pub use storage::AppliedBatch;
 #[doc(hidden)]
