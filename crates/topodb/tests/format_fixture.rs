@@ -87,6 +87,17 @@
 //! `migrate_v3_to_v4`'s postings-rechunking pass at all (`postings_already_
 //! chunked = true` — see `migrate_v4.rs`'s module doc comment).
 //!
+//! Format v5 (equality-index key normalization) changed no table layout:
+//! every fixture below now migrates/opens to `FORMAT_VERSION == 5`, with the
+//! v4->v5 step being a version stamp plus the `ensure_index_spec`-driven
+//! PROP_INDEX rebuild (see `prop_index.rs`'s `PROP_INDEX_NORM_VERSION`).
+//! `v4.redb` is therefore FROZEN now (an EIGHTH frozen fixture, the v4
+//! migration-input file) — no build on this branch can stamp a fresh file at
+//! 4 anymore. Its old generator is repurposed below as
+//! `regenerate_v5_fixture` (same content recipe, targeting `v5.redb`),
+//! exactly the same generator-repurposing move the v3->v4 flip made.
+//! `v5.redb` is now the ONLY fixture this build can regenerate.
+//!
 //! Node/scope ids use `NodeId::from_u128`/`ScopeId::from_u128`
 //! (`#[doc(hidden)]` debug-seam constructors added in `ids.rs` for exactly
 //! this purpose) rather than `Ulid::new()`, so the fixture's *content* is
@@ -99,16 +110,16 @@ use topodb::*;
 
 /// Regenerate with: cargo test -p topodb --test format_fixture -- --ignored regenerate
 ///
-/// Repurposed from the old (Task 5-era) `regenerate_v3_fixture`: same content
-/// recipe, now targeting `v4.redb` instead of `v3.redb` — this build's
-/// `FORMAT_VERSION` is 4 everywhere, so `Db::open_with` below stamps a native
-/// v4 file with no migration involved. `v3.redb` is untouched by this
-/// function and stays frozen at its Task-5 content (see the module doc
-/// comment).
+/// Repurposed from the old `regenerate_v4_fixture` (itself repurposed from
+/// the Task 5-era `regenerate_v3_fixture`): same content recipe, now
+/// targeting `v5.redb` — this build's `FORMAT_VERSION` is 5 everywhere, so
+/// `Db::open_with` below stamps a native v5 file with no migration involved.
+/// `v4.redb` is untouched by this function and stays frozen (see the module
+/// doc comment).
 #[test]
 #[ignore]
-fn regenerate_v4_fixture() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.redb");
+fn regenerate_v5_fixture() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v5.redb");
     let _ = std::fs::remove_file(&path);
     let spec = IndexSpec {
         equality: vec![PropIndex {
@@ -171,8 +182,62 @@ fn regenerate_v4_fixture() {
 
     assert!(
         path.exists(),
-        "regenerate_v4_fixture: fixture file was not created at {path:?}"
+        "regenerate_v5_fixture: fixture file was not created at {path:?}"
     );
+}
+
+/// The native v5 fixture, written by `regenerate_v5_fixture` (the SAME
+/// content recipe every earlier native fixture used) directly at the current
+/// `FORMAT_VERSION` — no migration involved on open at all. Same standard
+/// query set as the others, plus the one v5-specific behavior worth pinning
+/// at the fixture level: the equality index matches name variants
+/// case-insensitively via `nodes_by_prop_normalized`.
+#[test]
+fn v5_fixture_opens_and_reads() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v5.redb");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v5.redb");
+    std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(&path, spec).unwrap();
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.nodes_by_prop_normalized(&scopes, "Entity", "name", &PropValue::Str(" ADA ".into()))
+            .unwrap()
+            .len(),
+        1,
+        "v5 normalized equality keys must match case/whitespace variants"
+    );
+    assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_vector(&VectorQuery {
+            scopes: scopes.clone(),
+            model: "m1".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            candidates: None,
+        })
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(db.current_seq().unwrap(), 3);
+    assert_eq!(db.format_version(), 5);
 }
 
 #[test]
@@ -214,7 +279,7 @@ fn v1_fixture_opens_and_reads() {
         1
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 4);
+    assert_eq!(db.format_version(), 5);
     drop(db);
     // The second open takes the v4 fast path; migration is idempotent.
     let reopened = Db::open_with(
@@ -260,7 +325,7 @@ fn v2_fixture_opens_and_reads() {
     );
     assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 4);
+    assert_eq!(db.format_version(), 5);
 }
 
 /// Migrates all the way to v4: the mid-branch `#[ignore]` guard lifted now
@@ -304,7 +369,7 @@ fn v3_fixture_opens_and_reads() {
         1
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 4);
+    assert_eq!(db.format_version(), 5);
 }
 
 /// The load-bearing migration test (Task 7, corpus-purity amendment): a
@@ -357,7 +422,7 @@ fn v3_legacy_fixture_migrates_and_reads() {
         1
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 4);
+    assert_eq!(db.format_version(), 5);
 }
 
 /// Task 8 (storage-format-v4 plan): the native v4 fixture, written by
@@ -405,5 +470,5 @@ fn v4_fixture_opens_and_reads() {
         1
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 4);
+    assert_eq!(db.format_version(), 5);
 }

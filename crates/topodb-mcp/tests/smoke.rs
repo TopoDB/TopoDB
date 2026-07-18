@@ -13,7 +13,7 @@ mod common;
 use common::{Server, DEFAULT_TIMEOUT};
 
 #[test]
-fn handshake_and_tools_list_exposes_all_ten_tools() {
+fn handshake_and_tools_list_exposes_all_tools() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("smoke.redb");
     let mut server = Server::spawn(&db_path, &[]);
@@ -28,11 +28,11 @@ fn handshake_and_tools_list_exposes_all_ten_tools() {
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
 
-    // Plan 6 is complete: db_info + 7 read tools + 8 write tools = 16 total.
+    // db_info + 8 read tools + 10 write tools = 19 total.
     assert_eq!(
         tools.len(),
-        16,
-        "expected exactly 16 tools, got: {tools:#?}"
+        19,
+        "expected exactly 19 tools, got: {tools:#?}"
     );
     for name in [
         "db_info",
@@ -42,9 +42,12 @@ fn handshake_and_tools_list_exposes_all_ten_tools() {
         "traverse",
         "access_stats",
         "get_changes",
+        "get_edges",
         "create_memory",
         "create_entity",
         "link",
+        "add_alias",
+        "add_synonym",
     ] {
         let tool = tools
             .iter()

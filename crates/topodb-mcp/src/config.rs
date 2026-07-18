@@ -2,7 +2,8 @@
 //!
 //! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!      [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
-//!      [--allow-unscoped-changes]`
+//!      [--allow-unscoped-changes] [--embeddings <off|model>]
+//!      [--model-dir <path>]`
 //! - `--scope`: the default **write** scope — the scope a created node/edge is
 //!   stamped with when a write tool omits `scope`. `"shared"` (case-insensitive)
 //!   or omitted => [`Scope::Shared`]; any other value is parsed as a ULID.
@@ -20,8 +21,17 @@
 //!   in a db shared across projects, an agent calling `get_changes` would
 //!   otherwise replay every other project's writes. Sync/consolidation hosts
 //!   that legitimately need the whole log pass this flag.
+//! - `--embeddings <off|model>`: `off` (case-insensitive) permanently disables
+//!   the embedder (`db_info` reports `Off` status forever, every write/search
+//!   stays text-only). Omitted => auto: start the embedder with the built-in
+//!   default model. Any other value is taken as a model name to start with —
+//!   an unrecognized name still constructs an embedder, it just lands in
+//!   `Failed` status (see `embedder::Embedder::start`) rather than refusing to
+//!   start the server.
+//! - `--model-dir <path>`: overrides where the embedding model is
+//!   downloaded/cached. Omitted => `default_model_cache_dir()` (`main.rs`).
 //!
-//! Arg parsing is hand-rolled: the surface is five flags, so `clap` would add
+//! Arg parsing is hand-rolled: the surface is seven flags, so `clap` would add
 //! a dependency and a proc-macro build for no real gain here.
 
 use std::error::Error;
@@ -34,7 +44,10 @@ use topodb::{IndexSpec, Scope, ScopeId};
 /// `topodb-cli`'s `create-entity`/`create-memory`) and re-exported here so
 /// existing `topodb-mcp` call sites (`use crate::config::{ENTITY_LABEL, ...}`)
 /// keep working unchanged.
-pub use topodb_json::{ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL};
+pub use topodb_json::{
+    ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL, ENTITY_NAME_PROP,
+    MEMORY_CONTENT_PROP, MEMORY_LABEL, SYNONYM_EXPANSION_PROP, SYNONYM_LABEL, SYNONYM_TERM_PROP,
+};
 
 /// A **non-empty** set of scopes a read filters by. The non-empty invariant is
 /// structural rather than conventional: an empty [`ScopeSet`] admits nothing, so
@@ -89,6 +102,16 @@ pub struct Config {
     /// consolidation hosts, which legitimately need the whole log, pass
     /// `--allow-unscoped-changes`.
     pub allow_unscoped_changes: bool,
+    /// `--embeddings <off|model>`. `None` (flag omitted) => auto: start the
+    /// embedder with the built-in default model. `Some("off")`
+    /// (case-insensitive) => the embedder is permanently disabled. `Some(other)`
+    /// => start the embedder with that model name (unknown names still
+    /// construct an `Embedder`, just one that lands in `Failed` status — see
+    /// `embedder::Embedder::start`).
+    pub embeddings: Option<String>,
+    /// `--model-dir <path>`: overrides the embedding model cache directory.
+    /// `None` => `default_model_cache_dir()` in `main`.
+    pub model_dir: Option<PathBuf>,
 }
 
 /// The built-in default index spec used when `--spec` is omitted: equality on
@@ -152,6 +175,8 @@ impl Config {
         let mut read_scopes: Option<String> = None;
         let mut spec_path: Option<PathBuf> = None;
         let mut allow_unscoped_changes = false;
+        let mut embeddings: Option<String> = None;
+        let mut model_dir: Option<PathBuf> = None;
 
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
@@ -178,9 +203,22 @@ impl Config {
                 "--allow-unscoped-changes" => {
                     allow_unscoped_changes = true;
                 }
+                "--embeddings" => {
+                    embeddings = Some(
+                        it.next()
+                            .ok_or("--embeddings requires an <off|model> value")?,
+                    );
+                }
+                "--model-dir" => {
+                    model_dir = Some(
+                        it.next()
+                            .ok_or("--model-dir requires a <path> value")?
+                            .into(),
+                    );
+                }
                 other => {
                     return Err(format!(
-                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes]"
+                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|model>] [--model-dir <path>]"
                     )
                     .into());
                 }
@@ -213,6 +251,8 @@ impl Config {
             default_read_scopes,
             spec,
             allow_unscoped_changes,
+            embeddings,
+            model_dir,
         })
     }
 }

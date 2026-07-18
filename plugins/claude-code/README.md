@@ -108,8 +108,16 @@ Two consequences are deliberate and worth knowing before you rely on this:
   (guided by the bundled skill), nothing runs on a session-lifecycle hook.
   (`@topodb/pi`'s episode recorder has since shipped there; whether to bring
   the equivalent here is open, tracked separately from this plugin.)
-- No vector search / embeddings configuration. The server supports it;
-  this plugin does not expose setup for it.
+- No embeddings configuration knob. The server the plugin launches runs
+  embeddings **on by default** (`bge-small-en-v1.5`, downloaded once to
+  `~/.cache/topodb/models`), so `search_memories` gets a semantic-recall leg
+  in addition to text and graph. That requires an ONNX Runtime dynamic
+  library on the host (e.g. `brew install onnxruntime`; the loader honors
+  `ORT_DYLIB_PATH` if you point it at one directly) — without it, `db_info`
+  reports embeddings `status: "failed"` and the plugin runs exactly as before,
+  text+graph-only, with no other change in behavior. This plugin does not
+  expose a way to pass `--embeddings off` or `--model-dir`; if you need that,
+  run `topodb-mcp` yourself (see the main [`topodb-mcp` README](../../crates/topodb-mcp/README.md#cli-reference)).
 - No CLI, no direct file access story beyond what `topodb-mcp` itself gives
   you. For scripting against a `.redb` file directly, see
   [`topodb-cli`](../../crates/topodb-cli/README.md) in the main repo.
@@ -122,3 +130,16 @@ deliberate — a server whose tool surface moved under this plugin without a
 matching update here is worse than one that's a version behind — but it also
 means the pin can go stale if `topodb-mcp` publishes and this plugin doesn't
 bump in step.
+
+> **Release coordination (read this before publishing docs off this
+> branch).** The docs in this repo currently describe `topodb-mcp` 0.0.9,
+> which is **unreleased** — `server-args.js`'s `SERVER_VERSION` is still
+> pinned to `0.0.8` and must NOT be bumped until 0.0.9 is actually published
+> to npm (bumping early would point every installed plugin at a version that
+> doesn't exist). Until that pin is bumped, a plugin-launched server is
+> running 0.0.8 and does **not** have `get_edges`, `add_alias`,
+> `add_synonym`, hybrid (RRF-fused) recall, or embeddings — only the tools
+> and behavior 0.0.8 shipped with. Bumping `SERVER_VERSION` to `0.0.9` (and
+> re-verifying `plugins/claude-code/test/broker.test.js` against the real
+> published package) is a required step of the 0.0.9 release checklist — see
+> `CHANGELOG.md`'s `topodb-mcp` Unreleased section.

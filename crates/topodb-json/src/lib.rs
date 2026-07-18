@@ -30,13 +30,19 @@ pub const ENTITY_LABEL: &str = "Entity";
 pub const ENTITY_NAME_PROP: &str = "name";
 pub const MEMORY_LABEL: &str = "Memory";
 pub const MEMORY_CONTENT_PROP: &str = "content";
+pub const ALIAS_LABEL: &str = "Alias";
+pub const ALIAS_NAME_PROP: &str = "name";
+pub const ALIAS_EDGE_TYPE: &str = "alias_of";
+pub const SYNONYM_LABEL: &str = "Synonym";
+pub const SYNONYM_TERM_PROP: &str = "term";
+pub const SYNONYM_EXPANSION_PROP: &str = "expansion";
 
 /// The ONE canonical default [`IndexSpec`] for TopoDB's built-in write shapes,
 /// shared by every front end (`topodb-mcp` when `--spec` is omitted;
 /// `topodb-cli` when it creates a brand-new db file). Declares equality on
-/// `(Entity, name)` and text on `(Memory, content)`, using the shared
-/// [`ENTITY_LABEL`]/[`ENTITY_NAME_PROP`]/[`MEMORY_LABEL`]/[`MEMORY_CONTENT_PROP`]
-/// constants.
+/// `(Entity, name)`, `(Alias, name)`, and `(Synonym, term)`, and text on
+/// `(Memory, content)`, `(Entity, name)`, and `(Alias, name)`, using the shared
+/// label and property constants.
 ///
 /// Single-sourcing this is load-bearing: because a CLI-created db and an
 /// MCP-created db are opened with a *byte-identical* persisted `index_spec`,
@@ -47,6 +53,51 @@ pub const MEMORY_CONTENT_PROP: &str = "content";
 /// tool wrote it.
 pub fn default_spec() -> IndexSpec {
     IndexSpec {
+        equality: vec![
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+            // Aliases resolve exactly like entity names (upsert/find probe
+            // both); synonym terms are looked up per query word.
+            PropIndex {
+                label: ALIAS_LABEL.into(),
+                prop: ALIAS_NAME_PROP.into(),
+            },
+            PropIndex {
+                label: SYNONYM_LABEL.into(),
+                prop: SYNONYM_TERM_PROP.into(),
+            },
+        ],
+        text: vec![
+            PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            },
+            // Entity names are text-indexed too (not just equality-indexed)
+            // so `search_memories` can find an entity by name — without
+            // this, a search for "Drew" returns only Memory nodes whose
+            // content happens to mention the name, and the entity itself is
+            // reachable only by exact `find_by_prop`.
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+            PropIndex {
+                label: ALIAS_LABEL.into(),
+                prop: ALIAS_NAME_PROP.into(),
+            },
+        ],
+    }
+}
+
+/// Every stock spec generation this crate has ever shipped, oldest first.
+/// A persisted spec equal (order-insensitively) to ANY of them upgrades to
+/// the current `default_spec`; anything else is a customization and is
+/// returned unchanged.
+fn stock_generations() -> Vec<IndexSpec> {
+    // g0 (pre-0.0.9): equality (Entity, name); text (Memory, content).
+    let g0 = IndexSpec {
         equality: vec![PropIndex {
             label: ENTITY_LABEL.into(),
             prop: ENTITY_NAME_PROP.into(),
@@ -55,7 +106,87 @@ pub fn default_spec() -> IndexSpec {
             label: MEMORY_LABEL.into(),
             prop: MEMORY_CONTENT_PROP.into(),
         }],
+    };
+    // g1: g0 + text (Entity, name).
+    let g1 = IndexSpec {
+        equality: g0.equality.clone(),
+        text: vec![
+            PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            },
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+        ],
+    };
+    vec![g0, g1]
+}
+
+/// Maps a db's persisted spec forward when — and only when — it is exactly a
+/// stock default this crate has shipped: any recognized stock generation
+/// upgrades to the current [`default_spec`]. Any other spec — a `--spec`
+/// customization, however small — is returned unchanged: silently rewriting a
+/// declared spec would reindex data behind its owner's back. Comparison is
+/// order-insensitive, matching how the engine's `ensure_index_spec` compares
+/// specs (it sorts both lists before persisting).
+pub fn upgraded_spec(persisted: IndexSpec) -> IndexSpec {
+    let sorted = |spec: &IndexSpec| {
+        let mut eq: Vec<(String, String)> = spec
+            .equality
+            .iter()
+            .map(|p| (p.label.to_string(), p.prop.clone()))
+            .collect();
+        let mut text: Vec<(String, String)> = spec
+            .text
+            .iter()
+            .map(|p| (p.label.to_string(), p.prop.clone()))
+            .collect();
+        eq.sort();
+        text.sort();
+        (eq, text)
+    };
+    let p = sorted(&persisted);
+    if stock_generations().iter().any(|g| sorted(g) == p) {
+        default_spec()
+    } else {
+        persisted
     }
+}
+
+/// Canonical form for edge types: Unicode-lowercased, with runs of
+/// whitespace, hyphens, and underscores collapsed to a single underscore
+/// (leading/trailing separators dropped). `"Works At"`, `"works-at"`, and
+/// `"works_at"` all normalize to `"works_at"` — one relation, one vocabulary
+/// entry, instead of three parallel edge types that silently fragment
+/// traversal filters. Every front-end write path (`link` tool, batch `link`
+/// command, CLI) passes edge types through here; read-side type filters
+/// should probe both the raw and normalized forms so edges written before
+/// normalization stay reachable. `Err` on a type that normalizes to empty.
+pub fn normalize_edge_type(raw: &str) -> Result<String, String> {
+    let lowered = raw.to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut pending_sep = false;
+    for c in lowered.chars() {
+        if c.is_whitespace() || c == '-' || c == '_' {
+            if !out.is_empty() {
+                pending_sep = true;
+            }
+        } else {
+            if pending_sep {
+                out.push('_');
+                pending_sep = false;
+            }
+            out.push(c);
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "edge type {raw:?} is empty once normalized (lowercase, separators collapsed to '_')"
+        ));
+    }
+    Ok(out)
 }
 
 /// Human/JSON-facing rendering of a [`Scope`]: `"shared"` or the ULID string.
@@ -629,6 +760,70 @@ mod tests {
         assert_eq!(j["edges"][0]["id"], Value::String(e.id.to_string()));
     }
 
+    // --- normalize_edge_type: one relation, one vocabulary entry ---
+
+    #[test]
+    fn edge_type_variants_normalize_to_one_form() {
+        for raw in [
+            "works_at",
+            "Works At",
+            "works-at",
+            "WORKS_AT",
+            " works  at ",
+            "works--at",
+            "works_-at",
+        ] {
+            assert_eq!(
+                normalize_edge_type(raw).unwrap(),
+                "works_at",
+                "{raw:?} should normalize to works_at"
+            );
+        }
+        assert_eq!(normalize_edge_type("about").unwrap(), "about");
+    }
+
+    #[test]
+    fn edge_type_empty_after_normalization_is_an_error() {
+        for raw in ["", "   ", "---", "_", " - _ "] {
+            assert!(normalize_edge_type(raw).is_err(), "{raw:?} should error");
+        }
+    }
+
+    // --- upgraded_spec: stock specs upgrade, customized specs don't ---
+
+    #[test]
+    fn legacy_stock_spec_upgrades_to_current_default() {
+        let legacy = IndexSpec {
+            equality: vec![PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            }],
+            text: vec![PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            }],
+        };
+        assert_eq!(upgraded_spec(legacy), default_spec());
+        // Idempotent: the current default maps to itself... via the
+        // not-legacy branch (it is not byte-equal to the legacy spec).
+        assert_eq!(upgraded_spec(default_spec()), default_spec());
+    }
+
+    #[test]
+    fn customized_spec_is_never_rewritten() {
+        let custom = IndexSpec {
+            equality: vec![PropIndex {
+                label: "Person".into(),
+                prop: "handle".into(),
+            }],
+            text: vec![PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            }],
+        };
+        assert_eq!(upgraded_spec(custom.clone()), custom);
+    }
+
     // --- scope resolution ---
 
     #[test]
@@ -775,5 +970,48 @@ mod tests {
     fn f32_vec_rejects_overflow_to_infinity() {
         // Finite as f64 but overflows f32 -> must be rejected, not silently Inf.
         assert!(json_to_f32_vec(&serde_json::json!([1e40])).is_err());
+    }
+
+    #[test]
+    fn default_spec_covers_alias_and_synonym() {
+        let s = default_spec();
+        let has = |list: &[PropIndex], l: &str, p: &str| {
+            list.iter().any(|pi| pi.label == l && pi.prop == p)
+        };
+        assert!(has(&s.equality, ALIAS_LABEL, ALIAS_NAME_PROP));
+        assert!(has(&s.equality, SYNONYM_LABEL, SYNONYM_TERM_PROP));
+        assert!(has(&s.text, ALIAS_LABEL, ALIAS_NAME_PROP));
+    }
+
+    #[test]
+    fn every_stock_generation_upgrades_to_current_default() {
+        // v0 (pre-0.0.9): eq (Entity,name); text (Memory,content).
+        let v0 = IndexSpec {
+            equality: vec![PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            }],
+            text: vec![PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            }],
+        };
+        // v1: v0 + text (Entity,name).
+        let v1 = IndexSpec {
+            equality: v0.equality.clone(),
+            text: vec![
+                PropIndex {
+                    label: MEMORY_LABEL.into(),
+                    prop: MEMORY_CONTENT_PROP.into(),
+                },
+                PropIndex {
+                    label: ENTITY_LABEL.into(),
+                    prop: ENTITY_NAME_PROP.into(),
+                },
+            ],
+        };
+        assert_eq!(upgraded_spec(v0), default_spec());
+        assert_eq!(upgraded_spec(v1), default_spec());
+        assert_eq!(upgraded_spec(default_spec()), default_spec());
     }
 }

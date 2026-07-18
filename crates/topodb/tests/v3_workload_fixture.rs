@@ -33,7 +33,7 @@ fn v3_workload_fixture_migrates_to_v4_and_reads() {
         }],
     };
     let db = Db::open_with(&path, spec).unwrap();
-    assert_eq!(db.format_version(), 4);
+    assert_eq!(db.format_version(), 5);
 
     let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
 

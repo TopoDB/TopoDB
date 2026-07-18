@@ -16,6 +16,62 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Added
+
+- **`Db::recall` + `RecallQuery`** — hybrid recall over up to three legs, fused with Reciprocal
+  Rank Fusion (`RRF_K = 60`): a BM25 **text** leg (`search_text_expanded`, honoring host-supplied
+  synonym expansions); a cosine **vector** leg when the query carries a `(model, vector)` pair
+  (omitted, not erroring, if the model has no vectors); and a two-stage **graph** leg — the
+  preliminary text+vector fusion's top 5 hits become seeds, their 1-hop neighbors (both
+  directions) are pulled in at half weight (`WEIGHT_GRAPH = 0.5` against `WEIGHT_TEXT`/
+  `WEIGHT_VECTOR = 1.0`) — toggled by `graph_boost`. Recency weighting is deliberately applied
+  **once, after fusion** (each leg runs with `recency_weight: 0.0`), so freshness can't be
+  double-counted across legs. `search_text_expanded` and the public `topodb::analyze` (the same
+  camelCase-split/lowercase/Snowball-stem pipeline FTS already used internally) are now exported
+  so callers can pre-analyze synonym terms consistently with stored content.
+- **Golden-set recall-quality gate** (`crates/topodb/tests/recall_quality.rs`): a fixed ~62-memory/
+  ~18-entity corpus with hand-labeled expected top hits, scored by Mean Reciprocal Rank across four
+  configs (bm25-only, +vector, +graph, full hybrid). Measured at landing: bm25-only **0.718** →
+  +vector **0.748** → full hybrid **0.760**; the full-hybrid config additionally asserts every
+  query's expected id lands in the top 3. The suite hard-gates on `MRR_FLOOR = 0.740` (measured
+  minus a 0.02 margin) for the full-hybrid config, so a regression that erodes recall quality fails
+  CI instead of silently degrading behind a fusion change.
+- **Normalized equality lookup** (`Db::nodes_by_prop_normalized`): case- and whitespace-insensitive
+  matching for `Str` values — the dedup primitive that lets a caller resolve "drew powell" to a
+  stored "Drew Powell" instead of minting a duplicate. `nodes_by_prop` keeps byte-exact semantics
+  via a record-level post-filter.
+- **`Db::edges_from`** — scoped listing of a node's outgoing edges, filterable by target, edge type,
+  and open-only. The supersession primitive: find the open edges a changed fact should close,
+  without a full traverse.
+- **Recency-weighted text search** (`Db::search_text_with` + `SearchOptions`): each hit's BM25 score
+  is multiplied by `(1-w) + w·2^(-age/half_life)`, with age read from the node id's ULID timestamp
+  (also newly exposed as `NodeId::timestamp_ms` etc.). Opt-in; `search_text` is unchanged
+  (weight 0). Applied before top-k truncation, so fresh hits can displace stale ones out of the
+  window, and floored so a strong old match is never erased.
+- **Stemming analyzer (v1)**: FTS tokenization is now split-on-non-alphanumeric → camelCase split
+  (acronym-aware: `parseHttpRequest` → `parse`/`http`/`request`, `HTTPServer` → `http`/`server`) →
+  Unicode lowercase → Snowball English stem (via the pure-Rust `rust-stemmers` dep), applied
+  identically to documents and queries — `databases` matches `database`, `running` matches `run`.
+  The pipeline is versioned in META (`"fts_analyzer_version"`); a file built under a different (or
+  pre-stamp) analyzer gets its FTS tables drained and rebuilt on open, same machinery as the
+  PROP_INDEX norm stamp.
+- **Miss-only fuzzy/prefix fallback** (`SearchOptions::fuzzy_fallback`, default ON): a query term
+  with zero df in a scope — it would contribute nothing anyway — expands to its closest vocabulary
+  neighbors (prefix matches ≥3 chars, bounded edit distance ≤1 for 3-5-char terms / ≤2 for longer),
+  capped at 4 candidates whose BM25 contributions are discounted 0.6×, so exact hits always
+  dominate and hitting queries pay nothing. Query-time only: the scope vocabulary is enumerated
+  from the existing scope-prefixed postings keys — no auxiliary index, no format change,
+  deterministic.
+
+#### Changed
+
+- **Format v5** (`FORMAT_VERSION = 5`): PROP_INDEX `Str` keys are now stored under their normalized
+  form (`prop_index::normalize_str`), and FTS postings under the v1 stemming analyzer; no table
+  layout changed. Existing files upgrade on first open — the v4→v5 arm stamps the version and
+  `ensure_index_spec` drains + rebuilds both indexes, driven by the new `"prop_index_norm_version"`
+  and `"fts_analyzer_version"` META stamps (pre-v5 files lack both). Pre-v5 builds refuse a v5 file
+  with `UnsupportedFormat` rather than silently missing every `Str` probe. See FORMAT.md.
+
 #### Fixed
 
 - **Edit-heavy re-indexing no longer grows a covering postings chunk without bound.** Adding a term
@@ -160,6 +216,34 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### Unreleased
+
+#### Added
+
+- **`Alias` and `Synonym` label/prop constants**, alongside the existing `Entity`/`Memory` ones —
+  the shared vocabulary `topodb-mcp`'s `add_alias`/`add_synonym` tools and their index-spec entries
+  are built from, so the two crates cannot drift on what an alias or synonym node looks like.
+- **`normalize_edge_type`** — the shared edge-type vocabulary normalizer (lowercase; whitespace/
+  hyphen/underscore runs collapse to a single `_`), used by the MCP `link` tool, the batch DSL's
+  `link` command, and `topodb-cli link`, so the three write paths can no longer fragment the edge
+  type dictionary (`works_at` vs `Works At` vs `works-at`).
+- **`upgraded_spec`** — maps a db's persisted spec forward when (and only when) it is exactly a
+  stock default this crate has shipped; customized specs are returned unchanged. Used by
+  `topodb-mcp` and `topodb-cli` to roll the default-spec change below out to existing stock dbs.
+
+#### Changed
+
+- **`default_spec` is now v3**: text-indexes `(Entity, name)` and `(Alias, name)` in addition to
+  `(Memory, content)`, and equality-indexes `(Alias, name)` and `(Synonym, term)` in addition to
+  `(Entity, name)` — so
+  `search_memories`/`search-text` can find an entity or its aliases by name, and alias/synonym
+  lookups have an index to run against, instead of relying solely on exact-match `find_by_prop`.
+  `upgraded_spec` is now **generation-aware**: it recognizes a db on ANY older stock generation
+  (not just the immediately-previous one) and maps it forward to v3 in one step, so a db that has
+  never been `--spec`-customized picks up every generation's additions on its next open regardless
+  of how many versions behind it is; customized specs are still returned unchanged. Batch `link`
+  commands now normalize their `type` field.
+
 ### 0.0.4
 
 #### Changed
@@ -202,6 +286,88 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### Unreleased
+
+#### Added
+
+- **`get_edges` tool** (17 tools now): list a node's outgoing edges, filterable by target/type,
+  open-only by default — how an agent finds the edge id to `close_edge`, and checks what a node is
+  already linked to. Type filters match both the normalized and raw stored forms.
+- **`link` gains `supersede: true`**: atomically closes every other open same-type edge from the
+  source before creating/reusing the new one — the "changed employer/owner/team" flow — reporting
+  the closed ids in `superseded`.
+- **Recency-weighted `search_memories`** (`recency_weight`, default 0.3; `recency_half_life_days`,
+  default 30): fresher memories outrank stale ones at equal BM25 relevance; `recency_weight: 0`
+  restores pure BM25.
+- **`search_memories` stems and fuzzy-recovers**: query terms are analyzed like documents
+  (camelCase split + Snowball stem), and a term matching nothing falls back to close prefix/typo
+  neighbors at a score discount (`fuzzy: false` disables). Tool description and server
+  instructions now say what search does and doesn't handle.
+- **`add_alias` and `add_synonym` tools** (19 tools now): `add_alias(entity_id, alias)` registers an
+  alternate name for an existing entity ("Drew" for "Drew Powell") — `create_entity`, `find_by_prop`,
+  and `search_memories` all resolve it to the canonical node from then on; errors if the alias
+  already names a different entity (a merge situation, both ids reported). `add_synonym(term,
+  expansion, bidirectional = true)` teaches search a domain equivalence ("auth" ↔ "login") — terms
+  and expansions are stored/looked up in analyzed (stemmed) form so `add_synonym('auth','login')`
+  also catches `"logins"`, expansion is depth-1 only (synonyms never chain), and query-time
+  resolution is capped at 4 expansions per term (sorted, deduped, truncated). Both are ordinary
+  nodes — `remove_node` retires either.
+- **Local embeddings subsystem**: `--embeddings <off|model>` (default: auto-loads
+  `bge-small-en-v1.5`, 384-dim) and `--model-dir <path>` (default `~/.cache/topodb/models`) flags.
+  Write-path embedding happens automatically and atomically (`create_memory`/`create_entity` fold
+  a `SetEmbedding` op into the same batch as the `CreateNode`) once the embedder reaches `ready`;
+  a startup backfill embeds any node created while the embedder was still loading, driven by
+  replaying `ops_since` rather than a per-scope label scan (matches the change-feed doctrine, needs
+  no new engine API). `db_info` reports `embeddings: { model, status }` (`off`/`downloading`/
+  `ready`/`failed`) so a client can tell whether the vector leg is live. **Requires an ONNX Runtime
+  dynamic library on the host** — this server is built against fastembed's `ort-load-dynamic`, so
+  embeddings only reach `ready` once a compatible ONNX Runtime dylib is discoverable (e.g.
+  `brew install onnxruntime`; the loader honors `ORT_DYLIB_PATH`, e.g.
+  `/usr/local/lib/libonnxruntime.dylib`). Without one, status is `failed` and the server runs
+  exactly as before — text+graph-only recall, no write-path embedding, no other change in
+  behavior.
+
+#### Changed
+
+- **`search_memories` now runs hybrid recall** (`Db::recall`) instead of plain BM25: a `graph_boost`
+  param (default `true`) adds a two-stage graph leg — the preliminary text+vector fusion's top 5
+  hits become seeds, their 1-hop neighbors are pulled in at half weight — RRF-fused (k=60) with the
+  text and, when the embedder is `ready`, vector legs; recency weighting moved to apply once, after
+  fusion, rather than inside the text leg alone. Learned synonyms (`add_synonym`) now expand a
+  query's terms automatically. None of this is a breaking param change — every existing call
+  without `graph_boost` still gets it (default on).
+- **`create_entity` is now find-or-create**, and alias-aware. The name is matched case- and
+  whitespace-insensitively across the read scopes, the write scope, AND `shared`, and — via
+  registered aliases (`add_alias`) — resolves an alternate name to its canonical entity too; an
+  existing entity is returned with `created: false` (oldest wins among pre-existing duplicates, so
+  links converge) and new props keys are merged without overwriting. This closes the main
+  duplicate-entity path: an unconditional create guarded only by advisory "check first" prose.
+- **`find_by_prop` also resolves aliases** for `(Entity, name)` lookups with `exact: false` — an
+  alias name now returns the canonical entity it points to, not a miss. `exact: true` and every
+  other `(label, prop)` pair are unaffected.
+- **`link` is idempotent per `(from, to, type)`** within the write scope — an identical open edge
+  is reused (`created: false`) instead of stacking a parallel duplicate — and **edge types are
+  normalized** (`Works At` == `works-at` == `works_at`). `traverse`'s `edge_types` filter probes
+  raw and normalized forms.
+- **`find_by_prop` matches strings case/whitespace-insensitively by default**; pass `exact: true`
+  for the old byte-exact behavior.
+- **Temporal-bound sanity guards**: `link.valid_from` / `close_edge.valid_to` reject
+  seconds-since-epoch values (would date the edge to January 1970) and future timestamps (would
+  make the edge invisible to every "now" read) with actionable errors.
+- **Stock-spec auto-upgrade on open**: a db still on an older stock default spec (never
+  `--spec`-customized) is upgraded to the current default — adding the `(Entity, name)` text index
+  so entities are searchable by name — with a one-time reindex. Customized specs are untouched.
+- Tool descriptions and server instructions rewritten around the new semantics: always link what
+  you store, supersede when a to-one fact changes, retry token-variant queries before concluding
+  nothing is stored.
+
+#### Release checklist
+
+- **Bump the Claude Code plugin's server pin** (`plugins/claude-code/server-args.js`'s
+  `SERVER_VERSION`, currently still `"0.0.8"`) to this version once it is published to npm, and
+  re-verify `plugins/claude-code/test/broker.test.js` against the real published package — see
+  `plugins/claude-code/README.md`'s "Server version" section for why the pin can't move early.
 
 ### 0.0.8
 
@@ -342,6 +508,22 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 ---
 
 ## `topodb-cli`
+
+### Unreleased
+
+#### Added
+
+- **`find --normalized`**: case- and whitespace-insensitive matching for string values
+  (`"drew powell"` finds `"Drew Powell"`) via the engine's new `nodes_by_prop_normalized`;
+  the default stays byte-exact.
+
+#### Changed
+
+- **`link` normalizes edge types** through the shared `topodb_json::normalize_edge_type`
+  (lowercase; whitespace/hyphens collapse to `_`), matching the MCP `link` tool and the batch DSL.
+- **Stock-spec auto-upgrade on open** (same behavior as `topodb-mcp`): a db still on an older stock
+  default spec is upgraded to the current default — adding the `(Entity, name)` text index — with a
+  one-time reindex; customized specs are inherited verbatim.
 
 ### 0.0.4
 

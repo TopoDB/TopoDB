@@ -70,6 +70,13 @@ impl Server {
     pub fn spawn(db_path: &Path, extra_args: &[&str]) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_topodb-mcp"));
         cmd.arg("--db").arg(db_path);
+        // Keep every test server offline by default: `--embeddings off` goes
+        // BEFORE `extra_args` because the config parse loop is last-wins, so
+        // a test that wants to exercise the real embedder passes its own
+        // `--embeddings`/`--model-dir` later and it still wins. Without this,
+        // every server spawned by every existing test would kick off a
+        // background model download.
+        cmd.arg("--embeddings").arg("off");
         for arg in extra_args {
             cmd.arg(arg);
         }

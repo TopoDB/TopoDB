@@ -1,0 +1,750 @@
+{
+  "nodes": [
+    {
+      "key": "e1",
+      "label": "Entity",
+      "text": "Drew Powell",
+      "links": []
+    },
+    {
+      "key": "e2",
+      "label": "Entity",
+      "text": "Maya Chen",
+      "links": []
+    },
+    {
+      "key": "e3",
+      "label": "Entity",
+      "text": "Jordan Lee",
+      "links": []
+    },
+    {
+      "key": "e4",
+      "label": "Entity",
+      "text": "Priya Nair",
+      "links": []
+    },
+    {
+      "key": "e5",
+      "label": "Entity",
+      "text": "Sam Ortiz",
+      "links": []
+    },
+    {
+      "key": "e6",
+      "label": "Entity",
+      "text": "Redb",
+      "links": []
+    },
+    {
+      "key": "e7",
+      "label": "Entity",
+      "text": "SQLite",
+      "links": []
+    },
+    {
+      "key": "e8",
+      "label": "Entity",
+      "text": "Postgres",
+      "links": []
+    },
+    {
+      "key": "e9",
+      "label": "Entity",
+      "text": "Kafka",
+      "links": []
+    },
+    {
+      "key": "e10",
+      "label": "Entity",
+      "text": "Billing Service",
+      "links": []
+    },
+    {
+      "key": "e11",
+      "label": "Entity",
+      "text": "Auth Service",
+      "links": []
+    },
+    {
+      "key": "e12",
+      "label": "Entity",
+      "text": "Search Service",
+      "links": []
+    },
+    {
+      "key": "e13",
+      "label": "Entity",
+      "text": "Ingestion Pipeline",
+      "links": []
+    },
+    {
+      "key": "e14",
+      "label": "Entity",
+      "text": "CI Pipeline",
+      "links": []
+    },
+    {
+      "key": "e15",
+      "label": "Entity",
+      "text": "Staging Environment",
+      "links": []
+    },
+    {
+      "key": "e16",
+      "label": "Entity",
+      "text": "Production Environment",
+      "links": []
+    },
+    {
+      "key": "e17",
+      "label": "Entity",
+      "text": "Vector Index",
+      "links": []
+    },
+    {
+      "key": "e18",
+      "label": "Entity",
+      "text": "On-call Rotation",
+      "links": []
+    },
+    {
+      "key": "m1",
+      "label": "Memory",
+      "text": "The original storage engine author still reviews every schema migration before it merges.",
+      "links": [
+        "e1"
+      ]
+    },
+    {
+      "key": "m2",
+      "label": "Memory",
+      "text": "The team prefers small, reversible pull requests over large rewrites because rollbacks are cheaper to reason about.",
+      "links": []
+    },
+    {
+      "key": "m3",
+      "label": "Memory",
+      "text": "There is one primary point of contact for questions about the on-disk format and the write-ahead log.",
+      "links": [
+        "e1"
+      ]
+    },
+    {
+      "key": "m4",
+      "label": "Memory",
+      "text": "An engineer flagged that the nightly backup job was silently truncating large snapshots and pushed the fix within a day.",
+      "links": []
+    },
+    {
+      "key": "m5",
+      "label": "Memory",
+      "text": "The billing service has a single owner end to end, from invoicing logic to the Stripe webhook handlers.",
+      "links": [
+        "e2"
+      ]
+    },
+    {
+      "key": "m6",
+      "label": "Memory",
+      "text": "The billing owner insists every change ships behind a feature flag because refunds are expensive to undo.",
+      "links": []
+    },
+    {
+      "key": "m7",
+      "label": "Memory",
+      "text": "The billing owner rewrote the nightly reconciliation job so retried webhooks stop double-charging customers.",
+      "links": []
+    },
+    {
+      "key": "m8",
+      "label": "Memory",
+      "text": "The billing owner is on parental leave through September; a colleague is covering escalations until she returns.",
+      "links": [
+        "e2"
+      ]
+    },
+    {
+      "key": "m9",
+      "label": "Memory",
+      "text": "The search service has an owner who tuned the BM25 ranking weights last quarter.",
+      "links": [
+        "e3",
+        "m41"
+      ]
+    },
+    {
+      "key": "m10",
+      "label": "Memory",
+      "text": "The search index was rebuilding on every single deploy, tripling deploy time, until the rebuild was discovered and moved off the deploy path into an async job.",
+      "links": []
+    },
+    {
+      "key": "m11",
+      "label": "Memory",
+      "text": "The search owner pairs best in the mornings; schedule design reviews before noon for sharp feedback.",
+      "links": [
+        "e3"
+      ]
+    },
+    {
+      "key": "m12",
+      "label": "Memory",
+      "text": "The on-call lead rewrote the escalation policy after last winter's paging storm.",
+      "links": [
+        "e4",
+        "m57"
+      ]
+    },
+    {
+      "key": "m13",
+      "label": "Memory",
+      "text": "The on-call lead is the fastest responder to production incidents on the team and keeps a running postmortem log.",
+      "links": [
+        "e4"
+      ]
+    },
+    {
+      "key": "m14",
+      "label": "Memory",
+      "text": "The on-call lead covers billing escalations while the usual owner is on leave, so route Stripe disputes accordingly for now.",
+      "links": [
+        "e4"
+      ]
+    },
+    {
+      "key": "m15",
+      "label": "Memory",
+      "text": "The ingestion pipeline has an owner who rewrote the Kafka consumer to handle partition rebalances gracefully.",
+      "links": [
+        "e5",
+        "m43"
+      ]
+    },
+    {
+      "key": "m16",
+      "label": "Memory",
+      "text": "The pipeline owner decided to cap ingestion batch size at five thousand records after a burst of oversized payloads stalled consumers.",
+      "links": [
+        "e5"
+      ]
+    },
+    {
+      "key": "m17",
+      "label": "Memory",
+      "text": "The pipeline owner is skeptical of adding another queue; the existing Kafka topics already cover it.",
+      "links": []
+    },
+    {
+      "key": "m18",
+      "label": "Memory",
+      "text": "We chose redb over SQLite for the storage engine because it gives us a single-writer MVCC B-tree without a C dependency.",
+      "links": [
+        "e6"
+      ]
+    },
+    {
+      "key": "m19",
+      "label": "Memory",
+      "text": "Zero-copy reads let the engine memory-map pages directly instead of deserializing every record on access.",
+      "links": [
+        "e6"
+      ]
+    },
+    {
+      "key": "m20",
+      "label": "Memory",
+      "text": "The redb upgrade to the v2 file format required a one-time migration pass over every table on first open.",
+      "links": []
+    },
+    {
+      "key": "m21",
+      "label": "Memory",
+      "text": "There is no support for concurrent writers, so the engine funnels every write through a single applier thread.",
+      "links": [
+        "e6",
+        "e1"
+      ]
+    },
+    {
+      "key": "m22",
+      "label": "Memory",
+      "text": "SQLite was the original prototype backend before the switch to redb; it is kept only in the legacy migration tests.",
+      "links": [
+        "e7"
+      ]
+    },
+    {
+      "key": "m23",
+      "label": "Memory",
+      "text": "We never shipped SQLite to production because its file locking caused timeouts under concurrent agent writes.",
+      "links": []
+    },
+    {
+      "key": "m24",
+      "label": "Memory",
+      "text": "An early database candidate's WAL mode was tempting, but the lack of a typed schema made property indexing awkward and slowed queries.",
+      "links": [
+        "e7"
+      ]
+    },
+    {
+      "key": "m25",
+      "label": "Memory",
+      "text": "The analytics warehouse mirrors write events into Postgres nightly so the data team can run ad-hoc SQL.",
+      "links": [
+        "e8"
+      ]
+    },
+    {
+      "key": "m26",
+      "label": "Memory",
+      "text": "Postgres is not on the hot write path; it only receives a batched, eventually-consistent copy of the graph.",
+      "links": [
+        "e8"
+      ]
+    },
+    {
+      "key": "m27",
+      "label": "Memory",
+      "text": "We decided against Postgres as the primary store because we needed embedded, single-file deployment for agents running on laptops.",
+      "links": [
+        "e8"
+      ]
+    },
+    {
+      "key": "m28",
+      "label": "Memory",
+      "text": "Kafka backs the ingestion pipeline's event bus; each topic is partitioned by scope id for locality.",
+      "links": [
+        "e13",
+        "m43"
+      ]
+    },
+    {
+      "key": "m29",
+      "label": "Memory",
+      "text": "We lost three hours of events last spring when a Kafka broker ran out of disk; retention is now capped tighter.",
+      "links": []
+    },
+    {
+      "key": "m30",
+      "label": "Memory",
+      "text": "Kafka consumer lag over five minutes triggers a page to whoever is on call that week.",
+      "links": []
+    },
+    {
+      "key": "m31",
+      "label": "Memory",
+      "text": "The billing service's invoice generator runs at 2am UTC daily and emails a summary if it fails twice in a row.",
+      "links": [
+        "e10"
+      ]
+    },
+    {
+      "key": "m32",
+      "label": "Memory",
+      "text": "Billing has a hard constraint: no refund logic may run without a second engineer's sign-off in the pull request.",
+      "links": [
+        "e10"
+      ]
+    },
+    {
+      "key": "m33",
+      "label": "Memory",
+      "text": "The billing service migrated off its legacy tax table last spring after two states changed their rates mid-quarter.",
+      "links": []
+    },
+    {
+      "key": "m34",
+      "label": "Memory",
+      "text": "Never deploy changes on the last day of the month; that's when transaction volume peaks and rollbacks are riskiest.",
+      "links": [
+        "e10"
+      ]
+    },
+    {
+      "key": "m35",
+      "label": "Memory",
+      "text": "The login password rotates every ninety days and users get a heads-up email one week ahead.",
+      "links": [
+        "e11"
+      ]
+    },
+    {
+      "key": "m36",
+      "label": "Memory",
+      "text": "We chose to store session tokens with a short fifteen-minute expiry and silent refresh instead of long-lived cookies.",
+      "links": [
+        "e11"
+      ]
+    },
+    {
+      "key": "m37",
+      "label": "Memory",
+      "text": "Auth service outages count as sev-1 incidents because every other service depends on it to validate requests.",
+      "links": []
+    },
+    {
+      "key": "m38",
+      "label": "Memory",
+      "text": "Never run the auth service migration during peak hours; the last attempt locked the sessions table for six minutes.",
+      "links": []
+    },
+    {
+      "key": "m39",
+      "label": "Memory",
+      "text": "The search service's ranking pipeline blends BM25 text relevance with a vector leg and a lightweight graph boost.",
+      "links": [
+        "e12",
+        "m41"
+      ]
+    },
+    {
+      "key": "m40",
+      "label": "Memory",
+      "text": "Search latency regressed after the last index rebuild; it was traced to a missing composite index on scope id.",
+      "links": [
+        "e12",
+        "m41"
+      ]
+    },
+    {
+      "key": "m41",
+      "label": "Memory",
+      "text": "The most heavily load-tested ranking pipeline component needed tuning after a latency regression, since every recall call touches it on the hot path.",
+      "links": [
+        "e12"
+      ]
+    },
+    {
+      "key": "m42",
+      "label": "Memory",
+      "text": "The ingestion pipeline validates every incoming record against its schema before it reaches the write queue.",
+      "links": [
+        "e13"
+      ]
+    },
+    {
+      "key": "m43",
+      "label": "Memory",
+      "text": "A schema decision added an unindexed lookup on every record, dropping throughput by half.",
+      "links": [
+        "e13",
+        "e5"
+      ]
+    },
+    {
+      "key": "m44",
+      "label": "Memory",
+      "text": "Failed writes retry three times with exponential backoff before a record is parked in the dead-letter topic.",
+      "links": [
+        "e9"
+      ]
+    },
+    {
+      "key": "m45",
+      "label": "Memory",
+      "text": "The CI pipeline runs the full differential fuzz suite on every merge to main, not just on release branches.",
+      "links": [
+        "e14",
+        "m47"
+      ]
+    },
+    {
+      "key": "m46",
+      "label": "Memory",
+      "text": "We decided against nightly-only fuzz runs after a corruption bug sat undetected in main for four days.",
+      "links": [
+        "e14"
+      ]
+    },
+    {
+      "key": "m47",
+      "label": "Memory",
+      "text": "It takes eleven minutes end to end, fast enough to run on every merge instead of batching into a nightly run; anything slower gets flagged as a build health regression.",
+      "links": [
+        "e14"
+      ]
+    },
+    {
+      "key": "m48",
+      "label": "Memory",
+      "text": "Staging mirrors production's index configuration exactly so a schema regression shows up before it ever reaches customers.",
+      "links": [
+        "e15"
+      ]
+    },
+    {
+      "key": "m49",
+      "label": "Memory",
+      "text": "Nobody may skip the staging deploy step, even for a one-line hotfix; two outages started as bypassed staging checks.",
+      "links": [
+        "e15"
+      ]
+    },
+    {
+      "key": "m50",
+      "label": "Memory",
+      "text": "Production runs on three availability zones with automatic failover if the primary zone's health check fails twice.",
+      "links": [
+        "e16"
+      ]
+    },
+    {
+      "key": "m51",
+      "label": "Memory",
+      "text": "We had a four-hour outage last winter when a bad migration locked the primary table during peak traffic.",
+      "links": [
+        "e16"
+      ]
+    },
+    {
+      "key": "m52",
+      "label": "Memory",
+      "text": "Production capacity planning assumes ten times the current write volume to leave headroom for a big customer's launch.",
+      "links": []
+    },
+    {
+      "key": "m53",
+      "label": "Memory",
+      "text": "The vector index stores bge-small embeddings per node and is rebuilt in the background whenever the model changes.",
+      "links": [
+        "e17"
+      ]
+    },
+    {
+      "key": "m54",
+      "label": "Memory",
+      "text": "Cosine similarity lookups over the vector index are capped at a candidate depth so a huge k can't scan the whole corpus.",
+      "links": [
+        "e17"
+      ]
+    },
+    {
+      "key": "m55",
+      "label": "Memory",
+      "text": "We picked a 384-dimension embedding model as the default because it keeps the vector index small enough to fit in memory for most workloads.",
+      "links": []
+    },
+    {
+      "key": "m56",
+      "label": "Memory",
+      "text": "The on-call rotation is now two weeks long instead of one after the team found one week caused too much handoff churn.",
+      "links": [
+        "e18",
+        "m57"
+      ]
+    },
+    {
+      "key": "m57",
+      "label": "Memory",
+      "text": "Anyone paged for a sev-1 must post an initial status update within ten minutes, even if it's just 'still investigating'.",
+      "links": [
+        "e18"
+      ]
+    },
+    {
+      "key": "m58",
+      "label": "Memory",
+      "text": "The on-call runbook was rewritten after a postmortem showed the old steps referenced a decommissioned dashboard.",
+      "links": [
+        "e18"
+      ]
+    },
+    {
+      "key": "m59",
+      "label": "Memory",
+      "text": "We standardized on conventional commits across every repo so the changelog can be generated automatically.",
+      "links": []
+    },
+    {
+      "key": "m60",
+      "label": "Memory",
+      "text": "The team retro cadence moved from weekly to biweekly after feedback that weekly retros surfaced the same three issues repeatedly.",
+      "links": []
+    },
+    {
+      "key": "m61",
+      "label": "Memory",
+      "text": "Document review turnaround is capped at two business days to keep design proposals from stalling in review.",
+      "links": []
+    },
+    {
+      "key": "m62",
+      "label": "Memory",
+      "text": "The office snack budget was cut in half this quarter to fund an extra load-testing environment instead.",
+      "links": []
+    }
+  ],
+  "synonyms": [
+    {
+      "term": "vcs",
+      "expansion": "commits"
+    },
+    {
+      "term": "db",
+      "expansion": "redb"
+    },
+    {
+      "term": "perf",
+      "expansion": "latency"
+    },
+    {
+      "term": "ci",
+      "expansion": "fuzz"
+    }
+  ],
+  "queries": [
+    {
+      "query": "storage engine reviewer",
+      "expect_top3": [
+        "m1"
+      ]
+    },
+    {
+      "query": "reconciliation job double charging",
+      "expect_top3": [
+        "m7"
+      ]
+    },
+    {
+      "query": "search index rebuilding tripling deploy time",
+      "expect_top3": [
+        "m10"
+      ]
+    },
+    {
+      "query": "kafka consumer partition rebalance",
+      "expect_top3": [
+        "m15"
+      ]
+    },
+    {
+      "query": "invoice generator failure email",
+      "expect_top3": [
+        "m31"
+      ]
+    },
+    {
+      "query": "auth migration peak hours locked sessions",
+      "expect_top3": [
+        "m38"
+      ]
+    },
+    {
+      "query": "fuzz suite merge to main",
+      "expect_top3": [
+        "m45"
+      ]
+    },
+    {
+      "query": "staging deploy skip hotfix",
+      "expect_top3": [
+        "m49"
+      ]
+    },
+    {
+      "query": "vector index rebuild background model change",
+      "expect_top3": [
+        "m53"
+      ]
+    },
+    {
+      "query": "on-call rotation two weeks handoff",
+      "expect_top3": [
+        "m56"
+      ]
+    },
+    {
+      "query": "credentials expiry schedule",
+      "expect_top3": [
+        "m35"
+      ]
+    },
+    {
+      "query": "when the login system goes down every other system breaks too",
+      "expect_top3": [
+        "m37"
+      ]
+    },
+    {
+      "query": "a message queue crashed after running low on storage",
+      "expect_top3": [
+        "m29"
+      ]
+    },
+    {
+      "query": "a flawed rollout locked the main datastore at the worst possible time",
+      "expect_top3": [
+        "m51"
+      ]
+    },
+    {
+      "query": "who is responsible for adjusting relevance scoring parameters",
+      "expect_top3": [
+        "m9"
+      ]
+    },
+    {
+      "query": "an early database candidate accepted any shape of entry, making queries clumsy",
+      "expect_top3": [
+        "m24"
+      ]
+    },
+    {
+      "query": "vcs convention behind auto-generated release notes",
+      "expect_top3": [
+        "m59"
+      ]
+    },
+    {
+      "query": "db choice without a C library",
+      "expect_top3": [
+        "m18"
+      ]
+    },
+    {
+      "query": "perf dip linked to a scope lookup gap",
+      "expect_top3": [
+        "m40"
+      ]
+    },
+    {
+      "query": "ci discipline after an undetected defect lingered for days",
+      "expect_top3": [
+        "m46"
+      ]
+    },
+    {
+      "query": "sign-off requirements before releasing billing changes",
+      "expect_top3": [
+        "m34"
+      ]
+    },
+    {
+      "query": "on-call shift length and what triggers an escalation policy change",
+      "expect_top3": [
+        "m57"
+      ]
+    },
+    {
+      "query": "ranking pipeline tuning and latency regressions in the search stack",
+      "expect_top3": [
+        "m41"
+      ]
+    },
+    {
+      "query": "batch sizing and Kafka consumer rebalancing decisions for the pipeline",
+      "expect_top3": [
+        "m43"
+      ]
+    },
+    {
+      "query": "why we run the full fuzz suite on every merge instead of only nightly",
+      "expect_top3": [
+        "m47"
+      ]
+    }
+  ]
+}

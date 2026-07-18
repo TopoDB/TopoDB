@@ -25,14 +25,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeSet, TopoError,
-    TraversalQuery, VectorQuery,
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, RecallQuery, Scope, ScopeSet,
+    SearchOptions, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
-    scope_label, Config, ReadScopes, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP,
-    MEMORY_LABEL,
+    scope_label, Config, ReadScopes, ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL,
+    ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL, SYNONYM_EXPANSION_PROP, SYNONYM_LABEL,
+    SYNONYM_TERM_PROP,
 };
+use crate::embedder::{Embedder, EmbedderStatus};
 use topodb_json as convert;
 
 /// The MCP server state. `Clone` is required by rmcp (the service clones the
@@ -58,6 +60,15 @@ pub struct TopoServer {
     db_path: String,
     /// See `Config::allow_unscoped_changes`.
     allow_unscoped_changes: bool,
+    /// The embedding subsystem's lifecycle handle — reported via `db_info`
+    /// (Task 10) and consulted by every write tool that indexes text
+    /// (`embed_op`, Task 11) to attach a `SetEmbedding` op when the model is
+    /// `Ready`, and by `search_memories`/`recall`-backed tools to embed the
+    /// query for the vector leg. A model that is not yet `Ready` (or errors
+    /// on a given text) simply yields no vector for that call — writes and
+    /// searches proceed text-only, and the backfill pass catches missed
+    /// embeddings up once the model becomes `Ready`.
+    embedder: Embedder,
     tool_router: ToolRouter<Self>,
 }
 
@@ -164,8 +175,9 @@ impl TopoServer {
         Ok(out)
     }
 
-    /// Wraps an open [`Db`] and the resolved [`Config`] into a server handler.
-    pub fn new(db: Db, config: &Config) -> Self {
+    /// Wraps an open [`Db`], the resolved [`Config`], and the process's
+    /// [`Embedder`] handle into a server handler.
+    pub fn new(db: Db, config: &Config, embedder: Embedder) -> Self {
         let default_scopes = convert::scopes_to_scope_set(config.default_read_scopes.as_slice());
         Self {
             db,
@@ -174,6 +186,7 @@ impl TopoServer {
             default_read_scopes: config.default_read_scopes.clone(),
             db_path: config.db_path.display().to_string(),
             allow_unscoped_changes: config.allow_unscoped_changes,
+            embedder,
             tool_router: Self::tool_router(),
         }
     }
@@ -255,6 +268,70 @@ impl TopoServer {
             .map(|a| a.last_seq)
             .map_err(classify_topo_error)
     }
+
+    /// The SetEmbedding op for `text` under the active model — or None
+    /// when the embedder isn't Ready / errored on this text. Callers
+    /// append it to their write batch; absence never blocks the write
+    /// (backfill catches up later).
+    fn embed_op(&self, id: NodeId, text: &str) -> Option<Op> {
+        let vector = self.embedder.embed(text)?;
+        Some(Op::SetEmbedding {
+            id,
+            model: self.embedder.model_name(),
+            vector,
+        })
+    }
+
+    /// Canonical entities for `name`: direct (Entity, name) matches plus
+    /// (Alias, name) matches followed through alias_of. Deduped by id,
+    /// oldest first.
+    ///
+    /// Returns the raw `TopoError` (not `ErrorData`) rather than swallowing
+    /// it: the two existing call sites disagree on what an undeclared
+    /// (Entity, name) index should mean. `find_by_prop` must still surface it
+    /// as a caller error — that is the exact contract
+    /// `tests/spec_persistence.rs` pins down (an undeclared-index probe on a
+    /// custom spec must error, not silently return empty, or a clobbered
+    /// spec reopen would go undetected). `create_entity` instead treats it as
+    /// "can't dedup on this spec" and degrades to create-always. Only the
+    /// (Alias, name) probe's `Rejected` is unconditionally swallowed here —
+    /// a spec that predates Task 8's Alias index (or a custom spec that
+    /// never declared it) simply has no aliases to resolve, which is never a
+    /// caller error.
+    fn resolve_entities_by_name(
+        &self,
+        scopes: &ScopeSet,
+        name: &str,
+    ) -> Result<Vec<topodb::NodeRecord>, TopoError> {
+        let value = PropValue::Str(name.to_string());
+        let mut out =
+            self.db
+                .nodes_by_prop_normalized(scopes, ENTITY_LABEL, ENTITY_NAME_PROP, &value)?;
+        let aliases =
+            match self
+                .db
+                .nodes_by_prop_normalized(scopes, ALIAS_LABEL, ALIAS_NAME_PROP, &value)
+            {
+                Ok(hits) => hits,
+                Err(TopoError::Rejected(_)) => Vec::new(),
+                Err(e) => return Err(e),
+            };
+        for alias in aliases {
+            for edge in self
+                .db
+                .edges_from(scopes, alias.id, None, Some(ALIAS_EDGE_TYPE), true)?
+            {
+                if let Some(canonical) = self.db.node(scopes, edge.to) {
+                    if canonical.label == ENTITY_LABEL {
+                        out.push(canonical);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|n| n.id);
+        out.dedup_by_key(|n| n.id);
+        Ok(out)
+    }
 }
 
 /// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
@@ -313,6 +390,49 @@ fn parse_node_id(id: &str) -> Result<NodeId, ErrorData> {
         .map_err(|e| ErrorData::invalid_params(format!("invalid node id {id:?}: {e}"), None))
 }
 
+/// Wall-clock milliseconds since the Unix epoch, read once per call site.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_millis() as i64
+}
+
+/// Sanity-checks an agent-supplied temporal bound (`link`'s `valid_from`,
+/// `close_edge`'s `valid_to`). Two silent-failure traps are worth a hard
+/// error here: a seconds-since-epoch value (any modern date is ~2e9, below
+/// the 1e12 ms floor) would land the bound in January 1970, and a
+/// future-dated bound makes the edge invisible to every "now" read until
+/// that instant arrives — both produce an edge that LOOKS written but never
+/// surfaces. 5 minutes of forward slack absorbs clock skew.
+fn validate_ms_timestamp(field: &str, v: i64) -> Result<(), ErrorData> {
+    const MIN_MS: i64 = 1_000_000_000_000; // 2001-09-09 in ms
+    const FUTURE_SLACK_MS: i64 = 5 * 60 * 1000;
+    let now = wall_clock_ms();
+    if v < MIN_MS {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "{field} = {v} is not a plausible milliseconds-since-epoch value \
+                 (below {MIN_MS}). This looks like SECONDS since the epoch — \
+                 multiply by 1000."
+            ),
+            None,
+        ));
+    }
+    if v > now + FUTURE_SLACK_MS {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "{field} = {v} is in the future (now = {now} ms). A future-dated \
+                 bound makes the edge invisible to every \"now\" traversal until \
+                 that time arrives; pass a past-or-present ms timestamp, or omit \
+                 the field to let the engine stamp commit time."
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// The `db_info` result payload. `Json<DbInfo>` (below) makes it structured
 /// tool output.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -334,6 +454,24 @@ struct DbInfo {
     /// filters by this whole set, a write is stamped with the single
     /// `default_scope` above.
     default_read_scopes: Vec<String>,
+    /// Embedding subsystem state: model namespace + lifecycle status. Every
+    /// write tool that indexes text, and every search/recall tool's vector
+    /// leg, consult the embedder directly (see `TopoServer::embedder`'s doc
+    /// comment) — this field makes that live status (and
+    /// `--embeddings`/`--model-dir`'s effect) observable via `db_info`.
+    embeddings: EmbeddingsInfo,
+}
+
+/// `db_info`'s embedding-subsystem sub-payload (see [`DbInfo::embeddings`]).
+/// `model` is the namespace string reported by `Embedder::model_name`
+/// (`--embeddings`'s value, or [`crate::embedder::DEFAULT_MODEL`] when
+/// omitted) regardless of whether the model ever reaches `Ready` — a caller
+/// diagnosing a `Failed` status still needs to know which model was
+/// attempted.
+#[derive(Debug, Serialize, JsonSchema)]
+struct EmbeddingsInfo {
+    model: String,
+    status: EmbedderStatus,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -375,10 +513,17 @@ struct FindByPropParams {
     /// Property name to match — must be declared in the index spec's
     /// equality list for this label.
     prop: String,
-    /// Value to match exactly: a string, integer, or boolean (floats are not
-    /// equality-indexable).
+    /// Value to match: a string, integer, or boolean (floats are not
+    /// equality-indexable). String matching is case- and whitespace-
+    /// insensitive unless `exact` is set.
     #[schemars(schema_with = "prop_value_schema")]
     value: Value,
+    /// Require a byte-exact value match. Defaults to `false`: string values
+    /// match case- and whitespace-insensitively ("drew powell" finds
+    /// "Drew Powell"), which is almost always what a dedup or resolve step
+    /// wants.
+    #[serde(default)]
+    exact: bool,
     /// Scope to search in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
     #[serde(default)]
@@ -405,6 +550,14 @@ fn default_search_k() -> usize {
     10
 }
 
+fn default_recency_weight() -> f32 {
+    0.3
+}
+
+fn default_recency_half_life_days() -> f64 {
+    30.0
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchMemoriesParams {
@@ -428,6 +581,27 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
+    /// How much recency shifts ranking, 0.0-1.0. Each hit's BM25 score is
+    /// multiplied by `(1-w) + w * 2^(-age/half_life)` (age = time since the
+    /// node was created), so fresher memories win ties and stale ones sink
+    /// without a strong old match ever being erased. Set 0 for pure BM25.
+    #[serde(default = "default_recency_weight")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    recency_weight: f32,
+    /// Half-life for the recency decay, in days. Must be > 0.
+    #[serde(default = "default_recency_half_life_days")]
+    #[schemars(range(min = 0.001))]
+    recency_half_life_days: f64,
+    /// Typo/prefix recovery for query terms that match nothing (default
+    /// true): a missing term expands to its closest vocabulary neighbors
+    /// (prefix or small edit distance) at a score discount, so exact matches
+    /// always dominate. Set false for strict term matching.
+    #[serde(default = "default_true")]
+    fuzzy: bool,
+    /// Pull 1-hop graph neighbors of top hits into the results (linked
+    /// context). Default true; set false for lexical/semantic-only.
+    #[serde(default = "default_true")]
+    graph_boost: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -599,10 +773,58 @@ struct CreateEntityParams {
     scope: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddAliasParams {
+    /// ULID of the canonical Entity this alias names.
+    entity_id: String,
+    /// The alternate name. Matched case/whitespace-insensitively everywhere
+    /// entity names are.
+    alias: String,
+    /// Scope for the alias node + edge. Defaults to the canonical entity's
+    /// own scope (NOT the server default — an alias belongs with its entity).
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddSynonymParams {
+    /// Query word this expansion applies to (normalized on store).
+    term: String,
+    /// The equivalent word/phrase searches should also try.
+    expansion: String,
+    /// Also register the reverse direction (expansion -> term). Default true.
+    #[serde(default = "default_true")]
+    bidirectional: bool,
+    /// Scope for the synonym node(s); defaults to the server write scope.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct AddSynonymResult {
+    /// Synonym node id(s) — one per direction written or reused.
+    ids: Vec<String>,
+    /// False when every requested direction already existed.
+    created: bool,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct CreateResult {
     /// ULID of the newly created node.
     id: String,
+}
+
+/// Result of a find-or-create write (`create_entity`).
+#[derive(Debug, Serialize, JsonSchema)]
+struct UpsertResult {
+    /// ULID of the entity: newly created when `created` is true, the
+    /// already-existing node's id otherwise.
+    id: String,
+    /// `false` means the name resolved (case/whitespace-insensitively) to an
+    /// existing entity and NO new node was created — link against this id.
+    created: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -627,15 +849,71 @@ struct LinkParams {
     #[schemars(with = "Option<PropsSchema>")]
     props: Option<Value>,
     /// Milliseconds since Unix epoch the edge becomes valid from. Defaults to
-    /// "now" (resolved by the engine at commit time) when omitted.
+    /// "now" (resolved by the engine at commit time) when omitted. Must be a
+    /// plausible past-or-present ms value — seconds-since-epoch and
+    /// future-dated values are rejected (both would make the edge invisible
+    /// or wrongly dated).
     #[serde(default)]
     valid_from: Option<i64>,
+    /// The new fact REPLACES the old one for this relation: atomically close
+    /// every other open edge of the same type from this node (to any other
+    /// target) before creating/reusing this one. Use for to-one relations
+    /// whose target changed — e.g. `works_at` a new employer. Leave false
+    /// (the default) for relations that accumulate (`knows`, `about`).
+    #[serde(default)]
+    supersede: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct LinkResult {
-    /// ULID of the newly created edge.
+    /// ULID of the edge: newly created when `created` is true, the existing
+    /// open edge with the same from/to/type otherwise.
     id: String,
+    /// `false` means an identical open edge already existed and was reused —
+    /// no duplicate was created.
+    created: bool,
+    /// Edge ids closed by `supersede: true` (empty otherwise).
+    superseded: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetEdgesParams {
+    /// ULID of the source node whose outgoing edges to list.
+    from_id: String,
+    /// Restrict to edges pointing at this target node ULID.
+    #[serde(default)]
+    to_id: Option<String>,
+    /// Restrict to this edge type (normalized like `link` normalizes it;
+    /// edges stored under the raw un-normalized form are matched too).
+    #[serde(default)]
+    edge_type: Option<String>,
+    /// Only currently-open edges (no `valid_to`). Defaults to true — the
+    /// common case is finding the open edge that a changed fact should close.
+    #[serde(default = "default_true")]
+    open_only: bool,
+    /// Scope to read in: `"shared"` or a scope ULID. Defaults to the
+    /// server's configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct GetEdgesResult {
+    /// Matching edges (id/type/from/to/scope/props/valid_from/valid_to),
+    /// oldest first. `valid_to: null` means the edge is currently open.
+    edges: Vec<Value>,
 }
 
 /// The `{ "seq": <last_seq> }` result shared by the mutating tools that don't
@@ -754,7 +1032,7 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, and the default READ scope set applied to a read call that omits both scope/scopes. Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
+        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, the default READ scope set applied to a read call that omits both scope/scopes, and the embedding subsystem's model name + lifecycle status (off/downloading/ready/failed). Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
@@ -771,6 +1049,10 @@ impl TopoServer {
                 .iter()
                 .map(scope_label)
                 .collect(),
+            embeddings: EmbeddingsInfo {
+                model: self.embedder.model_name(),
+                status: self.embedder.status(),
+            },
         }))
     }
 
@@ -800,7 +1082,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Exact-match lookup on an equality-indexed property (e.g. an Entity's name). Call this to resolve a known identifier to a node — NOT for fuzzy or full-text search; use search_memories for that. Errors if (label, prop) is not declared in the index spec."
+        description = "Look up nodes by an equality-indexed property (e.g. an Entity's name). String values match case- and whitespace-insensitively by default ('drew powell' finds 'Drew Powell'); pass exact: true for a byte-exact match. Call this to resolve a known identifier to a node — for topic/phrase search use search_memories instead. Errors if (label, prop) is not declared in the index spec. Zero rows (not an error) when nothing matches — before concluding an entity is new, also try search_memories with the name, and check the shared scope (scopes: [<project>, \"shared\"])."
     )]
     fn find_by_prop(
         &self,
@@ -815,13 +1097,40 @@ impl TopoServer {
         // (undeclared index / Float value). Only the input-validation
         // `Rejected` maps to invalid_params; everything else is a
         // server-side internal_error (same split as `search_memories`).
-        let hits = self
-            .db
-            .nodes_by_prop(&scope_set, &p.label, &p.prop, &value)
-            .map_err(|e| match e {
-                TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?;
+        let hits = if p.exact {
+            self.db
+                .nodes_by_prop(&scope_set, &p.label, &p.prop, &value)
+                .map_err(|e| match e {
+                    TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?
+        } else if p.label == ENTITY_LABEL && p.prop == ENTITY_NAME_PROP {
+            // Alias-aware: an alias name resolves to its canonical entity
+            // (Task 8), same as create_entity's dedup lookup. Only this
+            // specific (label, prop) pair carries alias semantics — any
+            // other equality-indexed lookup keeps the plain normalized match.
+            let name = match &value {
+                PropValue::Str(s) => s.clone(),
+                other => {
+                    return Err(ErrorData::invalid_params(
+                        format!("(Entity, name) matches string values only, got {other:?}"),
+                        None,
+                    ))
+                }
+            };
+            self.resolve_entities_by_name(&scope_set, &name)
+                .map_err(|e| match e {
+                    TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?
+        } else {
+            self.db
+                .nodes_by_prop_normalized(&scope_set, &p.label, &p.prop, &value)
+                .map_err(|e| match e {
+                    TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?
+        };
         let nodes = hits
             .iter()
             .map(convert::node_to_json)
@@ -831,24 +1140,87 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text properties. Call this when looking for memories relevant to a topic or phrase. Returns up to k nodes ranked by relevance with scores."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context."
     )]
     fn search_memories(
         &self,
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
-        // `search_text` opens a redb read transaction, so unlike the pure
-        // snapshot reads it CAN fail with `Storage`/`Encoding` — only its
-        // input-validation `Rejected` (k == 0, token-less query) maps to
-        // invalid_params; everything else is a server-side internal_error.
-        let hits = self
-            .db
-            .search_text(&scope_set, &p.query, p.k)
-            .map_err(|e| match e {
-                TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?;
+        // Resolve synonyms per query word. Lookup key is the ANALYZED
+        // (stemmed) form via topodb::analyze, matching how add_synonym
+        // stores terms — so "logins" finds a synonym stored for "login".
+        // Degrade silently when the spec has no Synonym index. Spec cap:
+        // at most 4 expansions per term, lexicographically smallest first
+        // (deterministic).
+        let mut expansions: Vec<(String, Vec<String>)> = Vec::new();
+        // Dedup query words by their analyzed key: a duplicate/
+        // morphologically-equal word ("auth auth", or "logins" after
+        // "login") would otherwise look up and push the SAME synonym set
+        // twice, and `search_text_expanded`'s per-scope discount only
+        // corroborates each distinct token once anyway — a second identical
+        // expansion entry is pure waste, not extra signal.
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for word in p.query.split_whitespace() {
+            let Some(key) = topodb::analyze(word).into_iter().next() else {
+                continue;
+            };
+            if !seen_keys.insert(key.clone()) {
+                continue;
+            }
+            let hits = match self.db.nodes_by_prop_normalized(
+                &scope_set,
+                SYNONYM_LABEL,
+                SYNONYM_TERM_PROP,
+                &PropValue::Str(key),
+            ) {
+                Ok(h) => h,
+                Err(TopoError::Rejected(_)) => continue,
+                Err(e) => return Err(classify_topo_error(e)),
+            };
+            let mut terms: Vec<String> = hits
+                .iter()
+                .filter_map(|n| match n.props.get(SYNONYM_EXPANSION_PROP) {
+                    Some(PropValue::Str(x)) => Some(x.clone()),
+                    _ => None,
+                })
+                .collect();
+            terms.sort();
+            terms.dedup();
+            terms.truncate(4);
+            if !terms.is_empty() {
+                expansions.push((word.to_string(), terms));
+            }
+        }
+        let options = SearchOptions {
+            recency_weight: p.recency_weight,
+            recency_half_life_ms: (p.recency_half_life_days * 86_400_000.0) as i64,
+            now_ms: None,
+            fuzzy_fallback: p.fuzzy,
+        };
+        let query = RecallQuery {
+            scopes: scope_set,
+            query: p.query.clone(),
+            k: p.k,
+            // None when the embedder isn't Ready (or errors on this text) —
+            // recall then degrades to text/graph legs only.
+            vector: self
+                .embedder
+                .embed(&p.query)
+                .map(|v| (self.embedder.model_name(), v)),
+            expansions,
+            graph_boost: p.graph_boost,
+            options,
+        };
+        // `recall` opens redb read transactions, so unlike the pure snapshot
+        // reads it CAN fail with `Storage`/`Encoding` — only its
+        // input-validation `Rejected` (k == 0, token-less query, bad recency
+        // tuning) maps to invalid_params; everything else is a server-side
+        // internal_error.
+        let hits = self.db.recall(&query).map_err(|e| match e {
+            TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })?;
         let hits = hits
             .iter()
             .map(|(n, score)| {
@@ -871,13 +1243,27 @@ impl TopoServer {
     ) -> Result<Json<TraverseResult>, ErrorData> {
         let seed = parse_node_id(&p.seed_id)?;
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        // Each requested type name probes BOTH its raw and normalized forms:
+        // `link` normalizes on write, but edges written before normalization
+        // (or by a raw engine caller) are stored verbatim — a filter that
+        // only knew one form would silently drop the other's edges.
+        let edge_types = p.edge_types.map(|v| {
+            let mut out: Vec<_> = Vec::with_capacity(v.len());
+            for name in v {
+                if let Ok(norm) = convert::normalize_edge_type(&name) {
+                    if norm != name {
+                        out.push(norm.into());
+                    }
+                }
+                out.push(name.into());
+            }
+            out
+        });
         let query = TraversalQuery {
             scopes: scope_set,
             seeds: vec![seed],
             max_hops: p.max_hops,
-            edge_types: p
-                .edge_types
-                .map(|v| v.into_iter().map(Into::into).collect()),
+            edge_types,
             direction: p.direction.into(),
             as_of: None,
         };
@@ -959,12 +1345,15 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Store a new memory. Call this when the user or task produces information worth remembering later. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id — keep it if you plan to link this memory to entities."
+        description = "Store a new memory. Call this when the user or task produces information worth remembering later. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id — then LINK it to the entities it concerns (create_entity + link), every time: an unlinked memory can only ever be found by keyword search, never by traversing from the people/projects it is about."
     )]
     fn create_memory(
         &self,
         Parameters(p): Parameters<CreateMemoryParams>,
     ) -> Result<Json<CreateResult>, ErrorData> {
+        let id = NodeId::new();
+        // Embed before `p.content` moves into the props map below.
+        let embed = self.embed_op(id, &p.content);
         let props = convert::merge_required_prop(
             MEMORY_CONTENT_PROP,
             PropValue::Str(p.content),
@@ -972,62 +1361,411 @@ impl TopoServer {
         )
         .map_err(|e| ErrorData::invalid_params(e, None))?;
         let scope = self.resolve_scope(p.scope.as_deref())?;
-        let id = NodeId::new();
-        self.submit_write(vec![Op::CreateNode {
+        let mut ops = vec![Op::CreateNode {
             id,
             scope,
             label: MEMORY_LABEL.into(),
             props,
-        }])?;
+        }];
+        ops.extend(embed);
+        self.submit_write(ops)?;
         Ok(Json(CreateResult { id: id.to_string() }))
     }
 
     #[tool(
-        description = "Create an entity node (person, project, concept). Call this the FIRST time something is mentioned that memories should attach to; use find_by_prop first to check it doesn't already exist. name is equality-indexed for exact lookup."
+        description = "Find-or-create an entity node (person, project, concept). Safe to call whenever something worth attaching memories to is mentioned: the name is matched case- and whitespace-insensitively across the read scopes, the write scope, AND shared — if the entity already exists anywhere visible, its id is returned with created: false and NO duplicate is made (any new props keys are merged; existing keys are never overwritten). Use one canonical name form per entity (prefer the fullest name you know, e.g. 'Drew Powell' over 'Drew') so future mentions keep resolving to the same node."
     )]
     fn create_entity(
         &self,
         Parameters(p): Parameters<CreateEntityParams>,
-    ) -> Result<Json<CreateResult>, ErrorData> {
+    ) -> Result<Json<UpsertResult>, ErrorData> {
         let props = convert::merge_required_prop(
             ENTITY_NAME_PROP,
-            PropValue::Str(p.name),
+            PropValue::Str(p.name.clone()),
             p.props.as_ref(),
         )
         .map_err(|e| ErrorData::invalid_params(e, None))?;
         let scope = self.resolve_scope(p.scope.as_deref())?;
+
+        // Dedup lookup runs against everything this session can SEE plus
+        // everything it could COLLIDE with: the default read set, the write
+        // scope, and shared. Without shared here, a shared entity would be
+        // invisible to a project-scoped check and get a project-local twin —
+        // the single most common duplicate-entity path.
+        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup_scopes.push(scope);
+        lookup_scopes.push(Scope::Shared);
+        let lookup_set = convert::scopes_to_scope_set(&lookup_scopes);
+        // Oldest id wins (ULIDs sort by mint time): when duplicates already
+        // exist from before upsert semantics, every new link converges on
+        // one canonical node instead of scattering further. This also
+        // resolves through any alias registered for `p.name` (Task 8), so an
+        // alias mention finds the canonical entity rather than minting a
+        // duplicate.
+        let existing = match self.resolve_entities_by_name(&lookup_set, &p.name) {
+            Ok(hits) => hits.into_iter().min_by_key(|n| n.id),
+            // A custom spec without (Entity, name) equality-indexed can't
+            // dedup — degrade to create-always rather than failing the write.
+            Err(TopoError::Rejected(_)) => None,
+            Err(e) => return Err(classify_topo_error(e)),
+        };
+
+        if let Some(node) = existing {
+            // Merge only NEW metadata keys onto the existing entity; never
+            // overwrite what's already recorded, and never touch `name` (the
+            // stored casing stays canonical).
+            let new_keys: std::collections::BTreeMap<String, Option<PropValue>> = props
+                .into_iter()
+                .filter(|(k, _)| k != ENTITY_NAME_PROP && !node.props.contains_key(k))
+                .map(|(k, v)| (k, Some(v)))
+                .collect();
+            if !new_keys.is_empty() {
+                self.submit_write(vec![Op::SetNodeProps {
+                    id: node.id,
+                    props: new_keys,
+                }])?;
+            }
+            return Ok(Json(UpsertResult {
+                id: node.id.to_string(),
+                created: false,
+            }));
+        }
+
         let id = NodeId::new();
-        self.submit_write(vec![Op::CreateNode {
+        // Create path only: the matched/upsert path above embeds nothing —
+        // the canonical node either already has its vector or backfill
+        // covers it.
+        let embed = self.embed_op(id, &p.name);
+        let mut ops = vec![Op::CreateNode {
             id,
             scope,
             label: ENTITY_LABEL.into(),
             props,
-        }])?;
-        Ok(Json(CreateResult { id: id.to_string() }))
+        }];
+        ops.extend(embed);
+        self.submit_write(ops)?;
+        Ok(Json(UpsertResult {
+            id: id.to_string(),
+            created: true,
+        }))
     }
 
     #[tool(
-        description = "Create a typed, time-aware edge between two existing nodes. Call this to connect a memory to the entities it concerns, or entities to each other (e.g. 'works_on'). edge_type is free-form but be consistent — traverse can filter by it. Returns the edge id. Errors if either node doesn't exist."
+        description = "Register an alternate name for an existing entity ('Drew' for 'Drew Powell', 'the broker' for 'launch.js'). From then on create_entity, find_by_prop, and search resolve the alias to the canonical entity — use this the moment you learn a second name for something instead of creating a duplicate. Errors if the alias already names a DIFFERENT entity (that's a merge situation; both ids are reported). Idempotent for the same entity. Remove an alias with remove_node on the alias node id."
+    )]
+    fn add_alias(
+        &self,
+        Parameters(p): Parameters<AddAliasParams>,
+    ) -> Result<Json<UpsertResult>, ErrorData> {
+        let entity_id = parse_node_id(&p.entity_id)?;
+        // Read set for validation: default read scopes + shared (aliases can
+        // point at shared entities).
+        let mut lookup: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup.push(Scope::Shared);
+        let read_set = convert::scopes_to_scope_set(&lookup);
+
+        let Some(target) = self.db.node(&read_set, entity_id) else {
+            return Err(ErrorData::invalid_params(
+                format!("entity {} not found in the read scopes", p.entity_id),
+                None,
+            ));
+        };
+        if target.label != ENTITY_LABEL {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "add_alias target must be an Entity, {} is a {}",
+                    p.entity_id, target.label
+                ),
+                None,
+            ));
+        }
+        // Conflict: alias equal to a different entity's name or alias. A
+        // custom spec without (Entity, name) equality-indexed can't check
+        // for a conflict — degrade to "no conflict" rather than failing the
+        // write, same as create_entity's dedup lookup.
+        let existing = match self.resolve_entities_by_name(&read_set, &p.alias) {
+            Ok(hits) => hits,
+            Err(TopoError::Rejected(_)) => Vec::new(),
+            Err(e) => return Err(classify_topo_error(e)),
+        };
+        if let Some(other) = existing.iter().find(|n| n.id != entity_id) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "\"{}\" already resolves to entity {} — adding it as an alias of {} \
+                     would make the name ambiguous. If they are the same thing, merge \
+                     them (relink + remove_node) instead.",
+                    p.alias, other.id, entity_id
+                ),
+                None,
+            ));
+        }
+        // Idempotency: an Alias node with this name already pointing here?
+        let alias_hits = self
+            .db
+            .nodes_by_prop_normalized(
+                &read_set,
+                ALIAS_LABEL,
+                ALIAS_NAME_PROP,
+                &PropValue::Str(p.alias.clone()),
+            )
+            .map_err(classify_topo_error)?;
+        for a in &alias_hits {
+            let edges = self
+                .db
+                .edges_from(
+                    &read_set,
+                    a.id,
+                    Some(entity_id),
+                    Some(ALIAS_EDGE_TYPE),
+                    true,
+                )
+                .map_err(classify_topo_error)?;
+            if !edges.is_empty() {
+                return Ok(Json(UpsertResult {
+                    id: a.id.to_string(),
+                    created: false,
+                }));
+            }
+        }
+        // Create alias node + alias_of edge atomically. Scope defaults to
+        // the ENTITY's scope so the pair travels together.
+        let scope = match p.scope.as_deref() {
+            Some(s) => self.resolve_scope(Some(s))?,
+            None => target.scope,
+        };
+        let alias_id = NodeId::new();
+        // Embed before `p.alias` moves into the props map below.
+        let embed = self.embed_op(alias_id, &p.alias);
+        let mut props = Props::new();
+        props.insert(ALIAS_NAME_PROP.to_string(), PropValue::Str(p.alias));
+        let mut ops = vec![
+            Op::CreateNode {
+                id: alias_id,
+                scope,
+                label: ALIAS_LABEL.into(),
+                props,
+            },
+            Op::CreateEdge {
+                id: EdgeId::new(),
+                scope,
+                ty: ALIAS_EDGE_TYPE.into(),
+                from: alias_id,
+                to: entity_id,
+                props: Props::new(),
+                valid_from: None,
+            },
+        ];
+        ops.extend(embed);
+        self.submit_write(ops)?;
+        Ok(Json(UpsertResult {
+            id: alias_id.to_string(),
+            created: true,
+        }))
+    }
+
+    #[tool(
+        description = "Teach search a domain equivalence: after add_synonym('auth','login'), searching 'auth' also matches memories that say 'login' (at a discount, so exact matches still win). Bidirectional by default. Use when you learn this project's vocabulary — 'broker' meaning launch.js, 'the engine' meaning crates/topodb. Depth-1 only: synonyms never chain. Remove with remove_node on the synonym node id."
+    )]
+    fn add_synonym(
+        &self,
+        Parameters(p): Parameters<AddSynonymParams>,
+    ) -> Result<Json<AddSynonymResult>, ErrorData> {
+        // Terms are stored in ANALYZED (stemmed, lowercased) form so
+        // query-time lookup — which analyzes the query word the same way —
+        // can never miss a morphological variant. Expansions stay raw
+        // (trimmed): the engine tokenizes them at scoring time.
+        let term = topodb::analyze(&p.term)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let expansion = p.expansion.trim().to_lowercase();
+        let expansion_key = topodb::analyze(&expansion)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if term.is_empty() || expansion_key.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "term and expansion must each contain at least one word",
+                None,
+            ));
+        }
+        if term == expansion_key {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "term and expansion reduce to the same word ({term:?}) — a self-synonym does nothing"
+                ),
+                None,
+            ));
+        }
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let read_set = convert::scope_to_scope_set(scope);
+        let mut ids = Vec::new();
+        let mut created = false;
+        // Reverse direction stores the ANALYZED expansion as its term and
+        // the raw term text as its expansion — both directions must be
+        // lookup-able by analyzed key.
+        let raw_term = p.term.trim().to_lowercase();
+        let pairs: Vec<(String, String)> = if p.bidirectional {
+            vec![(term.clone(), expansion.clone()), (expansion_key, raw_term)]
+        } else {
+            vec![(term, expansion)]
+        };
+        for (t, e) in pairs {
+            // Idempotent per direction: existing (term, expansion) pair reused.
+            let existing = self
+                .db
+                .nodes_by_prop_normalized(
+                    &read_set,
+                    SYNONYM_LABEL,
+                    SYNONYM_TERM_PROP,
+                    &PropValue::Str(t.clone()),
+                )
+                .map_err(classify_topo_error)?;
+            if let Some(node) = existing.iter().find(|n| {
+                matches!(n.props.get(SYNONYM_EXPANSION_PROP), Some(PropValue::Str(x)) if x == &e)
+            }) {
+                ids.push(node.id.to_string());
+                continue;
+            }
+            let id = NodeId::new();
+            let mut props = Props::new();
+            props.insert(SYNONYM_TERM_PROP.to_string(), PropValue::Str(t));
+            props.insert(SYNONYM_EXPANSION_PROP.to_string(), PropValue::Str(e));
+            self.submit_write(vec![Op::CreateNode {
+                id,
+                scope,
+                label: SYNONYM_LABEL.into(),
+                props,
+            }])?;
+            ids.push(id.to_string());
+            created = true;
+        }
+        Ok(Json(AddSynonymResult { ids, created }))
+    }
+
+    #[tool(
+        description = "Create (or reuse) a typed, time-aware edge between two existing nodes. ALWAYS link what you store: a memory to the entities it concerns ('about'), entities to each other ('works_on', 'works_at') — an unlinked memory is invisible to traverse. edge_type is normalized (lowercased; spaces/hyphens collapse to '_', so 'Works At' == 'works_at'); reuse existing type names rather than inventing synonyms ('works_at', not also 'employed_by'). Calling link again with the same from/to/type returns the existing open edge (created: false) instead of a duplicate. When the new fact REPLACES the old one for a to-one relation (moved teams, changed employer), pass supersede: true to atomically close the other open same-type edges from this node. Errors if either node doesn't exist. When linking shared-scope nodes, pass scope: 'shared' or the edge is invisible outside this project."
     )]
     fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<Json<LinkResult>, ErrorData> {
         let from = parse_node_id(&p.from_id)?;
         let to = parse_node_id(&p.to_id)?;
+        let ty = convert::normalize_edge_type(&p.edge_type)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        if let Some(vf) = p.valid_from {
+            validate_ms_timestamp("valid_from", vf)?;
+        }
         let props = match &p.props {
             Some(v) => convert::json_to_props(v).map_err(|e| ErrorData::invalid_params(e, None))?,
             None => Props::new(),
         };
         let scope = self.resolve_scope(p.scope.as_deref())?;
+        let write_set = convert::scope_to_scope_set(scope);
+
+        // Reuse an identical open edge instead of stacking a parallel
+        // duplicate — re-recording a still-true fact is normal agent
+        // behavior, and must be idempotent. Dedup is per write scope: a
+        // deliberately different-scoped edge between the same nodes stays
+        // possible.
+        let existing = self
+            .db
+            .edges_from(&write_set, from, Some(to), Some(&ty), true)
+            .map_err(classify_topo_error)?;
+
+        let mut ops: Vec<Op> = Vec::new();
+        let mut superseded: Vec<String> = Vec::new();
+        if p.supersede {
+            let open_same_ty = self
+                .db
+                .edges_from(&write_set, from, None, Some(&ty), true)
+                .map_err(classify_topo_error)?;
+            for e in open_same_ty.iter().filter(|e| e.to != to) {
+                ops.push(Op::CloseEdge {
+                    id: e.id,
+                    valid_to: None,
+                });
+                superseded.push(e.id.to_string());
+            }
+        }
+
+        if let Some(e) = existing.first() {
+            // Same-target open edge already records this fact — close the
+            // superseded siblings (if any) and reuse it.
+            if !ops.is_empty() {
+                self.submit_write(ops)?;
+            }
+            return Ok(Json(LinkResult {
+                id: e.id.to_string(),
+                created: false,
+                superseded,
+            }));
+        }
+
         let id = EdgeId::new();
-        self.submit_write(vec![Op::CreateEdge {
+        ops.push(Op::CreateEdge {
             id,
             scope,
-            ty: p.edge_type.into(),
+            ty: ty.into(),
             from,
             to,
             props,
             valid_from: p.valid_from,
-        }])?;
-        Ok(Json(LinkResult { id: id.to_string() }))
+        });
+        // One submit: the closes and the create commit atomically — a
+        // supersede can never close the old fact and then fail to record the
+        // new one.
+        self.submit_write(ops)?;
+        Ok(Json(LinkResult {
+            id: id.to_string(),
+            created: true,
+            superseded,
+        }))
+    }
+
+    #[tool(
+        description = "List a node's outgoing edges, optionally filtered by target node and/or edge type; open edges only by default. This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
+    )]
+    fn get_edges(
+        &self,
+        Parameters(p): Parameters<GetEdgesParams>,
+    ) -> Result<Json<GetEdgesResult>, ErrorData> {
+        let from = parse_node_id(&p.from_id)?;
+        let to = match &p.to_id {
+            Some(s) => Some(parse_node_id(s)?),
+            None => None,
+        };
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let mut edges = match &p.edge_type {
+            None => self
+                .db
+                .edges_from(&scope_set, from, to, None, p.open_only)
+                .map_err(classify_topo_error)?,
+            Some(raw) => {
+                let norm = convert::normalize_edge_type(raw)
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                let mut es = self
+                    .db
+                    .edges_from(&scope_set, from, to, Some(&norm), p.open_only)
+                    .map_err(classify_topo_error)?;
+                // Edges written before type normalization are stored under
+                // the raw form — probe it too so they stay findable.
+                if norm != *raw {
+                    es.extend(
+                        self.db
+                            .edges_from(&scope_set, from, to, Some(raw), p.open_only)
+                            .map_err(classify_topo_error)?,
+                    );
+                }
+                es
+            }
+        };
+        edges.sort_by_key(|e| e.id);
+        edges.dedup_by_key(|e| e.id);
+        let edges = edges
+            .iter()
+            .map(convert::edge_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(Json(GetEdgesResult { edges }))
     }
 
     #[tool(
@@ -1057,7 +1795,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Close an open edge, stamping its valid_to. valid_to defaults to now when omitted. Errors if the edge doesn't exist. Returns the committed seq."
+        description = "Close an open edge, stamping its valid_to — the edge stops being 'currently true' but stays in history. Call this when a linked fact stops holding (left the team, project ended); find the edge id with get_edges. valid_to defaults to now when omitted (recommended). For the common 'X changed to Y' case, prefer link with supersede: true, which closes and re-links atomically. Errors if the edge doesn't exist or is already closed."
     )]
     fn close_edge(
         &self,
@@ -1066,6 +1804,9 @@ impl TopoServer {
         let id = EdgeId::from_str(&p.id).map_err(|e| {
             ErrorData::invalid_params(format!("invalid edge id {:?}: {e}", p.id), None)
         })?;
+        if let Some(vt) = p.valid_to {
+            validate_ms_timestamp("valid_to", vt)?;
+        }
         let seq = self.submit_seq(vec![Op::CloseEdge {
             id,
             valid_to: p.valid_to,
@@ -1133,7 +1874,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; create_node { label, props?, scope? } — a node with an arbitrary label (for host-level schemas like episode recording); link { from, to, type, scope?, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
+        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed, backward-only), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). CAUTION: batch commands are raw writes — batch create_entity ALWAYS creates a new node (no find-or-create) and batch link never dedupes; when the entity or edge might already exist, use the create_entity/link tools instead. Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; create_node { label, props?, scope? } — a node with an arbitrary label (for host-level schemas like episode recording); link { from, to, type, scope?, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
     )]
     fn submit_batch(
         &self,
@@ -1164,7 +1905,14 @@ impl ServerHandler for TopoServer {
                  exactly ONE scope (per-call `scope: string`, or the server's default write \
                  scope when omitted). The default read set can be WIDER than the default write \
                  scope. Start with db_info to confirm wiring — it reports both defaults \
-                 separately.",
+                 separately. Storing well: create_entity is find-or-create (safe to call \
+                 repeatedly; never duplicates), link is idempotent per (from, to, type) and \
+                 takes supersede: true when a to-one fact changes, and every memory should be \
+                 linked to the entities it concerns. Recalling well: search_memories stems \
+                 terms and falls back to close prefix/typo matches, but does NOT \
+                 understand synonyms — retry with different words before concluding \
+                 nothing is stored — then traverse from the best hit; use \
+                 get_edges to inspect or retire a node's current relations.",
             )
     }
 

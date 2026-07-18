@@ -536,7 +536,7 @@ mod tests {
 
         // Open -> v2->v3 migration assigns slots in ULID order: B=0, A=1.
         let s = crate::storage::Storage::open(&path).unwrap();
-        assert_eq!(s.format_version().unwrap(), 4);
+        assert_eq!(s.format_version().unwrap(), crate::storage::FORMAT_VERSION);
         let slot_of = |s: &crate::storage::Storage, id| {
             let tx = s.db.begin_read().unwrap();
             let t = tx.open_table(NODE_SLOTS).unwrap();
@@ -588,7 +588,7 @@ mod tests {
         write_v2_fixture(&path, &[], &[]);
 
         let s = crate::storage::Storage::open(&path).unwrap();
-        assert_eq!(s.format_version().unwrap(), 4);
+        assert_eq!(s.format_version().unwrap(), crate::storage::FORMAT_VERSION);
         for report in s.storage_report().unwrap() {
             match report.table {
                 "meta" => assert!(report.rows >= 1, "meta must retain format_version"),
@@ -621,7 +621,7 @@ mod tests {
         write_v2_fixture(&path, &[node], &[]);
 
         let s = crate::storage::Storage::open(&path).unwrap();
-        assert_eq!(s.format_version().unwrap(), 4);
+        assert_eq!(s.format_version().unwrap(), crate::storage::FORMAT_VERSION);
         let rec = s
             .load_node(id)
             .unwrap()
@@ -682,7 +682,7 @@ mod tests {
         }
 
         let s = crate::storage::Storage::open(&path).unwrap();
-        assert_eq!(s.format_version().unwrap(), 4);
+        assert_eq!(s.format_version().unwrap(), crate::storage::FORMAT_VERSION);
         assert_eq!(
             s.oldest_seq().unwrap(),
             5,

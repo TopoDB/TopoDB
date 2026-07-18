@@ -194,3 +194,208 @@ fn changed_text_spec_reindexes_at_open() {
         1
     );
 }
+
+/// Recency weighting: at equal BM25 relevance, `search_text_with` with a
+/// nonzero `recency_weight` ranks the fresher node (by its id's ULID
+/// timestamp) above the staler one — and with weight 0 the ordering falls
+/// back to the pure-BM25 tie-break (ascending id, i.e. OLDEST first),
+/// proving the reorder really is the recency factor.
+#[test]
+fn recency_weight_prefers_fresher_hit_at_equal_relevance() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+
+    // Controlled creation times via from_u128: a ULID's top 48 bits are its
+    // millisecond timestamp.
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = 1_800_000_000_000; // fixed "now" for determinism
+    let ulid_at = |ts_ms: i64, n: u128| ((ts_ms as u128) << 80) | n;
+    let old_id = NodeId::from_u128(ulid_at(now - 120 * DAY_MS, 1));
+    let new_id = NodeId::from_u128(ulid_at(now - DAY_MS, 2));
+    for id in [old_id, new_id] {
+        let mut props = Props::new();
+        props.insert(
+            "content".into(),
+            PropValue::Str("identical recency probe".into()),
+        );
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }])
+        .unwrap();
+    }
+
+    // Weight 0 (the search_text default): equal scores, tie-break by
+    // ascending id — the OLDER node first.
+    let plain = db.search_text(&scopes, "recency probe", 10).unwrap();
+    assert_eq!(plain.len(), 2);
+    assert_eq!(plain[0].0.id, old_id);
+    assert!((plain[0].1 - plain[1].1).abs() < f32::EPSILON);
+
+    // Weight on: the fresher node must outrank the stale one.
+    let opts = SearchOptions {
+        recency_weight: 0.5,
+        recency_half_life_ms: 30 * DAY_MS,
+        now_ms: Some(now),
+        ..Default::default()
+    };
+    let weighted = db
+        .search_text_with(&scopes, "recency probe", 10, &opts)
+        .unwrap();
+    assert_eq!(weighted.len(), 2);
+    assert_eq!(weighted[0].0.id, new_id, "fresher hit must rank first");
+    assert!(weighted[0].1 > weighted[1].1);
+    // The floor guarantees a stale hit keeps at least (1 - w) of its score.
+    assert!(weighted[1].1 >= plain[1].1 * 0.5 - f32::EPSILON);
+}
+
+/// Bad recency tuning is a caller error, not a silent no-op.
+#[test]
+fn search_text_with_rejects_bad_recency_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    for opts in [
+        SearchOptions {
+            recency_weight: -0.1,
+            ..Default::default()
+        },
+        SearchOptions {
+            recency_weight: 1.5,
+            ..Default::default()
+        },
+        SearchOptions {
+            recency_weight: 0.5,
+            recency_half_life_ms: 0,
+            now_ms: None,
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            db.search_text_with(&scopes, "anything", 10, &opts),
+            Err(TopoError::Rejected(_))
+        ));
+    }
+}
+
+/// Analyzer v1: morphological variants land on one posting — the biggest
+/// lexical blind spot of the old exact-token tokenizer.
+#[test]
+fn stemming_matches_morphological_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = memory("the database is running smoothly", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    for query in ["databases", "database", "run", "runs", "smooth"] {
+        let hits = db.search_text(&scopes, query, 10).unwrap();
+        assert_eq!(hits.len(), 1, "query {query:?} must match via stemming");
+        assert_eq!(hits[0].0.id, a);
+    }
+}
+
+/// Analyzer v1: camelCase identifiers split into their words (snake_case
+/// already splits at the non-alphanumeric boundary), acronym-aware.
+#[test]
+fn camel_case_identifiers_are_searchable_by_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = memory("refactored parseHttpRequest into HTTPServer", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    for query in ["parse", "http", "request", "server", "parseHttpRequest"] {
+        let hits = db.search_text(&scopes, query, 10).unwrap();
+        assert_eq!(hits.len(), 1, "query {query:?} must match via camel split");
+        assert_eq!(hits[0].0.id, a);
+    }
+}
+
+/// Miss-only fuzzy fallback: a typo'd or prefix-truncated query term that
+/// matches nothing expands to its nearest vocabulary neighbors at a
+/// discount; a term that hits exactly pays nothing and scores identically.
+#[test]
+fn fuzzy_fallback_recovers_typos_and_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = memory("vector recall pipeline design", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    // Typo: one transposition ("vectro" -> "vector").
+    let hits = db.search_text(&scopes, "vectro", 10).unwrap();
+    assert_eq!(hits.len(), 1, "typo must recover via edit distance");
+    assert_eq!(hits[0].0.id, a);
+
+    // Prefix: "pipel" is a prefix of "pipelin" (the stem of "pipeline").
+    let hits = db.search_text(&scopes, "pipel", 10).unwrap();
+    assert_eq!(hits.len(), 1, "prefix must recover");
+
+    // The fuzzy contribution is discounted below an exact hit's.
+    let exact = db.search_text(&scopes, "vector", 10).unwrap()[0].1;
+    let fuzzy = db.search_text(&scopes, "vectro", 10).unwrap()[0].1;
+    assert!(
+        fuzzy < exact,
+        "fuzzy score {fuzzy} must be below exact score {exact}"
+    );
+
+    // Garbage stays garbage: nothing within distance 2 of "zzzzzzz".
+    assert!(db.search_text(&scopes, "zzzzzzz", 10).unwrap().is_empty());
+
+    // Opt-out: with the fallback disabled the typo matches nothing.
+    let opts = SearchOptions {
+        fuzzy_fallback: false,
+        ..Default::default()
+    };
+    assert!(db
+        .search_text_with(&scopes, "vectro", 10, &opts)
+        .unwrap()
+        .is_empty());
+}
+
+/// The v5 analyzer-versioning contract: FTS tables written under a different
+/// (or pre-stamp) analyzer are drained and rebuilt on open — simulated by
+/// clearing the stamp and the postings from outside, exactly what a pre-v5
+/// file looks like to this build.
+#[test]
+fn stale_analyzer_version_triggers_fts_rebuild_on_open() {
+    use redb::TableDefinition;
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    const POSTINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("postings");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let s = ScopeId::new();
+    let a;
+    {
+        let db = Db::open_with(&path, spec()).unwrap();
+        let (id, op) = memory("reindex probe for analyzers", Scope::Id(s));
+        a = id;
+        db.submit(vec![op]).unwrap();
+    }
+    {
+        let raw = redb::Database::open(&path).unwrap();
+        let tx = raw.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            postings.retain(|_, _| false).unwrap();
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("fts_analyzer_version", 0u32.to_le_bytes().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let db = Db::open_with(&path, spec()).unwrap();
+    let hits = db.search_text(&ScopeSet::of(&[s]), "analyzer", 10).unwrap();
+    assert_eq!(hits.len(), 1, "stale analyzer stamp must force a rebuild");
+    assert_eq!(hits[0].0.id, a);
+}

@@ -607,6 +607,95 @@ impl Db {
             .collect()
     }
 
+    /// Scoped edge listing from `from`: every edge whose source is `from`,
+    /// optionally restricted to a target node, an edge type (matched against
+    /// the stored type string exactly — normalize before calling if the type
+    /// vocabulary is normalized), and to currently-open edges only
+    /// (`valid_to.is_none()`). Only edges whose own scope is in `scopes` are
+    /// returned (there is no unscoped read); the endpoints' scopes are NOT
+    /// re-gated — an in-scope edge already names both endpoint ids, and this
+    /// returns edge records, not node records.
+    ///
+    /// This is the supersession primitive: when a fact changes, list the open
+    /// edges of the old fact's type here, close them, and create the new edge
+    /// — the discovery step `traverse` is too coarse for. A missing `from`
+    /// slot (never existed, or removed) yields an empty result, not an error.
+    /// Does not bump access counters — no node record is returned.
+    pub fn edges_from(
+        &self,
+        scopes: &ScopeSet,
+        from: NodeId,
+        to: Option<NodeId>,
+        ty: Option<&str>,
+        open_only: bool,
+    ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
+        let storage = self.storage();
+        let dicts = storage.dicts.read().expect("dict lock poisoned");
+        let scope_registry = storage
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        // An edge-type name the dict has never interned has never been
+        // written: match nothing (an empty filter list is still a filter),
+        // mirroring `traverse`'s treatment of unknown type names.
+        let type_filter: Option<Vec<u32>> = ty.map(|name| {
+            dicts
+                .id_of(crate::dict::DictKind::EdgeType, name)
+                .into_iter()
+                .collect()
+        });
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let node_slots = tx
+            .open_table(crate::slots::NODE_SLOTS)
+            .map_err(crate::error::storage_err)?;
+        let Some(from_slot) = crate::slots::node_slot(&node_slots, from)? else {
+            return Ok(Vec::new());
+        };
+        let to_slot = match to {
+            None => None,
+            Some(to) => match crate::slots::node_slot(&node_slots, to)? {
+                // A target that has no slot has no edges either.
+                None => return Ok(Vec::new()),
+                some => some,
+            },
+        };
+        let out_adj = tx
+            .open_table(crate::adj::OUT_ADJ)
+            .map_err(crate::error::storage_err)?;
+        let edges_table = tx
+            .open_table(crate::storage::EDGES)
+            .map_err(crate::error::storage_err)?;
+        let node_ids = tx
+            .open_table(crate::slots::NODE_IDS)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for (_ty, entry) in crate::adj::read_adj(&out_adj, from_slot, type_filter.as_deref())? {
+            if to_slot.is_some_and(|slot| entry.target != slot) {
+                continue;
+            }
+            if open_only && entry.valid_to.is_some() {
+                continue;
+            }
+            let entry_scope = scope_registry.resolve(entry.scope)?;
+            if !scopes.contains(entry_scope) {
+                continue;
+            }
+            if let Some(rec) = crate::storage::read_edge_by_slot(
+                &edges_table,
+                &dicts,
+                &scope_registry,
+                &node_ids,
+                entry.edge,
+            )? {
+                out.push(rec);
+            }
+        }
+        // Deterministic order: by edge id (ULIDs sort by mint time, so this
+        // is oldest-first).
+        out.sort_by_key(|e| e.id);
+        Ok(out)
+    }
+
     /// Shared implementation for `all_edges_between`/`open_edges_between`: a
     /// bounded OUT_ADJ scan from `from`'s slot, filtered to entries whose
     /// target resolves to `to`, then fetched as full `EdgeRecord`s — all in

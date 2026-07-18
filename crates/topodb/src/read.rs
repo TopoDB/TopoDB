@@ -101,12 +101,52 @@ impl Db {
     /// `value` is a `Float` (not equality-indexable — Floats never enter the
     /// index in the first place). Otherwise an index lookup followed by a
     /// scope filter.
+    ///
+    /// Exact match: the on-disk index keys are stored under
+    /// `prop_index::normalize_str` (case/whitespace-folded), so the index
+    /// probe over-fetches normalized variants; this method restores byte-exact
+    /// semantics by post-filtering candidates on the stored prop value. Use
+    /// [`Db::nodes_by_prop_normalized`] when the relaxed match is wanted (e.g.
+    /// resolving an entity name an agent may have re-typed with different
+    /// casing or spacing).
     pub fn nodes_by_prop(
         &self,
         scopes: &ScopeSet,
         label: &str,
         prop: &str,
         value: &PropValue,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
+        let hits = self.nodes_by_prop_inner(scopes, label, prop, value, true)?;
+        self.bump(hits.iter().map(|node| node.id));
+        Ok(hits)
+    }
+
+    /// Like [`Db::nodes_by_prop`], but case- and whitespace-insensitive for
+    /// `Str` values: `"drew powell"` matches a node whose stored value is
+    /// `"Drew Powell"` (or `" Drew  Powell "`). Non-`Str` values behave
+    /// identically to `nodes_by_prop` — normalization only affects strings.
+    /// This is the dedup primitive: check it before creating an entity so a
+    /// re-typed name resolves to the existing node instead of minting a
+    /// duplicate.
+    pub fn nodes_by_prop_normalized(
+        &self,
+        scopes: &ScopeSet,
+        label: &str,
+        prop: &str,
+        value: &PropValue,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
+        let hits = self.nodes_by_prop_inner(scopes, label, prop, value, false)?;
+        self.bump(hits.iter().map(|node| node.id));
+        Ok(hits)
+    }
+
+    fn nodes_by_prop_inner(
+        &self,
+        scopes: &ScopeSet,
+        label: &str,
+        prop: &str,
+        value: &PropValue,
+        exact: bool,
     ) -> Result<Vec<NodeRecord>, TopoError> {
         let spec = &self.storage().spec;
         if !spec
@@ -132,8 +172,8 @@ impl Db {
         let hits: Vec<NodeRecord> = candidates
             .into_iter()
             .filter(|node| node.label == label && scopes.contains(node.scope))
+            .filter(|node| !exact || node.props.get(prop) == Some(value))
             .collect();
-        self.bump(hits.iter().map(|node| node.id));
         Ok(hits)
     }
 

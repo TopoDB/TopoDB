@@ -197,7 +197,8 @@ pub fn resolve_batch(
             "link" => {
                 let from_raw = req_str(obj, "from", idx)?;
                 let to_raw = req_str(obj, "to", idx)?;
-                let ty = req_str(obj, "type", idx)?;
+                let ty = crate::normalize_edge_type(&req_str(obj, "type", idx)?)
+                    .map_err(|e| format!("command #{idx}: {e}"))?;
                 let scope = scope_of(obj, default_scope, idx)?;
                 let from = parse_node(
                     &resolve_ref(&from_raw, IdKind::Node, &produced, "from", idx)?,

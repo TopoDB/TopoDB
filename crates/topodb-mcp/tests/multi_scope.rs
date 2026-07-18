@@ -507,8 +507,9 @@ fn all_six_read_tools_honour_scopes_default_vs_override() {
     );
     assert_eq!(
         overridden["hits"].as_array().unwrap().len(),
-        1,
-        "search_memories with scopes: [\"shared\"] must find the memory: {overridden:#?}"
+        3,
+        "search_memories with scopes: [\"shared\"] must find the memory AND \
+         both entities (entity names are text-indexed by the default spec): {overridden:#?}"
     );
 
     // --- traverse ----------------------------------------------------------

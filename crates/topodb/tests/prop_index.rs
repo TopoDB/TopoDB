@@ -231,6 +231,138 @@ fn redeclaring_equality_index_does_not_resurrect_stale_rows() {
     assert_eq!(hits[0].id, a);
 }
 
+/// The dedup primitive: `nodes_by_prop_normalized` matches Str values case-
+/// and whitespace-insensitively, while `nodes_by_prop` stays byte-exact via
+/// its post-filter — both against the same (normalized) on-disk keys.
+#[test]
+fn normalized_lookup_matches_case_and_whitespace_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = entity("Drew Powell", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    for variant in [
+        "drew powell",
+        "DREW POWELL",
+        " Drew  Powell ",
+        "Drew\u{a0}Powell",
+    ] {
+        let hits = db
+            .nodes_by_prop_normalized(&scopes, "Entity", "name", &PropValue::Str(variant.into()))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "variant {variant:?} must match");
+        assert_eq!(hits[0].id, a);
+    }
+
+    // Exact lookup only matches the stored bytes.
+    assert!(db
+        .nodes_by_prop(
+            &scopes,
+            "Entity",
+            "name",
+            &PropValue::Str("drew powell".into())
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.nodes_by_prop(
+            &scopes,
+            "Entity",
+            "name",
+            &PropValue::Str("Drew Powell".into())
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+
+    // A genuinely different name matches neither way.
+    assert!(db
+        .nodes_by_prop_normalized(&scopes, "Entity", "name", &PropValue::Str("Drew".into()))
+        .unwrap()
+        .is_empty());
+}
+
+/// Two nodes whose names differ only in case share one normalized index key:
+/// exact lookup separates them, normalized lookup returns both.
+#[test]
+fn exact_lookup_separates_case_variant_twins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = entity("Ada", Scope::Id(s));
+    let (b, op_b) = entity("ada", Scope::Id(s));
+    db.submit(vec![op_a, op_b]).unwrap();
+
+    let exact = db
+        .nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("Ada".into()))
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].id, a);
+
+    let mut both: Vec<NodeId> = db
+        .nodes_by_prop_normalized(&scopes, "Entity", "name", &PropValue::Str("ADA".into()))
+        .unwrap()
+        .into_iter()
+        .map(|n| n.id)
+        .collect();
+    both.sort();
+    let mut expected = vec![a, b];
+    expected.sort();
+    assert_eq!(both, expected);
+}
+
+/// The v5 upgrade path: a file whose PROP_INDEX predates key normalization
+/// (simulated by draining the table and clearing the norm-version stamp via
+/// raw redb) must be rebuilt on the next open — the `prop_index_norm_version`
+/// check in `ensure_index_spec`, not the spec comparison, is what triggers
+/// it, since the spec itself is unchanged.
+#[test]
+fn stale_norm_version_triggers_prop_index_rebuild_on_open() {
+    use redb::TableDefinition;
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    const PROP_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("prop_index");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let s = ScopeId::new();
+    let a;
+    {
+        let db = Db::open_with(&path, spec()).unwrap();
+        let (id, op) = entity("Drew Powell", Scope::Id(s));
+        a = id;
+        db.submit(vec![op]).unwrap();
+    }
+    {
+        // Sabotage from outside: empty the index and mark its key scheme as
+        // version 0 (what a pre-v5 file effectively is).
+        let raw = redb::Database::open(&path).unwrap();
+        let tx = raw.begin_write().unwrap();
+        {
+            let mut prop_index = tx.open_table(PROP_INDEX).unwrap();
+            prop_index.retain(|_, _| false).unwrap();
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("prop_index_norm_version", 0u32.to_le_bytes().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let db = Db::open_with(&path, spec()).unwrap();
+    let hits = db
+        .nodes_by_prop_normalized(
+            &ScopeSet::of(&[s]),
+            "Entity",
+            "name",
+            &PropValue::Str("drew powell".into()),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "stale norm version must force a rebuild");
+    assert_eq!(hits[0].id, a);
+}
+
 #[test]
 fn open_with_rejects_float_equality_declaration_and_duplicates() {
     let dir = tempfile::tempdir().unwrap();
