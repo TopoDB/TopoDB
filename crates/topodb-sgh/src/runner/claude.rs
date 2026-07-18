@@ -1,0 +1,65 @@
+use std::process::Command;
+
+use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
+
+/// Assembles the prompt for a node. Kept separate from process spawning so it
+/// is unit-testable without invoking a model.
+pub fn build_prompt(req: &NodeRequest) -> String {
+    let mut p = String::new();
+    p.push_str(&req.prompt);
+
+    if !req.inputs.is_empty() {
+        p.push_str("\n\n## Inputs\n\n");
+        p.push_str(
+            "These are the complete outputs of this step's declared dependencies. \
+             They are the only context from the run available to you.\n\n",
+        );
+        for (id, json) in &req.inputs {
+            p.push_str(&format!("### {id}\n\n```json\n{json}\n```\n\n"));
+        }
+    }
+
+    if let Some(schema) = &req.output_schema {
+        p.push_str("\n\n## Required output\n\n");
+        p.push_str(
+            "Reply with bare JSON matching this schema and nothing else — no prose, \
+             no code fences. Output that does not match is treated as a failure.\n\n",
+        );
+        p.push_str(&serde_json::to_string_pretty(schema).unwrap_or_default());
+        p.push('\n');
+    }
+
+    p
+}
+
+pub struct ClaudeCodeRunner {
+    model: Option<String>,
+}
+
+impl ClaudeCodeRunner {
+    pub fn new(model: Option<String>) -> Self {
+        ClaudeCodeRunner { model }
+    }
+}
+
+impl AgentRunner for ClaudeCodeRunner {
+    fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
+        let mut cmd = Command::new("claude");
+        cmd.arg("-p").arg(build_prompt(req));
+        if let Some(m) = &self.model {
+            cmd.arg("--model").arg(m);
+        }
+
+        let out = cmd.output()?;
+        let stdout = String::from_utf8(out.stdout).map_err(|_| RunnerError::Utf8)?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            return Ok(NodeOutcome::Failed {
+                error: format!("claude exited with {}: {}", out.status, stderr.trim()),
+            });
+        }
+
+        Ok(NodeOutcome::Succeeded { output: stdout.trim().to_string() })
+    }
+}
