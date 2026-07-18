@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod validate;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
     #[error("yaml parse error: {0}")]
