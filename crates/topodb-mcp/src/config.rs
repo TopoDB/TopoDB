@@ -34,7 +34,10 @@ use topodb::{IndexSpec, Scope, ScopeId};
 /// `topodb-cli`'s `create-entity`/`create-memory`) and re-exported here so
 /// existing `topodb-mcp` call sites (`use crate::config::{ENTITY_LABEL, ...}`)
 /// keep working unchanged.
-pub use topodb_json::{ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL};
+pub use topodb_json::{
+    ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL, ENTITY_NAME_PROP,
+    MEMORY_CONTENT_PROP, MEMORY_LABEL,
+};
 
 /// A **non-empty** set of scopes a read filters by. The non-empty invariant is
 /// structural rather than conventional: an empty [`ScopeSet`] admits nothing, so

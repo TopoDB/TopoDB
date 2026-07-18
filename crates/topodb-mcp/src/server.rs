@@ -30,8 +30,8 @@ use topodb::{
 };
 
 use crate::config::{
-    scope_label, Config, ReadScopes, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP,
-    MEMORY_LABEL,
+    scope_label, Config, ReadScopes, ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL,
+    ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
 };
 use topodb_json as convert;
 
@@ -254,6 +254,57 @@ impl TopoServer {
             .submit(ops)
             .map(|a| a.last_seq)
             .map_err(classify_topo_error)
+    }
+
+    /// Canonical entities for `name`: direct (Entity, name) matches plus
+    /// (Alias, name) matches followed through alias_of. Deduped by id,
+    /// oldest first.
+    ///
+    /// Returns the raw `TopoError` (not `ErrorData`) rather than swallowing
+    /// it: the two existing call sites disagree on what an undeclared
+    /// (Entity, name) index should mean. `find_by_prop` must still surface it
+    /// as a caller error — that is the exact contract
+    /// `tests/spec_persistence.rs` pins down (an undeclared-index probe on a
+    /// custom spec must error, not silently return empty, or a clobbered
+    /// spec reopen would go undetected). `create_entity` instead treats it as
+    /// "can't dedup on this spec" and degrades to create-always. Only the
+    /// (Alias, name) probe's `Rejected` is unconditionally swallowed here —
+    /// a spec that predates Task 8's Alias index (or a custom spec that
+    /// never declared it) simply has no aliases to resolve, which is never a
+    /// caller error.
+    fn resolve_entities_by_name(
+        &self,
+        scopes: &ScopeSet,
+        name: &str,
+    ) -> Result<Vec<topodb::NodeRecord>, TopoError> {
+        let value = PropValue::Str(name.to_string());
+        let mut out =
+            self.db
+                .nodes_by_prop_normalized(scopes, ENTITY_LABEL, ENTITY_NAME_PROP, &value)?;
+        let aliases =
+            match self
+                .db
+                .nodes_by_prop_normalized(scopes, ALIAS_LABEL, ALIAS_NAME_PROP, &value)
+            {
+                Ok(hits) => hits,
+                Err(TopoError::Rejected(_)) => Vec::new(),
+                Err(e) => return Err(e),
+            };
+        for alias in aliases {
+            for edge in self
+                .db
+                .edges_from(scopes, alias.id, None, Some(ALIAS_EDGE_TYPE), true)?
+            {
+                if let Some(canonical) = self.db.node(scopes, edge.to) {
+                    if canonical.label == ENTITY_LABEL {
+                        out.push(canonical);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|n| n.id);
+        out.dedup_by_key(|n| n.id);
+        Ok(out)
     }
 }
 
@@ -674,6 +725,20 @@ struct CreateEntityParams {
     scope: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddAliasParams {
+    /// ULID of the canonical Entity this alias names.
+    entity_id: String,
+    /// The alternate name. Matched case/whitespace-insensitively everywhere
+    /// entity names are.
+    alias: String,
+    /// Scope for the alias node + edge. Defaults to the canonical entity's
+    /// own scope (NOT the server default — an alias belongs with its entity).
+    #[serde(default)]
+    scope: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct CreateResult {
     /// ULID of the newly created node.
@@ -958,15 +1023,39 @@ impl TopoServer {
         // `Rejected` maps to invalid_params; everything else is a
         // server-side internal_error (same split as `search_memories`).
         let hits = if p.exact {
-            self.db.nodes_by_prop(&scope_set, &p.label, &p.prop, &value)
+            self.db
+                .nodes_by_prop(&scope_set, &p.label, &p.prop, &value)
+                .map_err(|e| match e {
+                    TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?
+        } else if p.label == ENTITY_LABEL && p.prop == ENTITY_NAME_PROP {
+            // Alias-aware: an alias name resolves to its canonical entity
+            // (Task 8), same as create_entity's dedup lookup. Only this
+            // specific (label, prop) pair carries alias semantics — any
+            // other equality-indexed lookup keeps the plain normalized match.
+            let name = match &value {
+                PropValue::Str(s) => s.clone(),
+                other => {
+                    return Err(ErrorData::invalid_params(
+                        format!("(Entity, name) matches string values only, got {other:?}"),
+                        None,
+                    ))
+                }
+            };
+            self.resolve_entities_by_name(&scope_set, &name)
+                .map_err(|e| match e {
+                    TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?
         } else {
             self.db
                 .nodes_by_prop_normalized(&scope_set, &p.label, &p.prop, &value)
-        }
-        .map_err(|e| match e {
-            TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })?;
+                .map_err(|e| match e {
+                    TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })?
+        };
         let nodes = hits
             .iter()
             .map(convert::node_to_json)
@@ -1172,15 +1261,13 @@ impl TopoServer {
         lookup_scopes.push(scope);
         lookup_scopes.push(Scope::Shared);
         let lookup_set = convert::scopes_to_scope_set(&lookup_scopes);
-        let existing = match self.db.nodes_by_prop_normalized(
-            &lookup_set,
-            ENTITY_LABEL,
-            ENTITY_NAME_PROP,
-            &PropValue::Str(p.name.clone()),
-        ) {
-            // Oldest id wins (ULIDs sort by mint time): when duplicates
-            // already exist from before upsert semantics, every new link
-            // converges on one canonical node instead of scattering further.
+        // Oldest id wins (ULIDs sort by mint time): when duplicates already
+        // exist from before upsert semantics, every new link converges on
+        // one canonical node instead of scattering further. This also
+        // resolves through any alias registered for `p.name` (Task 8), so an
+        // alias mention finds the canonical entity rather than minting a
+        // duplicate.
+        let existing = match self.resolve_entities_by_name(&lookup_set, &p.name) {
             Ok(hits) => hits.into_iter().min_by_key(|n| n.id),
             // A custom spec without (Entity, name) equality-indexed can't
             // dedup — degrade to create-always rather than failing the write.
@@ -1218,6 +1305,115 @@ impl TopoServer {
         }])?;
         Ok(Json(UpsertResult {
             id: id.to_string(),
+            created: true,
+        }))
+    }
+
+    #[tool(
+        description = "Register an alternate name for an existing entity ('Drew' for 'Drew Powell', 'the broker' for 'launch.js'). From then on create_entity, find_by_prop, and search resolve the alias to the canonical entity — use this the moment you learn a second name for something instead of creating a duplicate. Errors if the alias already names a DIFFERENT entity (that's a merge situation; both ids are reported). Idempotent for the same entity. Remove an alias with remove_node on the alias node id."
+    )]
+    fn add_alias(
+        &self,
+        Parameters(p): Parameters<AddAliasParams>,
+    ) -> Result<Json<UpsertResult>, ErrorData> {
+        let entity_id = parse_node_id(&p.entity_id)?;
+        // Read set for validation: default read scopes + shared (aliases can
+        // point at shared entities).
+        let mut lookup: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup.push(Scope::Shared);
+        let read_set = convert::scopes_to_scope_set(&lookup);
+
+        let Some(target) = self.db.node(&read_set, entity_id) else {
+            return Err(ErrorData::invalid_params(
+                format!("entity {} not found in the read scopes", p.entity_id),
+                None,
+            ));
+        };
+        if target.label != ENTITY_LABEL {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "add_alias target must be an Entity, {} is a {}",
+                    p.entity_id, target.label
+                ),
+                None,
+            ));
+        }
+        // Conflict: alias equal to a different entity's name or alias. A
+        // custom spec without (Entity, name) equality-indexed can't check
+        // for a conflict — degrade to "no conflict" rather than failing the
+        // write, same as create_entity's dedup lookup.
+        let existing = match self.resolve_entities_by_name(&read_set, &p.alias) {
+            Ok(hits) => hits,
+            Err(TopoError::Rejected(_)) => Vec::new(),
+            Err(e) => return Err(classify_topo_error(e)),
+        };
+        if let Some(other) = existing.iter().find(|n| n.id != entity_id) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "\"{}\" already resolves to entity {} — adding it as an alias of {} \
+                     would make the name ambiguous. If they are the same thing, merge \
+                     them (relink + remove_node) instead.",
+                    p.alias, other.id, entity_id
+                ),
+                None,
+            ));
+        }
+        // Idempotency: an Alias node with this name already pointing here?
+        let alias_hits = self
+            .db
+            .nodes_by_prop_normalized(
+                &read_set,
+                ALIAS_LABEL,
+                ALIAS_NAME_PROP,
+                &PropValue::Str(p.alias.clone()),
+            )
+            .map_err(classify_topo_error)?;
+        for a in &alias_hits {
+            let edges = self
+                .db
+                .edges_from(
+                    &read_set,
+                    a.id,
+                    Some(entity_id),
+                    Some(ALIAS_EDGE_TYPE),
+                    true,
+                )
+                .map_err(classify_topo_error)?;
+            if !edges.is_empty() {
+                return Ok(Json(UpsertResult {
+                    id: a.id.to_string(),
+                    created: false,
+                }));
+            }
+        }
+        // Create alias node + alias_of edge atomically. Scope defaults to
+        // the ENTITY's scope so the pair travels together.
+        let scope = match p.scope.as_deref() {
+            Some(s) => self.resolve_scope(Some(s))?,
+            None => target.scope,
+        };
+        let alias_id = NodeId::new();
+        let mut props = Props::new();
+        props.insert(ALIAS_NAME_PROP.to_string(), PropValue::Str(p.alias));
+        self.submit_write(vec![
+            Op::CreateNode {
+                id: alias_id,
+                scope,
+                label: ALIAS_LABEL.into(),
+                props,
+            },
+            Op::CreateEdge {
+                id: EdgeId::new(),
+                scope,
+                ty: ALIAS_EDGE_TYPE.into(),
+                from: alias_id,
+                to: entity_id,
+                props: Props::new(),
+                valid_from: None,
+            },
+        ])?;
+        Ok(Json(UpsertResult {
+            id: alias_id.to_string(),
             created: true,
         }))
     }
