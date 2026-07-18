@@ -34,6 +34,11 @@ impl<'r> Executor<'r> {
         Executor { store, graph, runner, clock: 0, model_calls: 0 }
     }
 
+    /// Read-only access to the run store, for inspection and tests.
+    pub fn store_ref(&self) -> &RunStore {
+        &self.store
+    }
+
     /// Every write advances a logical clock rather than reading wall time, so
     /// a run's timeline is reproducible.
     fn tick(&mut self) -> i64 {
