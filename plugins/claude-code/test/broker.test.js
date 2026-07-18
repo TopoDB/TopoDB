@@ -13,7 +13,7 @@
 // failing is worse than no test at all.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -815,6 +815,28 @@ test("broker_idle_exits_and_releases_the_lock", async () => {
       if (!opened) await sleep(300);
     }
 
+    // DIAGNOSTICS (debug branch only): on failure, identify what still holds
+    // the redb lock — broker log, surviving topodb processes, and the fd
+    // holder — so the CI log names the culprit instead of just the symptom.
+    if (!opened) {
+      const sh = (cmd) => {
+        try {
+          return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+        } catch (e) {
+          return `(${cmd} -> ${e.message})\n${e.stdout || ""}`;
+        }
+      };
+      let diag = "\n===== IDLE-EXIT DIAGNOSTICS =====\n";
+      try {
+        diag += "--- broker.log ---\n" + readFileSync(path.join(dataDir, "broker.log"), "utf8");
+      } catch (e) {
+        diag += `broker.log unreadable: ${e.message}\n`;
+      }
+      diag += "--- topodb processes ---\n" + sh("ps -eo pid,ppid,etime,stat,args | grep -i topodb | grep -v grep");
+      diag += "--- db lock holder (lsof) ---\n" + sh(`lsof -- ${dbPath} 2>&1 | head -20`);
+      diag += "--- db lock holder (fuser) ---\n" + sh(`fuser -v ${dbPath} 2>&1`);
+      console.error(diag);
+    }
     assert.ok(opened, `expected the db to be openable directly after the broker's idle-exit; last error: ${lastErr?.message}`);
   } finally {
     if (session) killAll([session]);
