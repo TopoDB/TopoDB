@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use topodb::Db;
 use topodb_sgh::executor::Executor;
 use topodb_sgh::runner::claude::ClaudeCodeRunner;
+use topodb_sgh::runner::command::ShellCommandRunner;
 use topodb_sgh::schema::bound::worst_case;
 use topodb_sgh::schema::validate::{validate, Validated};
 use topodb_sgh::schema::{Graph, NodeKind};
@@ -30,23 +31,23 @@ enum Cmd {
         /// Skip the approval prompt.
         #[arg(long)]
         yes: bool,
+        /// Seconds a single command node may run before it is killed.
+        #[arg(long, default_value_t = 120)]
+        command_timeout: u64,
     },
 }
 
-/// Command nodes parse, validate, and cost exactly like any other node, but
-/// there is no shell execution path anywhere in this crate yet: the executor
-/// dispatches `NodeKind::Command` through `AgentRunner` exactly like
-/// `NodeKind::Agent`, which would send a shell command to a *model* as a
-/// prompt rather than executing it. Real command execution is deferred to
-/// v0.0.2 (a `CommandRunner` shell path). Rather than ship that silently
-/// wrong behavior, the CLI refuses any graph containing a command node.
-/// Returns the offending node ids in declaration order.
-fn unsupported_command_nodes(v: &Validated) -> Vec<String> {
+/// Every command node's id and full `run:` string, in declaration order.
+///
+/// Displayed verbatim at the approval gate. Commands may be model-authored
+/// once the planner lands, so the human seeing exactly what will execute is
+/// the control — never summarize or truncate these.
+fn command_preview(v: &Validated) -> Vec<String> {
     v.graph
         .nodes
         .iter()
         .filter(|n| n.kind == NodeKind::Command)
-        .map(|n| n.id.clone())
+        .map(|n| format!("{}: {}", n.id, n.run.clone().unwrap_or_default()))
         .collect()
 }
 
@@ -59,16 +60,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let g = Graph::from_yaml(&src)?;
             match validate(&g) {
                 Ok(v) => {
-                    let offenders = unsupported_command_nodes(&v);
-                    if !offenders.is_empty() {
-                        eprintln!(
-                            "error: command nodes are not supported until v0.0.2: {}",
-                            offenders.join(", ")
-                        );
-                        std::process::exit(2);
-                    }
                     println!("valid: {} node(s)", v.graph.nodes.len());
                     println!("{}", worst_case(&v));
+                    let commands = command_preview(&v);
+                    if !commands.is_empty() {
+                        println!("command nodes ({}):", commands.len());
+                        for line in &commands {
+                            println!("  {line}");
+                        }
+                    }
                 }
                 Err(errors) => {
                     for e in &errors {
@@ -78,7 +78,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Cmd::Run { graph, model, yes } => {
+        Cmd::Run {
+            graph,
+            model,
+            yes,
+            command_timeout,
+        } => {
             let src = std::fs::read_to_string(&graph)?;
             let g = Graph::from_yaml(&src)?;
             let v = match validate(&g) {
@@ -91,19 +96,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let offenders = unsupported_command_nodes(&v);
-            if !offenders.is_empty() {
-                eprintln!(
-                    "error: command nodes are not supported until v0.0.2: {}",
-                    offenders.join(", ")
-                );
-                std::process::exit(2);
-            }
-
             let bound = worst_case(&v);
             println!("Goal: {}", v.graph.goal);
             println!("Nodes: {}", v.graph.nodes.len());
             println!("Bound: {bound}");
+
+            let commands = command_preview(&v);
+            if !commands.is_empty() {
+                println!("\nCommands that will execute in a shell:");
+                for line in &commands {
+                    println!("  {line}");
+                }
+            }
 
             if !yes {
                 println!("\nProceed? [y/N]");
@@ -120,8 +124,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let now = 1;
             let store = RunStore::create(&db, &run_id, &v, now)?;
             let runner = ClaudeCodeRunner::new(model);
+            let command_runner =
+                ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
 
-            let mut ex = Executor::new(store, v, &runner);
+            let mut ex = Executor::new(store, v, &runner).with_command_runner(&command_runner);
             let report = ex.run(now + 1)?;
 
             println!("\nrun {run_id}");
@@ -131,6 +137,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "  model calls: {} (bound was {})",
                 report.model_calls, bound.agent_calls
+            );
+            println!(
+                "  command runs: {} (bound was {})",
+                report.command_runs, bound.command_runs
             );
 
             if !report.blocked.is_empty() {
@@ -144,48 +154,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::unsupported_command_nodes;
+    use super::*;
     use topodb_sgh::schema::validate::validate;
     use topodb_sgh::schema::Graph;
 
-    #[test]
-    fn flags_command_nodes_by_id() {
-        let yaml = r#"
-version: 1
-goal: "test"
-nodes:
-  - id: survey
-    kind: agent
-    prompt: "Locate every call site"
-    budget: {retries: 0, repairs: 0}
-  - id: build
-    kind: command
-    run: "cargo build"
-    needs: [survey]
-    budget: {retries: 0, repairs: 0}
-"#;
-        let g = Graph::from_yaml(yaml).unwrap();
-        let v = validate(&g).unwrap();
-        assert_eq!(unsupported_command_nodes(&v), vec!["build".to_string()]);
+    fn validated(yaml: &str) -> topodb_sgh::schema::validate::Validated {
+        validate(&Graph::from_yaml(yaml).expect("parses")).expect("valid")
     }
 
     #[test]
-    fn empty_when_only_agent_and_gate_nodes() {
-        let yaml = r#"
-version: 1
-goal: "test"
-nodes:
-  - id: survey
-    kind: agent
-    prompt: "Locate every call site"
-    budget: {retries: 0, repairs: 0}
-  - id: approve
-    kind: gate
-    needs: [survey]
-    budget: {retries: 0, repairs: 0}
-"#;
-        let g = Graph::from_yaml(yaml).unwrap();
-        let v = validate(&g).unwrap();
-        assert!(unsupported_command_nodes(&v).is_empty());
+    fn command_preview_lists_every_command_with_its_full_run_string() {
+        let v = validated(
+            "version: 1\ngoal: g\nnodes:\n\
+             - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+             - {id: b, kind: command, run: 'cargo build -p topodb', budget: {retries: 0, repairs: 0}}\n\
+             - {id: c, kind: command, run: 'rm -rf ./tmp', budget: {retries: 0, repairs: 0}}\n",
+        );
+        let lines = command_preview(&v);
+        assert_eq!(
+            lines,
+            vec![
+                "b: cargo build -p topodb".to_string(),
+                "c: rm -rf ./tmp".to_string(),
+            ],
+            "every command must be shown in full — the gate is the control on model-authored shell"
+        );
+    }
+
+    #[test]
+    fn command_preview_is_empty_without_command_nodes() {
+        let v = validated(
+            "version: 1\ngoal: g\nnodes:\n\
+             - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n",
+        );
+        assert!(command_preview(&v).is_empty());
     }
 }
