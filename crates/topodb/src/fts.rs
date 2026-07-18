@@ -88,6 +88,15 @@ pub struct SearchOptions {
     /// per call (this is a read path; only writes must never embed
     /// wall-clock time). The deterministic seam for tests.
     pub now_ms: Option<i64>,
+    /// Miss-only typo/prefix recovery (default ON). A query term that
+    /// matches NOTHING in a scope (df == 0 — it would contribute zero
+    /// either way) is expanded against that scope's vocabulary: prefix
+    /// matches plus bounded-edit-distance matches (≤1 for short terms, ≤2
+    /// for longer), capped at [`FUZZY_MAX_EXPANSIONS`] candidates whose
+    /// contributions are discounted by [`FUZZY_DISCOUNT`] — so an exact hit
+    /// always dominates a fuzzy one, and a query that already hits pays
+    /// nothing. Purely query-time: no extra index, deterministic.
+    pub fuzzy_fallback: bool,
 }
 
 impl Default for SearchOptions {
@@ -96,17 +105,89 @@ impl Default for SearchOptions {
             recency_weight: 0.0,
             recency_half_life_ms: 30 * 24 * 60 * 60 * 1000,
             now_ms: None,
+            fuzzy_fallback: true,
         }
     }
 }
 
-/// Lowercase, split on every non-alphanumeric boundary, drop empty tokens.
+/// Cap on fuzzy candidates admitted per missing query term — bounds both
+/// cost and noise; the closest (then lexicographically smallest) win.
+pub const FUZZY_MAX_EXPANSIONS: usize = 4;
+/// Score multiplier for a fuzzy-matched term's BM25 contribution: strong
+/// enough to surface the memory, weak enough that any exact match outranks it.
+pub const FUZZY_DISCOUNT: f32 = 0.6;
+/// Minimum length (chars) of the shorter side for a prefix match to count —
+/// "da" should not expand to every term starting with "da".
+const FUZZY_MIN_PREFIX: usize = 3;
+
+/// Version stamp for the analyzer pipeline below, persisted in META
+/// (`"fts_analyzer_version"`) by `ensure_index_spec`. A file whose stored
+/// stamp differs (or is absent — v4-and-earlier files, and early-v5 files
+/// built before stemming landed) gets its FTS tables drained and rebuilt on
+/// open, so on-disk postings always match what `tokenize` produces for a
+/// query. Bump this whenever the pipeline's output can change for any input.
+pub(crate) const FTS_ANALYZER_VERSION: u32 = 1;
+
+/// The analyzer (v1), applied identically to documents at index time and to
+/// queries at search time — the two sides must never disagree:
+///
+/// 1. split on every non-alphanumeric boundary;
+/// 2. split each word again at camelCase boundaries (`parseHttpRequest` →
+///    `parse`/`Http`/`Request`, acronym-aware: `HTTPServer` → `HTTP`/
+///    `Server`) — snake_case already splits at step 1;
+/// 3. lowercase (Unicode);
+/// 4. Snowball English stem (`databases` → `databas`, `running` → `run`), so
+///    morphological variants land on one posting. Stemming is deterministic,
+///    dictionary-free, and language-fixed — non-English tokens pass through
+///    mostly untouched.
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
+    let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
+    let mut out = Vec::new();
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        for part in split_camel(word) {
+            let lowered = part.to_lowercase();
+            if lowered.is_empty() {
+                continue;
+            }
+            out.push(stemmer.stem(&lowered).into_owned());
+        }
+    }
+    out
+}
+
+/// Splits one alphanumeric word at camelCase boundaries: before an uppercase
+/// letter that follows a lowercase letter or digit (`camelCase` →
+/// `camel`/`Case`), and before the last uppercase of an uppercase run that is
+/// followed by a lowercase letter (`HTTPServer` → `HTTP`/`Server`). A word
+/// with no such boundary comes back whole.
+fn split_camel(word: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = word.char_indices().collect();
+    let mut cuts: Vec<usize> = Vec::new();
+    for w in chars.windows(2) {
+        let ((_, prev), (idx, cur)) = (w[0], w[1]);
+        if cur.is_uppercase() && (prev.is_lowercase() || prev.is_numeric()) {
+            cuts.push(idx);
+        }
+    }
+    for w in chars.windows(3) {
+        let ((_, a), (idx, b), (_, c)) = (w[0], w[1], w[2]);
+        if a.is_uppercase() && b.is_uppercase() && c.is_lowercase() {
+            cuts.push(idx);
+        }
+    }
+    if cuts.is_empty() {
+        return vec![word];
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut parts = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0;
+    for cut in cuts {
+        parts.push(&word[start..cut]);
+        start = cut;
+    }
+    parts.push(&word[start..]);
+    parts
 }
 
 /// The declared text of a node under `spec.text`: every `Str` prop whose
@@ -798,6 +879,102 @@ pub(crate) fn set_posting(
     store_posting_chunk_splitting(postings, scope_id, term, &keys, at, &entries)
 }
 
+/// Every distinct term in one scope's postings, sorted: a bounded range scan
+/// over the scope-id key prefix (`chunked_posting_key` layout: `scope_id:4 ++
+/// term ++ chunk:4`), deduping consecutive chunk keys of the same term. This
+/// is the fuzzy fallback's candidate pool — agent-memory vocabularies are
+/// thousands of terms, so a linear pass is cheap; no auxiliary index needed.
+fn scope_terms(
+    postings: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope_id: u32,
+) -> Result<Vec<String>, TopoError> {
+    let prefix = scope_id.to_be_bytes();
+    let mut out: Vec<String> = Vec::new();
+    // Open-ended range + starts_with break instead of an exclusive end key:
+    // avoids the scope_id == u32::MAX overflow case entirely.
+    for entry in postings.range(&prefix[..]..).map_err(storage_err)? {
+        let (k, _) = entry.map_err(storage_err)?;
+        let key = k.value();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        if key.len() < 8 {
+            return Err(TopoError::Encoding("postings chunk key too short".into()));
+        }
+        let term = std::str::from_utf8(&key[4..key.len() - 4])
+            .map_err(|_| TopoError::Encoding("non-UTF-8 postings term".into()))?;
+        if out.last().map(String::as_str) != Some(term) {
+            out.push(term.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Levenshtein distance between `a` (pre-split chars) and `b`, bounded:
+/// `None` as soon as the distance provably exceeds `max`. Classic
+/// two-row DP with a row-minimum early exit — at vocab-scan scale this beats
+/// carrying a bit-parallel implementation.
+fn bounded_levenshtein(a: &[char], b: &str, max: u32) -> Option<u32> {
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max as usize {
+        return None;
+    }
+    let mut prev: Vec<u32> = (0..=b.len() as u32).collect();
+    let mut cur = vec![0u32; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i as u32 + 1;
+        let mut row_min = cur[0];
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = u32::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+            row_min = row_min.min(cur[j + 1]);
+        }
+        if row_min > max {
+            return None;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    (prev[b.len()] <= max).then_some(prev[b.len()])
+}
+
+/// The near-matches a missing query term expands to, drawn from one scope's
+/// vocabulary: prefix matches (either direction, shorter side ≥
+/// `FUZZY_MIN_PREFIX` chars — rank 1) and bounded-edit-distance matches
+/// (rank = distance; ≤1 for 3-5-char terms, ≤2 for longer, none for shorter),
+/// sorted by (rank, term) and capped at `FUZZY_MAX_EXPANSIONS`. Pure and
+/// deterministic — same vocab + same term ⇒ same expansions.
+fn fuzzy_expansions(vocab: &[String], q: &str) -> Vec<String> {
+    let q_chars: Vec<char> = q.chars().collect();
+    let max_d: u32 = match q_chars.len() {
+        0..=2 => 0,
+        3..=5 => 1,
+        _ => 2,
+    };
+    let mut ranked: Vec<(u32, &String)> = Vec::new();
+    for t in vocab {
+        if t.as_str() == q {
+            continue; // df == 0 already established for q itself
+        }
+        let t_len = t.chars().count();
+        let prefix_hit = (q_chars.len() >= FUZZY_MIN_PREFIX && t.starts_with(q))
+            || (t_len >= FUZZY_MIN_PREFIX && q.starts_with(t.as_str()));
+        let rank = if prefix_hit {
+            1
+        } else if max_d == 0 {
+            continue;
+        } else {
+            match bounded_levenshtein(&q_chars, t, max_d) {
+                Some(d) => d,
+                None => continue,
+            }
+        };
+        ranked.push((rank, t));
+    }
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    ranked.truncate(FUZZY_MAX_EXPANSIONS);
+    ranked.into_iter().map(|(_, t)| t.clone()).collect()
+}
+
 impl Db {
     /// Scoped BM25 full-text search over the declared text index.
     ///
@@ -895,22 +1072,52 @@ impl Db {
                 continue;
             }
             let avgdl = total_len as f32 / n_docs as f32;
-            for term in &distinct {
-                // df fast path first: most query terms miss most scopes, and
-                // this sums each chunk's block-count header without
-                // decoding a single entry — skip the full decode below
-                // entirely when there's nothing to score.
-                let df = posting_df(&postings, scope_id, term)? as f32;
-                if df == 0.0 {
-                    continue;
-                }
+            // One BM25 accumulation pass for a (term, weight) pair; the
+            // weight is 1.0 for exact terms, FUZZY_DISCOUNT for expansions.
+            let accumulate = |term: &str,
+                              df: f32,
+                              weight: f32,
+                              scores: &mut HashMap<u64, f32>|
+             -> Result<(), TopoError> {
                 let list = read_posting(&postings, scope_id, term)?;
                 let idf = ((n_docs as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
                 for (slot, tf) in list {
                     let len = read_doc_len(&docs, slot)? as f32;
                     let tf = tf as f32;
                     let denom = tf + K1 * (1.0 - B + B * len / avgdl);
-                    *scores.entry(slot).or_insert(0.0) += idf * tf * (K1 + 1.0) / denom;
+                    *scores.entry(slot).or_insert(0.0) += weight * idf * tf * (K1 + 1.0) / denom;
+                }
+                Ok(())
+            };
+            // The scope's vocabulary, materialized lazily: only a query term
+            // that misses everything in this scope pays for the scan, and
+            // later missing terms in the same scope reuse it.
+            let mut vocab: Option<Vec<String>> = None;
+            for term in &distinct {
+                // df fast path first: most query terms miss most scopes, and
+                // this sums each chunk's block-count header without
+                // decoding a single entry — skip the full decode below
+                // entirely when there's nothing to score.
+                let df = posting_df(&postings, scope_id, term)? as f32;
+                if df > 0.0 {
+                    accumulate(term, df, 1.0, &mut scores)?;
+                    continue;
+                }
+                if !options.fuzzy_fallback {
+                    continue;
+                }
+                // Miss-only fuzzy/prefix fallback: this term contributes
+                // nothing as-is, so recover near-matches from the scope's
+                // own vocabulary at a discount (see SearchOptions docs).
+                if vocab.is_none() {
+                    vocab = Some(scope_terms(&postings, scope_id)?);
+                }
+                let vocab = vocab.as_deref().expect("vocab filled above");
+                for candidate in fuzzy_expansions(vocab, term) {
+                    let cdf = posting_df(&postings, scope_id, &candidate)? as f32;
+                    if cdf > 0.0 {
+                        accumulate(&candidate, cdf, FUZZY_DISCOUNT, &mut scores)?;
+                    }
                 }
             }
         }

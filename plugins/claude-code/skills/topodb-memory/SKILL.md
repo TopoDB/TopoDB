@@ -15,11 +15,13 @@ Y", "last time we tried this" — call `search_memories` **before** answering fr
 the conversation alone. Reads already span this project and `shared`; you do not
 pass a scope to read.
 
-Search matches **exact tokens** (lowercased, no stemming): "databases" does not
-match "database". If a query comes back empty or thin, retry with other word
-forms or synonyms and raise `k` before concluding nothing is stored. Entity
-names are searchable too, so a person or project name is a good query. Results
-are recency-weighted — fresher memories outrank stale ones at equal relevance.
+Search stems words ("databases" matches "database"), splits camelCase
+identifiers, and recovers typos and prefixes when a term matches nothing — but
+it does **not** understand synonyms: "auth" won't find a memory that only says
+"login". If a query comes back empty or thin, retry with different words and
+raise `k` before concluding nothing is stored. Entity names are searchable
+too, so a person or project name is a good query. Results are recency-weighted
+— fresher memories outrank stale ones at equal relevance.
 
 Then `traverse` from a hit to gather what surrounds it. A memory's neighbours
 are usually the reason it mattered. `get_edges` on a node shows its current

@@ -30,14 +30,29 @@ workspace are versioned and released independently (tags are per-package, e.g.
   (also newly exposed as `NodeId::timestamp_ms` etc.). Opt-in; `search_text` is unchanged
   (weight 0). Applied before top-k truncation, so fresh hits can displace stale ones out of the
   window, and floored so a strong old match is never erased.
+- **Stemming analyzer (v1)**: FTS tokenization is now split-on-non-alphanumeric → camelCase split
+  (acronym-aware: `parseHttpRequest` → `parse`/`http`/`request`, `HTTPServer` → `http`/`server`) →
+  Unicode lowercase → Snowball English stem (via the pure-Rust `rust-stemmers` dep), applied
+  identically to documents and queries — `databases` matches `database`, `running` matches `run`.
+  The pipeline is versioned in META (`"fts_analyzer_version"`); a file built under a different (or
+  pre-stamp) analyzer gets its FTS tables drained and rebuilt on open, same machinery as the
+  PROP_INDEX norm stamp.
+- **Miss-only fuzzy/prefix fallback** (`SearchOptions::fuzzy_fallback`, default ON): a query term
+  with zero df in a scope — it would contribute nothing anyway — expands to its closest vocabulary
+  neighbors (prefix matches ≥3 chars, bounded edit distance ≤1 for 3-5-char terms / ≤2 for longer),
+  capped at 4 candidates whose BM25 contributions are discounted 0.6×, so exact hits always
+  dominate and hitting queries pay nothing. Query-time only: the scope vocabulary is enumerated
+  from the existing scope-prefixed postings keys — no auxiliary index, no format change,
+  deterministic.
 
 #### Changed
 
 - **Format v5** (`FORMAT_VERSION = 5`): PROP_INDEX `Str` keys are now stored under their normalized
-  form (`prop_index::normalize_str`); no table layout changed. Existing files upgrade on first open
-  — the v4→v5 arm stamps the version and `ensure_index_spec` drains + rebuilds PROP_INDEX, driven
-  by the new `"prop_index_norm_version"` META stamp (pre-v5 files lack it). Pre-v5 builds refuse a
-  v5 file with `UnsupportedFormat` rather than silently missing every `Str` probe. See FORMAT.md.
+  form (`prop_index::normalize_str`), and FTS postings under the v1 stemming analyzer; no table
+  layout changed. Existing files upgrade on first open — the v4→v5 arm stamps the version and
+  `ensure_index_spec` drains + rebuilds both indexes, driven by the new `"prop_index_norm_version"`
+  and `"fts_analyzer_version"` META stamps (pre-v5 files lack both). Pre-v5 builds refuse a v5 file
+  with `UnsupportedFormat` rather than silently missing every `Str` probe. See FORMAT.md.
 
 #### Fixed
 
@@ -258,6 +273,10 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **Recency-weighted `search_memories`** (`recency_weight`, default 0.3; `recency_half_life_days`,
   default 30): fresher memories outrank stale ones at equal BM25 relevance; `recency_weight: 0`
   restores pure BM25.
+- **`search_memories` stems and fuzzy-recovers**: query terms are analyzed like documents
+  (camelCase split + Snowball stem), and a term matching nothing falls back to close prefix/typo
+  neighbors at a score discount (`fuzzy: false` disables). Tool description and server
+  instructions now say what search does and doesn't handle (synonyms are still on the agent).
 
 #### Changed
 

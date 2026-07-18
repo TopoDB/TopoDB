@@ -241,6 +241,7 @@ fn recency_weight_prefers_fresher_hit_at_equal_relevance() {
         recency_weight: 0.5,
         recency_half_life_ms: 30 * DAY_MS,
         now_ms: Some(now),
+        ..Default::default()
     };
     let weighted = db
         .search_text_with(&scopes, "recency probe", 10, &opts)
@@ -272,6 +273,7 @@ fn search_text_with_rejects_bad_recency_options() {
             recency_weight: 0.5,
             recency_half_life_ms: 0,
             now_ms: None,
+            ..Default::default()
         },
     ] {
         assert!(matches!(
@@ -279,4 +281,121 @@ fn search_text_with_rejects_bad_recency_options() {
             Err(TopoError::Rejected(_))
         ));
     }
+}
+
+/// Analyzer v1: morphological variants land on one posting — the biggest
+/// lexical blind spot of the old exact-token tokenizer.
+#[test]
+fn stemming_matches_morphological_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = memory("the database is running smoothly", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    for query in ["databases", "database", "run", "runs", "smooth"] {
+        let hits = db.search_text(&scopes, query, 10).unwrap();
+        assert_eq!(hits.len(), 1, "query {query:?} must match via stemming");
+        assert_eq!(hits[0].0.id, a);
+    }
+}
+
+/// Analyzer v1: camelCase identifiers split into their words (snake_case
+/// already splits at the non-alphanumeric boundary), acronym-aware.
+#[test]
+fn camel_case_identifiers_are_searchable_by_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = memory("refactored parseHttpRequest into HTTPServer", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    for query in ["parse", "http", "request", "server", "parseHttpRequest"] {
+        let hits = db.search_text(&scopes, query, 10).unwrap();
+        assert_eq!(hits.len(), 1, "query {query:?} must match via camel split");
+        assert_eq!(hits[0].0.id, a);
+    }
+}
+
+/// Miss-only fuzzy fallback: a typo'd or prefix-truncated query term that
+/// matches nothing expands to its nearest vocabulary neighbors at a
+/// discount; a term that hits exactly pays nothing and scores identically.
+#[test]
+fn fuzzy_fallback_recovers_typos_and_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (a, op_a) = memory("vector recall pipeline design", Scope::Id(s));
+    db.submit(vec![op_a]).unwrap();
+
+    // Typo: one transposition ("vectro" -> "vector").
+    let hits = db.search_text(&scopes, "vectro", 10).unwrap();
+    assert_eq!(hits.len(), 1, "typo must recover via edit distance");
+    assert_eq!(hits[0].0.id, a);
+
+    // Prefix: "pipel" is a prefix of "pipelin" (the stem of "pipeline").
+    let hits = db.search_text(&scopes, "pipel", 10).unwrap();
+    assert_eq!(hits.len(), 1, "prefix must recover");
+
+    // The fuzzy contribution is discounted below an exact hit's.
+    let exact = db.search_text(&scopes, "vector", 10).unwrap()[0].1;
+    let fuzzy = db.search_text(&scopes, "vectro", 10).unwrap()[0].1;
+    assert!(
+        fuzzy < exact,
+        "fuzzy score {fuzzy} must be below exact score {exact}"
+    );
+
+    // Garbage stays garbage: nothing within distance 2 of "zzzzzzz".
+    assert!(db.search_text(&scopes, "zzzzzzz", 10).unwrap().is_empty());
+
+    // Opt-out: with the fallback disabled the typo matches nothing.
+    let opts = SearchOptions {
+        fuzzy_fallback: false,
+        ..Default::default()
+    };
+    assert!(db
+        .search_text_with(&scopes, "vectro", 10, &opts)
+        .unwrap()
+        .is_empty());
+}
+
+/// The v5 analyzer-versioning contract: FTS tables written under a different
+/// (or pre-stamp) analyzer are drained and rebuilt on open — simulated by
+/// clearing the stamp and the postings from outside, exactly what a pre-v5
+/// file looks like to this build.
+#[test]
+fn stale_analyzer_version_triggers_fts_rebuild_on_open() {
+    use redb::TableDefinition;
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    const POSTINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("postings");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let s = ScopeId::new();
+    let a;
+    {
+        let db = Db::open_with(&path, spec()).unwrap();
+        let (id, op) = memory("reindex probe for analyzers", Scope::Id(s));
+        a = id;
+        db.submit(vec![op]).unwrap();
+    }
+    {
+        let raw = redb::Database::open(&path).unwrap();
+        let tx = raw.begin_write().unwrap();
+        {
+            let mut postings = tx.open_table(POSTINGS).unwrap();
+            postings.retain(|_, _| false).unwrap();
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("fts_analyzer_version", 0u32.to_le_bytes().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let db = Db::open_with(&path, spec()).unwrap();
+    let hits = db.search_text(&ScopeSet::of(&[s]), "analyzer", 10).unwrap();
+    assert_eq!(hits.len(), 1, "stale analyzer stamp must force a rebuild");
+    assert_eq!(hits[0].0.id, a);
 }

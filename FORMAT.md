@@ -37,10 +37,15 @@ v4 — only the `prop_index` key scheme: `Str` values are keyed by their
 Unicode-lowercased) instead of their raw bytes, making equality-index probes
 case- and whitespace-insensitive (`Db::nodes_by_prop` restores byte-exact
 semantics with a record-level post-filter; `Db::nodes_by_prop_normalized`
-exposes the relaxed match). The rebuild to the new keys is driven by
-`ensure_index_spec`'s `"prop_index_norm_version"` META check (see below), not
-by the version-match arms; the v4→v5 arm only stamps the version so pre-v5
-builds refuse the file instead of silently missing every Str probe.
+exposes the relaxed match). v5 also versioned the FTS analyzer: postings are
+built from the v1 pipeline (split on non-alphanumeric → camelCase split →
+Unicode lowercase → Snowball English stem, `fts::tokenize`), stamped in META
+as `"fts_analyzer_version"` — a file whose stamp is absent or different gets
+its FTS tables drained and rebuilt on open, so postings always agree with
+what a query tokenizes to. Both rebuilds are driven by `ensure_index_spec`'s
+META checks (see below), not by the version-match arms; the v4→v5 arm only
+stamps the version so pre-v5 builds refuse the file instead of silently
+missing every Str probe.
 
 `Storage::open_with_options` opens (or creates) every table, reads META
 `"format_version"`, and dispatches on it — all inside ONE redb write
@@ -470,6 +475,10 @@ sorted by `(label, prop)` before encoding so declaration order never looks
 like a spec change); `"prop_index_norm_version"` (4-byte LE `u32`, v5: the
 Str-key normalization scheme PROP_INDEX was last built under — absent or
 mismatched ⇒ `ensure_index_spec` drains + rebuilds the index and re-stamps);
+`"fts_analyzer_version"` (4-byte LE `u32`, v5: the analyzer pipeline the FTS
+tables were last built under — absent or mismatched ⇒ same drain + rebuild +
+re-stamp treatment, since postings from a different tokenizer can disagree
+with what this build tokenizes a query into);
 `"next_node_slot"`/`"next_edge_slot"` (8-byte LE `u64`
 monotonic slot counters, `slots.rs`). Legacy Plan-2 keys `"fts_spec"`,
 `"fts_doc_count"`, `"fts_total_len"` are read (and, if present, removed) only

@@ -24,6 +24,7 @@ smol_str = { version = "0.3", features = ["serde"] }
 thiserror = "2"
 crossbeam-channel = "0.5"
 lz4_flex = "0.11"
+rust-stemmers = "1"
 
 [dev-dependencies]
 proptest = "1"

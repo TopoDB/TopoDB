@@ -478,6 +478,21 @@ impl Storage {
                 }
                 None => true,
             };
+            // Same contract for the FTS analyzer: postings written under a
+            // different tokenizer pipeline (or before the stamp existed) can
+            // disagree with what this build tokenizes a query into, so they
+            // must be rebuilt even when the spec itself is unchanged.
+            let analyzer_stale = match meta.get("fts_analyzer_version").map_err(storage_err)? {
+                Some(v) => {
+                    let b: [u8; 4] = v
+                        .value()
+                        .try_into()
+                        .map_err(|_| TopoError::Encoding("bad fts_analyzer_version".into()))?;
+                    u32::from_le_bytes(b) != crate::fts::FTS_ANALYZER_VERSION
+                }
+                None => true,
+            };
+            let norm_stale = norm_stale || analyzer_stale;
             if meta.get("fts_spec").map_err(storage_err)?.is_some() {
                 (true, true)
             } else {
@@ -570,6 +585,13 @@ impl Storage {
                 crate::prop_index::PROP_INDEX_NORM_VERSION
                     .to_le_bytes()
                     .as_slice(),
+            )
+            .map_err(storage_err)?;
+            // And the analyzer version the FTS tables were (re)built under —
+            // same unconditional-stamp rationale.
+            meta.insert(
+                "fts_analyzer_version",
+                crate::fts::FTS_ANALYZER_VERSION.to_le_bytes().as_slice(),
             )
             .map_err(storage_err)?;
         }

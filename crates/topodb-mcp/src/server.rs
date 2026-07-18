@@ -497,6 +497,12 @@ struct SearchMemoriesParams {
     #[serde(default = "default_recency_half_life_days")]
     #[schemars(range(min = 0.001))]
     recency_half_life_days: f64,
+    /// Typo/prefix recovery for query terms that match nothing (default
+    /// true): a missing term expands to its closest vocabulary neighbors
+    /// (prefix or small edit distance) at a score discount, so exact matches
+    /// always dominate. Set false for strict term matching.
+    #[serde(default = "default_true")]
+    fuzzy: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -970,7 +976,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Matching is exact-token after lowercasing — no stemming or fuzzy matching, so 'databases' does NOT match 'database'; if a query returns nothing useful, retry with different word forms or synonyms, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Synonyms are still not understood — if a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context."
     )]
     fn search_memories(
         &self,
@@ -981,6 +987,7 @@ impl TopoServer {
             recency_weight: p.recency_weight,
             recency_half_life_ms: (p.recency_half_life_days * 86_400_000.0) as i64,
             now_ms: None,
+            fuzzy_fallback: p.fuzzy,
         };
         // `search_text` opens a redb read transaction, so unlike the pure
         // snapshot reads it CAN fail with `Storage`/`Encoding` — only its
@@ -1480,9 +1487,10 @@ impl ServerHandler for TopoServer {
                  separately. Storing well: create_entity is find-or-create (safe to call \
                  repeatedly; never duplicates), link is idempotent per (from, to, type) and \
                  takes supersede: true when a to-one fact changes, and every memory should be \
-                 linked to the entities it concerns. Recalling well: search_memories matches \
-                 exact tokens only (no stemming) — retry with other word forms before \
-                 concluding nothing is stored — then traverse from the best hit; use \
+                 linked to the entities it concerns. Recalling well: search_memories stems \
+                 terms and falls back to close prefix/typo matches, but does NOT \
+                 understand synonyms — retry with different words before concluding \
+                 nothing is stored — then traverse from the best hit; use \
                  get_edges to inspect or retire a node's current relations.",
             )
     }
