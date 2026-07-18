@@ -1,0 +1,14 @@
+version: 1
+goal: "port the search analyzer"
+nodes:
+  - id: survey
+    kind: agent
+    prompt: "Locate every call site"
+    output:
+      schema: {type: object}
+    budget: {retries: 2, repairs: 1}
+  - id: build
+    kind: command
+    run: "cargo build -p topodb"
+    needs: [survey]
+    budget: {retries: 1, repairs: 0}
