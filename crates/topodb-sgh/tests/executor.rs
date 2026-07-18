@@ -232,3 +232,82 @@ fn schema_mismatch_is_a_failure() {
         "missing required field fails the node"
     );
 }
+
+#[test]
+fn a_configured_command_runner_lets_command_nodes_execute() {
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+         - {id: b, kind: command, run: 'true', needs: [a], budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+    let agents = MockRunner::new();
+    let commands = topodb_sgh::runner::command::MockCommandRunner::new();
+
+    let mut ex = Executor::new(store, v, &agents).with_command_runner(&commands);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.succeeded, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(report.model_calls, 1, "only the agent node costs a model call");
+    assert_eq!(report.command_runs, 1, "the command node is counted separately");
+    assert_eq!(commands.calls(), vec!["b".to_string()]);
+    assert_eq!(agents.calls(), vec!["a".to_string()], "the command never reaches the agent runner");
+}
+
+#[test]
+fn command_runs_stay_within_the_computed_bound_under_retries() {
+    // retries: 2 -> bound allows 1 + 2 = 3 command runs.
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: b, kind: command, run: 'false', budget: {retries: 2, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+    let bound = topodb_sgh::schema::bound::worst_case(&v);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+    let agents = MockRunner::new();
+    let commands = topodb_sgh::runner::command::MockCommandRunner::new()
+        .script("b", vec![NodeOutcome::Failed { error: "nope".into() }]);
+
+    let mut ex = Executor::new(store, v, &agents).with_command_runner(&commands);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["b".to_string()]);
+    assert_eq!(report.command_runs, 3, "1 initial + 2 retries");
+    assert!(report.command_runs <= bound.command_runs);
+    assert_eq!(report.model_calls, 0, "a command node never costs a model call");
+}
+
+#[test]
+fn a_command_node_is_still_refused_without_a_command_runner() {
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: b, kind: command, run: 'true', budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let agents = MockRunner::new();
+
+    let mut ex = Executor::new(store, v, &agents);
+    match ex.run(10) {
+        Err(topodb_sgh::store::SghError::UnsupportedNodeKind { nodes }) => {
+            assert_eq!(nodes, vec!["b".to_string()]);
+        }
+        other => panic!("expected refusal without a command runner, got {other:?}"),
+    }
+    assert_eq!(agents.call_count(), 0, "nothing ran");
+}

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::recovery::{contract_preserved, NoopRepairer, Repairer, Rung};
+use crate::runner::command::{CommandRequest, CommandRunner};
 use crate::runner::{AgentRunner, NodeOutcome, NodeRequest};
 use crate::schema::validate::Validated;
 use crate::schema::NodeKind;
@@ -13,6 +14,9 @@ pub struct RunReport {
     pub blocked: Vec<String>,
     pub skipped: Vec<String>,
     pub model_calls: u64,
+    /// Shell command executions. Counted separately from `model_calls`
+    /// because `Bound` budgets them as a distinct dimension.
+    pub command_runs: u64,
 }
 
 /// Advances every node of a `Validated` graph through the state machine,
@@ -28,8 +32,10 @@ pub struct Executor<'r> {
     graph: Validated,
     runner: &'r dyn AgentRunner,
     repairer: &'r dyn Repairer,
+    command_runner: Option<&'r dyn CommandRunner>,
     clock: i64,
     model_calls: u64,
+    command_runs: u64,
 }
 
 impl<'r> Executor<'r> {
@@ -39,8 +45,10 @@ impl<'r> Executor<'r> {
             graph,
             runner,
             repairer: &NoopRepairer,
+            command_runner: None,
             clock: 0,
             model_calls: 0,
+            command_runs: 0,
         }
     }
 
@@ -50,6 +58,14 @@ impl<'r> Executor<'r> {
     /// falls straight from RETRY to BLOCK.
     pub fn with_repairer(mut self, repairer: &'r dyn Repairer) -> Self {
         self.repairer = repairer;
+        self
+    }
+
+    /// Supply a runner for command nodes. Without one, `run` refuses any
+    /// graph containing a command node — the library must not be able to
+    /// execute shell steps by accident.
+    pub fn with_command_runner(mut self, command_runner: &'r dyn CommandRunner) -> Self {
+        self.command_runner = Some(command_runner);
         self
     }
 
@@ -66,25 +82,27 @@ impl<'r> Executor<'r> {
     }
 
     pub fn run(&mut self, start_ms: i64) -> Result<RunReport, SghError> {
-        // Command nodes parse, validate, and cost exactly like any other
-        // node kind, but there is no shell execution path in this crate yet
-        // (see the module doc comment): dispatching one through
-        // `AgentRunner` would send a shell command to a model as a prompt,
+        // Command nodes have a shell path only when a CommandRunner is
+        // configured. Without one, dispatching a command node through
+        // `AgentRunner` would send a shell command to a model as a prompt —
         // a real model call the cost bound never budgeted for. The CLI
         // (`bin/sgh.rs`) already refuses these graphs with a friendlier
         // message, but `Executor` is public, so the refusal must also live
         // here — otherwise any other library caller could drive the
-        // executor straight past its own published bound.
-        let offenders: Vec<String> = self
-            .graph
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Command)
-            .map(|n| n.id.clone())
-            .collect();
-        if !offenders.is_empty() {
-            return Err(SghError::UnsupportedNodeKind { nodes: offenders });
+        // executor straight past its own published bound without
+        // deliberately supplying a runner.
+        if self.command_runner.is_none() {
+            let offenders: Vec<String> = self
+                .graph
+                .graph
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Command)
+                .map(|n| n.id.clone())
+                .collect();
+            if !offenders.is_empty() {
+                return Err(SghError::UnsupportedNodeKind { nodes: offenders });
+            }
         }
 
         self.clock = start_ms;
@@ -164,25 +182,48 @@ impl<'r> Executor<'r> {
         let mut repairs_left = repair_budget;
 
         loop {
-            let req = NodeRequest {
-                node_id: id.to_string(),
-                prompt: node.prompt.clone().or(node.run.clone()).unwrap_or_default(),
-                inputs: inputs.clone(),
-                output_schema: node.output.as_ref().map(|o| o.schema.clone()),
-            };
-
             let t = self.tick();
             self.store.set_state(id, NodeState::Running, t)?;
 
-            if node.kind == NodeKind::Agent {
-                self.model_calls += 1;
-            }
+            let outcome = if node.kind == NodeKind::Command {
+                let creq = CommandRequest {
+                    node_id: id.to_string(),
+                    run: node.run.clone().expect("validated: command nodes have run"),
+                    inputs: inputs.clone(),
+                    // Mirrors the agent branch. The runner uses this only to
+                    // decide whether to pass stdout through verbatim (schema
+                    // declared) or wrap it as {"stdout":..,"exit_code":..}.
+                    // Validation itself still happens in `validate_output`.
+                    output_schema: node.output.as_ref().map(|o| o.schema.clone()),
+                };
+                self.command_runs += 1;
+                let runner = self
+                    .command_runner
+                    .expect("checked in run(): command nodes imply a command runner");
+                match runner.run(&creq) {
+                    Ok(o) => o,
+                    Err(e) => NodeOutcome::Failed {
+                        error: e.to_string(),
+                    },
+                }
+            } else {
+                let req = NodeRequest {
+                    node_id: id.to_string(),
+                    prompt: node.prompt.clone().or(node.run.clone()).unwrap_or_default(),
+                    inputs: inputs.clone(),
+                    output_schema: node.output.as_ref().map(|o| o.schema.clone()),
+                };
 
-            let outcome = match self.runner.run(&req) {
-                Ok(o) => o,
-                Err(e) => NodeOutcome::Failed {
-                    error: e.to_string(),
-                },
+                if node.kind == NodeKind::Agent {
+                    self.model_calls += 1;
+                }
+
+                match self.runner.run(&req) {
+                    Ok(o) => o,
+                    Err(e) => NodeOutcome::Failed {
+                        error: e.to_string(),
+                    },
+                }
             };
 
             let error = match outcome {
@@ -265,6 +306,7 @@ impl<'r> Executor<'r> {
     fn report(&self) -> Result<RunReport, SghError> {
         let mut r = RunReport {
             model_calls: self.model_calls,
+            command_runs: self.command_runs,
             ..Default::default()
         };
         for id in &self.graph.topo_order {
