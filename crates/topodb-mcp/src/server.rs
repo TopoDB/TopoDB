@@ -25,13 +25,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeSet, SearchOptions, TopoError,
-    TraversalQuery, VectorQuery,
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, RecallQuery, Scope, ScopeSet,
+    SearchOptions, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
     scope_label, Config, ReadScopes, ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL,
-    ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL,
+    ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL, SYNONYM_EXPANSION_PROP, SYNONYM_LABEL,
+    SYNONYM_TERM_PROP,
 };
 use topodb_json as convert;
 
@@ -554,6 +555,10 @@ struct SearchMemoriesParams {
     /// always dominate. Set false for strict term matching.
     #[serde(default = "default_true")]
     fuzzy: bool,
+    /// Pull 1-hop graph neighbors of top hits into the results (linked
+    /// context). Default true; set false for lexical/semantic-only.
+    #[serde(default = "default_true")]
+    graph_boost: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -737,6 +742,29 @@ struct AddAliasParams {
     /// own scope (NOT the server default — an alias belongs with its entity).
     #[serde(default)]
     scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddSynonymParams {
+    /// Query word this expansion applies to (normalized on store).
+    term: String,
+    /// The equivalent word/phrase searches should also try.
+    expansion: String,
+    /// Also register the reverse direction (expansion -> term). Default true.
+    #[serde(default = "default_true")]
+    bidirectional: bool,
+    /// Scope for the synonym node(s); defaults to the server write scope.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct AddSynonymResult {
+    /// Synonym node id(s) — one per direction written or reused.
+    ids: Vec<String>,
+    /// False when every requested direction already existed.
+    created: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1065,31 +1093,72 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Synonyms are still not understood — if a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context."
     )]
     fn search_memories(
         &self,
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        // Resolve synonyms per query word. Lookup key is the ANALYZED
+        // (stemmed) form via topodb::analyze, matching how add_synonym
+        // stores terms — so "logins" finds a synonym stored for "login".
+        // Degrade silently when the spec has no Synonym index. Spec cap:
+        // at most 4 expansions per term, lexicographically smallest first
+        // (deterministic).
+        let mut expansions: Vec<(String, Vec<String>)> = Vec::new();
+        for word in p.query.split_whitespace() {
+            let Some(key) = topodb::analyze(word).into_iter().next() else {
+                continue;
+            };
+            let hits = match self.db.nodes_by_prop_normalized(
+                &scope_set,
+                SYNONYM_LABEL,
+                SYNONYM_TERM_PROP,
+                &PropValue::Str(key),
+            ) {
+                Ok(h) => h,
+                Err(TopoError::Rejected(_)) => continue,
+                Err(e) => return Err(classify_topo_error(e)),
+            };
+            let mut terms: Vec<String> = hits
+                .iter()
+                .filter_map(|n| match n.props.get(SYNONYM_EXPANSION_PROP) {
+                    Some(PropValue::Str(x)) => Some(x.clone()),
+                    _ => None,
+                })
+                .collect();
+            terms.sort();
+            terms.dedup();
+            terms.truncate(4);
+            if !terms.is_empty() {
+                expansions.push((word.to_string(), terms));
+            }
+        }
         let options = SearchOptions {
             recency_weight: p.recency_weight,
             recency_half_life_ms: (p.recency_half_life_days * 86_400_000.0) as i64,
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
         };
-        // `search_text` opens a redb read transaction, so unlike the pure
-        // snapshot reads it CAN fail with `Storage`/`Encoding` — only its
+        let query = RecallQuery {
+            scopes: scope_set,
+            query: p.query.clone(),
+            k: p.k,
+            vector: None, // Task 11 wires the embedder here
+            expansions,
+            graph_boost: p.graph_boost,
+            options,
+        };
+        // `recall` opens redb read transactions, so unlike the pure snapshot
+        // reads it CAN fail with `Storage`/`Encoding` — only its
         // input-validation `Rejected` (k == 0, token-less query, bad recency
         // tuning) maps to invalid_params; everything else is a server-side
         // internal_error.
-        let hits = self
-            .db
-            .search_text_with(&scope_set, &p.query, p.k, &options)
-            .map_err(|e| match e {
-                TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?;
+        let hits = self.db.recall(&query).map_err(|e| match e {
+            TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })?;
         let hits = hits
             .iter()
             .map(|(n, score)| {
@@ -1416,6 +1485,86 @@ impl TopoServer {
             id: alias_id.to_string(),
             created: true,
         }))
+    }
+
+    #[tool(
+        description = "Teach search a domain equivalence: after add_synonym('auth','login'), searching 'auth' also matches memories that say 'login' (at a discount, so exact matches still win). Bidirectional by default. Use when you learn this project's vocabulary — 'broker' meaning launch.js, 'the engine' meaning crates/topodb. Depth-1 only: synonyms never chain. Remove with remove_node on the synonym node id."
+    )]
+    fn add_synonym(
+        &self,
+        Parameters(p): Parameters<AddSynonymParams>,
+    ) -> Result<Json<AddSynonymResult>, ErrorData> {
+        // Terms are stored in ANALYZED (stemmed, lowercased) form so
+        // query-time lookup — which analyzes the query word the same way —
+        // can never miss a morphological variant. Expansions stay raw
+        // (trimmed): the engine tokenizes them at scoring time.
+        let term = topodb::analyze(&p.term)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let expansion = p.expansion.trim().to_lowercase();
+        let expansion_key = topodb::analyze(&expansion)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if term.is_empty() || expansion_key.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "term and expansion must each contain at least one word",
+                None,
+            ));
+        }
+        if term == expansion_key {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "term and expansion reduce to the same word ({term:?}) — a self-synonym does nothing"
+                ),
+                None,
+            ));
+        }
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let read_set = convert::scope_to_scope_set(scope);
+        let mut ids = Vec::new();
+        let mut created = false;
+        // Reverse direction stores the ANALYZED expansion as its term and
+        // the raw term text as its expansion — both directions must be
+        // lookup-able by analyzed key.
+        let raw_term = p.term.trim().to_lowercase();
+        let pairs: Vec<(String, String)> = if p.bidirectional {
+            vec![(term.clone(), expansion.clone()), (expansion_key, raw_term)]
+        } else {
+            vec![(term, expansion)]
+        };
+        for (t, e) in pairs {
+            // Idempotent per direction: existing (term, expansion) pair reused.
+            let existing = self
+                .db
+                .nodes_by_prop_normalized(
+                    &read_set,
+                    SYNONYM_LABEL,
+                    SYNONYM_TERM_PROP,
+                    &PropValue::Str(t.clone()),
+                )
+                .map_err(classify_topo_error)?;
+            if let Some(node) = existing.iter().find(|n| {
+                matches!(n.props.get(SYNONYM_EXPANSION_PROP), Some(PropValue::Str(x)) if x == &e)
+            }) {
+                ids.push(node.id.to_string());
+                continue;
+            }
+            let id = NodeId::new();
+            let mut props = Props::new();
+            props.insert(SYNONYM_TERM_PROP.to_string(), PropValue::Str(t));
+            props.insert(SYNONYM_EXPANSION_PROP.to_string(), PropValue::Str(e));
+            self.submit_write(vec![Op::CreateNode {
+                id,
+                scope,
+                label: SYNONYM_LABEL.into(),
+                props,
+            }])?;
+            ids.push(id.to_string());
+            created = true;
+        }
+        Ok(Json(AddSynonymResult { ids, created }))
     }
 
     #[tool(

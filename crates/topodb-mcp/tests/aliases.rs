@@ -98,3 +98,128 @@ fn add_alias_conflict_and_bad_target_are_errors() {
     );
     expect_tool_error(&resp);
 }
+
+#[test]
+fn synonym_expands_search_and_graph_boost_pulls_neighbors() {
+    let (_dir, mut server) = fresh_server();
+    let m = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "login page rework details" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Before the synonym: "auth" finds nothing.
+    let empty = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "auth", "fuzzy": false }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(empty["hits"].as_array().unwrap().len(), 0);
+
+    server.call_tool_ok(
+        "add_synonym",
+        serde_json::json!({ "term": "auth", "expansion": "login" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // After: the login memory surfaces for "auth".
+    let hits = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "auth", "fuzzy": false }),
+        DEFAULT_TIMEOUT,
+    );
+    let ids: Vec<&str> = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["node"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![m.as_str()]);
+
+    // Bidirectional default: "login" query ALSO expands to "auth".
+    let m2 = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "auth token refresh bug" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hits2 = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "login", "fuzzy": false }),
+        DEFAULT_TIMEOUT,
+    );
+    let ids2: Vec<&str> = hits2["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["node"]["id"].as_str().unwrap())
+        .collect();
+    assert!(ids2.contains(&m.as_str()) && ids2.contains(&m2.as_str()));
+
+    // add_synonym rejects term == expansion.
+    let resp = server.call_tool(
+        "add_synonym",
+        serde_json::json!({ "term": "auth", "expansion": "AUTH" }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}
+
+#[test]
+fn search_memories_graph_boost_param_controls_neighbor_pull() {
+    let (_dir, mut server) = fresh_server();
+    let hit = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "deployment pipeline broke friday" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let linked = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "rollback procedure revert redeploy" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.call_tool_ok(
+        "link",
+        serde_json::json!({ "from_id": linked, "to_id": hit, "edge_type": "about" }),
+        DEFAULT_TIMEOUT,
+    );
+    let with = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "deployment friday" }),
+        DEFAULT_TIMEOUT,
+    );
+    let ids: Vec<&str> = with["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["node"]["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&linked.as_str()),
+        "graph_boost default-on pulls the neighbor"
+    );
+
+    let without = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "deployment friday", "graph_boost": false }),
+        DEFAULT_TIMEOUT,
+    );
+    let ids2: Vec<&str> = without["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["node"]["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids2.contains(&linked.as_str()));
+}

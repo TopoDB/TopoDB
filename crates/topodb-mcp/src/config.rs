@@ -36,7 +36,7 @@ use topodb::{IndexSpec, Scope, ScopeId};
 /// keep working unchanged.
 pub use topodb_json::{
     ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL, ENTITY_NAME_PROP,
-    MEMORY_CONTENT_PROP, MEMORY_LABEL,
+    MEMORY_CONTENT_PROP, MEMORY_LABEL, SYNONYM_EXPANSION_PROP, SYNONYM_LABEL, SYNONYM_TERM_PROP,
 };
 
 /// A **non-empty** set of scopes a read filters by. The non-empty invariant is
