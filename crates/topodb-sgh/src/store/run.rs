@@ -1,0 +1,333 @@
+use std::collections::HashMap;
+
+use topodb::{Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery};
+
+use super::supersede::link_superseding;
+use super::{
+    SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED_BY,
+    LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_RUN, LABEL_STATE,
+};
+use crate::schema::validate::Validated;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeState {
+    Pending,
+    Ready,
+    Running,
+    Succeeded,
+    Failed,
+    Recovering,
+    Blocked,
+    Skipped,
+}
+
+impl NodeState {
+    pub const ALL: [NodeState; 8] = [
+        NodeState::Pending,
+        NodeState::Ready,
+        NodeState::Running,
+        NodeState::Succeeded,
+        NodeState::Failed,
+        NodeState::Recovering,
+        NodeState::Blocked,
+        NodeState::Skipped,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeState::Pending => "PENDING",
+            NodeState::Ready => "READY",
+            NodeState::Running => "RUNNING",
+            NodeState::Succeeded => "SUCCEEDED",
+            NodeState::Failed => "FAILED",
+            NodeState::Recovering => "RECOVERING",
+            NodeState::Blocked => "BLOCKED",
+            NodeState::Skipped => "SKIPPED",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        NodeState::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+
+    /// Terminal states end a node's participation in the run.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, NodeState::Succeeded | NodeState::Blocked | NodeState::Skipped)
+    }
+}
+
+/// Persists a run's DAG, per-node state history, outputs, and failed
+/// attempts. Every run lives in its own `Scope::Id` — no data written by
+/// `RunStore` is ever shared-scope, so reads use a bare `ScopeSet::of(&[sid])`
+/// (see `link_superseding`'s doc comment on why `.with_shared()` would be
+/// wrong here: it would let out-of-scope edges participate in reads that are
+/// supposed to be scoped to this one run).
+pub struct RunStore {
+    db: Db,
+    scope: Scope,
+    scopes: ScopeSet,
+    run_node: NodeId,
+    /// graph node id -> engine node id
+    nodes: HashMap<String, NodeId>,
+    /// state name -> engine node id
+    states: HashMap<&'static str, NodeId>,
+}
+
+impl RunStore {
+    pub fn create(db: &Db, run_id: &str, v: &Validated, now_ms: i64) -> Result<Self, SghError> {
+        let sid = ScopeId::new();
+        let scope = Scope::Id(sid);
+        let scopes = ScopeSet::of(&[sid]);
+
+        let run_node = NodeId::new();
+        let mut props = Props::new();
+        props.insert("run_id".into(), PropValue::Str(run_id.to_string()));
+        props.insert("goal".into(), PropValue::Str(v.graph.goal.clone()));
+        let mut ops = vec![Op::CreateNode {
+            id: run_node,
+            scope,
+            label: LABEL_RUN.into(),
+            props,
+        }];
+
+        // One state node per variant, per run.
+        let mut states = HashMap::new();
+        for st in NodeState::ALL {
+            let id = NodeId::new();
+            let mut p = Props::new();
+            p.insert("name".into(), PropValue::Str(st.as_str().to_string()));
+            ops.push(Op::CreateNode { id, scope, label: LABEL_STATE.into(), props: p });
+            states.insert(st.as_str(), id);
+        }
+
+        // One graph node per declared node.
+        let mut nodes = HashMap::new();
+        for n in &v.graph.nodes {
+            let id = NodeId::new();
+            let mut p = Props::new();
+            p.insert("node_id".into(), PropValue::Str(n.id.clone()));
+            p.insert("kind".into(), PropValue::Str(format!("{:?}", n.kind).to_lowercase()));
+            p.insert("retries".into(), PropValue::Int(n.budget.retries as i64));
+            p.insert("repairs".into(), PropValue::Int(n.budget.repairs as i64));
+            ops.push(Op::CreateNode { id, scope, label: LABEL_NODE.into(), props: p });
+            nodes.insert(n.id.clone(), id);
+        }
+
+        db.submit_at(ops, now_ms)?;
+
+        let store = RunStore {
+            db: db.clone(),
+            scope,
+            scopes,
+            run_node,
+            nodes,
+            states,
+        };
+
+        // Structural edges, then initial state. These are plain creates, not
+        // supersessions — DEPENDS_ON is many-valued and must not self-close.
+        let mut ops = Vec::new();
+        for n in &v.graph.nodes {
+            let from = store.nodes[&n.id];
+            ops.push(Op::CreateEdge {
+                id: EdgeId::new(),
+                scope,
+                ty: EDGE_MEMBER_OF.into(),
+                from,
+                to: run_node,
+                props: Props::new(),
+                valid_from: Some(now_ms),
+            });
+            for need in &n.needs {
+                ops.push(Op::CreateEdge {
+                    id: EdgeId::new(),
+                    scope,
+                    ty: EDGE_DEPENDS_ON.into(),
+                    from,
+                    to: store.nodes[need],
+                    props: Props::new(),
+                    valid_from: Some(now_ms),
+                });
+            }
+        }
+        db.submit_at(ops, now_ms)?;
+
+        for n in &v.graph.nodes {
+            store.set_state(&n.id, NodeState::Pending, now_ms)?;
+        }
+
+        Ok(store)
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    pub fn run_node(&self) -> NodeId {
+        self.run_node
+    }
+
+    pub fn set_state(&self, node_id: &str, state: NodeState, now_ms: i64) -> Result<(), SghError> {
+        let from = self.nodes[node_id];
+        let to = self.states[state.as_str()];
+        link_superseding(&self.db, self.scope, from, to, EDGE_HAS_STATE, now_ms)?;
+        Ok(())
+    }
+
+    /// Current state, i.e. the still-open `HAS_STATE` edge. Reads with a
+    /// sentinel `as_of` far in the future rather than `as_of: None` (wall
+    /// clock): every write in this crate goes through `submit_at` with an
+    /// explicit, caller-supplied `now_ms` — often small/synthetic in tests —
+    /// so anchoring "latest" to the real wall clock would work today (the
+    /// real clock is always later) but ties correctness to an environmental
+    /// fact that has nothing to do with the run. The sentinel makes "read
+    /// whatever is open" deterministic and independent of when the test (or
+    /// process) happens to run.
+    pub fn state(&self, node_id: &str) -> Result<NodeState, SghError> {
+        let from = self.nodes[node_id];
+        // No `edges_from` exists on the engine — `traverse` is the public read
+        // that answers "open edges of this type out of this node". See Task 4.
+        let sg = self.db.traverse(&TraversalQuery {
+            scopes: self.scopes.clone(),
+            seeds: vec![from],
+            max_hops: 1,
+            edge_types: Some(vec![EDGE_HAS_STATE.into()]),
+            direction: Direction::Out,
+            as_of: Some(i64::MAX - 1),
+        })?;
+        let open: Vec<_> = sg.edges.iter().filter(|e| e.from == from).collect();
+        let edge = open.first().expect("every node has exactly one open state edge");
+        let rec = self.db.node(&self.scopes, edge.to).expect("state node exists");
+        let name = match rec.props.get("name") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => unreachable!("state node always carries a name"),
+        };
+        Ok(NodeState::from_str(&name).expect("known state name"))
+    }
+
+    /// Historical state read. Uses `traverse`, the only read that honours
+    /// `as_of` (`read.rs`); one hop suffices for a node's state edge.
+    pub fn state_at(&self, node_id: &str, as_of: i64) -> Result<Option<NodeState>, SghError> {
+        let from = self.nodes[node_id];
+        let q = TraversalQuery {
+            scopes: self.scopes.clone(),
+            seeds: vec![from],
+            max_hops: 1,
+            edge_types: Some(vec![EDGE_HAS_STATE.into()]),
+            direction: Direction::Out,
+            as_of: Some(as_of),
+        };
+        let sub = self.db.traverse(&q)?;
+        for rec in sub.nodes.iter() {
+            if rec.label == LABEL_STATE {
+                if let Some(PropValue::Str(name)) = rec.props.get("name") {
+                    return Ok(NodeState::from_str(name));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn record_output(&self, node_id: &str, json: &str, now_ms: i64) -> Result<(), SghError> {
+        let node = self.nodes[node_id];
+        let id = NodeId::new();
+        let mut props = Props::new();
+        props.insert("content".into(), PropValue::Str(json.to_string()));
+        self.db.submit_at(
+            vec![
+                Op::CreateNode { id, scope: self.scope, label: LABEL_OUTPUT.into(), props },
+                Op::CreateEdge {
+                    id: EdgeId::new(),
+                    scope: self.scope,
+                    ty: EDGE_PRODUCED_BY.into(),
+                    from: id,
+                    to: node,
+                    props: Props::new(),
+                    valid_from: Some(now_ms),
+                },
+            ],
+            now_ms,
+        )?;
+        Ok(())
+    }
+
+    pub fn output(&self, node_id: &str) -> Result<Option<String>, SghError> {
+        let node = self.nodes[node_id];
+        let q = TraversalQuery {
+            scopes: self.scopes.clone(),
+            seeds: vec![node],
+            max_hops: 1,
+            edge_types: Some(vec![EDGE_PRODUCED_BY.into()]),
+            direction: Direction::In,
+            as_of: None,
+        };
+        let sub = self.db.traverse(&q)?;
+        for rec in sub.nodes.iter() {
+            if rec.label == LABEL_OUTPUT {
+                if let Some(PropValue::Str(c)) = rec.props.get("content") {
+                    return Ok(Some(c.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn record_attempt(
+        &self,
+        node_id: &str,
+        rung: &str,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<(), SghError> {
+        let node = self.nodes[node_id];
+        let id = NodeId::new();
+        let mut props = Props::new();
+        props.insert("rung".into(), PropValue::Str(rung.to_string()));
+        props.insert("error".into(), PropValue::Str(error.to_string()));
+        props.insert("at".into(), PropValue::DateTime(now_ms));
+        self.db.submit_at(
+            vec![
+                Op::CreateNode { id, scope: self.scope, label: LABEL_ATTEMPT.into(), props },
+                Op::CreateEdge {
+                    id: EdgeId::new(),
+                    scope: self.scope,
+                    ty: EDGE_ATTEMPT_OF.into(),
+                    from: id,
+                    to: node,
+                    props: Props::new(),
+                    valid_from: Some(now_ms),
+                },
+            ],
+            now_ms,
+        )?;
+        Ok(())
+    }
+
+    pub fn attempts(&self, node_id: &str) -> Result<Vec<(String, String)>, SghError> {
+        let node = self.nodes[node_id];
+        let q = TraversalQuery {
+            scopes: self.scopes.clone(),
+            seeds: vec![node],
+            max_hops: 1,
+            edge_types: Some(vec![EDGE_ATTEMPT_OF.into()]),
+            direction: Direction::In,
+            as_of: None,
+        };
+        let sub = self.db.traverse(&q)?;
+        let mut out = Vec::new();
+        for rec in sub.nodes.iter() {
+            if rec.label == LABEL_ATTEMPT {
+                let rung = match rec.props.get("rung") {
+                    Some(PropValue::Str(s)) => s.clone(),
+                    _ => continue,
+                };
+                let err = match rec.props.get("error") {
+                    Some(PropValue::Str(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                out.push((rung, err));
+            }
+        }
+        Ok(out)
+    }
+}
