@@ -47,6 +47,18 @@ fn outputs_round_trip() {
 }
 
 #[test]
+fn record_output_supersedes_prior_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    s.record_output("survey", r#"{"sites":[]}"#, 500).unwrap();
+    s.record_output("survey", r#"{"sites":["a"]}"#, 600).unwrap();
+
+    assert_eq!(s.output("survey").unwrap().as_deref(), Some(r#"{"sites":["a"]}"#));
+}
+
+#[test]
 fn attempts_accumulate() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();

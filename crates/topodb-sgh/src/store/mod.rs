@@ -13,7 +13,10 @@ pub const LABEL_REVISION: &str = "SghRevision";
 
 pub const EDGE_DEPENDS_ON: &str = "DEPENDS_ON";
 pub const EDGE_HAS_STATE: &str = "HAS_STATE";
-pub const EDGE_PRODUCED_BY: &str = "PRODUCED_BY";
+/// `node -[EDGE_PRODUCED]-> SghOutput`. Keyed on the stable node id so
+/// `link_superseding` can close the prior output edge when a node produces a
+/// new output (see `RunStore::record_output`).
+pub const EDGE_PRODUCED: &str = "PRODUCED";
 pub const EDGE_ATTEMPT_OF: &str = "ATTEMPT_OF";
 pub const EDGE_REVISION_OF: &str = "REVISION_OF";
 pub const EDGE_MEMBER_OF: &str = "MEMBER_OF";

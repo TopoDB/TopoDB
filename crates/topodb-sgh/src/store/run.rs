@@ -4,7 +4,7 @@ use topodb::{Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId
 
 use super::supersede::link_superseding;
 use super::{
-    SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED_BY,
+    SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED,
     LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_RUN, LABEL_STATE,
 };
 use crate::schema::validate::Validated;
@@ -228,48 +228,47 @@ impl RunStore {
         Ok(None)
     }
 
+    /// Outputs are a mutable current value, same as node state: a fresh
+    /// `SghOutput` node is created on every call, then linked with
+    /// `link_superseding` as `node -[EDGE_PRODUCED]-> output` so the prior
+    /// output edge for this node (if any) is closed rather than left open
+    /// alongside the new one. The edge direction matters here — supersession
+    /// is keyed on `(from, ty)`, so it must key on the stable node id, not on
+    /// the freshly-created output id (which would never match a prior edge).
     pub fn record_output(&self, node_id: &str, json: &str, now_ms: i64) -> Result<(), SghError> {
         let node = self.nodes[node_id];
         let id = NodeId::new();
         let mut props = Props::new();
         props.insert("content".into(), PropValue::Str(json.to_string()));
-        self.db.submit_at(
-            vec![
-                Op::CreateNode { id, scope: self.scope, label: LABEL_OUTPUT.into(), props },
-                Op::CreateEdge {
-                    id: EdgeId::new(),
-                    scope: self.scope,
-                    ty: EDGE_PRODUCED_BY.into(),
-                    from: id,
-                    to: node,
-                    props: Props::new(),
-                    valid_from: Some(now_ms),
-                },
-            ],
-            now_ms,
-        )?;
+        self.db
+            .submit_at(vec![Op::CreateNode { id, scope: self.scope, label: LABEL_OUTPUT.into(), props }], now_ms)?;
+        link_superseding(&self.db, self.scope, node, id, EDGE_PRODUCED, now_ms)?;
         Ok(())
     }
 
+    /// Current output, i.e. the still-open `PRODUCED` edge's target. Mirrors
+    /// `state()`: reads with a sentinel `as_of` far in the future for the
+    /// same reason (see `state()`'s doc comment) rather than `as_of: None`.
     pub fn output(&self, node_id: &str) -> Result<Option<String>, SghError> {
         let node = self.nodes[node_id];
         let q = TraversalQuery {
             scopes: self.scopes.clone(),
             seeds: vec![node],
             max_hops: 1,
-            edge_types: Some(vec![EDGE_PRODUCED_BY.into()]),
-            direction: Direction::In,
-            as_of: None,
+            edge_types: Some(vec![EDGE_PRODUCED.into()]),
+            direction: Direction::Out,
+            as_of: Some(i64::MAX - 1),
         };
         let sub = self.db.traverse(&q)?;
-        for rec in sub.nodes.iter() {
-            if rec.label == LABEL_OUTPUT {
-                if let Some(PropValue::Str(c)) = rec.props.get("content") {
-                    return Ok(Some(c.clone()));
-                }
-            }
+        let open: Vec<_> = sub.edges.iter().filter(|e| e.from == node).collect();
+        let Some(edge) = open.first() else {
+            return Ok(None);
+        };
+        let rec = self.db.node(&self.scopes, edge.to).expect("output node exists");
+        match rec.props.get("content") {
+            Some(PropValue::Str(c)) => Ok(Some(c.clone())),
+            _ => Ok(None),
         }
-        Ok(None)
     }
 
     pub fn record_attempt(
