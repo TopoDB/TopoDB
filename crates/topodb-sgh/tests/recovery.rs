@@ -83,6 +83,10 @@ fn contract_breaking_repairs_are_rejected() {
     let mut rebudget = original.clone();
     rebudget.budget.retries = 99;
     assert!(!contract_preserved(original, &rebudget), "budget change is not a repair");
+
+    let mut rekinded = original.clone();
+    rekinded.kind = topodb_sgh::schema::NodeKind::Command;
+    assert!(!contract_preserved(original, &rekinded), "kind change is not a repair");
 }
 
 #[test]
@@ -113,4 +117,90 @@ fn repair_is_attempted_after_retries_and_records_an_attempt() {
     let attempts = ex.store_ref().attempts("a").unwrap();
     assert!(attempts.iter().any(|(rung, _)| rung == "retry"));
     assert!(attempts.iter().any(|(rung, _)| rung == "repair"));
+}
+
+/// End-to-end: a `Repairer` that returns a contract-breaking `Node` must
+/// have its repair refused by the executor, not merely by the pure
+/// `contract_preserved` function in isolation. This is the wiring in
+/// `execute_node` (around the `Rung::Repair` match arm) that a future
+/// refactor could accidentally bypass — e.g. by forgetting to check
+/// `contract_preserved` before accepting `repairer.repair()`'s output, or
+/// by checking it but still looping back to re-run the node regardless of
+/// the result.
+#[test]
+fn contract_breaking_repair_is_rejected_and_node_blocks_without_reexecuting() {
+    let g = one_node(0, 1);
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
+    // The node fails every time it is invoked; if the rejected repair were
+    // ever executed anyway, this would surface as an extra call.
+    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+
+    struct ContractBreakingRepairer;
+    impl Repairer for ContractBreakingRepairer {
+        fn repair(&self, node: &Node, _error: &str) -> Option<Node> {
+            // Widens the contract by adding a dependency that was never in
+            // the frozen graph — exactly the "silent replan" the invariant
+            // exists to forbid.
+            let mut n = node.clone();
+            n.needs.push("ghost".into());
+            Some(n)
+        }
+    }
+
+    let mut ex = Executor::new(store, v, &runner).with_repairer(&ContractBreakingRepairer);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    // retries: 0, so the very first failure already lands on the REPAIR
+    // rung. The repairer is consulted exactly once, its (contract-breaking)
+    // output is rejected, and the ladder blocks immediately without looping
+    // back to the top to invoke the runner again. So the runner should have
+    // been called exactly once: the initial attempt, and nothing after.
+    assert_eq!(
+        runner.call_count(),
+        1,
+        "a rejected repair must not trigger another execution of the node"
+    );
+}
+
+/// Positive counterpart to the test above: with the same shape of graph and
+/// failure, a `Repairer` whose output *does* preserve the contract (only
+/// `prompt` differs) is accepted and the node is re-executed and allowed to
+/// succeed. Paired with the rejection test, this proves the branch in
+/// `execute_node` actually discriminates on `contract_preserved` rather than
+/// always blocking on REPAIR (a test that only showed blocking would pass
+/// even if repairs were unconditionally refused).
+#[test]
+fn contract_preserving_repair_is_accepted_end_to_end_and_node_succeeds() {
+    let g = one_node(0, 1);
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script(
+        "a",
+        vec![
+            NodeOutcome::Failed { error: "boom".into() },
+            NodeOutcome::Succeeded { output: "{}".into() },
+        ],
+    );
+
+    struct PromptOnlyRepairer;
+    impl Repairer for PromptOnlyRepairer {
+        fn repair(&self, node: &Node, _error: &str) -> Option<Node> {
+            let mut n = node.clone();
+            n.prompt = Some("revised prompt".into());
+            Some(n)
+        }
+    }
+
+    let mut ex = Executor::new(store, v, &runner).with_repairer(&PromptOnlyRepairer);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.succeeded, vec!["a".to_string()]);
+    // 1 initial failure + 1 repaired execution that succeeds.
+    assert_eq!(runner.call_count(), 2);
 }
