@@ -7,6 +7,6 @@
     "test": "node --test \"test/*.test.js\""
   },
   "devDependencies": {
-    "@topodb/topodb-mcp": "0.0.9"
+    "@topodb/topodb-mcp": "0.0.10"
   }
 }
