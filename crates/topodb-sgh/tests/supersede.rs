@@ -1,11 +1,18 @@
-use topodb::{Db, Direction, EdgeRecord, NodeId, Op, Props, Scope, ScopeId, ScopeSet, TraversalQuery};
+use topodb::{
+    Db, Direction, EdgeRecord, NodeId, Op, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
+};
 use topodb_sgh::store::supersede::link_superseding;
 use topodb_sgh::store::SghError;
 
 fn node(db: &Db, scope: Scope, label: &str, t: i64) -> NodeId {
     let id = NodeId::new();
     db.submit_at(
-        vec![Op::CreateNode { id, scope, label: label.into(), props: Props::new() }],
+        vec![Op::CreateNode {
+            id,
+            scope,
+            label: label.into(),
+            props: Props::new(),
+        }],
         t,
     )
     .expect("create node");
@@ -64,7 +71,11 @@ fn superseding_closes_the_previous_edge_of_the_same_type() {
     let all = all_edges(&db, step, "HAS_STATE");
     assert_eq!(all.len(), 2, "history is preserved, not overwritten");
     let closed = all.iter().find(|e| e.to == running).unwrap();
-    assert_eq!(closed.valid_to, Some(20), "old edge closed at the new edge's timestamp");
+    assert_eq!(
+        closed.valid_to,
+        Some(20),
+        "old edge closed at the new edge's timestamp"
+    );
 }
 
 #[test]

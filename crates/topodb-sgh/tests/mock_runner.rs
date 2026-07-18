@@ -12,14 +12,26 @@ fn req(id: &str) -> NodeRequest {
 
 #[test]
 fn returns_scripted_outcomes_in_order() {
-    let r = MockRunner::new()
-        .script("a", vec![
-            NodeOutcome::Failed { error: "boom".into() },
-            NodeOutcome::Succeeded { output: r#"{"ok":true}"#.into() },
-        ]);
+    let r = MockRunner::new().script(
+        "a",
+        vec![
+            NodeOutcome::Failed {
+                error: "boom".into(),
+            },
+            NodeOutcome::Succeeded {
+                output: r#"{"ok":true}"#.into(),
+            },
+        ],
+    );
 
-    assert!(matches!(r.run(&req("a")).unwrap(), NodeOutcome::Failed { .. }));
-    assert!(matches!(r.run(&req("a")).unwrap(), NodeOutcome::Succeeded { .. }));
+    assert!(matches!(
+        r.run(&req("a")).unwrap(),
+        NodeOutcome::Failed { .. }
+    ));
+    assert!(matches!(
+        r.run(&req("a")).unwrap(),
+        NodeOutcome::Succeeded { .. }
+    ));
 }
 
 #[test]
@@ -33,9 +45,17 @@ fn unscripted_nodes_succeed_with_empty_object() {
 
 #[test]
 fn exhausted_script_repeats_its_last_outcome() {
-    let r = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "always".into() }]);
+    let r = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "always".into(),
+        }],
+    );
     for _ in 0..5 {
-        assert!(matches!(r.run(&req("a")).unwrap(), NodeOutcome::Failed { .. }));
+        assert!(matches!(
+            r.run(&req("a")).unwrap(),
+            NodeOutcome::Failed { .. }
+        ));
     }
 }
 

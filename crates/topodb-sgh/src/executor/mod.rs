@@ -94,7 +94,13 @@ impl<'r> Executor<'r> {
         // dependents are considered.
         let order = self.graph.topo_order.clone();
         for id in order {
-            let deps = self.graph.graph.node(&id).expect("node exists").needs.clone();
+            let deps = self
+                .graph
+                .graph
+                .node(&id)
+                .expect("node exists")
+                .needs
+                .clone();
 
             let mut any_dep_unfinished = false;
             for d in &deps {
@@ -174,7 +180,9 @@ impl<'r> Executor<'r> {
 
             let outcome = match self.runner.run(&req) {
                 Ok(o) => o,
-                Err(e) => NodeOutcome::Failed { error: e.to_string() },
+                Err(e) => NodeOutcome::Failed {
+                    error: e.to_string(),
+                },
             };
 
             let error = match outcome {
@@ -255,7 +263,10 @@ impl<'r> Executor<'r> {
     }
 
     fn report(&self) -> Result<RunReport, SghError> {
-        let mut r = RunReport { model_calls: self.model_calls, ..Default::default() };
+        let mut r = RunReport {
+            model_calls: self.model_calls,
+            ..Default::default()
+        };
         for id in &self.graph.topo_order {
             match self.store.state(id)? {
                 NodeState::Succeeded => r.succeeded.push(id.clone()),
@@ -272,7 +283,9 @@ impl<'r> Executor<'r> {
 /// failed — this is what makes declared outputs load-bearing rather than
 /// documentation. A node with no declared output schema is unconstrained.
 fn validate_output(node: &crate::schema::Node, output: &str) -> Result<(), String> {
-    let Some(spec) = &node.output else { return Ok(()) };
+    let Some(spec) = &node.output else {
+        return Ok(());
+    };
     let value: serde_json::Value =
         serde_json::from_str(output).map_err(|e| format!("output is not valid json: {e}"))?;
     let compiled = jsonschema::JSONSchema::compile(&spec.schema)

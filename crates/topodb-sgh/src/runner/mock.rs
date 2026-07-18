@@ -43,10 +43,14 @@ impl AgentRunner for MockRunner {
 
         let scripts = self.scripts.lock().unwrap();
         let Some(outcomes) = scripts.get(&req.node_id) else {
-            return Ok(NodeOutcome::Succeeded { output: "{}".to_string() });
+            return Ok(NodeOutcome::Succeeded {
+                output: "{}".to_string(),
+            });
         };
         if outcomes.is_empty() {
-            return Ok(NodeOutcome::Succeeded { output: "{}".to_string() });
+            return Ok(NodeOutcome::Succeeded {
+                output: "{}".to_string(),
+            });
         }
 
         let mut cursors = self.cursors.lock().unwrap();

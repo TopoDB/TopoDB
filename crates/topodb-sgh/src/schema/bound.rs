@@ -29,7 +29,10 @@ pub fn worst_case(v: &Validated) -> Bound {
         }
     }
 
-    Bound { agent_calls, command_runs }
+    Bound {
+        agent_calls,
+        command_runs,
+    }
 }
 
 impl std::fmt::Display for Bound {

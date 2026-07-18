@@ -65,6 +65,8 @@ impl AgentRunner for ClaudeCodeRunner {
         }
 
         let stdout = String::from_utf8(out.stdout).map_err(|_| RunnerError::Utf8)?;
-        Ok(NodeOutcome::Succeeded { output: stdout.trim().to_string() })
+        Ok(NodeOutcome::Succeeded {
+            output: stdout.trim().to_string(),
+        })
     }
 }

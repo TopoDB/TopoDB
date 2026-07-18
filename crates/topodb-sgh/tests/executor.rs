@@ -48,7 +48,10 @@ fn a_failed_node_blocks_and_its_dependents_skip() {
 
     assert_eq!(report.blocked, vec!["b".to_string()]);
     assert_eq!(report.skipped, vec!["d".to_string()], "d needs b");
-    assert!(report.succeeded.contains(&"c".to_string()), "independent branch still runs");
+    assert!(
+        report.succeeded.contains(&"c".to_string()),
+        "independent branch still runs"
+    );
 }
 
 #[test]
@@ -72,7 +75,9 @@ fn declared_inputs_are_the_only_context_a_node_receives() {
             if req.node_id == "a" {
                 assert!(req.inputs.is_empty(), "a has no deps and sees nothing");
             }
-            Ok(NodeOutcome::Succeeded { output: "{}".into() })
+            Ok(NodeOutcome::Succeeded {
+                output: "{}".into(),
+            })
         }
     }
 
@@ -92,7 +97,10 @@ fn model_calls_counts_exactly_the_four_agent_nodes() {
     let report = ex.run(10).unwrap();
 
     assert_eq!(report.succeeded.len(), 4);
-    assert_eq!(report.model_calls, 4, "each of the 4 agent nodes makes exactly one model call");
+    assert_eq!(
+        report.model_calls, 4,
+        "each of the 4 agent nodes makes exactly one model call"
+    );
 }
 
 /// Command nodes have no execution path (see the executor module doc
@@ -124,13 +132,21 @@ fn run_refuses_a_graph_containing_a_command_node() {
 
     match err {
         SghError::UnsupportedNodeKind { nodes } => {
-            assert_eq!(nodes, vec!["b".to_string()], "the command node is named in the error")
+            assert_eq!(
+                nodes,
+                vec!["b".to_string()],
+                "the command node is named in the error"
+            )
         }
         other => panic!("expected UnsupportedNodeKind, got {other:?}"),
     }
     // Refused before any node executes: no model calls happened at all, not
     // even for `a`, which topologically precedes the offending node.
-    assert_eq!(runner.call_count(), 0, "the run must be refused before any node executes");
+    assert_eq!(
+        runner.call_count(),
+        0,
+        "the run must be refused before any node executes"
+    );
 }
 
 /// A graph with more than one command node names all of them, in
@@ -182,7 +198,10 @@ fn model_calls_excludes_a_gate_node() {
     // dispatches to the runner and its dependents (there are none here)
     // would be skipped rather than run.
     assert_eq!(report.blocked, vec!["g".to_string()]);
-    assert_eq!(report.model_calls, 1, "only node a's model call counts; the gate contributes 0");
+    assert_eq!(
+        report.model_calls, 1,
+        "only node a's model call counts; the gate contributes 0"
+    );
 }
 
 #[test]
@@ -198,10 +217,18 @@ fn schema_mismatch_is_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let store = RunStore::create(&db, "r", &v, 1).unwrap();
-    let runner = MockRunner::new()
-        .script("a", vec![NodeOutcome::Succeeded { output: "{}".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Succeeded {
+            output: "{}".into(),
+        }],
+    );
 
     let mut ex = Executor::new(store, v, &runner);
     let report = ex.run(10).unwrap();
-    assert_eq!(report.blocked, vec!["a".to_string()], "missing required field fails the node");
+    assert_eq!(
+        report.blocked,
+        vec!["a".to_string()],
+        "missing required field fails the node"
+    );
 }

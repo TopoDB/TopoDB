@@ -43,7 +43,10 @@ fn outputs_round_trip() {
 
     assert_eq!(s.output("survey").unwrap(), None);
     s.record_output("survey", r#"{"sites":[]}"#, 500).unwrap();
-    assert_eq!(s.output("survey").unwrap().as_deref(), Some(r#"{"sites":[]}"#));
+    assert_eq!(
+        s.output("survey").unwrap().as_deref(),
+        Some(r#"{"sites":[]}"#)
+    );
 }
 
 #[test]
@@ -53,9 +56,13 @@ fn record_output_supersedes_prior_output() {
     let s = store(&db);
 
     s.record_output("survey", r#"{"sites":[]}"#, 500).unwrap();
-    s.record_output("survey", r#"{"sites":["a"]}"#, 600).unwrap();
+    s.record_output("survey", r#"{"sites":["a"]}"#, 600)
+        .unwrap();
 
-    assert_eq!(s.output("survey").unwrap().as_deref(), Some(r#"{"sites":["a"]}"#));
+    assert_eq!(
+        s.output("survey").unwrap().as_deref(),
+        Some(r#"{"sites":["a"]}"#)
+    );
 }
 
 #[test]
@@ -65,7 +72,8 @@ fn attempts_accumulate() {
     let s = store(&db);
 
     s.record_attempt("survey", "retry", "timeout", 600).unwrap();
-    s.record_attempt("survey", "repair", "schema mismatch", 700).unwrap();
+    s.record_attempt("survey", "repair", "schema mismatch", 700)
+        .unwrap();
     assert_eq!(s.attempts("survey").unwrap().len(), 2);
 }
 
@@ -88,9 +96,15 @@ fn attempts_are_visible_even_when_the_run_is_stamped_far_in_the_future() {
     let future = 4_102_444_800_000i64; // year 2100
     let s = RunStore::create(&db, "run-future", &v, future).expect("create run");
 
-    s.record_attempt("survey", "retry", "timeout", future + 100).unwrap();
-    s.record_attempt("survey", "repair", "schema mismatch", future + 200).unwrap();
+    s.record_attempt("survey", "retry", "timeout", future + 100)
+        .unwrap();
+    s.record_attempt("survey", "repair", "schema mismatch", future + 200)
+        .unwrap();
 
     let attempts = s.attempts("survey").unwrap();
-    assert_eq!(attempts.len(), 2, "attempts recorded with future timestamps must still be visible");
+    assert_eq!(
+        attempts.len(),
+        2,
+        "attempts recorded with future timestamps must still be visible"
+    );
 }

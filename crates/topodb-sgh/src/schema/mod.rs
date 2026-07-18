@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub mod validate;
 pub mod bound;
+pub mod validate;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {

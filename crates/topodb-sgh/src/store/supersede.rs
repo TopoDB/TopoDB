@@ -93,7 +93,10 @@ pub fn link_superseding(
 
         let mut ops: Vec<Op> = open
             .iter()
-            .map(|e| Op::CloseEdge { id: e.id, valid_to: Some(now_ms) })
+            .map(|e| Op::CloseEdge {
+                id: e.id,
+                valid_to: Some(now_ms),
+            })
             .collect();
 
         let new_id = EdgeId::new();
@@ -128,5 +131,7 @@ pub fn link_superseding(
         }
     }
 
-    Err(SghError::Contended { attempts: MAX_ATTEMPTS })
+    Err(SghError::Contended {
+        attempts: MAX_ATTEMPTS,
+    })
 }

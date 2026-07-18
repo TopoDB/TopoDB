@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use topodb::{Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery};
+use topodb::{
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
+};
 
 use super::supersede::link_superseding;
 use super::{
@@ -52,7 +54,10 @@ impl NodeState {
 
     /// Terminal states end a node's participation in the run.
     pub fn is_terminal(self) -> bool {
-        matches!(self, NodeState::Succeeded | NodeState::Blocked | NodeState::Skipped)
+        matches!(
+            self,
+            NodeState::Succeeded | NodeState::Blocked | NodeState::Skipped
+        )
     }
 }
 
@@ -96,7 +101,12 @@ impl RunStore {
             let id = NodeId::new();
             let mut p = Props::new();
             p.insert("name".into(), PropValue::Str(st.as_str().to_string()));
-            ops.push(Op::CreateNode { id, scope, label: LABEL_STATE.into(), props: p });
+            ops.push(Op::CreateNode {
+                id,
+                scope,
+                label: LABEL_STATE.into(),
+                props: p,
+            });
             states.insert(st.as_str(), id);
         }
 
@@ -106,10 +116,18 @@ impl RunStore {
             let id = NodeId::new();
             let mut p = Props::new();
             p.insert("node_id".into(), PropValue::Str(n.id.clone()));
-            p.insert("kind".into(), PropValue::Str(format!("{:?}", n.kind).to_lowercase()));
+            p.insert(
+                "kind".into(),
+                PropValue::Str(format!("{:?}", n.kind).to_lowercase()),
+            );
             p.insert("retries".into(), PropValue::Int(n.budget.retries as i64));
             p.insert("repairs".into(), PropValue::Int(n.budget.repairs as i64));
-            ops.push(Op::CreateNode { id, scope, label: LABEL_NODE.into(), props: p });
+            ops.push(Op::CreateNode {
+                id,
+                scope,
+                label: LABEL_NODE.into(),
+                props: p,
+            });
             nodes.insert(n.id.clone(), id);
         }
 
@@ -196,8 +214,13 @@ impl RunStore {
             as_of: Some(i64::MAX - 1),
         })?;
         let open: Vec<_> = sg.edges.iter().filter(|e| e.from == from).collect();
-        let edge = open.first().expect("every node has exactly one open state edge");
-        let rec = self.db.node(&self.scopes, edge.to).expect("state node exists");
+        let edge = open
+            .first()
+            .expect("every node has exactly one open state edge");
+        let rec = self
+            .db
+            .node(&self.scopes, edge.to)
+            .expect("state node exists");
         let name = match rec.props.get("name") {
             Some(PropValue::Str(s)) => s.clone(),
             _ => unreachable!("state node always carries a name"),
@@ -240,8 +263,15 @@ impl RunStore {
         let id = NodeId::new();
         let mut props = Props::new();
         props.insert("content".into(), PropValue::Str(json.to_string()));
-        self.db
-            .submit_at(vec![Op::CreateNode { id, scope: self.scope, label: LABEL_OUTPUT.into(), props }], now_ms)?;
+        self.db.submit_at(
+            vec![Op::CreateNode {
+                id,
+                scope: self.scope,
+                label: LABEL_OUTPUT.into(),
+                props,
+            }],
+            now_ms,
+        )?;
         link_superseding(&self.db, self.scope, node, id, EDGE_PRODUCED, now_ms)?;
         Ok(())
     }
@@ -264,7 +294,10 @@ impl RunStore {
         let Some(edge) = open.first() else {
             return Ok(None);
         };
-        let rec = self.db.node(&self.scopes, edge.to).expect("output node exists");
+        let rec = self
+            .db
+            .node(&self.scopes, edge.to)
+            .expect("output node exists");
         match rec.props.get("content") {
             Some(PropValue::Str(c)) => Ok(Some(c.clone())),
             _ => Ok(None),
@@ -286,7 +319,12 @@ impl RunStore {
         props.insert("at".into(), PropValue::DateTime(now_ms));
         self.db.submit_at(
             vec![
-                Op::CreateNode { id, scope: self.scope, label: LABEL_ATTEMPT.into(), props },
+                Op::CreateNode {
+                    id,
+                    scope: self.scope,
+                    label: LABEL_ATTEMPT.into(),
+                    props,
+                },
                 Op::CreateEdge {
                     id: EdgeId::new(),
                     scope: self.scope,

@@ -22,7 +22,12 @@ fn retries_are_exhausted_before_blocking() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "boom".into(),
+        }],
+    );
 
     let mut ex = Executor::new(store, v, &runner);
     let report = ex.run(10).unwrap();
@@ -41,8 +46,12 @@ fn a_retry_that_succeeds_ends_the_ladder() {
     let runner = MockRunner::new().script(
         "a",
         vec![
-            NodeOutcome::Failed { error: "flaky".into() },
-            NodeOutcome::Succeeded { output: "{}".into() },
+            NodeOutcome::Failed {
+                error: "flaky".into(),
+            },
+            NodeOutcome::Succeeded {
+                output: "{}".into(),
+            },
         ],
     );
 
@@ -69,25 +78,40 @@ fn contract_breaking_repairs_are_rejected() {
 
     let mut renamed = original.clone();
     renamed.id = "b".into();
-    assert!(!contract_preserved(original, &renamed), "id change is not a repair");
+    assert!(
+        !contract_preserved(original, &renamed),
+        "id change is not a repair"
+    );
 
     let mut redeped = original.clone();
     redeped.needs = vec!["z".into()];
-    assert!(!contract_preserved(original, &redeped), "new dependency is not a repair");
+    assert!(
+        !contract_preserved(original, &redeped),
+        "new dependency is not a repair"
+    );
 
     let mut reschema = original.clone();
     reschema.output = Some(topodb_sgh::schema::OutputSpec {
         schema: serde_json::json!({"type": "object"}),
     });
-    assert!(!contract_preserved(original, &reschema), "schema change is not a repair");
+    assert!(
+        !contract_preserved(original, &reschema),
+        "schema change is not a repair"
+    );
 
     let mut rebudget = original.clone();
     rebudget.budget.retries = 99;
-    assert!(!contract_preserved(original, &rebudget), "budget change is not a repair");
+    assert!(
+        !contract_preserved(original, &rebudget),
+        "budget change is not a repair"
+    );
 
     let mut rekinded = original.clone();
     rekinded.kind = topodb_sgh::schema::NodeKind::Command;
-    assert!(!contract_preserved(original, &rekinded), "kind change is not a repair");
+    assert!(
+        !contract_preserved(original, &rekinded),
+        "kind change is not a repair"
+    );
 
     // `run` is the command-node analogue of `prompt`. It is inert today
     // because commands always get a repair budget of 0 (never reach the
@@ -97,7 +121,10 @@ fn contract_breaking_repairs_are_rejected() {
     // repairer from rewriting `run` freely.
     let mut rerun = original.clone();
     rerun.run = Some("rm -rf /".into());
-    assert!(!contract_preserved(original, &rerun), "run change is not a repair");
+    assert!(
+        !contract_preserved(original, &rerun),
+        "run change is not a repair"
+    );
 }
 
 #[test]
@@ -107,7 +134,12 @@ fn repair_is_attempted_after_retries_and_records_an_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "boom".into(),
+        }],
+    );
 
     struct AlwaysRepairs;
     impl Repairer for AlwaysRepairs {
@@ -147,7 +179,12 @@ fn contract_breaking_repair_is_rejected_and_node_blocks_without_reexecuting() {
     let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
     // The node fails every time it is invoked; if the rejected repair were
     // ever executed anyway, this would surface as an extra call.
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "boom".into(),
+        }],
+    );
 
     struct ContractBreakingRepairer;
     impl Repairer for ContractBreakingRepairer {
@@ -194,8 +231,12 @@ fn contract_preserving_repair_is_accepted_end_to_end_and_node_succeeds() {
     let runner = MockRunner::new().script(
         "a",
         vec![
-            NodeOutcome::Failed { error: "boom".into() },
-            NodeOutcome::Succeeded { output: "{}".into() },
+            NodeOutcome::Failed {
+                error: "boom".into(),
+            },
+            NodeOutcome::Succeeded {
+                output: "{}".into(),
+            },
         ],
     );
 
@@ -236,7 +277,12 @@ fn model_calls_counts_the_repair_consultation_and_matches_the_bound() {
     let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
     // Fails every time: 1 initial + 1 retry + 1 repaired re-execution, all
     // failures, so the ladder exhausts every rung the bound budgets for.
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "boom".into(),
+        }],
+    );
 
     struct PromptOnlyRepairer;
     impl Repairer for PromptOnlyRepairer {
@@ -259,5 +305,8 @@ fn model_calls_counts_the_repair_consultation_and_matches_the_bound() {
         report.model_calls, 4,
         "model_calls must count the repair consultation, matching the published bound"
     );
-    assert!(report.model_calls <= bound.agent_calls, "must never exceed the bound");
+    assert!(
+        report.model_calls <= bound.agent_calls,
+        "must never exceed the bound"
+    );
 }

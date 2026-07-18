@@ -128,7 +128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  succeeded: {:?}", report.succeeded);
             println!("  blocked:   {:?}", report.blocked);
             println!("  skipped:   {:?}", report.skipped);
-            println!("  model calls: {} (bound was {})", report.model_calls, bound.agent_calls);
+            println!(
+                "  model calls: {} (bound was {})",
+                report.model_calls, bound.agent_calls
+            );
 
             if !report.blocked.is_empty() {
                 std::process::exit(1);

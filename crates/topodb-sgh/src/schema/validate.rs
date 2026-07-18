@@ -88,7 +88,8 @@ pub fn validate(graph: &Graph) -> Result<Validated, Vec<ValidationError>> {
     // many times a `need` is repeated, so incrementing once per occurrence
     // here (as before) left the counter permanently off by the duplicate
     // count and a valid graph was misreported as `Cycle`.
-    let mut indegree: HashMap<&str, usize> = graph.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
+    let mut indegree: HashMap<&str, usize> =
+        graph.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
     for n in &graph.nodes {
         let mut distinct: HashSet<&str> = HashSet::new();
         for need in &n.needs {
@@ -125,7 +126,10 @@ pub fn validate(graph: &Graph) -> Result<Validated, Vec<ValidationError>> {
     }
 
     if errors.is_empty() {
-        Ok(Validated { graph: graph.clone(), topo_order: order })
+        Ok(Validated {
+            graph: graph.clone(),
+            topo_order: order,
+        })
     } else {
         Err(errors)
     }

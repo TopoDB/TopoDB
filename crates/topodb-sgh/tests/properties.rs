@@ -61,16 +61,27 @@ fn dag() -> impl Strategy<Value = Graph> {
                     let gate = is_gate[i];
                     Node {
                         id: format!("n{i}"),
-                        kind: if gate { NodeKind::Gate } else { NodeKind::Agent },
+                        kind: if gate {
+                            NodeKind::Gate
+                        } else {
+                            NodeKind::Agent
+                        },
                         needs,
                         prompt: if gate { None } else { Some("p".into()) },
                         run: None,
                         output: None,
-                        budget: Budget { retries: budgets[i].0, repairs: budgets[i].1 },
+                        budget: Budget {
+                            retries: budgets[i].0,
+                            repairs: budgets[i].1,
+                        },
                     }
                 })
                 .collect();
-            Graph { version: 1, goal: "g".into(), nodes }
+            Graph {
+                version: 1,
+                goal: "g".into(),
+                nodes,
+            }
         })
     })
 }

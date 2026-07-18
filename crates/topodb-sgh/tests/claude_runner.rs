@@ -31,7 +31,10 @@ fn prompt_demands_bare_json_when_a_schema_is_declared() {
     };
 
     let p = build_prompt(&req);
-    assert!(p.contains("JSON"), "schema-bearing nodes must be told to emit JSON");
+    assert!(
+        p.contains("JSON"),
+        "schema-bearing nodes must be told to emit JSON"
+    );
     assert!(p.contains(r#""type""#), "the schema itself is included");
 }
 
