@@ -61,9 +61,13 @@ pub struct TopoServer {
     /// See `Config::allow_unscoped_changes`.
     allow_unscoped_changes: bool,
     /// The embedding subsystem's lifecycle handle — reported via `db_info`
-    /// (Task 10). Not yet consulted by any write/search tool (Task 11 wires
-    /// that up); today this field only makes the process's embedding status
-    /// observable.
+    /// (Task 10) and consulted by every write tool that indexes text
+    /// (`embed_op`, Task 11) to attach a `SetEmbedding` op when the model is
+    /// `Ready`, and by `search_memories`/`recall`-backed tools to embed the
+    /// query for the vector leg. A model that is not yet `Ready` (or errors
+    /// on a given text) simply yields no vector for that call — writes and
+    /// searches proceed text-only, and the backfill pass catches missed
+    /// embeddings up once the model becomes `Ready`.
     embedder: Embedder,
     tool_router: ToolRouter<Self>,
 }
@@ -450,9 +454,11 @@ struct DbInfo {
     /// filters by this whole set, a write is stamped with the single
     /// `default_scope` above.
     default_read_scopes: Vec<String>,
-    /// Embedding subsystem state: model namespace + lifecycle status. Not
-    /// consulted by any write/search tool yet (Task 11 wires that up) — today
-    /// this just makes `--embeddings`/`--model-dir`'s effect observable.
+    /// Embedding subsystem state: model namespace + lifecycle status. Every
+    /// write tool that indexes text, and every search/recall tool's vector
+    /// leg, consult the embedder directly (see `TopoServer::embedder`'s doc
+    /// comment) — this field makes that live status (and
+    /// `--embeddings`/`--model-dir`'s effect) observable via `db_info`.
     embeddings: EmbeddingsInfo,
 }
 
@@ -1148,10 +1154,20 @@ impl TopoServer {
         // at most 4 expansions per term, lexicographically smallest first
         // (deterministic).
         let mut expansions: Vec<(String, Vec<String>)> = Vec::new();
+        // Dedup query words by their analyzed key: a duplicate/
+        // morphologically-equal word ("auth auth", or "logins" after
+        // "login") would otherwise look up and push the SAME synonym set
+        // twice, and `search_text_expanded`'s per-scope discount only
+        // corroborates each distinct token once anyway — a second identical
+        // expansion entry is pure waste, not extra signal.
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for word in p.query.split_whitespace() {
             let Some(key) = topodb::analyze(word).into_iter().next() else {
                 continue;
             };
+            if !seen_keys.insert(key.clone()) {
+                continue;
+            }
             let hits = match self.db.nodes_by_prop_normalized(
                 &scope_set,
                 SYNONYM_LABEL,

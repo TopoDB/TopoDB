@@ -104,7 +104,13 @@ pub struct RecallQuery {
     /// seeds join as a third, half-weight list.
     pub graph_boost: bool,
     /// Recency + fuzzy knobs. Recency is applied ONCE, post-fusion (the
-    /// legs run recency-free so the decay can't compound).
+    /// legs run recency-free so the decay can't compound). `options.now_ms`
+    /// pins BOTH clocks a call needs to be deterministic: the post-fusion
+    /// recency decay's "now" (see above), AND the graph leg's `as_of`
+    /// traversal time (`SubgraphQuery::as_of`, passed through verbatim) — a
+    /// test or replay that fixes `now_ms` gets a single consistent instant
+    /// for every time-sensitive part of one `recall` call, not two that
+    /// could drift apart.
     pub options: SearchOptions,
 }
 

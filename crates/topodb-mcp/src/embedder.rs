@@ -137,13 +137,9 @@ impl Embedder {
     }
 
     /// `None` unless `Ready`. Synchronous (callers run in tool handlers /
-    /// backfill thread); ~10-40ms per text.
-    ///
-    /// Not yet called anywhere in this crate — write tools/search/backfill
-    /// wiring is Task 11. `allow(dead_code)` here rather than on the whole
-    /// module: every other method IS exercised (by `server.rs`'s `db_info`
-    /// and this module's own tests).
-    #[allow(dead_code)]
+    /// backfill thread); ~10-40ms per text. Called by `server.rs`'s
+    /// `embed_op` (write tools) and by the search/recall tools' vector leg,
+    /// plus the startup backfill pass.
     pub fn embed(&self, text: &str) -> Option<Vec<f32>> {
         let mut guard = self.inner.engine.lock().unwrap();
         let engine = guard.as_mut()?;

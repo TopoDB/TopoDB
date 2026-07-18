@@ -43,13 +43,16 @@ struct Built {
     scope: ScopeId,
     ids: HashMap<String, NodeId>,
     corpus: Corpus,
+    // Held for its Drop impl only (removes the backing directory when the
+    // last `Built` using it goes out of scope) — never read directly. Must
+    // outlive `db`, which holds an open handle into this directory.
+    _dir: tempfile::TempDir,
 }
 
 fn build() -> Built {
     let corpus = load();
     let dir = tempfile::tempdir().unwrap();
-    // Leak the tempdir so the db outlives this fn (tests are short-lived).
-    let path = Box::leak(Box::new(dir)).path().join("q.redb");
+    let path = dir.path().join("q.redb");
     let spec = IndexSpec {
         equality: vec![],
         text: vec![
@@ -113,6 +116,7 @@ fn build() -> Built {
         scope,
         ids,
         corpus,
+        _dir: dir,
     }
 }
 

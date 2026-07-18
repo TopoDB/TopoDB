@@ -13,7 +13,7 @@ mod common;
 use common::{Server, DEFAULT_TIMEOUT};
 
 #[test]
-fn handshake_and_tools_list_exposes_all_ten_tools() {
+fn handshake_and_tools_list_exposes_all_tools() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("smoke.redb");
     let mut server = Server::spawn(&db_path, &[]);

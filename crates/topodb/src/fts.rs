@@ -1128,19 +1128,55 @@ impl Db {
             // that misses everything in this scope pays for the scan, and
             // later missing terms in the same scope reuse it.
             let mut vocab: Option<Vec<String>> = None;
+            // WHY: discounted evidence (synonym expansions + fuzzy fallback)
+            // is corroboration, not independent signal — it must never stack
+            // past a single discount for the same token in one scope, nor
+            // re-add a token that already scored at full (exact) weight.
+            // Without these guards a duplicate/morphologically-equal query
+            // word can produce two expansion entries for the same stemmed
+            // token, an expansion list can name two words that stem
+            // identically, or a df==0 term can be reachable by BOTH its
+            // expansion block and the fuzzy fallback — any of which would
+            // let one token's 0.6x contribution accumulate twice (1.2x,
+            // outscoring a genuine 1.0x exact hit).
+            let mut discounted_seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut exact_hits: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+            // Pass 1: exact (weight-1.0) contributions for every distinct
+            // query term that hits this scope. Computed up front (not
+            // interleaved with expansions below) so `exact_hits` is complete
+            // before any discounted accumulation runs — a term processed
+            // early in iteration order must not miss a later term's exact
+            // hit on the same token.
+            for term in &distinct {
+                let df = posting_df(&postings, scope_id, term)? as f32;
+                if df > 0.0 {
+                    accumulate(term, df, 1.0, &mut scores)?;
+                    exact_hits.insert(term.as_str());
+                }
+            }
+
             for term in &distinct {
                 // Host-resolved expansions for this term (synonyms): extra
                 // discounted terms, tokenized through the same analyzer so
                 // multi-word expansions ("single sign on") contribute each
                 // of their tokens. Runs regardless of whether `term` itself
-                // hits below — an expansion is independent evidence, not a
-                // fallback for a miss.
+                // hits — an expansion is independent evidence, not a
+                // fallback for a miss — but a token that already scored
+                // exactly, or that another expansion already discounted in
+                // this scope, is skipped.
                 for (expanded_from, terms) in expansions {
                     if tokenize(expanded_from).first().map(String::as_str) != Some(term.as_str()) {
                         continue;
                     }
                     for raw in terms {
                         for etoken in tokenize(raw) {
+                            if exact_hits.contains(etoken.as_str())
+                                || !discounted_seen.insert(etoken.clone())
+                            {
+                                continue;
+                            }
                             let edf = posting_df(&postings, scope_id, &etoken)? as f32;
                             if edf > 0.0 {
                                 accumulate(&etoken, edf, FUZZY_DISCOUNT, &mut scores)?;
@@ -1149,26 +1185,27 @@ impl Db {
                     }
                 }
 
-                // df fast path first: most query terms miss most scopes, and
-                // this sums each chunk's block-count header without
-                // decoding a single entry — skip the full decode below
-                // entirely when there's nothing to score.
-                let df = posting_df(&postings, scope_id, term)? as f32;
-                if df > 0.0 {
-                    accumulate(term, df, 1.0, &mut scores)?;
+                // Miss-only fuzzy/prefix fallback: skip entirely when this
+                // term already hit exactly (pass 1 above already scored it).
+                if exact_hits.contains(term.as_str()) {
                     continue;
                 }
                 if !options.fuzzy_fallback {
                     continue;
                 }
-                // Miss-only fuzzy/prefix fallback: this term contributes
-                // nothing as-is, so recover near-matches from the scope's
-                // own vocabulary at a discount (see SearchOptions docs).
+                // This term contributes nothing as-is, so recover
+                // near-matches from the scope's own vocabulary at a
+                // discount (see SearchOptions docs).
                 if vocab.is_none() {
                     vocab = Some(scope_terms(&postings, scope_id)?);
                 }
                 let vocab = vocab.as_deref().expect("vocab filled above");
                 for candidate in fuzzy_expansions(vocab, term) {
+                    if exact_hits.contains(candidate.as_str())
+                        || !discounted_seen.insert(candidate.clone())
+                    {
+                        continue;
+                    }
                     let cdf = posting_df(&postings, scope_id, &candidate)? as f32;
                     if cdf > 0.0 {
                         accumulate(&candidate, cdf, FUZZY_DISCOUNT, &mut scores)?;

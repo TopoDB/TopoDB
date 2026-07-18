@@ -87,11 +87,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => Db::open_with(&config.db_path, config::default_spec())?,
     };
     // `--embeddings off` (case-insensitive) => permanently disabled.
-    // Omitted => auto (start with the default model). Any other value is a
-    // model name to start with; an unrecognized one still starts an
-    // `Embedder`, it just lands in `Failed` status (see `embedder::Embedder`).
+    // Omitted, OR `--embeddings auto` (case-insensitive) => auto (start with
+    // the default model) — "auto" is accepted as an explicit spelling of the
+    // same default the flag already has when omitted, so a caller that always
+    // passes `--embeddings` doesn't need a special case for "use the
+    // default." Any other value is a model name to start with; an
+    // unrecognized one still starts an `Embedder`, it just lands in `Failed`
+    // status (see `embedder::Embedder`).
     let embedder = match config.embeddings.as_deref() {
         Some(s) if s.eq_ignore_ascii_case("off") => embedder::Embedder::disabled(),
+        Some(s) if s.eq_ignore_ascii_case("auto") => embedder::Embedder::start(
+            None,
+            config
+                .model_dir
+                .clone()
+                .unwrap_or_else(default_model_cache_dir),
+        ),
         other => embedder::Embedder::start(
             other.map(str::to_string),
             config
@@ -133,8 +144,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // it the only way a backfill can see every scope without a
                 // per-scope enumeration API. Single pass: collect embedded
                 // (under this model) and removed ids, then embed the
-                // misses. Content edited via SetNodeProps is only
-                // re-embedded on the next process start — acceptable, noted.
+                // misses. A compacted op log makes `ops_since(1)` return
+                // `Err(TopoError::Compacted { .. })` instead of full
+                // history — the `let Ok(events) = ... else { return }`
+                // below then exits this thread for good, so a db that has
+                // ever been compacted permanently skips backfill; an
+                // accepted limitation, not a bug, since there is no other
+                // unscoped read to fall back to. Memory/Entity/Alias text
+                // here is read from CreateNode-time props only; content
+                // edited afterward via SetNodeProps is only re-embedded on
+                // the next process start — acceptable, noted.
                 let model = embedder.model_name();
                 let mut batched = 0usize;
                 let Ok(events) = db.ops_since(1) else { return };

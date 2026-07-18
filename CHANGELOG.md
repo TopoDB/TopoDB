@@ -362,6 +362,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
   you store, supersede when a to-one fact changes, retry token-variant queries before concluding
   nothing is stored.
 
+#### Release checklist
+
+- **Bump the Claude Code plugin's server pin** (`plugins/claude-code/server-args.js`'s
+  `SERVER_VERSION`, currently still `"0.0.8"`) to this version once it is published to npm, and
+  re-verify `plugins/claude-code/test/broker.test.js` against the real published package — see
+  `plugins/claude-code/README.md`'s "Server version" section for why the pin can't move early.
+
 ### 0.0.8
 
 No engine or tool-surface changes. This release exists to ship a fix in the **npm launcher**

@@ -284,3 +284,59 @@ fn expansions_surface_synonym_hits_at_a_discount() {
         "exact term hit must outrank the discounted expansion"
     );
 }
+
+#[test]
+fn discounted_contributions_never_stack_past_one_discount() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (syn, op_s) = memory("login page rework details", Scope::Id(s));
+    let (other, op_o) = memory("deploy pipeline caching notes", Scope::Id(s));
+    db.submit(vec![op_s, op_o]).unwrap();
+
+    // One expansion entry: baseline discounted score for the synonym hit.
+    let mut q1 = text_only(&scopes, "auth deploy", 10);
+    q1.expansions = vec![("auth".into(), vec!["login".into()])];
+    let hits1 = db.recall(&q1).unwrap();
+    let syn_score_1 = hits1.iter().find(|(n, _)| n.id == syn).unwrap().1;
+
+    // Duplicate query word -> two identical expansion entries (what the MCP
+    // layer produces for "auth auth deploy"): the discounted contribution
+    // must NOT double.
+    let mut q2 = text_only(&scopes, "auth auth deploy", 10);
+    q2.expansions = vec![
+        ("auth".into(), vec!["login".into()]),
+        ("auth".into(), vec!["login".into()]),
+    ];
+    let hits2 = db.recall(&q2).unwrap();
+    let syn_score_2 = hits2.iter().find(|(n, _)| n.id == syn).unwrap().1;
+    assert!(
+        (syn_score_2 - syn_score_1).abs() < 1e-5,
+        "duplicate expansion entries must not stack: {syn_score_1} vs {syn_score_2}"
+    );
+    let _ = other;
+}
+
+#[test]
+fn expansion_token_matching_exact_hit_does_not_re_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (m, op) = memory("login flow design", Scope::Id(s));
+    db.submit(vec![op]).unwrap();
+
+    // "login" hits exactly; a synonym auth->login must not add a second,
+    // discounted helping of the same token to the same doc.
+    let plain = db.recall(&text_only(&scopes, "login auth", 10)).unwrap();
+    let base = plain.iter().find(|(n, _)| n.id == m).unwrap().1;
+    let mut q = text_only(&scopes, "login auth", 10);
+    q.expansions = vec![("auth".into(), vec!["login".into()])];
+    let hits = db.recall(&q).unwrap();
+    let with_exp = hits.iter().find(|(n, _)| n.id == m).unwrap().1;
+    assert!(
+        (with_exp - base).abs() < 1e-5,
+        "expansion equal to an exact-hit term must be a no-op: {base} vs {with_exp}"
+    );
+}
