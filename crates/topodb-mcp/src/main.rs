@@ -2,17 +2,20 @@
 //!
 //! Usage: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!         [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
-//!         [--allow-unscoped-changes]` — see `config`'s module doc for what
-//! each flag controls.
+//!         [--allow-unscoped-changes] [--embeddings <off|model>]
+//!         [--model-dir <path>]` — see `config`'s module doc for what each
+//! flag controls.
 //!
 //! The process speaks newline-delimited JSON-RPC over stdio (rmcp's `stdio`
 //! transport). stdout is reserved for the protocol; all diagnostics go to
 //! stderr.
 
 mod config;
+mod embedder;
 mod server;
 
 use std::error::Error;
+use std::path::PathBuf;
 
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
@@ -20,6 +23,19 @@ use topodb::Db;
 
 use crate::config::Config;
 use crate::server::TopoServer;
+
+/// Default embedding-model cache directory when `--model-dir` is omitted:
+/// `$HOME/.cache/topodb/models`, falling back to `.topodb-models` in the
+/// current directory if `$HOME` is unset (e.g. some sandboxed/CI shells).
+fn default_model_cache_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => PathBuf::from(home)
+            .join(".cache")
+            .join("topodb")
+            .join("models"),
+        _ => PathBuf::from(".topodb-models"),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -70,7 +86,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         None => Db::open_with(&config.db_path, config::default_spec())?,
     };
-    let server = TopoServer::new(db, &config);
+    // `--embeddings off` (case-insensitive) => permanently disabled.
+    // Omitted => auto (start with the default model). Any other value is a
+    // model name to start with; an unrecognized one still starts an
+    // `Embedder`, it just lands in `Failed` status (see `embedder::Embedder`).
+    let embedder = match config.embeddings.as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("off") => embedder::Embedder::disabled(),
+        other => embedder::Embedder::start(
+            other.map(str::to_string),
+            config
+                .model_dir
+                .clone()
+                .unwrap_or_else(default_model_cache_dir),
+        ),
+    };
+
+    let server = TopoServer::new(db, &config, embedder);
 
     // `serve` completes the initialize handshake; `waiting` blocks until the
     // client disconnects (stdin EOF) or the service errors.

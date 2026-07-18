@@ -34,6 +34,7 @@ use crate::config::{
     ENTITY_NAME_PROP, MEMORY_CONTENT_PROP, MEMORY_LABEL, SYNONYM_EXPANSION_PROP, SYNONYM_LABEL,
     SYNONYM_TERM_PROP,
 };
+use crate::embedder::{Embedder, EmbedderStatus};
 use topodb_json as convert;
 
 /// The MCP server state. `Clone` is required by rmcp (the service clones the
@@ -59,6 +60,11 @@ pub struct TopoServer {
     db_path: String,
     /// See `Config::allow_unscoped_changes`.
     allow_unscoped_changes: bool,
+    /// The embedding subsystem's lifecycle handle — reported via `db_info`
+    /// (Task 10). Not yet consulted by any write/search tool (Task 11 wires
+    /// that up); today this field only makes the process's embedding status
+    /// observable.
+    embedder: Embedder,
     tool_router: ToolRouter<Self>,
 }
 
@@ -165,8 +171,9 @@ impl TopoServer {
         Ok(out)
     }
 
-    /// Wraps an open [`Db`] and the resolved [`Config`] into a server handler.
-    pub fn new(db: Db, config: &Config) -> Self {
+    /// Wraps an open [`Db`], the resolved [`Config`], and the process's
+    /// [`Embedder`] handle into a server handler.
+    pub fn new(db: Db, config: &Config, embedder: Embedder) -> Self {
         let default_scopes = convert::scopes_to_scope_set(config.default_read_scopes.as_slice());
         Self {
             db,
@@ -175,6 +182,7 @@ impl TopoServer {
             default_read_scopes: config.default_read_scopes.clone(),
             db_path: config.db_path.display().to_string(),
             allow_unscoped_changes: config.allow_unscoped_changes,
+            embedder,
             tool_router: Self::tool_router(),
         }
     }
@@ -429,6 +437,22 @@ struct DbInfo {
     /// filters by this whole set, a write is stamped with the single
     /// `default_scope` above.
     default_read_scopes: Vec<String>,
+    /// Embedding subsystem state: model namespace + lifecycle status. Not
+    /// consulted by any write/search tool yet (Task 11 wires that up) — today
+    /// this just makes `--embeddings`/`--model-dir`'s effect observable.
+    embeddings: EmbeddingsInfo,
+}
+
+/// `db_info`'s embedding-subsystem sub-payload (see [`DbInfo::embeddings`]).
+/// `model` is the namespace string reported by `Embedder::model_name`
+/// (`--embeddings`'s value, or [`crate::embedder::DEFAULT_MODEL`] when
+/// omitted) regardless of whether the model ever reaches `Ready` — a caller
+/// diagnosing a `Failed` status still needs to know which model was
+/// attempted.
+#[derive(Debug, Serialize, JsonSchema)]
+struct EmbeddingsInfo {
+    model: String,
+    status: EmbedderStatus,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -989,7 +1013,7 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, and the default READ scope set applied to a read call that omits both scope/scopes. Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
+        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, the default READ scope set applied to a read call that omits both scope/scopes, and the embedding subsystem's model name + lifecycle status (off/downloading/ready/failed). Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
@@ -1006,6 +1030,10 @@ impl TopoServer {
                 .iter()
                 .map(scope_label)
                 .collect(),
+            embeddings: EmbeddingsInfo {
+                model: self.embedder.model_name(),
+                status: self.embedder.status(),
+            },
         }))
     }
 
