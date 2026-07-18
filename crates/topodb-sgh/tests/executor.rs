@@ -80,6 +80,68 @@ fn declared_inputs_are_the_only_context_a_node_receives() {
 }
 
 #[test]
+fn model_calls_counts_exactly_the_four_agent_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let v = diamond();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new();
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.succeeded.len(), 4);
+    assert_eq!(report.model_calls, 4, "each of the 4 agent nodes makes exactly one model call");
+}
+
+#[test]
+fn model_calls_ignores_command_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+         - {id: b, kind: command, run: echo hi, needs: [a], budget: {retries: 0, repairs: 0}}\n\
+         - {id: c, kind: agent, prompt: p, needs: [b], budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new();
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.succeeded.len(), 3, "a, b (command), c all succeed");
+    assert_eq!(report.model_calls, 2, "only the 2 agent nodes count; the command node does not");
+}
+
+#[test]
+fn model_calls_excludes_a_gate_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+         - {id: g, kind: gate, needs: [a], budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new();
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    // No interactive surface exists yet for gates: a gate node always
+    // transitions straight to Blocked (see execute_node), so it never
+    // dispatches to the runner and its dependents (there are none here)
+    // would be skipped rather than run.
+    assert_eq!(report.blocked, vec!["g".to_string()]);
+    assert_eq!(report.model_calls, 1, "only node a's model call counts; the gate contributes 0");
+}
+
+#[test]
 fn schema_mismatch_is_a_failure() {
     let g = Graph::from_yaml(
         "version: 1\ngoal: g\nnodes:\n  \
