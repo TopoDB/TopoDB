@@ -123,6 +123,9 @@ impl Db {
         if q.k == 0 {
             return Err(TopoError::Rejected("recall requires k > 0".into()));
         }
+        // Check the CALLER's recency options before the leg call zeroes the
+        // weight — see SearchOptions::validate_recency for why.
+        q.options.validate_recency()?;
         if let Some((_, v)) = &q.vector {
             if v.is_empty() {
                 return Err(TopoError::Rejected(

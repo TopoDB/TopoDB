@@ -110,6 +110,29 @@ impl Default for SearchOptions {
     }
 }
 
+impl SearchOptions {
+    /// The recency-tuning validation `search_text_with` applies — factored
+    /// out so `Db::recall` can check the CALLER's options before it zeroes
+    /// the weight for its recency-free leg calls (otherwise a bad weight
+    /// would be laundered past this check and corrupt fused scores instead
+    /// of rejecting loudly).
+    pub(crate) fn validate_recency(&self) -> Result<(), TopoError> {
+        if !(0.0..=1.0).contains(&self.recency_weight) || !self.recency_weight.is_finite() {
+            return Err(TopoError::Rejected(format!(
+                "recency_weight must be in 0.0..=1.0, got {}",
+                self.recency_weight
+            )));
+        }
+        if self.recency_weight > 0.0 && self.recency_half_life_ms <= 0 {
+            return Err(TopoError::Rejected(format!(
+                "recency_half_life_ms must be > 0, got {}",
+                self.recency_half_life_ms
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Cap on fuzzy candidates admitted per missing query term — bounds both
 /// cost and noise; the closest (then lexicographically smallest) win.
 pub const FUZZY_MAX_EXPANSIONS: usize = 4;
@@ -1021,18 +1044,7 @@ impl Db {
         if k == 0 {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
         }
-        if !(0.0..=1.0).contains(&options.recency_weight) || !options.recency_weight.is_finite() {
-            return Err(TopoError::Rejected(format!(
-                "recency_weight must be in 0.0..=1.0, got {}",
-                options.recency_weight
-            )));
-        }
-        if options.recency_weight > 0.0 && options.recency_half_life_ms <= 0 {
-            return Err(TopoError::Rejected(format!(
-                "recency_half_life_ms must be > 0, got {}",
-                options.recency_half_life_ms
-            )));
-        }
+        options.validate_recency()?;
         let tokens = tokenize(query);
         if tokens.is_empty() {
             return Err(TopoError::Rejected("query has no searchable terms".into()));

@@ -93,3 +93,22 @@ fn recall_truncates_to_k_and_validates_input() {
     q.vector = Some(("m".into(), vec![]));
     assert!(matches!(db.recall(&q), Err(TopoError::Rejected(_))));
 }
+
+#[test]
+fn recall_rejects_bad_recency_options_despite_leg_zeroing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (_a, op) = memory("validation probe", Scope::Id(s));
+    db.submit(vec![op]).unwrap();
+
+    let mut q = text_only(&scopes, "probe", 5);
+    q.options.recency_weight = 1.5;
+    assert!(matches!(db.recall(&q), Err(TopoError::Rejected(_))));
+
+    let mut q2 = text_only(&scopes, "probe", 5);
+    q2.options.recency_weight = 0.5;
+    q2.options.recency_half_life_ms = 0;
+    assert!(matches!(db.recall(&q2), Err(TopoError::Rejected(_))));
+}
