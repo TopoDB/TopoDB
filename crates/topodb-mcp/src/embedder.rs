@@ -144,6 +144,9 @@ impl Embedder {
             // dies and holds the redb lock forever (the 0.0.9 broker
             // idle-exit `DatabaseAlreadyOpen` CI failure). A failed probe
             // here lands `Failed` cleanly without ort ever running.
+            // Upstream: fixed on ort main (17ed727, #560) but unreleased as
+            // of rc.12 — release request tracked at pykeio/ort#604. This
+            // probe stays even after an ort upgrade (defense in depth).
             if let Err(err) = ort_dylib_available() {
                 *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
                 eprintln!(
