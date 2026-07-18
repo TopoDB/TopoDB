@@ -28,7 +28,7 @@ fn handshake_and_tools_list_exposes_all_ten_tools() {
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
 
-    // db_info + 7 read tools + 11 write tools = 19 total.
+    // db_info + 8 read tools + 10 write tools = 19 total.
     assert_eq!(
         tools.len(),
         19,

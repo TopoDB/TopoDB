@@ -41,8 +41,8 @@ Arg parsing is hand-rolled (seven flags); there is no `--help` flag yet.
 
 ## Tools
 
-`tools/list` reports exactly 19 tools: `db_info`, seven read tools (`get_changes` included), and
-eleven write tools.
+`tools/list` reports exactly 19 tools: `db_info`, eight read tools (`get_changes` included), and
+ten write tools.
 
 | Tool | Params | Description |
 |---|---|---|
