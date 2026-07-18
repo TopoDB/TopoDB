@@ -5,7 +5,12 @@ use topodb_sgh::runner::command::{env_var_name, CommandRequest, CommandRunner, S
 use topodb_sgh::runner::NodeOutcome;
 
 fn req(run: &str) -> CommandRequest {
-    CommandRequest { node_id: "c".into(), run: run.into(), inputs: BTreeMap::new() }
+    CommandRequest {
+        node_id: "c".into(),
+        run: run.into(),
+        inputs: BTreeMap::new(),
+        output_schema: None,
+    }
 }
 
 fn runner() -> ShellCommandRunner {
@@ -50,12 +55,56 @@ fn declared_inputs_are_exported_as_environment_variables() {
         node_id: "c".into(),
         run: "printf '%s' \"$SGH_INPUT_SURVEY\"".into(),
         inputs,
+        output_schema: None,
     };
 
     match runner().run(&r).unwrap() {
         NodeOutcome::Succeeded { output } => {
             let v: serde_json::Value = serde_json::from_str(&output).unwrap();
             assert_eq!(v["stdout"], r#"{"sites":2}"#);
+        }
+        other => panic!("expected success, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_command_with_a_declared_schema_returns_stdout_verbatim() {
+    let r = CommandRequest {
+        node_id: "c".into(),
+        run: "echo '{\"sites\":2}'".into(),
+        inputs: BTreeMap::new(),
+        output_schema: Some(serde_json::json!({"type": "object"})),
+    };
+
+    match runner().run(&r).unwrap() {
+        NodeOutcome::Succeeded { output } => {
+            let v: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+            assert_eq!(v, serde_json::json!({"sites": 2}), "output must not be wrapped");
+        }
+        other => panic!("expected success, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_command_producing_well_over_the_pipe_buffer_succeeds_rather_than_timing_out() {
+    // ~200KB of stdout, well beyond the ~64KB OS pipe buffer. A poll loop
+    // that doesn't drain the pipe concurrently with waiting deadlocks here
+    // and reports a timeout even though the command would have succeeded.
+    let r = CommandRequest {
+        node_id: "c".into(),
+        run: "head -c 200000 /dev/zero | tr '\\0' 'x'".into(),
+        inputs: BTreeMap::new(),
+        output_schema: None,
+    };
+
+    // Generous timeout: this test is about the deadlock, not about slowness.
+    let big_runner = ShellCommandRunner::new(Duration::from_secs(30));
+    match big_runner.run(&r).unwrap() {
+        NodeOutcome::Succeeded { output } => {
+            let v: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+            let stdout = v["stdout"].as_str().expect("stdout is a string");
+            assert_eq!(stdout.len(), 200_000);
+            assert!(stdout.chars().all(|c| c == 'x'));
         }
         other => panic!("expected success, got {other:?}"),
     }
