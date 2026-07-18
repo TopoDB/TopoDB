@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use topodb_sgh::runner::command::{env_var_name, CommandRequest, CommandRunner, ShellCommandRunner};
 use topodb_sgh::runner::NodeOutcome;
@@ -120,4 +120,49 @@ fn a_command_exceeding_the_timeout_fails_rather_than_hanging() {
         ),
         other => panic!("expected timeout failure, got {other:?}"),
     }
+}
+
+#[test]
+fn a_backgrounded_grandchild_does_not_block_the_success_path() {
+    // `sleep 30 &` backgrounds a grandchild that inherits the stdout/stderr
+    // pipe write ends and outlives `sh`. `sh -c` itself exits immediately
+    // after starting it, so the command succeeds right away — but a reader
+    // thread joined unconditionally would still block until that orphaned
+    // `sleep` exits (or forever, for a true daemon).
+    let r = ShellCommandRunner::new(Duration::from_secs(10));
+    let started = Instant::now();
+    match r.run(&req("sleep 30 & echo done")).unwrap() {
+        NodeOutcome::Succeeded { output } => {
+            let v: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+            assert_eq!(v["stdout"], "done");
+        }
+        other => panic!("expected success, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must not wait on the orphaned grandchild's pipe: took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_backgrounded_grandchild_does_not_block_the_timeout_path() {
+    // Same orphan hazard, but this time `sh` itself is also still running
+    // (a second foreground `sleep`) when the runner's short timeout fires
+    // and kills it. The backgrounded `sleep 30` still holds the pipe open
+    // after the kill, so the post-kill drain must not block on it either.
+    let r = ShellCommandRunner::new(Duration::from_millis(300));
+    let started = Instant::now();
+    match r.run(&req("sleep 30 & sleep 30")).unwrap() {
+        NodeOutcome::Failed { error } => assert!(
+            error.to_lowercase().contains("timed out"),
+            "timeout must be named in the error: {error}"
+        ),
+        other => panic!("expected timeout failure, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must not wait on the orphaned grandchild's pipe: took {:?}",
+        started.elapsed()
+    );
 }

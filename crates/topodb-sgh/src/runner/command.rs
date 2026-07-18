@@ -75,16 +75,65 @@ impl CommandRunner for ShellCommandRunner {
         // buffer (~64KB) blocks in write() until someone reads — if we only
         // read after the process exits, try_wait() never returns Some and a
         // large-but-legitimate command is misreported as a timeout.
+        //
+        // The reader threads report completion over an mpsc channel instead
+        // of a JoinHandle, because `run:` can background a grandchild
+        // (`cmd &`) that inherits these pipe write ends and outlives `sh`.
+        // Killing (or even just waiting on) the immediate `sh` process does
+        // not close that inherited fd, so a `read_to_end` never sees EOF and
+        // a thread join would block forever. `recv_timeout` lets us bound
+        // the wait and abandon the thread instead of hanging the whole run.
+        //
+        // Each thread accumulates into a shared buffer via incremental
+        // `read()` calls rather than a single `read_to_end`, so that if the
+        // grace period expires before EOF (an orphan is still holding the
+        // pipe open), whatever bytes the *legitimate* process already wrote
+        // are still visible in the buffer instead of being discarded along
+        // with the abandoned thread.
+        let out_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut out_pipe = child.stdout.take().expect("piped");
-        let out_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            out_pipe.read_to_end(&mut buf).map(|_| buf)
-        });
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        {
+            let out_buf = std::sync::Arc::clone(&out_buf);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match out_pipe.read(&mut chunk) {
+                        Ok(0) => {
+                            let _ = out_tx.send(Ok(()));
+                            break;
+                        }
+                        Ok(n) => out_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(e) => {
+                            let _ = out_tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        let err_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut err_pipe = child.stderr.take().expect("piped");
-        let err_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            err_pipe.read_to_end(&mut buf).map(|_| buf)
-        });
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        {
+            let err_buf = std::sync::Arc::clone(&err_buf);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match err_pipe.read(&mut chunk) {
+                        Ok(0) => {
+                            let _ = err_tx.send(Ok(()));
+                            break;
+                        }
+                        Ok(n) => err_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(e) => {
+                            let _ = err_tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // Poll for completion so a hung command cannot stall the run. A
         // timeout is a Failed outcome, not an Err, so the recovery ladder
@@ -97,11 +146,17 @@ impl CommandRunner for ShellCommandRunner {
                     if started.elapsed() >= self.timeout {
                         let _ = child.kill();
                         let _ = child.wait();
-                        // Closing the pipes (via kill/wait dropping the
-                        // child's ends) lets the reader threads finish, so
-                        // join them before returning to avoid leaking them.
-                        let _ = out_handle.join();
-                        let _ = err_handle.join();
+                        // The command is already declared failed, so this
+                        // grace must not add meaningful latency — it only
+                        // exists to pick up output that was already fully
+                        // buffered before the kill landed. If an orphaned
+                        // grandchild still holds the pipe open, the recv
+                        // simply times out and that reader thread is
+                        // abandoned (leaked, blocked forever, but bounded to
+                        // one thread per affected run).
+                        let timeout_grace = Duration::from_millis(50);
+                        let _ = out_rx.recv_timeout(timeout_grace);
+                        let _ = err_rx.recv_timeout(timeout_grace);
                         return Ok(NodeOutcome::Failed {
                             error: format!(
                                 "command timed out after {:?}: {}",
@@ -114,17 +169,27 @@ impl CommandRunner for ShellCommandRunner {
             }
         };
 
-        let out_buf = out_handle
-            .join()
-            .map_err(|_| RunnerError::Utf8)?
-            .map_err(RunnerError::Io)?;
-        let err_buf = err_handle
-            .join()
-            .map_err(|_| RunnerError::Utf8)?
-            .map_err(RunnerError::Io)?;
+        // Normal-exit grace: the process has already exited, so under
+        // ordinary circumstances the pipe is closed and the reader thread's
+        // EOF signal has already landed (or is about to, essentially
+        // immediately) — a couple of seconds is generous slack for a slow
+        // scheduler, while still being bounded if an orphaned grandchild
+        // (`cmd &`) is holding the write end open. In that orphan case we
+        // don't fail the command solely because a stream couldn't be fully
+        // drained; we take whatever the buffer holds so far and abandon
+        // that reader thread.
+        let normal_grace = Duration::from_secs(2);
+        if let Ok(result) = out_rx.recv_timeout(normal_grace) {
+            result.map_err(RunnerError::Io)?;
+        }
+        if let Ok(result) = err_rx.recv_timeout(normal_grace) {
+            result.map_err(RunnerError::Io)?;
+        }
+        let out_snapshot = out_buf.lock().unwrap().clone();
+        let err_snapshot = err_buf.lock().unwrap().clone();
 
-        let stdout = String::from_utf8(out_buf).map_err(|_| RunnerError::Utf8)?;
-        let stderr = String::from_utf8_lossy(&err_buf).into_owned();
+        let stdout = String::from_utf8(out_snapshot).map_err(|_| RunnerError::Utf8)?;
+        let stderr = String::from_utf8_lossy(&err_snapshot).into_owned();
 
         if !status.success() {
             let code = status.code().unwrap_or(-1);
