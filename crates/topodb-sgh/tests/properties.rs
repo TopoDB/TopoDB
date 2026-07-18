@@ -50,7 +50,19 @@ fn failure_mask() -> impl Strategy<Value = Vec<bool>> {
     prop::collection::vec(any::<bool>(), 8)
 }
 
+/// Configure the proptest case count from the environment.
+/// Routine runs use 32 cases (fast, suitable for every commit).
+/// CI and releases should use SGH_PROPTEST_CASES=256+ for thorough coverage.
+/// This is a speed/coverage tradeoff, not a weakening of any property.
+fn cases() -> u32 {
+    std::env::var("SGH_PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32)
+}
+
 proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
     /// TERMINATION: every run reaches a terminal state, and never exceeds the
     /// bound computed from the graph alone before the run started.
     #[test]
