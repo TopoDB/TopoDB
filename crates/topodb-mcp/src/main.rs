@@ -101,6 +101,92 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
     };
 
+    // Backfill: embed nodes that predate the model (or missed their write-
+    // time embedding). Low-priority: small batches, sleeps between, skip
+    // silently on any error — never competes with tool calls for long.
+    {
+        let db = db.clone();
+        let embedder = embedder.clone();
+        std::thread::spawn(move || {
+            use topodb::{Op, PropValue};
+            use topodb_json::{
+                ALIAS_LABEL, ALIAS_NAME_PROP, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_PROP,
+                MEMORY_LABEL,
+            };
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if embedder.status() != crate::embedder::EmbedderStatus::Ready {
+                    if embedder.status() == crate::embedder::EmbedderStatus::Failed
+                        || embedder.status() == crate::embedder::EmbedderStatus::Off
+                    {
+                        return; // terminal states: nothing to backfill, ever
+                    }
+                    continue; // still downloading
+                }
+                // NOTE scoping: backfill must see every scope. nodes_by_label
+                // takes a ScopeSet; enumerate scopes via db.debug… — NOT
+                // available. Instead: backfill covers the change feed from
+                // seq 1 (ops_since is unscoped by design — the same
+                // host-level carve-out get_changes uses).
+                // The op log is the ONE unscoped read (`ops_since` — the
+                // same host-level carve-out get_changes uses), which makes
+                // it the only way a backfill can see every scope without a
+                // per-scope enumeration API. Single pass: collect embedded
+                // (under this model) and removed ids, then embed the
+                // misses. Content edited via SetNodeProps is only
+                // re-embedded on the next process start — acceptable, noted.
+                let model = embedder.model_name();
+                let mut batched = 0usize;
+                let Ok(events) = db.ops_since(1) else { return };
+                let mut embedded: std::collections::HashSet<topodb::NodeId> = Default::default();
+                let mut removed: std::collections::HashSet<topodb::NodeId> = Default::default();
+                let mut candidates: Vec<(topodb::NodeId, String)> = Vec::new();
+                for ev in &events {
+                    match ev.op.as_ref() {
+                        Op::SetEmbedding { id, model: m, .. } if *m == model => {
+                            embedded.insert(*id);
+                        }
+                        Op::RemoveNode { id } => {
+                            removed.insert(*id);
+                        }
+                        Op::CreateNode {
+                            id, label, props, ..
+                        } => {
+                            let text = match label.as_str() {
+                                l if l == MEMORY_LABEL => props.get(MEMORY_CONTENT_PROP),
+                                l if l == ENTITY_LABEL => props.get(ENTITY_NAME_PROP),
+                                l if l == ALIAS_LABEL => props.get(ALIAS_NAME_PROP),
+                                _ => None,
+                            };
+                            if let Some(PropValue::Str(t)) = text {
+                                candidates.push((*id, t.clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (id, text) in candidates {
+                    if embedded.contains(&id) || removed.contains(&id) {
+                        continue;
+                    }
+                    let Some(vector) = embedder.embed(&text) else {
+                        continue;
+                    };
+                    let _ = db.submit(vec![Op::SetEmbedding {
+                        id,
+                        model: model.clone(),
+                        vector,
+                    }]);
+                    batched += 1;
+                    if batched.is_multiple_of(16) {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                }
+                return; // one full pass per process start is enough
+            }
+        });
+    }
+
     let server = TopoServer::new(db, &config, embedder);
 
     // `serve` completes the initialize handshake; `waiting` blocks until the

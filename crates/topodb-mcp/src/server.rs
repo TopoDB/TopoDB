@@ -265,6 +265,19 @@ impl TopoServer {
             .map_err(classify_topo_error)
     }
 
+    /// The SetEmbedding op for `text` under the active model — or None
+    /// when the embedder isn't Ready / errored on this text. Callers
+    /// append it to their write batch; absence never blocks the write
+    /// (backfill catches up later).
+    fn embed_op(&self, id: NodeId, text: &str) -> Option<Op> {
+        let vector = self.embedder.embed(text)?;
+        Some(Op::SetEmbedding {
+            id,
+            model: self.embedder.model_name(),
+            vector,
+        })
+    }
+
     /// Canonical entities for `name`: direct (Entity, name) matches plus
     /// (Alias, name) matches followed through alias_of. Deduped by id,
     /// oldest first.
@@ -1173,7 +1186,12 @@ impl TopoServer {
             scopes: scope_set,
             query: p.query.clone(),
             k: p.k,
-            vector: None, // Task 11 wires the embedder here
+            // None when the embedder isn't Ready (or errors on this text) —
+            // recall then degrades to text/graph legs only.
+            vector: self
+                .embedder
+                .embed(&p.query)
+                .map(|v| (self.embedder.model_name(), v)),
             expansions,
             graph_boost: p.graph_boost,
             options,
@@ -1317,6 +1335,9 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<CreateMemoryParams>,
     ) -> Result<Json<CreateResult>, ErrorData> {
+        let id = NodeId::new();
+        // Embed before `p.content` moves into the props map below.
+        let embed = self.embed_op(id, &p.content);
         let props = convert::merge_required_prop(
             MEMORY_CONTENT_PROP,
             PropValue::Str(p.content),
@@ -1324,13 +1345,14 @@ impl TopoServer {
         )
         .map_err(|e| ErrorData::invalid_params(e, None))?;
         let scope = self.resolve_scope(p.scope.as_deref())?;
-        let id = NodeId::new();
-        self.submit_write(vec![Op::CreateNode {
+        let mut ops = vec![Op::CreateNode {
             id,
             scope,
             label: MEMORY_LABEL.into(),
             props,
-        }])?;
+        }];
+        ops.extend(embed);
+        self.submit_write(ops)?;
         Ok(Json(CreateResult { id: id.to_string() }))
     }
 
@@ -1394,12 +1416,18 @@ impl TopoServer {
         }
 
         let id = NodeId::new();
-        self.submit_write(vec![Op::CreateNode {
+        // Create path only: the matched/upsert path above embeds nothing —
+        // the canonical node either already has its vector or backfill
+        // covers it.
+        let embed = self.embed_op(id, &p.name);
+        let mut ops = vec![Op::CreateNode {
             id,
             scope,
             label: ENTITY_LABEL.into(),
             props,
-        }])?;
+        }];
+        ops.extend(embed);
+        self.submit_write(ops)?;
         Ok(Json(UpsertResult {
             id: id.to_string(),
             created: true,
@@ -1490,9 +1518,11 @@ impl TopoServer {
             None => target.scope,
         };
         let alias_id = NodeId::new();
+        // Embed before `p.alias` moves into the props map below.
+        let embed = self.embed_op(alias_id, &p.alias);
         let mut props = Props::new();
         props.insert(ALIAS_NAME_PROP.to_string(), PropValue::Str(p.alias));
-        self.submit_write(vec![
+        let mut ops = vec![
             Op::CreateNode {
                 id: alias_id,
                 scope,
@@ -1508,7 +1538,9 @@ impl TopoServer {
                 props: Props::new(),
                 valid_from: None,
             },
-        ])?;
+        ];
+        ops.extend(embed);
+        self.submit_write(ops)?;
         Ok(Json(UpsertResult {
             id: alias_id.to_string(),
             created: true,
