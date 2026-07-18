@@ -165,3 +165,51 @@ fn vector_leg_surfaces_semantic_hit_and_agreement_wins() {
     let hits2 = db.recall(&q2).unwrap();
     assert!(hits2.iter().all(|(n, _)| n.id == a || n.id == c));
 }
+
+#[test]
+fn graph_boost_surfaces_linked_but_lexically_silent_neighbor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (hit, op_h) = memory("deployment pipeline broke on friday", Scope::Id(s));
+    // Linked context that shares NO tokens with the query:
+    let (linked, op_l) = memory("rollback procedure: revert then redeploy", Scope::Id(s));
+    let (_stray, op_s) = memory("unrelated grocery list", Scope::Id(s));
+    db.submit(vec![op_h, op_l, op_s]).unwrap();
+    db.submit(vec![Op::CreateEdge {
+        id: EdgeId::new(),
+        scope: Scope::Id(s),
+        ty: "about".into(),
+        from: linked,
+        to: hit,
+        props: Props::new(),
+        valid_from: None,
+    }])
+    .unwrap();
+
+    let mut q = text_only(&scopes, "deployment friday", 10);
+    q.graph_boost = true;
+    let ids: Vec<NodeId> = db
+        .recall(&q)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert_eq!(ids[0], hit, "direct text hit stays first");
+    assert!(
+        ids.contains(&linked),
+        "1-hop neighbor must join the results"
+    );
+    assert!(!ids.contains(&_stray), "unlinked, unmatched node stays out");
+
+    // graph_boost=false: neighbor absent.
+    let q2 = text_only(&scopes, "deployment friday", 10);
+    let ids2: Vec<NodeId> = db
+        .recall(&q2)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(!ids2.contains(&linked));
+}

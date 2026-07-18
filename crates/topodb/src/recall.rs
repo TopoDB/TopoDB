@@ -110,6 +110,14 @@ pub struct RecallQuery {
 
 pub(crate) const WEIGHT_TEXT: f32 = 1.0;
 pub(crate) const WEIGHT_VECTOR: f32 = 1.0;
+/// Half weight for the graph leg: adjacency is corroboration, not
+/// relevance — a 1-hop neighbor should never outrank a genuine text or
+/// vector hit purely by being linked.
+pub(crate) const WEIGHT_GRAPH: f32 = 0.5;
+/// How many top preliminary-fusion nodes seed the graph leg's traversal —
+/// bounded so `graph_boost` costs a handful of 1-hop reads, not one per
+/// candidate in a potentially deep leg list.
+pub(crate) const GRAPH_SEEDS: usize = 5;
 
 impl Db {
     /// Hybrid recall: BM25 text (+ expansions), cosine vector, and 1-hop
@@ -163,6 +171,41 @@ impl Db {
                 records.entry(n.id).or_insert(n);
             }
             lists.push((WEIGHT_VECTOR, vids));
+        }
+        // Graph leg, two-stage (spec): preliminary text+vector fusion
+        // picks GRAPH_SEEDS seeds; their 1-hop neighbors (deduped, seeds
+        // and already-ranked nodes excluded from *seeding* but not from
+        // membership) form a third list ordered by seed rank. Half weight:
+        // adjacency is corroboration, not relevance.
+        if q.graph_boost {
+            let prelim = rrf_fuse(&lists);
+            let seeds: Vec<crate::NodeId> =
+                prelim.iter().take(GRAPH_SEEDS).map(|(id, _)| *id).collect();
+            let mut graph_ids: Vec<crate::NodeId> = Vec::new();
+            let mut seen: std::collections::HashSet<crate::NodeId> =
+                seeds.iter().copied().collect();
+            for seed in &seeds {
+                let sg = self.traverse(&crate::TraversalQuery {
+                    scopes: q.scopes.clone(),
+                    seeds: vec![*seed],
+                    max_hops: 1,
+                    edge_types: None,
+                    direction: crate::Direction::Both,
+                    as_of: q.options.now_ms,
+                })?;
+                // Deterministic within a seed: sort neighbors by id.
+                let mut neighbors: Vec<NodeRecord> = sg.nodes;
+                neighbors.sort_by_key(|n| n.id);
+                for n in neighbors {
+                    if seen.insert(n.id) {
+                        graph_ids.push(n.id);
+                        records.entry(n.id).or_insert(n);
+                    }
+                }
+            }
+            if !graph_ids.is_empty() {
+                lists.push((WEIGHT_GRAPH, graph_ids));
+            }
         }
         let fused = rrf_fuse(&lists);
 
