@@ -3,6 +3,7 @@ use topodb_sgh::executor::Executor;
 use topodb_sgh::recovery::{contract_preserved, Repairer};
 use topodb_sgh::runner::mock::MockRunner;
 use topodb_sgh::runner::NodeOutcome;
+use topodb_sgh::schema::bound::worst_case;
 use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::{Graph, Node};
 
@@ -87,6 +88,16 @@ fn contract_breaking_repairs_are_rejected() {
     let mut rekinded = original.clone();
     rekinded.kind = topodb_sgh::schema::NodeKind::Command;
     assert!(!contract_preserved(original, &rekinded), "kind change is not a repair");
+
+    // `run` is the command-node analogue of `prompt`. It is inert today
+    // because commands always get a repair budget of 0 (never reach the
+    // REPAIR rung), but `contract_preserved` itself must not treat an
+    // arbitrary rewrite of the shell command as contract-preserving — the
+    // instant command repair is implemented, this is the check that keeps a
+    // repairer from rewriting `run` freely.
+    let mut rerun = original.clone();
+    rerun.run = Some("rm -rf /".into());
+    assert!(!contract_preserved(original, &rerun), "run change is not a repair");
 }
 
 #[test]
@@ -203,4 +214,50 @@ fn contract_preserving_repair_is_accepted_end_to_end_and_node_succeeds() {
     assert_eq!(report.succeeded, vec!["a".to_string()]);
     // 1 initial failure + 1 repaired execution that succeeds.
     assert_eq!(runner.call_count(), 2);
+}
+
+/// `bound.rs` budgets an agent node `1 + retries + 2*repairs` model calls,
+/// explicitly including one call to consult the recovery model per repair.
+/// Before this fix, `execute_node` never incremented `model_calls` for the
+/// consultation itself (only for node re-executions), so `RunReport.
+/// model_calls` and `Bound.agent_calls` metered different things. Drive a
+/// node through every rung the bound accounts for (retries, then a repair
+/// consultation, then a repaired re-execution that still fails and blocks)
+/// and check the two totals agree exactly.
+#[test]
+fn model_calls_counts_the_repair_consultation_and_matches_the_bound() {
+    let g = one_node(1, 1); // bound: 1 + 1 + 2*1 = 4
+    let v = validate(&g).unwrap();
+    let bound = worst_case(&v);
+    assert_eq!(bound.agent_calls, 4);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = topodb_sgh::store::run::RunStore::create(&db, "r", &v, 1).unwrap();
+    // Fails every time: 1 initial + 1 retry + 1 repaired re-execution, all
+    // failures, so the ladder exhausts every rung the bound budgets for.
+    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+
+    struct PromptOnlyRepairer;
+    impl Repairer for PromptOnlyRepairer {
+        fn repair(&self, node: &Node, _error: &str) -> Option<Node> {
+            let mut n = node.clone();
+            n.prompt = Some("revised".into());
+            Some(n)
+        }
+    }
+
+    let mut ex = Executor::new(store, v, &runner).with_repairer(&PromptOnlyRepairer);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    // 1 initial execution + 1 retry execution + 1 repair consultation + 1
+    // repaired execution = 4, exactly the bound — not 3 (which is what the
+    // unfixed executor reported, since it only counted executions and
+    // dropped the consultation).
+    assert_eq!(
+        report.model_calls, 4,
+        "model_calls must count the repair consultation, matching the published bound"
+    );
+    assert!(report.model_calls <= bound.agent_calls, "must never exceed the bound");
 }

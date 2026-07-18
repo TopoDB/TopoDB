@@ -5,6 +5,7 @@ use topodb_sgh::runner::NodeOutcome;
 use topodb_sgh::schema::validate::{validate, Validated};
 use topodb_sgh::schema::Graph;
 use topodb_sgh::store::run::RunStore;
+use topodb_sgh::store::SghError;
 
 fn diamond() -> Validated {
     let g = Graph::from_yaml(
@@ -94,8 +95,17 @@ fn model_calls_counts_exactly_the_four_agent_nodes() {
     assert_eq!(report.model_calls, 4, "each of the 4 agent nodes makes exactly one model call");
 }
 
+/// Command nodes have no execution path (see the executor module doc
+/// comment): `Executor::run` must refuse a graph containing one before any
+/// node executes, rather than dispatching it through `AgentRunner` as a
+/// prompt. This used to be `model_calls_ignores_command_nodes`, which
+/// asserted the command node ran (via `AgentRunner`) and simply didn't count
+/// toward `model_calls` — pinning the exact defect this fix closes: the run
+/// happened and the bound (which gives command nodes `0` toward
+/// `agent_calls`) and the report disagreed about how many model calls
+/// occurred.
 #[test]
-fn model_calls_ignores_command_nodes() {
+fn run_refuses_a_graph_containing_a_command_node() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let g = Graph::from_yaml(
@@ -110,10 +120,44 @@ fn model_calls_ignores_command_nodes() {
     let runner = MockRunner::new();
 
     let mut ex = Executor::new(store, v, &runner);
-    let report = ex.run(10).unwrap();
+    let err = ex.run(10).unwrap_err();
 
-    assert_eq!(report.succeeded.len(), 3, "a, b (command), c all succeed");
-    assert_eq!(report.model_calls, 2, "only the 2 agent nodes count; the command node does not");
+    match err {
+        SghError::UnsupportedNodeKind { nodes } => {
+            assert_eq!(nodes, vec!["b".to_string()], "the command node is named in the error")
+        }
+        other => panic!("expected UnsupportedNodeKind, got {other:?}"),
+    }
+    // Refused before any node executes: no model calls happened at all, not
+    // even for `a`, which topologically precedes the offending node.
+    assert_eq!(runner.call_count(), 0, "the run must be refused before any node executes");
+}
+
+/// A graph with more than one command node names all of them, in
+/// declaration order, not just the first offender.
+#[test]
+fn run_refuses_and_names_every_command_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: command, run: 'true', budget: {retries: 0, repairs: 0}}\n\
+         - {id: b, kind: command, run: 'true', budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new();
+
+    let mut ex = Executor::new(store, v, &runner);
+    let err = ex.run(10).unwrap_err();
+
+    match err {
+        SghError::UnsupportedNodeKind { nodes } => {
+            assert_eq!(nodes, vec!["a".to_string(), "b".to_string()])
+        }
+        other => panic!("expected UnsupportedNodeKind, got {other:?}"),
+    }
 }
 
 #[test]

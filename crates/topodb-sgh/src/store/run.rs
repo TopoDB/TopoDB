@@ -302,6 +302,15 @@ impl RunStore {
         Ok(())
     }
 
+    /// Mirrors `state()` and `output()`: reads with a sentinel `as_of` far in
+    /// the future rather than `as_of: None` (wall clock). Every write here
+    /// goes through `submit_at` with an explicit, caller-supplied `now_ms`,
+    /// so anchoring "current" to the real wall clock only happens to work
+    /// when a caller's timestamps stay behind it — a caller stamping runs
+    /// with future-dated timestamps (nothing in this crate forbids that)
+    /// would see `as_of: None` treat every attempt as not-yet-valid and get
+    /// an empty history back with no error. The sentinel makes the read
+    /// deterministic and independent of wall time.
     pub fn attempts(&self, node_id: &str) -> Result<Vec<(String, String)>, SghError> {
         let node = self.nodes[node_id];
         let q = TraversalQuery {
@@ -310,7 +319,7 @@ impl RunStore {
             max_hops: 1,
             edge_types: Some(vec![EDGE_ATTEMPT_OF.into()]),
             direction: Direction::In,
-            as_of: None,
+            as_of: Some(i64::MAX - 1),
         };
         let sub = self.db.traverse(&q)?;
         let mut out = Vec::new();

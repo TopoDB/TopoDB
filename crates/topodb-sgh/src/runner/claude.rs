@@ -51,8 +51,12 @@ impl AgentRunner for ClaudeCodeRunner {
         }
 
         let out = cmd.output()?;
-        let stdout = String::from_utf8(out.stdout).map_err(|_| RunnerError::Utf8)?;
 
+        // Check the exit status before decoding stdout. A failing
+        // invocation's stdout is not a promise of valid UTF-8 (partial
+        // writes, binary diagnostics, etc.), and decoding it first would
+        // turn a diagnosable failure (exit status + stderr) into a
+        // confusing `RunnerError::Utf8` that discards both.
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             return Ok(NodeOutcome::Failed {
@@ -60,6 +64,7 @@ impl AgentRunner for ClaudeCodeRunner {
             });
         }
 
+        let stdout = String::from_utf8(out.stdout).map_err(|_| RunnerError::Utf8)?;
         Ok(NodeOutcome::Succeeded { output: stdout.trim().to_string() })
     }
 }

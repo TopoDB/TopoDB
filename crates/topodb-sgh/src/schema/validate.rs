@@ -78,13 +78,25 @@ pub fn validate(graph: &Graph) -> Result<Validated, Vec<ValidationError>> {
     }
 
     // Kahn's algorithm. Ties broken by declaration order for determinism.
+    //
+    // Indegree counts *distinct* existing dependencies per node, not raw
+    // `needs` occurrences: a duplicated `needs` entry (e.g. `needs: [a, a]`)
+    // is accepted as equivalent to declaring the dependency once — it is
+    // redundant, not a structural error, and doesn't deserve its own
+    // diagnostic. The removal side below (`other.needs.iter().any(...)`)
+    // already only ever decrements once per dependent node regardless of how
+    // many times a `need` is repeated, so incrementing once per occurrence
+    // here (as before) left the counter permanently off by the duplicate
+    // count and a valid graph was misreported as `Cycle`.
     let mut indegree: HashMap<&str, usize> = graph.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
     for n in &graph.nodes {
+        let mut distinct: HashSet<&str> = HashSet::new();
         for need in &n.needs {
             if ids.contains(need.as_str()) {
-                *indegree.get_mut(n.id.as_str()).unwrap() += 1;
+                distinct.insert(need.as_str());
             }
         }
+        *indegree.get_mut(n.id.as_str()).unwrap() += distinct.len();
     }
 
     let mut order: Vec<String> = Vec::with_capacity(graph.nodes.len());

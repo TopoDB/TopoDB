@@ -66,6 +66,27 @@ impl<'r> Executor<'r> {
     }
 
     pub fn run(&mut self, start_ms: i64) -> Result<RunReport, SghError> {
+        // Command nodes parse, validate, and cost exactly like any other
+        // node kind, but there is no shell execution path in this crate yet
+        // (see the module doc comment): dispatching one through
+        // `AgentRunner` would send a shell command to a model as a prompt,
+        // a real model call the cost bound never budgeted for. The CLI
+        // (`bin/sgh.rs`) already refuses these graphs with a friendlier
+        // message, but `Executor` is public, so the refusal must also live
+        // here — otherwise any other library caller could drive the
+        // executor straight past its own published bound.
+        let offenders: Vec<String> = self
+            .graph
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Command)
+            .map(|n| n.id.clone())
+            .collect();
+        if !offenders.is_empty() {
+            return Err(SghError::UnsupportedNodeKind { nodes: offenders });
+        }
+
         self.clock = start_ms;
 
         // Topological order makes a single forward pass sufficient: every
@@ -196,6 +217,18 @@ impl<'r> Executor<'r> {
                     self.store.set_state(id, NodeState::Recovering, t)?;
                 }
                 Rung::Repair => {
+                    // The bound (`bound.rs`) budgets `2*repairs` model calls
+                    // per agent node: one call to consult the recovery
+                    // model, then one re-execution of the node. Only the
+                    // re-execution was counted before this fix (at the top
+                    // of the loop); count the consultation itself here so
+                    // `RunReport.model_calls` and `Bound.agent_calls` meter
+                    // the same thing. Repair budget is always 0 for
+                    // non-agent nodes, so this rung is unreachable for them
+                    // and the guard is just documentation-by-code.
+                    if node.kind == NodeKind::Agent {
+                        self.model_calls += 1;
+                    }
                     match self.repairer.repair(&node, &error) {
                         // A repair that breaks the contract is not a repair
                         // — refuse it and block rather than let the graph

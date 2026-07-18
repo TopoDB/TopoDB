@@ -58,6 +58,27 @@ fn rejects_agent_without_prompt_and_command_without_run() {
     assert!(errs.iter().any(|e| matches!(e, ValidationError::MissingRun(id) if id == "b")));
 }
 
+/// A duplicated `needs` entry is redundant, not a structural error: the
+/// dependency is still declared exactly once in substance. Before this fix,
+/// indegree was incremented once per `needs` *occurrence* but decremented
+/// only once per dependent node on removal, so the counter for a node with
+/// `needs: [a, a]` never reached zero and the graph was rejected with a
+/// `Cycle` error that named a node with no cycle at all — an actively
+/// misleading diagnostic for a perfectly valid graph. Chosen resolution:
+/// accept duplicates silently (treat as a single dependency) rather than add
+/// a new diagnostic for them, since a repeated `needs` entry carries no
+/// information a validator needs to reject.
+#[test]
+fn duplicate_needs_entry_validates_successfully_rather_than_reporting_a_cycle() {
+    let g = graph(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: command, run: 'true', budget: {retries: 0, repairs: 0}}\n\
+         - {id: b, kind: command, run: 'true', needs: [a, a], budget: {retries: 0, repairs: 0}}\n",
+    );
+    let v = validate(&g).expect("a duplicated needs entry must not be reported as a cycle");
+    assert_eq!(v.topo_order, vec!["a".to_string(), "b".to_string()]);
+}
+
 #[test]
 fn rejects_malformed_output_schema() {
     let g = graph(

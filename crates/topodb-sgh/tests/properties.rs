@@ -1,6 +1,7 @@
 use proptest::prelude::*;
 use topodb::Db;
 use topodb_sgh::executor::Executor;
+use topodb_sgh::recovery::Repairer;
 use topodb_sgh::runner::mock::MockRunner;
 use topodb_sgh::runner::NodeOutcome;
 use topodb_sgh::schema::bound::worst_case;
@@ -8,14 +9,43 @@ use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::{Budget, Graph, Node, NodeKind};
 use topodb_sgh::store::run::{NodeState, RunStore};
 
+/// A contract-preserving repairer that changes only `prompt`, wired into the
+/// termination property so the REPAIR rung (and the `2*repairs` term of the
+/// bound) actually gets exercised. With `NoopRepairer` (the executor's
+/// default), every repair is declined and the ladder always falls straight
+/// from RETRY to BLOCK, so `repairs_left` never does anything and a
+/// regression that let the executor over-run its repair budget would pass
+/// undetected.
+struct PromptOnlyRepairer;
+impl Repairer for PromptOnlyRepairer {
+    fn repair(&self, node: &Node, error: &str) -> Option<Node> {
+        let mut n = node.clone();
+        n.prompt = Some(format!("retry after: {error}"));
+        Some(n)
+    }
+}
+
 /// Generate a random DAG. Edges only ever point backwards in the node list,
 /// so acyclicity holds by construction and every generated case is valid —
 /// the same trick `determinism.rs` uses with modulo indices.
+///
+/// Node kind is `Agent` or `Gate`, never `Command`: after Fix 1,
+/// `Executor::run` refuses any graph containing a command node outright, so
+/// generating one would make the run error rather than exercise these
+/// properties. Command refusal has its own targeted tests in
+/// `tests/executor.rs`; that's where it belongs, not diluted into a property
+/// that would just short-circuit on it.
+///
+/// `needs` is deliberately **not** deduped: duplicated entries are exactly
+/// the input that used to break the validator (see Fix 2 in
+/// `schema/validate.rs`) — a case the generator was previously sanitizing
+/// away before it ever reached the validator.
 fn dag() -> impl Strategy<Value = Graph> {
     (1usize..8).prop_flat_map(|n| {
         let deps = prop::collection::vec(prop::collection::vec(any::<u8>(), 0..3), n);
         let budgets = prop::collection::vec((0u32..3, 0u32..2), n);
-        (Just(n), deps, budgets).prop_map(|(n, deps, budgets)| {
+        let is_gate = prop::collection::vec(any::<bool>(), n);
+        (Just(n), deps, budgets, is_gate).prop_map(|(n, deps, budgets, is_gate)| {
             let nodes = (0..n)
                 .map(|i| {
                     let needs = if i == 0 {
@@ -26,14 +56,14 @@ fn dag() -> impl Strategy<Value = Graph> {
                             .map(|raw| format!("n{}", (*raw as usize) % i))
                             .collect();
                         d.sort();
-                        d.dedup();
                         d
                     };
+                    let gate = is_gate[i];
                     Node {
                         id: format!("n{i}"),
-                        kind: NodeKind::Agent,
+                        kind: if gate { NodeKind::Gate } else { NodeKind::Agent },
                         needs,
-                        prompt: Some("p".into()),
+                        prompt: if gate { None } else { Some("p".into()) },
                         run: None,
                         output: None,
                         budget: Budget { retries: budgets[i].0, repairs: budgets[i].1 },
@@ -84,7 +114,11 @@ proptest! {
             }
         }
 
-        let mut ex = Executor::new(store, v.clone(), &runner);
+        // A contract-preserving repairer, not the executor's default
+        // `NoopRepairer`, so failing nodes actually climb to the REPAIR rung
+        // and the `2*repairs` term of the bound is exercised rather than
+        // dead weight.
+        let mut ex = Executor::new(store, v.clone(), &runner).with_repairer(&PromptOnlyRepairer);
         let report = ex.run(10).unwrap();
 
         // Terminal: every node ended in exactly one terminal state.

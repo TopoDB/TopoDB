@@ -2032,6 +2032,7 @@ dependencies = [
 name = "topodb-sgh"
 version = "0.0.1"
 dependencies = [
+ "clap",
  "jsonschema",
  "proptest",
  "serde",
