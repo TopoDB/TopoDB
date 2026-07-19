@@ -240,4 +240,28 @@ mod tests {
         assert_eq!(e.status(), EmbedderStatus::Failed);
         assert_eq!(e.embed("hello"), None);
     }
+
+    /// Real network + ~50MB download + model fetch. Run explicitly:
+    /// `cargo test -p topodb-mcp real_ort_download -- --ignored --nocapture`
+    /// Precedent: the ignored real-model e2e tests. Asserts the F3 headline:
+    /// a clean cache dir on a host with NO system ORT still reaches Ready.
+    /// (On a host WITH a system ORT this passes trivially via the System
+    /// path — still a valid lifecycle check, just weaker.)
+    #[test]
+    #[ignore]
+    fn real_ort_download_reaches_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Embedder::start(None, dir.path().to_path_buf(), true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        while e.status() == EmbedderStatus::Downloading {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "init did not reach a terminal status within 10 minutes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        assert_eq!(e.status(), EmbedderStatus::Ready);
+        let v = e.embed("hello embeddings").expect("Ready must embed");
+        assert_eq!(v.len(), 384, "bge-small-en-v1.5 is 384-dim");
+    }
 }
