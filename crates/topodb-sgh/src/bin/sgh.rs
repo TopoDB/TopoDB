@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use topodb::Db;
 use topodb_sgh::executor::Executor;
+use topodb_sgh::planner::claude::ClaudePlanner;
+use topodb_sgh::planner::{PlanRequest, Planner};
 use topodb_sgh::runner::claude::ClaudeCodeRunner;
 use topodb_sgh::runner::command::ShellCommandRunner;
 use topodb_sgh::schema::bound::worst_case;
@@ -34,6 +36,22 @@ enum Cmd {
         /// Seconds a single command node may run before it is killed.
         #[arg(long, default_value_t = 120)]
         command_timeout: u64,
+    },
+    /// Compile a goal into a graph.yaml and print its worst-case bound.
+    Plan {
+        /// What you want done, in plain language.
+        goal: String,
+        /// Where to write the graph. Defaults to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Optional grounding: repo facts, constraints, prior findings.
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// How many times the planner may retry an invalid graph.
+        #[arg(long, default_value_t = 3)]
+        max_attempts: u32,
     },
 }
 
@@ -145,6 +163,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !report.blocked.is_empty() {
                 std::process::exit(1);
+            }
+        }
+        Cmd::Plan {
+            goal,
+            out,
+            context,
+            model,
+            max_attempts,
+        } => {
+            let planner = ClaudePlanner::new(model, max_attempts);
+            let graph = match planner.plan(&PlanRequest { goal, context }) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+
+            // The planner only returns validated graphs, but re-validate so
+            // the bound below is computed from a proof-carrying value rather
+            // than a trusted one.
+            let v = match validate(&graph) {
+                Ok(v) => v,
+                Err(errors) => {
+                    for e in &errors {
+                        eprintln!("error: {e}");
+                    }
+                    std::process::exit(2);
+                }
+            };
+
+            let yaml = serde_yaml::to_string(&graph)?;
+            match &out {
+                Some(path) => {
+                    std::fs::write(path, &yaml)?;
+                    eprintln!("wrote {} ({} node(s))", path.display(), v.graph.nodes.len());
+                    eprintln!("{}", worst_case(&v));
+                    let commands = command_preview(&v);
+                    if !commands.is_empty() {
+                        eprintln!("command nodes ({}):", commands.len());
+                        for line in &commands {
+                            eprintln!("  {line}");
+                        }
+                    }
+                    eprintln!("review it, then: sgh run {}", path.display());
+                }
+                None => print!("{yaml}"),
             }
         }
     }
