@@ -9,10 +9,13 @@ pub const LABEL_NODE: &str = "SghNode";
 pub const LABEL_STATE: &str = "SghState";
 pub const LABEL_OUTPUT: &str = "SghOutput";
 pub const LABEL_ATTEMPT: &str = "SghAttempt";
-// TODO(v0.0.2): reserved for persisting repair revisions (the sequence of
-// `Node`s a REPAIR rung produces via `Repairer::repair`) so a run's history
-// records not just that a node was repaired but what it was repaired to.
-// Not yet written or read anywhere.
+/// A proposed successor graph for a run, written by the replan step and
+/// linked `SghRun -[REVISION_OF]-> SghRevision`. Superseding, so a run
+/// carries at most one open proposal while earlier ones stay in history.
+/// The edge is keyed from the run, not the revision, because supersession
+/// keys on `(from, ty)` and must be anchored on the run's stable node id —
+/// a fresh revision id would never match a prior edge, so it could never
+/// close it out.
 pub const LABEL_REVISION: &str = "SghRevision";
 
 pub const EDGE_DEPENDS_ON: &str = "DEPENDS_ON";
@@ -22,8 +25,7 @@ pub const EDGE_HAS_STATE: &str = "HAS_STATE";
 /// new output (see `RunStore::record_output`).
 pub const EDGE_PRODUCED: &str = "PRODUCED";
 pub const EDGE_ATTEMPT_OF: &str = "ATTEMPT_OF";
-// TODO(v0.0.2): the `SghRevision -[EDGE_REVISION_OF]-> SghNode` edge for the
-// same not-yet-implemented repair-revision history as `LABEL_REVISION` above.
+/// Links a proposed successor graph to the run that produced it.
 pub const EDGE_REVISION_OF: &str = "REVISION_OF";
 pub const EDGE_MEMBER_OF: &str = "MEMBER_OF";
 
@@ -38,9 +40,8 @@ pub enum SghError {
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error(
-        "command nodes are not supported until v0.0.2: {nodes:?}; command execution has no \
-         shell path yet and dispatching them through AgentRunner would send the shell command \
-         to a model as a prompt"
+        "graph contains command nodes but no CommandRunner was configured: {nodes:?}; call \
+         Executor::with_command_runner"
     )]
-    UnsupportedNodeKind { nodes: Vec<String> },
+    NoCommandRunner { nodes: Vec<String> },
 }
