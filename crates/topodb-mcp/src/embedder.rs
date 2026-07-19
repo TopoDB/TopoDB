@@ -107,8 +107,21 @@ impl Embedder {
             // resolver's probes — see `ort_fetch::probe_loadable`). May
             // download on first run — that is why this runs here, under the
             // Downloading status, off the async runtime.
-            match crate::ort_fetch::resolve(&cache_dir, ort_download, &crate::ort_fetch::http_fetch)
-            {
+            let resolve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::ort_fetch::resolve(&cache_dir, ort_download, &crate::ort_fetch::http_fetch)
+            }));
+            let resolved = match resolve_result {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
+                    eprintln!(
+                        "topodb-mcp: embedding model {model_name} runtime resolution panicked; \
+                         running text-only"
+                    );
+                    return;
+                }
+            };
+            match resolved {
                 crate::ort_fetch::OrtRuntime::EnvOverride
                 | crate::ort_fetch::OrtRuntime::System => {}
                 crate::ort_fetch::OrtRuntime::Local(dylib) => {

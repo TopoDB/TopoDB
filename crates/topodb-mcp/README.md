@@ -24,7 +24,7 @@ which must be on `PATH` for the client configs below to find it by name.
 ```
 topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]]
            [--spec <path>] [--allow-unscoped-changes]
-           [--embeddings <off|auto|model>] [--model-dir <path>]
+           [--embeddings <off|auto|model>] [--model-dir <path>] [--no-ort-download]
 ```
 
 | Flag | Required | Default | Meaning |

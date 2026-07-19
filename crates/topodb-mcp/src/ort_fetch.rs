@@ -265,6 +265,15 @@ pub(crate) fn install_from_archive(
     }
 }
 
+/// Whether `entry_path` (forward-slash-normalized) names the artifact's
+/// `dylib_rel_path` as a whole path segment — either exactly, or as a
+/// suffix following a `/` boundary. A plain `ends_with` would also match an
+/// unrelated entry that merely shares the tail, e.g. `evillib/libonnxruntime...`
+/// matching `lib/libonnxruntime...`.
+fn matches_dylib_entry(entry_path: &str, dylib_rel_path: &str) -> bool {
+    entry_path == dylib_rel_path || entry_path.ends_with(&format!("/{dylib_rel_path}"))
+}
+
 /// Extract the single entry whose path ends with `a.dylib_rel_path` to
 /// `dest`. Archives lay content under a top-level
 /// `onnxruntime-<platform>-<ver>/` directory, so we match on suffix.
@@ -275,7 +284,7 @@ fn extract_dylib(archive: &Path, a: &OrtArtifact, dest: &Path) -> Result<(), Str
             zip::ZipArchive::new(f).map_err(|e| format!("zip {}: {e}", archive.display()))?;
         for i in 0..z.len() {
             let mut entry = z.by_index(i).map_err(|e| e.to_string())?;
-            if entry.name().replace('\\', "/").ends_with(a.dylib_rel_path) {
+            if matches_dylib_entry(&entry.name().replace('\\', "/"), a.dylib_rel_path) {
                 let mut out = std::fs::File::create(dest)
                     .map_err(|e| format!("create {}: {e}", dest.display()))?;
                 std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
@@ -288,7 +297,7 @@ fn extract_dylib(archive: &Path, a: &OrtArtifact, dest: &Path) -> Result<(), Str
         for entry in t.entries().map_err(|e| e.to_string())? {
             let mut entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-            if path.to_string_lossy().ends_with(a.dylib_rel_path) {
+            if matches_dylib_entry(&path.to_string_lossy(), a.dylib_rel_path) {
                 let mut out = std::fs::File::create(dest)
                     .map_err(|e| format!("create {}: {e}", dest.display()))?;
                 std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;

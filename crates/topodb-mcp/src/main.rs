@@ -3,8 +3,8 @@
 //! Usage: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!         [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
 //!         [--allow-unscoped-changes] [--embeddings <off|model>]
-//!         [--model-dir <path>]` — see `config`'s module doc for what each
-//! flag controls.
+//!         [--model-dir <path>] [--no-ort-download]` — see `config`'s module
+//! doc for what each flag controls.
 //!
 //! The process speaks newline-delimited JSON-RPC over stdio (rmcp's `stdio`
 //! transport). stdout is reserved for the protocol; all diagnostics go to
