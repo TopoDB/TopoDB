@@ -420,3 +420,21 @@ fn recent_memories_k_bounds_are_advertised() {
     assert_eq!(k["minimum"], 1, "k schema: {k}");
     assert_eq!(k["maximum"], 100, "k schema: {k}");
 }
+
+/// search_memories' tuning params advertise the bounds the engine enforces.
+#[test]
+fn search_memories_tuning_params_advertise_bounds() {
+    let (_dir, tools) = tools();
+    let props = properties(&tools, "search_memories");
+    for name in ["text_weight", "vector_weight", "graph_weight"] {
+        let p = &props[name];
+        assert_eq!(p["minimum"], 0.0, "{name}: {p}");
+        assert_eq!(p["maximum"], 10.0, "{name}: {p}");
+    }
+    let aw = &props["access_weight"];
+    assert_eq!(aw["minimum"], 0.0, "{aw}");
+    assert_eq!(aw["maximum"], 1.0, "{aw}");
+    let labels = &props["labels"];
+    assert_eq!(labels["type"], "array", "{labels}");
+    assert_eq!(labels["minItems"], 1, "{labels}");
+}

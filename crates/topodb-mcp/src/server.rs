@@ -637,6 +637,18 @@ fn default_recency_half_life_days() -> f64 {
     30.0
 }
 
+fn default_weight_one() -> f32 {
+    1.0
+}
+
+fn default_weight_half() -> f32 {
+    0.5
+}
+
+fn default_labels() -> Vec<String> {
+    vec!["Memory".to_string(), "Entity".to_string()]
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchMemoriesParams {
@@ -681,6 +693,33 @@ struct SearchMemoriesParams {
     /// context). Default true; set false for lexical/semantic-only.
     #[serde(default = "default_true")]
     graph_boost: bool,
+    /// Result label allowlist. Defaults to ["Memory","Entity"] — memories
+    /// plus the named entities they link to; Alias/Synonym plumbing nodes
+    /// never surface by default. Override to widen (e.g. add "Episode")
+    /// or narrow (["Memory"]). Must not be empty when present.
+    #[serde(default = "default_labels")]
+    #[schemars(length(min = 1))]
+    labels: Vec<String>,
+    /// RRF weight of the BM25 text leg (0-10, default 1).
+    #[serde(default = "default_weight_one")]
+    #[schemars(range(min = 0.0, max = 10.0))]
+    text_weight: f32,
+    /// RRF weight of the vector leg (0-10, default 1). Only meaningful
+    /// when embeddings are ready.
+    #[serde(default = "default_weight_one")]
+    #[schemars(range(min = 0.0, max = 10.0))]
+    vector_weight: f32,
+    /// RRF weight of the 1-hop graph leg (0-10, default 0.5); applies when
+    /// graph_boost is on.
+    #[serde(default = "default_weight_half")]
+    #[schemars(range(min = 0.0, max = 10.0))]
+    graph_weight: f32,
+    /// How much access history lifts ranking (0-1, default 0 = off):
+    /// frequently-recalled memories rank higher at equal relevance,
+    /// log-damped. Neutral on a node never recalled.
+    #[serde(default)]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    access_weight: f32,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1312,7 +1351,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking."
     )]
     fn search_memories(
         &self,
@@ -1380,6 +1419,11 @@ impl TopoServer {
             expansions,
             graph_boost: p.graph_boost,
             options,
+            labels: Some(p.labels.clone()),
+            text_weight: p.text_weight,
+            vector_weight: p.vector_weight,
+            graph_weight: p.graph_weight,
+            access_weight: p.access_weight,
             ..RecallQuery::new(scope_set, p.query.clone(), p.k)
         };
         // `recall` opens redb read transactions, so unlike the pure snapshot
