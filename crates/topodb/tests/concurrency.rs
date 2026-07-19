@@ -257,3 +257,191 @@ fn reads_complete_while_a_large_batch_commits() {
     let bulk = db.nodes_by_label(&scopes, "Bulk");
     assert_eq!(bulk.len(), 4_000);
 }
+
+/// F9c regression net: this test's shape (many independently-valid
+/// single-op batches from many threads) is EXACTLY the workload the
+/// applier's drain-and-group-commit optimization targets — the perf claim
+/// itself is the bench's job (`cargo bench -p topodb --bench storage --
+/// concurrent_submit_16`), not this test's. This test passed on the
+/// per-batch commit path BEFORE Task 6 and must keep passing unchanged
+/// after it: every submit still succeeds, and the change feed — fed once
+/// per batch, in submission order, whether batches share a commit or not —
+/// still delivers a gapless, strictly-increasing sequence with no
+/// duplicates and no drops.
+#[test]
+fn concurrent_submitters_all_succeed_and_feed_stays_ordered() {
+    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let db = Arc::new(db);
+
+    const THREADS: usize = 16;
+    const BATCHES_PER_THREAD: usize = 32;
+    const TOTAL: usize = THREADS * BATCHES_PER_THREAD;
+
+    // Subscribe BEFORE any concurrent submits so every batch's broadcast is
+    // captured. Generous capacity (well above `TOTAL`) keeps the
+    // best-effort broadcast (`db.rs`'s `broadcast_batch`: a full buffer
+    // silently drops the event) from ever firing at this small a volume —
+    // this test is checking ordering/gaplessness, not the drop-on-full
+    // behavior (that's `change_feed.rs`'s job).
+    let feed = db.subscribe(TOTAL * 4);
+
+    let scope = Scope::Id(ScopeId::new());
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                for _ in 0..BATCHES_PER_THREAD {
+                    db.submit(vec![Op::CreateNode {
+                        id: NodeId::new(),
+                        scope,
+                        label: "Concurrent".into(),
+                        props: Default::default(),
+                    }])
+                    .expect(
+                        "every batch in this test is independently valid — \
+                         optimistic group commit (F9c) must never poison a \
+                         sibling batch drained into the same group",
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // One op per batch, one seq per op: `current_seq` must equal the total
+    // submit count exactly (no batch was silently dropped or duplicated).
+    let current_seq = db.current_seq().unwrap();
+    assert_eq!(
+        current_seq as usize, TOTAL,
+        "current_seq must equal the total submit count"
+    );
+
+    // Drain the feed: seqs must be strictly increasing with NO gaps, from 1
+    // through current_seq, with exactly `TOTAL` events — regardless of
+    // which batches ended up sharing a group commit, the applier still
+    // broadcasts once per batch, per-batch, in submission order (see
+    // `apply_group`'s doc comment).
+    let mut seqs = Vec::with_capacity(TOTAL);
+    for _ in 0..TOTAL {
+        let ev = feed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("feed should have delivered every one of this test's batches within 5s");
+        seqs.push(ev.seq);
+    }
+    assert!(
+        feed.try_recv().is_err(),
+        "no extra events beyond the expected total"
+    );
+    for w in seqs.windows(2) {
+        assert_eq!(
+            w[1],
+            w[0] + 1,
+            "feed seqs must be strictly increasing with no gaps: {seqs:?}"
+        );
+    }
+    assert_eq!(seqs.first().copied(), Some(1));
+    assert_eq!(seqs.last().copied(), Some(current_seq));
+}
+
+/// F9c regression net: a batch that fails mid-apply (the Task 4 shape —
+/// `CreateNode` followed by `RemoveNode` on an id that was never created,
+/// so the second op always rejects) must never poison a sibling batch that
+/// happens to land in the same optimistic group. This test passed on the
+/// per-batch commit path BEFORE Task 6 (there each batch already got its
+/// own transaction) and must keep passing unchanged after it — the failure
+/// mode Task 6 introduces risk for is a GROUP-committed sibling being
+/// dragged down by another batch's failure, which `apply_batches`'s
+/// whole-group-abort + `apply_group`'s individual-replay fallback (see
+/// `db.rs`) exists specifically to prevent.
+#[test]
+fn failing_batch_in_a_group_poisons_nothing() {
+    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let db = Arc::new(db);
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+
+    const ROUNDS: usize = 64;
+
+    // Thread A: a valid single-op batch every round — always independently
+    // committable.
+    let a_db = db.clone();
+    let a_handle = std::thread::spawn(move || {
+        for _ in 0..ROUNDS {
+            a_db.submit(vec![Op::CreateNode {
+                id: NodeId::new(),
+                scope,
+                label: "Good".into(),
+                props: Default::default(),
+            }])
+            .expect(
+                "thread A's batches are always independently valid — a \
+                     sibling group batch's failure must never poison them",
+            );
+        }
+    });
+
+    // Thread B: the Task 4 failure shape every round — `RemoveNode` always
+    // targets a freshly generated id that was never created, so the batch
+    // fails mid-apply every time, on both the optimistic group-commit path
+    // and the individual-replay fallback.
+    let b_db = db.clone();
+    let b_handle = std::thread::spawn(move || {
+        let mut rejected = 0usize;
+        for _ in 0..ROUNDS {
+            match b_db.submit(vec![
+                Op::CreateNode {
+                    id: NodeId::new(),
+                    scope,
+                    label: "Bad".into(),
+                    props: Default::default(),
+                },
+                Op::RemoveNode { id: NodeId::new() },
+            ]) {
+                Err(TopoError::Rejected(_)) => rejected += 1,
+                other => panic!("expected every thread-B batch to be Rejected, got {other:?}"),
+            }
+        }
+        rejected
+    });
+
+    a_handle.join().unwrap();
+    let b_rejected = b_handle.join().unwrap();
+    assert_eq!(b_rejected, ROUNDS, "every thread-B batch must be rejected");
+
+    // Final state contains exactly A's nodes (count check): every "Good"
+    // node landed, and no "Bad" node survived — proving a rejected batch's
+    // `CreateNode` never partially committed even though its `RemoveNode`
+    // failed afterward.
+    let scopes = ScopeSet::of(&[scope_id]);
+    let good = db.nodes_by_label(&scopes, "Good");
+    assert_eq!(good.len(), ROUNDS, "every thread-A node must be present");
+    let bad = db.nodes_by_label(&scopes, "Bad");
+    assert!(
+        bad.is_empty(),
+        "no Bad-labeled node may survive a rejected batch"
+    );
+
+    // Replay equivalence (Task 3's `verify_replay_equivalence` idiom,
+    // inlined: dump state, rebuild from the op log on the same db, dump
+    // again, assert equality) — whatever is on disk must be exactly what
+    // replaying the surviving op log produces.
+    let nodes_before = db.debug_dump_nodes();
+    let edges_before = db.debug_dump_edges();
+    db.rebuild_state_from_ops().unwrap();
+    assert_eq!(
+        nodes_before,
+        db.debug_dump_nodes(),
+        "NODES must equal a replay of the surviving op log"
+    );
+    assert_eq!(
+        edges_before,
+        db.debug_dump_edges(),
+        "EDGES must equal a replay of the surviving op log"
+    );
+}

@@ -460,56 +460,31 @@ impl Storage {
         let incoming_bytes =
             postcard::to_allocvec(&incoming).map_err(|e| TopoError::Encoding(e.to_string()))?;
 
+        // Read-only precheck (F9d): an open against an already-reconciled
+        // file — same declared spec, current stamps — is the common case,
+        // and a write transaction commits (fsyncs) even when every table
+        // write inside it turns out to be a byte-identical no-op. Deciding
+        // first, inside a `begin_read`, means that common case never opens a
+        // write transaction at all. Only called from `open_with_options` at
+        // open time (see the call site below), never concurrently with a
+        // write, so there's no TOCTOU between this read and the `begin_write`
+        // below when something DOES need writing.
+        {
+            let tx = self.db.begin_read().map_err(storage_err)?;
+            let meta = tx.open_table(META).map_err(storage_err)?;
+            let (needs_reindex, _is_legacy_v1, meta_dirty) =
+                index_spec_reconcile_decision(&meta, &incoming, &incoming_bytes)?;
+            if !needs_reindex && !meta_dirty {
+                return Ok(());
+            }
+        }
+
         let tx = self.db.begin_write().map_err(storage_err)?;
         let (needs_reindex, is_legacy_v1) = {
             let meta = tx.open_table(META).map_err(storage_err)?;
-            // The PROP_INDEX key scheme is versioned independently of the
-            // spec: a file whose stored normalization stamp differs from this
-            // build's (or is absent — every pre-v5 file) has Str index keys
-            // this build's `lookup` can't compute, so it must be rebuilt even
-            // when the spec itself is unchanged.
-            let norm_stale = match meta.get("prop_index_norm_version").map_err(storage_err)? {
-                Some(v) => {
-                    let b: [u8; 4] = v
-                        .value()
-                        .try_into()
-                        .map_err(|_| TopoError::Encoding("bad prop_index_norm_version".into()))?;
-                    u32::from_le_bytes(b) != crate::prop_index::PROP_INDEX_NORM_VERSION
-                }
-                None => true,
-            };
-            // Same contract for the FTS analyzer: postings written under a
-            // different tokenizer pipeline (or before the stamp existed) can
-            // disagree with what this build tokenizes a query into, so they
-            // must be rebuilt even when the spec itself is unchanged.
-            let analyzer_stale = match meta.get("fts_analyzer_version").map_err(storage_err)? {
-                Some(v) => {
-                    let b: [u8; 4] = v
-                        .value()
-                        .try_into()
-                        .map_err(|_| TopoError::Encoding("bad fts_analyzer_version".into()))?;
-                    u32::from_le_bytes(b) != crate::fts::FTS_ANALYZER_VERSION
-                }
-                None => true,
-            };
-            let norm_stale = norm_stale || analyzer_stale;
-            if meta.get("fts_spec").map_err(storage_err)?.is_some() {
-                (true, true)
-            } else {
-                match meta.get("index_spec").map_err(storage_err)? {
-                    Some(v) => {
-                        let stored: IndexSpec = postcard::from_bytes(v.value())
-                            .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                        (
-                            norm_stale
-                                || stored.text != incoming.text
-                                || stored.equality != incoming.equality,
-                            false,
-                        )
-                    }
-                    None => (norm_stale || !incoming.text.is_empty(), false),
-                }
-            }
+            let (needs_reindex, is_legacy_v1, _meta_dirty) =
+                index_spec_reconcile_decision(&meta, &incoming, &incoming_bytes)?;
+            (needs_reindex, is_legacy_v1)
         };
 
         if needs_reindex {
@@ -901,13 +876,55 @@ impl Storage {
     /// validation failure nothing is committed and `TopoError::Rejected` is
     /// returned.
     pub(crate) fn apply_batch(&self, ops: Vec<Op>, now_ms: i64) -> Result<AppliedBatch, TopoError> {
-        if ops.is_empty() {
-            return Err(TopoError::Rejected("empty op batch".into()));
-        }
+        self.apply_batches(vec![ops], now_ms)
+            .pop()
+            .expect("apply_batches returns exactly one result per input group")
+    }
 
-        // Resolve defaults up front — the resolved op is what gets appended
-        // and applied, so replay stays deterministic.
-        let resolved: Vec<Op> = ops.into_iter().map(|op| resolve_op(op, now_ms)).collect();
+    /// Optimistic group commit (F9c): applies every group in `groups`
+    /// through ONE shared write transaction and ONE `tx.commit()` (one
+    /// fsync), rather than one transaction per group. `apply_batch` is now a
+    /// thin `apply_batches(vec![ops], now_ms)` wrapper — see its doc comment
+    /// — so every existing single-batch caller/test is unaffected; this is
+    /// purely an additive entry point for the applier's drained-job path in
+    /// `db.rs`.
+    ///
+    /// Semantics, per group:
+    /// - All-succeed: every batch's ops are appended/applied against the
+    ///   SAME `dicts`/`scope_registry` guards and the SAME `tx`, so a later
+    ///   batch sees an earlier batch's same-group effects (e.g. batch 2 can
+    ///   `SetNodeProps` a node batch 1 just `CreateNode`d) exactly as if they
+    ///   had run through separate `apply_batch` calls back to back. One
+    ///   `tx.commit()` durably lands the whole group at once.
+    /// - Any batch fails (validation or encoding, mid-loop): the WHOLE `tx`
+    ///   is dropped uncommitted (nothing any group batch did is persisted —
+    ///   redb never partially applies an uncommitted write txn) and the
+    ///   accumulated intern journal — covering every batch attempted so far
+    ///   in THIS group, not segmented per batch, because an abort here always
+    ///   reverts the entire group at once, so per-batch segment boundaries
+    ///   would add bookkeeping with no behavioral difference — is reverted
+    ///   from both in-memory mirrors. The returned `Vec` carries the REAL
+    ///   error at the failing index and a generic "aborted, not attempted"
+    ///   `Rejected` at every other index (both before and after): callers
+    ///   must not trust ANY entry as reflecting committed state on a
+    ///   group failure — the applier's contract (see `db.rs`) is to replay
+    ///   every batch in the group individually through `apply_batch` when it
+    ///   sees any `Err` here, discarding this `Vec` entirely.
+    /// - `tx.commit()` itself fails (fsync/IO error, not a validation
+    ///   failure): same "aborted, not attempted" shape, with the real commit
+    ///   error in the LAST slot (arbitrary but deterministic — for the
+    ///   `apply_batch` wrapper's single-group case that IS the only slot, so
+    ///   this degenerates to the exact same `Err(e)` `apply_batch` always
+    ///   returned on a commit failure).
+    pub(crate) fn apply_batches(
+        &self,
+        groups: Vec<Vec<Op>>,
+        now_ms: i64,
+    ) -> Vec<Result<AppliedBatch, TopoError>> {
+        let n = groups.len();
+        if n == 0 {
+            return Vec::new();
+        }
 
         let mut dicts = self.dicts.write().expect("dict lock poisoned");
         let mut scope_registry = self
@@ -917,24 +934,158 @@ impl Storage {
         // Invariant (replaces the old per-batch `Dicts::load`/
         // `ScopeRegistry::load` reload): from here down, the `dicts`/
         // `scope_registry` in-memory mirrors are mutated ONLY through
-        // `journal`-recording `intern` calls. Every fallible step in
-        // `result` below — the op loop, the FTS-edit application, the
-        // op-log append, and `tx.commit()` itself — is one closure so ANY
-        // `Err` return, from ANY of those steps, reaches the `if
-        // result.is_err()` below and reverts exactly this batch's journaled
-        // ids from both mirrors before the error propagates. The old scheme
-        // paid two extra read transactions + an O(vocabulary) decode on
-        // EVERY batch, successful or not, to heal phantom ids left by a
-        // PRIOR aborted batch; this pays O(new interns) and only when THIS
-        // batch actually fails.
+        // `journal`-recording `intern` calls. Every fallible step across
+        // EVERY batch in the group — the op loop, the FTS-edit application,
+        // the op-log append, and `tx.commit()` itself — is reachable from the
+        // `if result.is_err()` arms below, which revert exactly this GROUP's
+        // journaled ids from both mirrors before the error propagates. The
+        // old scheme paid two extra read transactions + an O(vocabulary)
+        // decode on EVERY batch, successful or not, to heal phantom ids left
+        // by a PRIOR aborted batch; this pays O(new interns) and only when
+        // the group actually fails.
         let mut journal = InternJournal::default();
-        // Returns the still-open, not-yet-committed `tx` alongside the
-        // `AppliedBatch` it will yield: everything up through here needs the
-        // `dicts`/`scope_registry` guards (every name touched by the batch
-        // gets resolved), but the commit itself does not — see the drop
-        // site below.
-        let pre_commit: Result<(redb::WriteTransaction, AppliedBatch), TopoError> = (|| {
-            let tx = self.db.begin_write().map_err(storage_err)?;
+        // Returns the still-open, not-yet-committed `tx` alongside every
+        // `AppliedBatch` it will yield, in group order: everything up
+        // through here needs the `dicts`/`scope_registry` guards (every name
+        // any batch touches gets resolved), but the commit itself does not —
+        // see the drop site below. `Err((idx, e))` names the FIRST batch
+        // (group-order index) whose application failed.
+        let pre_commit: Result<(redb::WriteTransaction, Vec<AppliedBatch>), (usize, TopoError)> =
+            (|| {
+                let tx = self
+                    .db
+                    .begin_write()
+                    .map_err(storage_err)
+                    .map_err(|e| (0, e))?;
+                let mut applied = Vec::with_capacity(n);
+                for (idx, ops) in groups.into_iter().enumerate() {
+                    match self.apply_ops_in_txn(
+                        &tx,
+                        ops,
+                        now_ms,
+                        &mut dicts,
+                        &mut scope_registry,
+                        &mut journal,
+                    ) {
+                        Ok(batch) => applied.push(batch),
+                        Err(e) => return Err((idx, e)),
+                    }
+                }
+                Ok((tx, applied))
+            })();
+
+        let (tx, applied) = match pre_commit {
+            Err((idx, e)) => {
+                // Every failure path inside the loop above lands here: the
+                // still-open `tx` is simply dropped (never committed), so
+                // NODES/EDGES/DICT/SCOPES on disk are untouched. The guards
+                // are still held here (never dropped on this path), so
+                // reverting the journal under them keeps the in-memory
+                // mirrors consistent with that untouched disk state.
+                dicts.revert(&journal);
+                scope_registry.revert(&journal);
+                let mut out: Vec<Result<AppliedBatch, TopoError>> = Vec::with_capacity(n);
+                for _ in 0..idx {
+                    out.push(Err(TopoError::Rejected(
+                        "optimistic group commit aborted by a later batch's failure in the same \
+                         group; this batch was never attempted — replay it individually"
+                            .into(),
+                    )));
+                }
+                out.push(Err(e));
+                for _ in (idx + 1)..n {
+                    out.push(Err(TopoError::Rejected(
+                        "optimistic group commit aborted by an earlier batch's failure in the \
+                         same group; this batch was never attempted — replay it individually"
+                            .into(),
+                    )));
+                }
+                return out;
+            }
+            Ok(pair) => pair,
+        };
+
+        // All interning is done — every name every batch in the group
+        // touches has already been resolved into `dicts`/`scope_registry`
+        // above. The guards' job is finished; only `tx.commit()` (the fsync)
+        // remains, and that doesn't touch either mirror. Drop them now,
+        // BEFORE the commit, so readers blocked on `dicts.read()`/
+        // `scope_registry.read()` are no longer serialized behind this
+        // group's fsync.
+        //
+        // Reader-visible window: between this drop and `tx.commit()`
+        // returning, a concurrent reader can resolve an id/name that
+        // belongs to THIS about-to-be-durable — or about-to-abort — group.
+        // If the commit succeeds, that's no different from a reader landing
+        // a moment later: the data is durable either way. If the commit
+        // FAILS, the reader briefly saw ids that resolve to absent rows on
+        // disk (the write transaction never committed, so NODES/EDGES/
+        // DICT/SCOPES are untouched) — indistinguishable from a read that
+        // simply ran BEFORE this group started. The commit-failure arm
+        // below then reverts the journal, removing those ids from the
+        // mirrors and restoring the exact pre-group state.
+        drop(dicts);
+        drop(scope_registry);
+
+        match tx.commit().map_err(storage_err) {
+            Ok(()) => applied.into_iter().map(Ok).collect(),
+            Err(e) => {
+                // Commit failed AFTER the guards were dropped: re-take them
+                // to revert the journal. The disk mutation never landed
+                // (redb drops an uncommitted/failed write txn without
+                // applying it), so the in-memory dict/scope mirrors must
+                // roll back to match — same journal, same `revert` calls as
+                // the pre-commit failure arm above, just re-acquiring the
+                // guards first since this path runs after they were
+                // released.
+                let mut dicts = self.dicts.write().expect("dict lock poisoned");
+                let mut scope_registry = self
+                    .scope_registry
+                    .write()
+                    .expect("scope registry lock poisoned");
+                dicts.revert(&journal);
+                scope_registry.revert(&journal);
+                // The real error goes in the LAST slot (borrowed via
+                // `Display` for every earlier slot first, then moved) so the
+                // `n == 1` case — `apply_batch`'s wrapper — degenerates to
+                // exactly `vec![Err(e)]`, byte-for-byte the same value
+                // `apply_batch` always returned on a commit failure.
+                let mut out: Vec<Result<AppliedBatch, TopoError>> = Vec::with_capacity(n);
+                for _ in 0..n.saturating_sub(1) {
+                    out.push(Err(TopoError::Rejected(format!(
+                        "optimistic group commit failed at tx.commit(): {e}"
+                    ))));
+                }
+                out.push(Err(e));
+                out
+            }
+        }
+    }
+
+    /// The body of one batch's application, run against an ALREADY-OPEN
+    /// write transaction `tx` shared across every batch in the group (see
+    /// `apply_batches`). Doesn't open or commit `tx` — that's the caller's
+    /// job, so N batches can share one commit — and doesn't revert the
+    /// journal on failure either; the caller owns both, since it's the one
+    /// that knows whether this is the last batch in the group.
+    fn apply_ops_in_txn(
+        &self,
+        tx: &redb::WriteTransaction,
+        ops: Vec<Op>,
+        now_ms: i64,
+        dicts: &mut Dicts,
+        scope_registry: &mut ScopeRegistry,
+        journal: &mut InternJournal,
+    ) -> Result<AppliedBatch, TopoError> {
+        if ops.is_empty() {
+            return Err(TopoError::Rejected("empty op batch".into()));
+        }
+
+        // Resolve defaults up front — the resolved op is what gets appended
+        // and applied, so replay stays deterministic.
+        let resolved: Vec<Op> = ops.into_iter().map(|op| resolve_op(op, now_ms)).collect();
+
+        (|| {
             // Text-index edits collected during the op loop and applied AFTER every
             // op has succeeded — still inside this transaction, so the postings
             // ride the batch's atomicity (a later failing op aborts the whole txn,
@@ -974,8 +1125,8 @@ impl Storage {
                             &nodes,
                             &vectors,
                             &embedding_ref,
-                            &dicts,
-                            &scope_registry,
+                            dicts,
+                            scope_registry,
                             &node_slots,
                             *id,
                         )? {
@@ -993,8 +1144,8 @@ impl Storage {
                             &nodes,
                             &vectors,
                             &embedding_ref,
-                            &dicts,
-                            &scope_registry,
+                            dicts,
+                            scope_registry,
                             &node_slots,
                             *id,
                         )?,
@@ -1002,7 +1153,7 @@ impl Storage {
                     };
                     if let Some(node) = &old_index_node {
                         if let Some(slot) = crate::slots::node_slot(&node_slots, node.id)? {
-                            unindex_node(&mut prop_index, &self.spec, &dicts, node, slot)?;
+                            unindex_node(&mut prop_index, &self.spec, dicts, node, slot)?;
                         }
                     }
                     apply_op(
@@ -1012,7 +1163,7 @@ impl Storage {
                         &mut vectors,
                         &mut embedding_ref,
                         &mut dict_table,
-                        &mut dicts,
+                        dicts,
                         &mut slot_meta,
                         &mut node_slots,
                         &mut node_ids,
@@ -1021,9 +1172,9 @@ impl Storage {
                         &mut out_adj,
                         &mut in_adj,
                         &mut scopes_table,
-                        &mut scope_registry,
+                        scope_registry,
                         op,
-                        &mut journal,
+                        journal,
                     )?;
                     if !matches!(op, Op::RemoveNode { .. }) {
                         let id = match op {
@@ -1035,13 +1186,13 @@ impl Storage {
                                 &nodes,
                                 &vectors,
                                 &embedding_ref,
-                                &dicts,
-                                &scope_registry,
+                                dicts,
+                                scope_registry,
                                 &node_slots,
                                 id,
                             )? {
                                 if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
-                                    index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
+                                    index_node(&mut prop_index, &self.spec, dicts, &node, slot)?;
                                 }
                             }
                         }
@@ -1053,8 +1204,8 @@ impl Storage {
                                 &nodes,
                                 &vectors,
                                 &embedding_ref,
-                                &dicts,
-                                &scope_registry,
+                                dicts,
+                                scope_registry,
                                 &node_slots,
                                 id,
                             )?
@@ -1078,8 +1229,7 @@ impl Storage {
                         // scope's only remaining reference in this op, but the
                         // scope was necessarily interned when the node was
                         // created, so it still resolves to the same id.
-                        let scope_id =
-                            scope_registry.intern(&mut scopes_table, scope, &mut journal)?;
+                        let scope_id = scope_registry.intern(&mut scopes_table, scope, journal)?;
                         fts_edits.push((scope_id, slot, old_text, new_text));
                     }
                 }
@@ -1131,77 +1281,12 @@ impl Storage {
                 }
             }
 
-            Ok((
-                tx,
-                AppliedBatch {
-                    first_seq,
-                    last_seq,
-                    resolved,
-                },
-            ))
-        })();
-
-        let (tx, applied) = match pre_commit {
-            Err(e) => {
-                // Every failure path between the first intern above and here
-                // lands in this arm: op-loop errors (validation rejections,
-                // encoding errors), FTS-edit errors, and op-log append
-                // errors all return `Err` from the closure without having
-                // mutated anything outside `dicts`/`scope_registry` — the
-                // still-open `tx` is simply dropped (never committed), so
-                // NODES/EDGES/DICT/SCOPES on disk are untouched. The guards
-                // are still held here (never dropped on this path), so
-                // reverting the journal under them keeps the in-memory
-                // mirrors consistent with that untouched disk state.
-                dicts.revert(&journal);
-                scope_registry.revert(&journal);
-                return Err(e);
-            }
-            Ok(pair) => pair,
-        };
-
-        // All interning is done — every name the batch touches has already
-        // been resolved into `dicts`/`scope_registry` above. The guards'
-        // job is finished; only `tx.commit()` (the fsync) remains, and that
-        // doesn't touch either mirror. Drop them now, BEFORE the commit, so
-        // readers blocked on `dicts.read()`/`scope_registry.read()` are no
-        // longer serialized behind this batch's fsync.
-        //
-        // Reader-visible window: between this drop and `tx.commit()`
-        // returning, a concurrent reader can resolve an id/name that
-        // belongs to THIS about-to-be-durable — or about-to-abort — batch.
-        // If the commit succeeds, that's no different from a reader landing
-        // a moment later: the data is durable either way. If the commit
-        // FAILS, the reader briefly saw ids that resolve to absent rows on
-        // disk (the write transaction never committed, so NODES/EDGES/
-        // DICT/SCOPES are untouched) — indistinguishable from a read that
-        // simply ran BEFORE this batch started. The commit-failure arm
-        // below then reverts the journal, removing those ids from the
-        // mirrors and restoring the exact pre-batch state.
-        drop(dicts);
-        drop(scope_registry);
-
-        match tx.commit().map_err(storage_err) {
-            Ok(()) => Ok(applied),
-            Err(e) => {
-                // Commit failed AFTER the guards were dropped: re-take them
-                // to revert the journal. The disk mutation never landed
-                // (redb drops an uncommitted/failed write txn without
-                // applying it), so the in-memory dict/scope mirrors must
-                // roll back to match — same journal, same `revert` calls as
-                // the pre-commit failure arm above, just re-acquiring the
-                // guards first since this path runs after they were
-                // released.
-                let mut dicts = self.dicts.write().expect("dict lock poisoned");
-                let mut scope_registry = self
-                    .scope_registry
-                    .write()
-                    .expect("scope registry lock poisoned");
-                dicts.revert(&journal);
-                scope_registry.revert(&journal);
-                Err(e)
-            }
-        }
+            Ok(AppliedBatch {
+                first_seq,
+                last_seq,
+                resolved,
+            })
+        })()
     }
 
     /// One-transaction indexed lookup: PROP_INDEX prefix scan + record fetches
@@ -1774,6 +1859,86 @@ fn normalized_spec(spec: &IndexSpec) -> IndexSpec {
     equality.sort_by_key(&key);
     text.sort_by_key(&key);
     IndexSpec { equality, text }
+}
+
+/// Read-only decision for `ensure_index_spec` (F9d): does the current META
+/// state already match `incoming`, or does something need writing? Shared by
+/// both the read-only precheck (a `ReadOnlyTable`, deciding whether to skip
+/// `begin_write` entirely) and the write path itself (a `Table`, deciding
+/// what to actually do once a write transaction is already open) — same
+/// logic, generic over `ReadableTable` so it works against either.
+///
+/// Returns `(needs_reindex, is_legacy_v1, meta_dirty)`:
+/// - `needs_reindex`: POSTINGS/FTS_DOCS/FTS_STATS/PROP_INDEX must be drained
+///   and rebuilt (see `ensure_index_spec`'s doc comment for the full
+///   decision table).
+/// - `is_legacy_v1`: the Plan-2 `"fts_spec"` key is present — always implies
+///   `needs_reindex` and additionally means the three legacy META keys must
+///   be removed.
+/// - `meta_dirty`: at least one META key this fn maintains (`"index_spec"`/
+///   `"prop_index_norm_version"`/`"fts_analyzer_version"`) would change
+///   value if (re)written now. Tracked independently of `needs_reindex`
+///   because a freshly-declared-empty spec on a brand-new file has nothing
+///   to reindex but still needs its first `"index_spec"` row written.
+fn index_spec_reconcile_decision(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+    incoming: &IndexSpec,
+    incoming_bytes: &[u8],
+) -> Result<(bool, bool, bool), TopoError> {
+    // The PROP_INDEX key scheme is versioned independently of the spec: a
+    // file whose stored normalization stamp differs from this build's (or is
+    // absent — every pre-v5 file) has Str index keys this build's `lookup`
+    // can't compute, so it must be rebuilt even when the spec itself is
+    // unchanged.
+    let norm_stale = match meta.get("prop_index_norm_version").map_err(storage_err)? {
+        Some(v) => {
+            let b: [u8; 4] = v
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad prop_index_norm_version".into()))?;
+            u32::from_le_bytes(b) != crate::prop_index::PROP_INDEX_NORM_VERSION
+        }
+        None => true,
+    };
+    // Same contract for the FTS analyzer: postings written under a different
+    // tokenizer pipeline (or before the stamp existed) can disagree with
+    // what this build tokenizes a query into, so they must be rebuilt even
+    // when the spec itself is unchanged.
+    let analyzer_stale = match meta.get("fts_analyzer_version").map_err(storage_err)? {
+        Some(v) => {
+            let b: [u8; 4] = v
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad fts_analyzer_version".into()))?;
+            u32::from_le_bytes(b) != crate::fts::FTS_ANALYZER_VERSION
+        }
+        None => true,
+    };
+    let stamps_stale = norm_stale || analyzer_stale;
+
+    if meta.get("fts_spec").map_err(storage_err)?.is_some() {
+        // Legacy layout: always reindexes AND always rewrites meta (the
+        // three legacy keys must be removed).
+        return Ok((true, true, true));
+    }
+
+    let (needs_reindex, spec_bytes_stale) = match meta.get("index_spec").map_err(storage_err)? {
+        Some(v) => {
+            let stored: IndexSpec =
+                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
+            (
+                stamps_stale
+                    || stored.text != incoming.text
+                    || stored.equality != incoming.equality,
+                v.value() != incoming_bytes,
+            )
+        }
+        // No stored spec at all: this is the row's first write, so it's
+        // always dirty regardless of whether a reindex is also needed.
+        None => (stamps_stale || !incoming.text.is_empty(), true),
+    };
+    let meta_dirty = stamps_stale || spec_bytes_stale;
+    Ok((needs_reindex, false, meta_dirty))
 }
 
 /// Fixed-width 17-byte scope key: a 1-byte tag (`0x00` Shared, `0x01` Id)

@@ -1,9 +1,10 @@
 use crate::counters::AccessStats;
 use crate::error::TopoError;
 use crate::feed::ChangeEvent;
-use crate::ids::{EdgeId, NodeId, ScopeSet};
+use crate::ids::{EdgeId, NodeId, Scope, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
+use crate::state::NodeRecord;
 use crate::storage::{AppliedBatch, Storage};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::Path;
@@ -19,6 +20,13 @@ pub struct DbOptions {
     /// redb's own default (1 GiB, split 90/10 read/write) in place.
     pub cache_size_bytes: Option<usize>,
 }
+
+/// One queued `Job::Apply`'s ops paired with the reply channel its submitter
+/// blocks on. The applier's group-drain path (see the `Job::Apply` arm and
+/// `apply_group`) collects these directly, having already peeled `at` off
+/// (group batches all share one wall-clock `now` — see the arm's doc
+/// comment) and dropped the `Job` wrapper.
+type ApplyJob = (Vec<Op>, Sender<Result<AppliedBatch, TopoError>>);
 
 /// A unit of work for the single applier thread. Both variants carry a reply
 /// channel so the submitting thread blocks until the applier has finished —
@@ -157,91 +165,85 @@ impl Db {
         let subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>> = Arc::new(Mutex::new(Vec::new()));
         let subs_for_applier = subs.clone();
         let applier = std::thread::spawn(move || {
-            while let Ok(job) = rx.recv() {
+            // `pending` carries a job that was already POPPED off `rx` by a
+            // `try_recv` drain (see the `Job::Apply` arm below) but turned
+            // out not to belong to the group being drained. crossbeam's
+            // `Receiver` has no peek — once popped, a job can't be put back
+            // — so it's stashed here and processed on the NEXT loop
+            // iteration, ahead of a fresh `rx.recv()`. This is the only
+            // reordering the drain introduces: a job that was sitting in the
+            // channel behind the triggering `Job::Apply` can end up
+            // processed after a whole group of LATER-arriving `Job::Apply`s
+            // that happened to be queued ahead of it at drain time — it was
+            // concurrent with the group either way, so this is not
+            // observable as anything other than ordinary scheduling
+            // nondeterminism between concurrent submitters.
+            let mut pending: Option<Job> = None;
+            loop {
+                let job = match pending.take() {
+                    Some(job) => job,
+                    None => match rx.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    },
+                };
                 match job {
                     Job::Apply { ops, at, reply } => {
-                        let now = at.unwrap_or_else(|| {
-                            SystemTime::now()
+                        // A `submit_at`-style deterministic timestamp is
+                        // never merged into a group: `apply_batches` takes
+                        // ONE `now_ms` for the whole group, so honoring a
+                        // caller's explicit clock and a group's shared clock
+                        // at once isn't possible. This keeps every test
+                        // built on `submit_at` determinism exact — those
+                        // jobs always take the single-batch path below,
+                        // unchanged from pre-Task-6 behavior.
+                        let Some(now) = at else {
+                            let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .expect("system clock before UNIX epoch")
-                                .as_millis() as i64
-                        });
-                        // Read pre-batch node state (scope) for every
-                        // CreateEdge endpoint this batch might reference, in
-                        // ONE storage read, BEFORE `apply_batch` runs — the
-                        // input `prevalidate_edge_scopes` (below) needs. Dim
-                        // pre-validation and slab maintenance used to need
-                        // this same read too (pre-Task-7); both are gone —
-                        // dim validation now lives entirely inside
-                        // `apply_batch`'s transaction (`storage::apply_op`'s
-                        // `SetEmbedding` arm / `check_or_pin_dim`), so it no
-                        // longer needs a separate pre-read at all.
-                        let pre = match storage_for_applier.load_nodes(&ids_needing_pre_state(&ops))
-                        {
-                            Ok(m) => m,
-                            Err(e) => {
-                                let _ = reply.send(Err(e));
-                                continue;
-                            }
-                        };
-                        // Edge-scope pre-validation has the same contract: reject
-                        // before `apply_batch` so storage is untouched. It must not
-                        // live in `apply_op`, which is shared with op-log replay.
-                        if let Err(e) = crate::validate::prevalidate_edge_scopes(&pre, &ops) {
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
-                        match storage_for_applier.apply_batch(ops, now) {
-                            Ok(batch) => {
-                                // Broadcast the committed ops to live
-                                // subscribers *after* `apply_batch` has
-                                // committed (so a subscriber that reacts by
-                                // reading sees its own event's effect) and
-                                // *before* replying.
-                                // Best-effort, non-blocking: a full subscriber
-                                // buffer drops the event (the subscriber
-                                // detects the `seq` gap and recovers via
-                                // `ops_since`); a disconnected receiver is
-                                // pruned. The applier NEVER blocks on a slow
-                                // subscriber. Only successful `Job::Apply`
-                                // batches broadcast — rejects and rebuilds
-                                // emit nothing.
-                                // Wrap each op in an `Arc` ONCE per op for the
-                                // whole batch (not once per op per
-                                // subscriber) — every subscriber below then
-                                // only pays for a cheap `Arc::clone`.
-                                let ev_ops: Vec<Arc<Op>> = batch
-                                    .resolved
-                                    .iter()
-                                    .map(|op| Arc::new(op.clone()))
-                                    .collect();
-                                let mut subs = subs_for_applier.lock().unwrap();
-                                subs.retain(|s| {
-                                    for (i, ev_op) in ev_ops.iter().enumerate() {
-                                        let ev = ChangeEvent {
-                                            seq: batch.first_seq + i as u64,
-                                            op: ev_op.clone(),
-                                        };
-                                        match s.try_send(ev) {
-                                            Ok(()) => {}
-                                            Err(crossbeam_channel::TrySendError::Full(_)) => {}
-                                            Err(crossbeam_channel::TrySendError::Disconnected(
-                                                _,
-                                            )) => return false,
-                                        }
+                                .as_millis() as i64;
+                            // Drain up to 16 total `Job::Apply` jobs / 4096
+                            // total ops (F9c): the common case under
+                            // concurrent submitters is many small batches
+                            // queued back to back, and sharing one
+                            // `apply_batches` commit means they pay one
+                            // fsync instead of one each. `try_recv` POPS —
+                            // see the `pending` comment above for what
+                            // happens to a non-matching popped job.
+                            let mut jobs: Vec<ApplyJob> = vec![(ops, reply)];
+                            let mut total_ops = jobs[0].0.len();
+                            while jobs.len() < 16 && total_ops < 4096 {
+                                match rx.try_recv() {
+                                    Ok(Job::Apply {
+                                        ops,
+                                        at: None,
+                                        reply,
+                                    }) => {
+                                        total_ops += ops.len();
+                                        jobs.push((ops, reply));
                                     }
-                                    true
-                                });
-                                drop(subs);
-                                // If the caller already dropped its reply
-                                // receiver, there's nothing to do with the
-                                // result — move on.
-                                let _ = reply.send(Ok(batch));
+                                    Ok(other) => {
+                                        pending = Some(other);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(e) => {
-                                let _ = reply.send(Err(e));
+                            if jobs.len() == 1 {
+                                let (ops, reply) = jobs.pop().expect("len checked above");
+                                apply_one_job(
+                                    &storage_for_applier,
+                                    &subs_for_applier,
+                                    ops,
+                                    now,
+                                    reply,
+                                );
+                            } else {
+                                apply_group(&storage_for_applier, &subs_for_applier, jobs, now);
                             }
-                        }
+                            continue;
+                        };
+                        apply_one_job(&storage_for_applier, &subs_for_applier, ops, now, reply);
                     }
                     Job::Rebuild { reply } => {
                         // Rebuild runs on the applier thread — the sole redb
@@ -1034,6 +1036,217 @@ fn ids_needing_pre_state(ops: &[Op]) -> std::collections::HashSet<NodeId> {
         }
     }
     ids
+}
+
+/// The single-batch apply path: pre-validate against real storage state,
+/// apply, broadcast, reply. This is the ENTIRE pre-Task-6 `Job::Apply`
+/// handling, unchanged — used both for a lone (non-grouped) submission and,
+/// by `apply_group` below, to replay a group's batches one at a time when
+/// the shared optimistic commit fails.
+fn apply_one_job(
+    storage: &Storage,
+    subs: &Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
+    ops: Vec<Op>,
+    now: i64,
+    reply: Sender<Result<AppliedBatch, TopoError>>,
+) {
+    // Read pre-batch node state (scope) for every CreateEdge endpoint this
+    // batch might reference, in ONE storage read, BEFORE `apply_batch` runs
+    // — the input `prevalidate_edge_scopes` (below) needs.
+    let pre = match storage.load_nodes(&ids_needing_pre_state(&ops)) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return;
+        }
+    };
+    // Edge-scope pre-validation has the same contract: reject before
+    // `apply_batch` so storage is untouched. It must not live in `apply_op`,
+    // which is shared with op-log replay.
+    if let Err(e) = crate::validate::prevalidate_edge_scopes(&pre, &ops) {
+        let _ = reply.send(Err(e));
+        return;
+    }
+    match storage.apply_batch(ops, now) {
+        Ok(batch) => {
+            broadcast_batch(subs, &batch);
+            // If the caller already dropped its reply receiver, there's
+            // nothing to do with the result — move on.
+            let _ = reply.send(Ok(batch));
+        }
+        Err(e) => {
+            let _ = reply.send(Err(e));
+        }
+    }
+}
+
+/// Broadcasts a committed batch's ops to live subscribers. Called *after*
+/// the batch has committed (so a subscriber that reacts by reading sees its
+/// own event's effect). Best-effort, non-blocking: a full subscriber buffer
+/// drops the event (the subscriber detects the `seq` gap and recovers via
+/// `ops_since`); a disconnected receiver is pruned. The applier NEVER blocks
+/// on a slow subscriber.
+fn broadcast_batch(subs: &Arc<Mutex<Vec<Sender<ChangeEvent>>>>, batch: &AppliedBatch) {
+    // Wrap each op in an `Arc` ONCE per op for the whole batch (not once per
+    // op per subscriber) — every subscriber below then only pays for a
+    // cheap `Arc::clone`.
+    let ev_ops: Vec<Arc<Op>> = batch
+        .resolved
+        .iter()
+        .map(|op| Arc::new(op.clone()))
+        .collect();
+    let mut subs = subs.lock().unwrap();
+    subs.retain(|s| {
+        for (i, ev_op) in ev_ops.iter().enumerate() {
+            let ev = ChangeEvent {
+                seq: batch.first_seq + i as u64,
+                op: ev_op.clone(),
+            };
+            match s.try_send(ev) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        true
+    });
+}
+
+/// Applies a drained group of 2..=16 `Job::Apply` jobs (all sharing wall
+/// clock `now` — see the `Job::Apply` arm's `submit_at` note) via one
+/// optimistic `Storage::apply_batches` commit (F9c: one shared fsync instead
+/// of one per batch). Falls back to replaying every included job
+/// individually through `apply_one_job` — the exact pre-Task-6 per-batch
+/// path — whenever pre-validation or the shared commit rejects any batch in
+/// the group, so per-batch atomicity is preserved: the group-commit optimism
+/// costs nothing beyond one wasted attempt when it doesn't pan out.
+fn apply_group(
+    storage: &Storage,
+    subs: &Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
+    jobs: Vec<ApplyJob>,
+    now: i64,
+) {
+    // ONE storage read covering every id any batch in the group might
+    // reference as a `CreateEdge` endpoint — same rationale as
+    // `apply_one_job`'s pre-read, just widened to the whole group up front
+    // so it's paid once instead of per batch.
+    let mut all_ids = std::collections::HashSet::new();
+    for (ops, _) in &jobs {
+        all_ids.extend(ids_needing_pre_state(ops));
+    }
+    let base_pre = match storage.load_nodes(&all_ids) {
+        Ok(m) => m,
+        Err(e) => {
+            // The read itself failed — not a per-batch validation rejection.
+            // `TopoError` isn't `Clone`, so every job gets its own error
+            // built from the same message rather than the original value.
+            let msg = e.to_string();
+            for (_, reply) in jobs {
+                let _ = reply.send(Err(TopoError::Rejected(format!(
+                    "group pre-validation read failed: {msg}"
+                ))));
+            }
+            return;
+        }
+    };
+
+    // Accumulated group-scope overlay (F9c pre-validation): the
+    // scope-affecting effect of every ALREADY-INCLUDED prior batch in this
+    // group (`CreateNode`/`RemoveNode`), keyed by node id, layered on top of
+    // `base_pre` (the real storage read taken before the group started) so
+    // batch N's pre-validation sees batch N-1's same-group `CreateNode`s and
+    // `RemoveNode`s without a fresh storage read. `Some(scope)` = as of this
+    // point in the group, the id resolves to a node with this scope (either
+    // just created by an earlier batch, or untouched and still whatever
+    // `base_pre`/absence said). `None` = an earlier batch in the group
+    // removed this id, so it must be treated as absent even though
+    // `base_pre` still has it.
+    let mut overlay: std::collections::HashMap<NodeId, Option<Scope>> =
+        std::collections::HashMap::new();
+    let mut included: Vec<ApplyJob> = Vec::with_capacity(jobs.len());
+
+    for (ops, reply) in jobs {
+        let mut effective_pre = base_pre.clone();
+        for (&id, ov) in &overlay {
+            match ov {
+                Some(scope) => {
+                    // Only `.scope` is ever read by `prevalidate_edge_scopes`
+                    // — the rest of the record is a synthesized, unused
+                    // placeholder.
+                    effective_pre.insert(
+                        id,
+                        NodeRecord {
+                            id,
+                            scope: *scope,
+                            label: Default::default(),
+                            props: Default::default(),
+                            embedding: None,
+                        },
+                    );
+                }
+                None => {
+                    effective_pre.remove(&id);
+                }
+            }
+        }
+
+        if let Err(e) = crate::validate::prevalidate_edge_scopes(&effective_pre, &ops) {
+            let _ = reply.send(Err(e));
+            continue;
+        }
+
+        // Record this batch's effect in the overlay BEFORE moving `ops`
+        // into `included` — subsequent batches in the group must see it.
+        for op in &ops {
+            match op {
+                Op::CreateNode { id, scope, .. } => {
+                    overlay.insert(*id, Some(*scope));
+                }
+                Op::RemoveNode { id } => {
+                    overlay.insert(*id, None);
+                }
+                _ => {}
+            }
+        }
+
+        included.push((ops, reply));
+    }
+
+    if included.is_empty() {
+        return;
+    }
+    if included.len() == 1 {
+        let (ops, reply) = included.pop().expect("len checked above");
+        apply_one_job(storage, subs, ops, now, reply);
+        return;
+    }
+
+    let groups: Vec<Vec<Op>> = included.iter().map(|(ops, _)| ops.clone()).collect();
+    let results = storage.apply_batches(groups, now);
+
+    if results.iter().all(Result::is_ok) {
+        // Happy path: one shared commit landed every batch. Broadcast +
+        // reply per batch, IN SUBMISSION ORDER — `included` was built (and
+        // `groups` derived from it) in the order jobs were drained off the
+        // channel, and `apply_batches` returns results in that same order.
+        for ((_, reply), result) in included.into_iter().zip(results) {
+            let batch = result.expect("checked all Ok above");
+            broadcast_batch(subs, &batch);
+            let _ = reply.send(Ok(batch));
+        }
+    } else {
+        // Any batch failed inside the shared txn: `apply_batches` aborted
+        // the WHOLE group — nothing in it committed (see its doc comment).
+        // Discard every entry in `results` (none reflect committed state,
+        // by construction) and replay each included batch individually
+        // through the exact pre-Task-6 per-batch path: real storage reads,
+        // real `apply_batch` calls, in submission order. Per-batch
+        // atomicity is exactly what it always was; the group-commit
+        // optimism just cost one wasted shared-txn attempt.
+        for (ops, reply) in included {
+            apply_one_job(storage, subs, ops, now, reply);
+        }
+    }
 }
 
 impl Drop for Inner {
