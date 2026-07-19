@@ -82,6 +82,29 @@ fn replan_banner(attempt: u32, max: u32) -> String {
     format!("\n=== replan {attempt} of {max} ===")
 }
 
+/// The decision made after a run halts: succeed, give up, or propose another
+/// revision. Pulled out of the run loop so the bounding logic — the
+/// security-critical piece that caps executions and planner calls — can be
+/// unit-tested directly instead of only hand-traced.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Success,
+    Exhausted,
+    /// Carries the new `replans_used` value (already incremented) so the
+    /// caller does not duplicate the increment.
+    Replan(u32),
+}
+
+fn next_step(blocked_empty: bool, replan: bool, replans_used: u32, max_replans: u32) -> Step {
+    if blocked_empty {
+        return Step::Success;
+    }
+    if !replan || replans_used >= max_replans {
+        return Step::Exhausted;
+    }
+    Step::Replan(replans_used + 1)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -181,20 +204,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.command_runs, bound.command_runs
                 );
 
-                if report.blocked.is_empty() {
-                    return Ok(());
-                }
-
-                if !replan || replans_used >= max_replans {
-                    if replan {
-                        eprintln!(
-                            "error: run halted and the replan budget of {max_replans} is exhausted"
-                        );
+                match next_step(report.blocked.is_empty(), replan, replans_used, max_replans) {
+                    Step::Success => return Ok(()),
+                    Step::Exhausted => {
+                        if replan {
+                            eprintln!(
+                                "error: run halted and the replan budget of {max_replans} is exhausted"
+                            );
+                        }
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
+                    Step::Replan(n) => {
+                        replans_used = n;
+                    }
                 }
-
-                replans_used += 1;
                 println!("{}", replan_banner(replans_used, max_replans));
 
                 let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
@@ -207,14 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let revised_yaml = serde_yaml::to_string(&revised)?;
-                ex.store_ref().record_revision(
-                    &revised_yaml,
-                    &format!("blocked: {:?}", report.blocked),
-                    now + 2,
-                )?;
-
-                current = match validate(&revised) {
+                // Validate before persisting: an invalid revision must never
+                // land in the run's revision history.
+                let validated = match validate(&revised) {
                     Ok(v) => v,
                     Err(errors) => {
                         for e in &errors {
@@ -223,6 +241,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(2);
                     }
                 };
+
+                let revised_yaml = serde_yaml::to_string(&revised)?;
+                ex.store_ref().record_revision(
+                    &revised_yaml,
+                    &format!("blocked: {:?}", report.blocked),
+                    now + 2,
+                )?;
+
+                current = validated;
 
                 println!("proposed revision:\n{revised_yaml}");
                 // Loop back: the revision re-enters the gate exactly like the
@@ -324,5 +351,35 @@ mod tests {
         let b = replan_banner(1, 2);
         assert!(b.contains('1'), "current attempt must be shown");
         assert!(b.contains('2'), "the ceiling must be shown so the bound is visible");
+    }
+
+    #[test]
+    fn next_step_succeeds_whenever_nothing_is_blocked_regardless_of_other_args() {
+        assert_eq!(next_step(true, false, 0, 0), Step::Success);
+        assert_eq!(next_step(true, true, 5, 1), Step::Success);
+        assert_eq!(next_step(true, true, 0, 100), Step::Success);
+    }
+
+    #[test]
+    fn next_step_exhausts_when_replan_flag_is_off_even_with_budget_remaining() {
+        assert_eq!(next_step(false, false, 0, 5), Step::Exhausted);
+    }
+
+    #[test]
+    fn next_step_replans_at_replans_used_one_below_max() {
+        // max_replans = 3: the third replan (replans_used going 2 -> 3) is
+        // still allowed.
+        assert_eq!(next_step(false, true, 2, 3), Step::Replan(3));
+    }
+
+    #[test]
+    fn next_step_exhausts_at_replans_used_equal_to_max() {
+        // Once replans_used has reached max_replans, the budget is spent.
+        assert_eq!(next_step(false, true, 3, 3), Step::Exhausted);
+    }
+
+    #[test]
+    fn next_step_exhausts_immediately_when_max_replans_is_zero_no_planner_calls() {
+        assert_eq!(next_step(false, true, 0, 0), Step::Exhausted);
     }
 }
