@@ -116,19 +116,39 @@ impl Embedder {
                     // programmatically — no env mutation (racy) needed.
                     // `init_from` returns `Result` (the dylib load itself,
                     // matching the resolver's own probe); `commit()` on the
-                    // resulting builder is infallible (`bool`: false only
-                    // means an environment was already configured, which is
-                    // harmless here — this is the first ort call on this
-                    // thread).
-                    match ort::init_from(&dylib) {
-                        Ok(builder) => {
-                            builder.commit();
-                        }
-                        Err(e) => {
+                    // resulting builder is infallible (`bool`). Both are
+                    // wrapped in `catch_unwind`: ort's dylib-load path can
+                    // panic internally (e.g. an `assert!` after
+                    // `OrtGetApiBase`), and an uncaught panic here would kill
+                    // this thread without ever setting `Failed`, leaving
+                    // `db_info` reporting `Downloading` forever instead of
+                    // degrading to text-only.
+                    let init_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            ort::init_from(&dylib).map(|builder| {
+                                // `false` only means an environment was
+                                // already configured elsewhere, which is
+                                // harmless here — this is the first ort call
+                                // on this thread and no env options are set.
+                                let _ = builder.commit();
+                            })
+                        }));
+                    match init_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
                             *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
                             eprintln!(
                                 "topodb-mcp: embedding model {model_name} unavailable (ort \
                                  init from {} failed: {e}); running text-only",
+                                dylib.display()
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
+                            eprintln!(
+                                "topodb-mcp: embedding model {model_name} unavailable (ort \
+                                 init from {} panicked); running text-only",
                                 dylib.display()
                             );
                             return;
