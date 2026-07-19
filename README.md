@@ -104,7 +104,7 @@ and scoped recall as a library call.
 | Vector search exposed over MCP / CLI | layers | ✅ |
 | Hybrid recall (BM25 + vector + graph, RRF-fused, recency-weighted) | engine + `topodb-mcp` | ✅ |
 | Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup/search | `topodb-mcp` | ✅ |
-| Local embeddings (fastembed, on by default, requires ONNX Runtime) with write-path embedding + startup backfill | `topodb-mcp` | ✅ |
+| Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime) | `topodb-mcp` | ✅ |
 | `set-props` / `remove-node` / bulk submit over CLI | `topodb-cli` | ✅ |
 | Multi-scope reads (read across a scope *set*) | `topodb-mcp` | ✅ |
 | Multi-scope reads over CLI | `topodb-cli` | Planned |
@@ -152,8 +152,7 @@ stdio JSON-RPC — `db_info` (now also reporting embeddings status); scoped read
 scope and is therefore off unless you pass `--allow-unscoped-changes`. Reads filter by a *set* of
 scopes (`--read-scopes` at startup, or a per-call `scopes` array); a write is stamped with exactly
 *one* scope (`--scope`, or a per-call `scope`) — `link` included, so an edge can join nodes living
-in different scopes. Local embeddings (`--embeddings`, on by default) require an ONNX Runtime
-dylib on the host or the server gracefully runs text+graph-only. Install with
+in different scopes. Local embeddings (`--embeddings`, on by default) auto-fetch an ONNX Runtime on first run (system runtimes and `ORT_DYLIB_PATH` take precedence; `--no-ort-download` disables fetching) — Intel Macs have no official 1.24.2 artifact and keep the manual path (system runtime or `ORT_DYLIB_PATH`); without any runtime the server gracefully runs text+graph-only. Install with
 `cargo install topodb-mcp` and wire it into Claude Code or Claude Desktop in a couple of lines.
 See [`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
 table, and client config examples.

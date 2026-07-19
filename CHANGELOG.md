@@ -298,6 +298,16 @@ workspace are versioned and released independently (tags are per-package, e.g.
   all in a **single engine batch**, so a stored fact can never strand unlinked. Params:
   `content`, `entities` (non-empty), `edge_type?`, `props?`, `scope?` (one scope for everything
   the call creates). Tool count 19 → 20.
+- **ONNX Runtime auto-download** — on first run with embeddings enabled and no system runtime,
+  the server fetches the official Microsoft ONNX Runtime build for the platform (pinned to
+  **1.24.2**, the version ort-sys 2.0.0-rc.12 distributes; archive sha256 verified against
+  compiled-in pins BEFORE extraction) into `<model-dir>/ort/1.24.2/`, atomically and
+  concurrent-start-safe. Resolution precedence: `ORT_DYLIB_PATH` (exclusive) → system runtime →
+  cached download → fetch. New flag `--no-ort-download` disables fetching; every failure still
+  degrades to text+graph-only exactly as before. Closes the install cliff where
+  `cargo install topodb-mcp` / npm users silently never got vector recall. macOS coverage is
+  arm64-only — Microsoft publishes no Intel-Mac 1.24.2 artifact, so Intel Macs keep the manual
+  path (system runtime or ORT_DYLIB_PATH).
 
 #### Changed
 
