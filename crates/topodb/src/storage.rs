@@ -5,7 +5,7 @@ use crate::counters::AccessStats;
 use crate::dict::{DictKind, Dicts, InternJournal, DICT};
 use crate::error::{storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
-use crate::ids::{EdgeId, NodeId, Scope};
+use crate::ids::{EdgeId, NodeId, Scope, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
 use crate::prop_index::{index_node, unindex_node, PROP_INDEX};
@@ -1406,6 +1406,199 @@ impl Storage {
             rec.embedding = read_embedding_by_slot(&vectors, &refs, &dicts, slot)?;
             out.push(rec);
         }
+        Ok(out)
+    }
+
+    /// Index-driven label scan (F9-11 Task 8): one read transaction, a
+    /// `LABEL_INDEX` range scan per in-`scopes` `(label, scope)` pair,
+    /// fetching only the matching NODES rows — never a full NODES iteration.
+    /// A `label`/`scope` that was never interned (so has no possible
+    /// `LABEL_INDEX` rows) degrades to contributing nothing, mirroring
+    /// `load_nodes_by_index`'s treatment of an unknown prop key.
+    ///
+    /// Order (pinned, see `Db::nodes_by_label`'s doc comment): scopes in
+    /// `ScopeSet::iter_scopes` order (`Shared` first if included, then each
+    /// `ScopeId` ascending), and — within a scope — ascending by `node_id`,
+    /// which `label_index_key`'s ULID tail makes mint-time order.
+    pub(crate) fn load_nodes_by_label(
+        &self,
+        scopes: &ScopeSet,
+        label: &str,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let index = tx.open_table(LABEL_INDEX).map_err(storage_err)?;
+        let nodes = tx.open_table(NODES).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scope_registry = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        let Some(label_id) = dicts.id_of(DictKind::Label, label) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for scope in scopes.iter_scopes() {
+            let Some(scope_id) = scope_registry.id_of(scope) else {
+                continue;
+            };
+            let start = label_index_key(label_id, scope_id, NodeId::from_u128(0));
+            let end = label_index_key(label_id, scope_id, NodeId::from_u128(u128::MAX));
+            for entry in index
+                .range(start.as_slice()..=end.as_slice())
+                .map_err(storage_err)?
+            {
+                let (_, slot) = entry.map_err(storage_err)?;
+                if let Some(rec) = read_node_by_slot(
+                    &nodes,
+                    &vectors,
+                    &refs,
+                    &dicts,
+                    &scope_registry,
+                    slot.value(),
+                )? {
+                    out.push(rec);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Newest-first, `k`-bounded label scan (F9-11 Task 8) — the
+    /// `recent_memories` shape, served near-`O(k)` instead of the old
+    /// full-scan-then-sort. Per in-`scopes` `(label, scope)` pair, reverse-
+    /// scans `LABEL_INDEX` and takes at most `k` rows (a global top-`k` by
+    /// `node_id` can never draw more than `k` rows from any single scope, so
+    /// this bound loses no candidate), then merges the per-scope candidates
+    /// by sorting descending on `node_id` and truncating to `k`. `k == 0`
+    /// short-circuits to empty without opening a transaction, matching
+    /// `nodes_by_label`'s "unknown label/scope contributes nothing" spirit.
+    pub(crate) fn load_nodes_by_label_newest(
+        &self,
+        scopes: &ScopeSet,
+        label: &str,
+        k: usize,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let index = tx.open_table(LABEL_INDEX).map_err(storage_err)?;
+        let nodes = tx.open_table(NODES).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scope_registry = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        let Some(label_id) = dicts.id_of(DictKind::Label, label) else {
+            return Ok(Vec::new());
+        };
+        let mut candidates: Vec<NodeRecord> = Vec::new();
+        for scope in scopes.iter_scopes() {
+            let Some(scope_id) = scope_registry.id_of(scope) else {
+                continue;
+            };
+            let start = label_index_key(label_id, scope_id, NodeId::from_u128(0));
+            let end = label_index_key(label_id, scope_id, NodeId::from_u128(u128::MAX));
+            let mut taken = 0usize;
+            for entry in index
+                .range(start.as_slice()..=end.as_slice())
+                .map_err(storage_err)?
+                .rev()
+            {
+                if taken >= k {
+                    break;
+                }
+                let (_, slot) = entry.map_err(storage_err)?;
+                if let Some(rec) = read_node_by_slot(
+                    &nodes,
+                    &vectors,
+                    &refs,
+                    &dicts,
+                    &scope_registry,
+                    slot.value(),
+                )? {
+                    candidates.push(rec);
+                    taken += 1;
+                }
+            }
+        }
+        candidates.sort_by_key(|n| std::cmp::Reverse(n.id));
+        candidates.truncate(k);
+        Ok(candidates)
+    }
+
+    /// Streams every node in slot order, decoding the NODES row only — no
+    /// VECTORS/EMBEDDING_REF lookup, so every yielded record's `embedding`
+    /// is `None`. Backs scans (`nodes_by_float_range`) that only need the
+    /// embedding for the rows they actually keep: paying for embedding
+    /// decode on every scanned-but-rejected row would be wasted work.
+    /// Callers that want the embedding for an accepted record fetch it
+    /// separately via `read_embedding_by_slot`, keyed by the slot this
+    /// yields alongside each record.
+    fn for_each_node_no_embedding(
+        table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+        dicts: &Dicts,
+        scope_registry: &ScopeRegistry,
+        mut f: impl FnMut(u64, NodeRecord) -> Result<(), TopoError>,
+    ) -> Result<(), TopoError> {
+        for entry in table.iter().map_err(storage_err)? {
+            let (k, v) = entry.map_err(storage_err)?;
+            let key: [u8; 8] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad node slot key".into()))?;
+            let slot = u64::from_be_bytes(key);
+            let raw = crate::codec::unframe_value(v.value())?;
+            let disk = postcard::from_bytes(raw.as_ref())
+                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let rec = crate::disk::node_from_disk_v3(disk, dicts, scope_registry)?;
+            f(slot, rec)?;
+        }
+        Ok(())
+    }
+
+    /// Streaming float-range scan (F9-11 Task 8): iterates NODES via
+    /// `for_each_node_no_embedding` — so a non-matching row never pays for
+    /// an embedding decode — and only fetches (and attaches) the embedding
+    /// for rows that pass the scope + range filter, preserving
+    /// `nodes_by_float_range`'s existing record shape (embeddings populated
+    /// on returned records) for the rows it actually returns.
+    pub(crate) fn load_nodes_by_float_range(
+        &self,
+        scopes: &ScopeSet,
+        prop: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<Vec<NodeRecord>, TopoError> {
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        let table = tx.open_table(NODES).map_err(storage_err)?;
+        let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+        let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+        let dicts = self.dicts.read().expect("dict lock poisoned");
+        let scope_registry = self
+            .scope_registry
+            .read()
+            .expect("scope registry lock poisoned");
+        let mut out = Vec::new();
+        Self::for_each_node_no_embedding(&table, &dicts, &scope_registry, |slot, mut rec| {
+            if !scopes.contains(rec.scope) {
+                return Ok(());
+            }
+            let in_range = matches!(
+                rec.props.get(prop),
+                Some(crate::props::PropValue::Float(f)) if *f >= min && *f <= max
+            );
+            if !in_range {
+                return Ok(());
+            }
+            rec.embedding = read_embedding_by_slot(&vectors, &refs, &dicts, slot)?;
+            out.push(rec);
+            Ok(())
+        })?;
         Ok(out)
     }
 

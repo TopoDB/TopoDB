@@ -353,6 +353,26 @@ fn v1_fixture_opens_and_reads() {
         .len(),
         1
     );
+    // F9-11 Task 8: pins that the multi-hop v1->v6 migration chain produces
+    // a correct, NON-EMPTY LABEL_INDEX — not just that `nodes_by_label`
+    // happens to still work via some other path. Recipe's known corpus:
+    // exactly one Entity node (n1) and one Memory node (n2), so exactly one
+    // LABEL_INDEX row each, and exactly two rows total on disk.
+    assert_eq!(
+        db.nodes_by_label(&scopes, "Entity").len(),
+        1,
+        "v1->v6 migration: recipe's known corpus has exactly one Entity node (n1)"
+    );
+    assert_eq!(
+        db.nodes_by_label(&scopes, "Memory").len(),
+        1,
+        "v1->v6 migration: recipe's known corpus has exactly one Memory node (n2)"
+    );
+    assert_eq!(
+        db.debug_dump_label_index().unwrap().len(),
+        2,
+        "v1->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
+    );
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 6);
     drop(db);
@@ -399,6 +419,16 @@ fn v2_fixture_opens_and_reads() {
         1
     );
     assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
+    // F9-11 Task 8: v2->v6 migration must produce a correct, NON-EMPTY
+    // LABEL_INDEX (see `v1_fixture_opens_and_reads`'s identical assertion
+    // block for the recipe/count rationale).
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(
+        db.debug_dump_label_index().unwrap().len(),
+        2,
+        "v2->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
+    );
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 6);
 }
@@ -442,6 +472,16 @@ fn v3_fixture_opens_and_reads() {
         .unwrap()
         .len(),
         1
+    );
+    // F9-11 Task 8: v3->v6 migration must produce a correct, NON-EMPTY
+    // LABEL_INDEX (see `v1_fixture_opens_and_reads`'s identical assertion
+    // block for the recipe/count rationale).
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(
+        db.debug_dump_label_index().unwrap().len(),
+        2,
+        "v3->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 6);
@@ -496,6 +536,19 @@ fn v3_legacy_fixture_migrates_and_reads() {
         .len(),
         1
     );
+    // F9-11 Task 8: v3-legacy->v6 migration must produce a correct,
+    // NON-EMPTY LABEL_INDEX (see `v1_fixture_opens_and_reads`'s identical
+    // assertion block for the recipe/count rationale) — this is the
+    // corpus-purity fixture, so this also proves the migration builds
+    // LABEL_INDEX correctly even starting from a file with none of the v4
+    // vector tables present at all.
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(
+        db.debug_dump_label_index().unwrap().len(),
+        2,
+        "v3-legacy->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
+    );
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 6);
 }
@@ -543,6 +596,16 @@ fn v4_fixture_opens_and_reads() {
         .unwrap()
         .len(),
         1
+    );
+    // F9-11 Task 8: v4->v6 migration must produce a correct, NON-EMPTY
+    // LABEL_INDEX (see `v1_fixture_opens_and_reads`'s identical assertion
+    // block for the recipe/count rationale).
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(
+        db.debug_dump_label_index().unwrap().len(),
+        2,
+        "v4->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 6);

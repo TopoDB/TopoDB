@@ -1338,12 +1338,13 @@ impl TopoServer {
             ));
         }
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
-        // Full label scan (engine has no per-label index yet — acceptable at
-        // session-start scale; the label-index follow-up is tracked as F10).
-        let mut nodes = self.db.nodes_by_label(&scope_set, MEMORY_LABEL);
-        // ULIDs sort by mint time: descending id = newest first.
-        nodes.sort_by_key(|node| std::cmp::Reverse(node.id));
-        nodes.truncate(p.k as usize);
+        // Near-O(k) via LABEL_INDEX reverse-bounded scans (F9-11 Task 8),
+        // not a full label scan + sort — `nodes_by_label_newest` already
+        // returns newest-first (ULIDs sort by mint time: descending id =
+        // newest first) and k-bounded.
+        let nodes = self
+            .db
+            .nodes_by_label_newest(&scope_set, MEMORY_LABEL, p.k as usize);
         let memories = nodes
             .iter()
             .map(convert::node_to_json)

@@ -130,6 +130,34 @@ mod reference {
             hits
         }
 
+        /// Every node under `label`, restricted to `scopes`, sorted by id
+        /// ascending — the comparison-friendly order (the engine's pinned
+        /// `nodes_by_label` order groups by scope first; sorting both sides
+        /// by id turns that into a set-equality check without caring about
+        /// the grouping, exactly like `find_by_prop` above).
+        pub fn find_by_label(&self, scopes: &ScopeSet, label: &str) -> Vec<NodeRecord> {
+            let mut hits: Vec<_> = self
+                .nodes
+                .values()
+                .filter(|node| node.label == label && scopes.contains(node.scope))
+                .cloned()
+                .collect();
+            hits.sort_by_key(|node| node.id);
+            hits
+        }
+
+        /// Newest-`k` under `label`, restricted to `scopes`: `find_by_label`
+        /// re-sorted descending by id (ULIDs sort by mint time, so
+        /// descending id = newest first) and truncated to `k`. Mirrors
+        /// `Db::nodes_by_label_newest`'s contract exactly, including order —
+        /// this is compared WITHOUT a re-sort on the engine side.
+        pub fn newest_by_label(&self, scopes: &ScopeSet, label: &str, k: usize) -> Vec<NodeRecord> {
+            let mut hits = self.find_by_label(scopes, label);
+            hits.sort_by_key(|node| std::cmp::Reverse(node.id));
+            hits.truncate(k);
+            hits
+        }
+
         /// Cosine-rank every stored embedding under `model` that is (a)
         /// scoped into `scopes` (via the owning node's scope) and (b), if
         /// `candidates` is given, restricted to that id set. Mirrors
@@ -274,6 +302,15 @@ enum Probe {
         prop: &'static str,
         value: PropValue,
     },
+    Label {
+        scopes: ScopeSet,
+        label: &'static str,
+    },
+    LabelNewest {
+        scopes: ScopeSet,
+        label: &'static str,
+        k: usize,
+    },
     Traverse {
         id: NodeId,
         scopes: ScopeSet,
@@ -328,6 +365,19 @@ fn assert_equivalent(db: &Db, model: &reference::RefModel, probes: &[Probe]) {
                     actual,
                     model.find_by_prop(scopes, label, prop, value),
                     "find {label}.{prop}"
+                );
+            }
+            Probe::Label { scopes, label } => {
+                let mut actual = db.nodes_by_label(scopes, label);
+                actual.sort_by_key(|node| node.id);
+                assert_eq!(actual, model.find_by_label(scopes, label), "label {label}");
+            }
+            Probe::LabelNewest { scopes, label, k } => {
+                let actual = db.nodes_by_label_newest(scopes, label, *k);
+                assert_eq!(
+                    actual,
+                    model.newest_by_label(scopes, label, *k),
+                    "label-newest {label} k={k}"
                 );
             }
             Probe::Traverse {
@@ -566,6 +616,40 @@ fn reference_model_matches_v2_engine_on_generated_workloads() {
             label: "Entity",
             prop: "name",
             value: PropValue::Str(format!("entity-{i}")),
+        });
+    }
+    // Label reads (F9-11 Task 8): "Memory" has been through both a
+    // create-then-RemoveNode pass (i % 13 == 0) and a SetNodeProps pass
+    // (i % 5 == 0, i % 13 != 0), so these exercise LABEL_INDEX maintenance
+    // across removal AND property mutation, not just plain creates. Every
+    // scope shape the workload already has (own alone, scope2 alone, own +
+    // shared) is probed for both the full scan and the newest-k read, plus
+    // a label that was never created (empty on both sides) and k edge
+    // cases (0, exactly-corpus-sized, larger-than-corpus).
+    for scope in &scopes {
+        probes.push(Probe::Label {
+            scopes: scope.clone(),
+            label: "Memory",
+        });
+        probes.push(Probe::Label {
+            scopes: scope.clone(),
+            label: "Entity",
+        });
+        probes.push(Probe::Label {
+            scopes: scope.clone(),
+            label: "NoSuchLabel",
+        });
+        for k in [0, 1, 5, spec.memories, spec.memories * 2] {
+            probes.push(Probe::LabelNewest {
+                scopes: scope.clone(),
+                label: "Memory",
+                k,
+            });
+        }
+        probes.push(Probe::LabelNewest {
+            scopes: scope.clone(),
+            label: "NoSuchLabel",
+            k: 5,
         });
     }
     let times = [1_699_999_999_999, 1_700_000_000_250, 1_700_000_200_000];

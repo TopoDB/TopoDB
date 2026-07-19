@@ -75,22 +75,45 @@ impl Db {
         hit
     }
 
-    /// All nodes with the given `label`, restricted to `scopes`. Order is
-    /// unspecified (NODES table iteration order). O(scope) by contract — a
-    /// label scan, not an indexed lookup — so this is one of the two places
-    /// (with `nodes_by_float_range`) a full iteration of the slot-keyed
-    /// NODES table (one read transaction, via `Storage::all_nodes`) is
-    /// legitimate. A storage read failure degrades to "no hits", mirroring
-    /// `Db::node`'s `.ok()` treatment of a storage error as absence.
+    /// All nodes with the given `label`, restricted to `scopes`. Served by a
+    /// `LABEL_INDEX` range scan per `(label, scope)` pair (F9-11 Task 8) —
+    /// loads only matching rows, not a full NODES iteration.
+    ///
+    /// Order (pinned — the pre-Task-8 doc comment called this "unspecified,
+    /// NODES table iteration order" incidentally, so this is a new,
+    /// documented contract, not a behavior change any caller relied on):
+    /// scopes in `ScopeSet::iter_scopes` order (`Shared` first if included,
+    /// then each `ScopeId` ascending), and — within a scope — ascending by
+    /// `node_id` (mint-time order). A storage read failure degrades to "no
+    /// hits", mirroring `Db::node`'s `.ok()` treatment of a storage error as
+    /// absence.
     #[must_use]
     pub fn nodes_by_label(&self, scopes: &ScopeSet, label: &str) -> Vec<NodeRecord> {
-        let hits: Vec<NodeRecord> = self
+        let hits = self
             .storage()
-            .all_nodes()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| n.label == label && scopes.contains(n.scope))
-            .collect();
+            .load_nodes_by_label(scopes, label)
+            .unwrap_or_default();
+        self.bump(hits.iter().map(|n| n.id));
+        hits
+    }
+
+    /// Newest-first, `k`-bounded label scan: the `recent_memories` shape,
+    /// served near-`O(k)` via reverse-bounded `LABEL_INDEX` scans per
+    /// `(label, scope)` pair, merged across scopes by `node_id` descending
+    /// (see `Storage::load_nodes_by_label_newest`). `k == 0` returns empty,
+    /// same "degrade, don't error" spirit as `nodes_by_label`. A storage
+    /// read failure likewise degrades to "no hits".
+    #[must_use]
+    pub fn nodes_by_label_newest(
+        &self,
+        scopes: &ScopeSet,
+        label: &str,
+        k: usize,
+    ) -> Vec<NodeRecord> {
+        let hits = self
+            .storage()
+            .load_nodes_by_label_newest(scopes, label, k)
+            .unwrap_or_default();
         self.bump(hits.iter().map(|n| n.id));
         hits
     }
@@ -180,11 +203,15 @@ impl Db {
     /// Unindexed scoped scan for `min <= props[prop] <= max` over
     /// `PropValue::Float` values. O(scope size) — the decay-sweep primitive;
     /// there is no float range index (equality indexing explicitly excludes
-    /// `Float`, see `IndexValue`). Like `nodes_by_label`, this is a full
-    /// iteration of the slot-keyed NODES table (one read transaction, via
-    /// `Storage::all_nodes`) — legitimate here because the API was always
-    /// O(n) by contract. A storage read failure degrades to "no hits" (see
-    /// `nodes_by_label`'s doc comment).
+    /// `Float`, see `IndexValue`). This is still a full iteration of the
+    /// slot-keyed NODES table (one read transaction) — legitimate here
+    /// because the API was always O(n) by contract — but (F9-11 Task 8) it
+    /// streams via `Storage::load_nodes_by_float_range`, which decodes each
+    /// row's embedding only for rows that pass the scope+range filter,
+    /// instead of eagerly decoding every scanned row's embedding
+    /// (`Storage::all_nodes`'s behavior) only to discard most of them. A
+    /// storage read failure degrades to "no hits" (see `nodes_by_label`'s
+    /// doc comment).
     /// Does NOT bump access counters, by design: this is the decay-sweep
     /// primitive. A sweep that bumped everything it scanned would overwrite the
     /// very recency signal (`last_accessed_at`) it exists to read.
@@ -197,12 +224,8 @@ impl Db {
         max: f64,
     ) -> Vec<NodeRecord> {
         self.storage()
-            .all_nodes()
+            .load_nodes_by_float_range(scopes, prop, min, max)
             .unwrap_or_default()
-            .into_iter()
-            .filter(|n| scopes.contains(n.scope))
-            .filter(|n| matches!(n.props.get(prop), Some(PropValue::Float(f)) if *f >= min && *f <= max))
-            .collect()
     }
 
     /// Bounded (`1..=4` hops), scoped, temporal BFS from `q.seeds` over
