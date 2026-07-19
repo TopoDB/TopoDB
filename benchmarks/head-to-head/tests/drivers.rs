@@ -112,29 +112,20 @@ fn minigraf_k_hop_reports_not_comparable() {
 /// queried database, not by reading the source.
 ///
 /// It does NOT need bookkeeping facts -- `insert_corpus` asserts exactly
-/// `PROP_NAMES.len()` triples per node plus one per edge, nothing more. But
-/// this test also surfaces a real, separate discrepancy discovered while
-/// verifying it: `Corpus::generate` can (and for this seed/size, does)
-/// produce two `LogicalEdge`s with the identical `(from, to, ty)` triple
-/// (here: two `(3, 1, DERIVED_FROM)` edges). TopoDB stores those as two
-/// distinct edge objects (each gets its own `EdgeId`), so
-/// `translation_ratio().facts` (= props + `corpus.edges.len()`, i.e. 70 for
-/// this corpus) matches what TopoDB writes. Minigraf's EAV model has no
-/// separate edge identity -- a fact's identity IS its `(entity, attribute,
-/// value)` triple -- so asserting the same triple twice yields exactly one
-/// observable fact, not two. The real distinct count minigraf ends up
-/// storing (69, not 70) is what this test checks against, computed
-/// independently from the corpus's own duplicate-collapsed edge set.
+/// `PROP_NAMES.len()` triples per node plus one per edge, nothing more.
 ///
-/// This is the opposite direction from the concern the ratio was designed to
-/// catch (extra minigraf bookkeeping *understating* its write volume): here
-/// `translation_ratio().facts` slightly *overstates* minigraf's real stored
-/// fact count, because it assumes one-fact-per-edge without accounting for
-/// the corpus generator's own possible (from, to, ty) duplicates. See the
-/// task report for the full discussion -- this is a finding for the human,
-/// not something silently corrected here.
+/// This test previously also caught a real, separate defect: `Corpus::generate`
+/// could produce two `LogicalEdge`s with the identical `(from, to, ty)`
+/// triple (e.g. two `(3, 1, DERIVED_FROM)` edges for seed 11, size 10).
+/// TopoDB stored those as two distinct edge objects, while minigraf's EAV
+/// identity collapsed them into one fact, so `translation_ratio().facts`
+/// silently overstated minigraf's real write volume. `Corpus::generate` now
+/// deduplicates `(from, to, ty)` at generation time (see `corpus.rs`), so
+/// `corpus.edges` is already distinct and `translation_ratio().facts` must
+/// match minigraf's real stored fact count exactly, with no divergence left
+/// to detect.
 #[test]
-fn minigraf_fact_count_matches_corpus_after_edge_deduplication() {
+fn minigraf_fact_count_matches_translation_ratio_exactly() {
     let (_d, db, corpus) = loaded_minigraf(10);
     let ratio = corpus.translation_ratio();
 
@@ -143,25 +134,19 @@ fn minigraf_fact_count_matches_corpus_after_edge_deduplication() {
         .iter()
         .map(|e| (e.from, e.to, e.ty.clone()))
         .collect();
-    let expected_distinct_facts = ratio.props + distinct_edges.len();
+    assert_eq!(
+        distinct_edges.len(),
+        corpus.edges.len(),
+        "Corpus::generate must not produce duplicate (from, to, ty) edges"
+    );
 
     let actual = db.fact_count().unwrap();
     assert_eq!(
-        actual, expected_distinct_facts,
-        "insert_corpus should store exactly props + distinct (from,to,ty) edges \
-         ({expected_distinct_facts}), got {actual}"
+        actual, ratio.facts,
+        "insert_corpus should store exactly translation_ratio().facts \
+         ({}), got {actual} -- the published fairness ratio must match reality",
+        ratio.facts
     );
-
-    if distinct_edges.len() < corpus.edges.len() {
-        let collapsed = corpus.edges.len() - distinct_edges.len();
-        assert_ne!(
-            actual, ratio.facts,
-            "expected translation_ratio().facts ({}) to overstate minigraf's real \
-             fact count by the {collapsed} duplicate edge(s) this corpus generated, \
-             but they matched",
-            ratio.facts
-        );
-    }
 }
 
 /// Both drivers must agree on what the corpus says. If they disagree, one of

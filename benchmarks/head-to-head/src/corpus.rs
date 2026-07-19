@@ -86,14 +86,37 @@ impl Corpus {
             // 1..=3 backward edges per node keeps the graph traversable at
             // depth 4 without exploding into a dense blob.
             let count = rng.gen_range(1..=3);
-            for _ in 0..count {
+
+            // `from` is fixed to `id` for every edge drawn in this loop
+            // iteration, so deduplicating (to, ty) pairs within this node's
+            // own edges is sufficient to guarantee global (from, to, ty)
+            // uniqueness across the whole corpus: no other iteration can ever
+            // produce an edge with this `from`.
+            //
+            // Membership is checked against a plain Vec built in draw order
+            // (not a HashSet) so no hash-iteration order can reach the
+            // output, keeping generation byte-identical across processes for
+            // a given seed. Re-rolls just keep consuming the same seeded RNG
+            // sequence, so they stay deterministic too.
+            //
+            // The attempt cap guards against small candidate spaces (node 1
+            // has only one possible target, so at most
+            // `EDGE_TYPES.len()` == 3 distinct edges exist for it at all):
+            // once exhausted, the node simply ends up with fewer than
+            // `count` edges rather than looping forever.
+            let mut node_edges: Vec<LogicalEdge> = Vec::with_capacity(count);
+            let max_attempts = 32;
+            let mut attempts = 0;
+            while node_edges.len() < count && attempts < max_attempts {
+                attempts += 1;
                 let target = rng.gen_range(0..id);
-                edges.push(LogicalEdge {
-                    from: id,
-                    to: target,
-                    ty: EDGE_TYPES[rng.gen_range(0..EDGE_TYPES.len())].to_string(),
-                });
+                let ty = EDGE_TYPES[rng.gen_range(0..EDGE_TYPES.len())].to_string();
+                if node_edges.iter().any(|e| e.to == target && e.ty == ty) {
+                    continue;
+                }
+                node_edges.push(LogicalEdge { from: id, to: target, ty });
             }
+            edges.extend(node_edges);
         }
 
         Corpus {

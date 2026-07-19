@@ -49,3 +49,22 @@ fn the_graph_is_connected_enough_to_traverse_four_hops() {
         "seed node must reach >10 nodes in 4 hops, got {reachable}"
     );
 }
+
+#[test]
+fn no_duplicate_edges_are_generated() {
+    // TopoDB stores each CreateEdge as a distinct object; minigraf's EAV
+    // identity collapses a repeated (from, to, ty) into one fact. A duplicate
+    // therefore makes the two engines store different amounts of data and
+    // silently invalidates the published translation ratio.
+    for seed in [1u64, 11, 42, 20260718] {
+        let c = Corpus::generate(seed, 200);
+        let mut seen = std::collections::HashSet::new();
+        for e in &c.edges {
+            assert!(
+                seen.insert((e.from, e.to, e.ty.clone())),
+                "duplicate edge ({}, {}, {}) at seed {seed}",
+                e.from, e.to, e.ty
+            );
+        }
+    }
+}
