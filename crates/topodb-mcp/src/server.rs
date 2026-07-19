@@ -608,7 +608,10 @@ struct SearchMemoriesParams {
 struct SearchHit {
     /// The matched node (id/scope/label/props).
     node: Value,
-    /// Relevance score — BM25 for text search, cosine similarity for vector search (higher is more relevant).
+    /// Relevance score, higher is more relevant. For search_memories this is the fused
+    /// hybrid (RRF) rank score — small magnitudes (~0.01–0.05), only comparable within a
+    /// single response, NOT a BM25 or similarity value to threshold on. For search_vectors
+    /// it is cosine similarity.
     score: f32,
 }
 
@@ -1909,8 +1912,9 @@ impl ServerHandler for TopoServer {
                  repeatedly; never duplicates), link is idempotent per (from, to, type) and \
                  takes supersede: true when a to-one fact changes, and every memory should be \
                  linked to the entities it concerns. Recalling well: search_memories stems \
-                 terms and falls back to close prefix/typo matches, but does NOT \
-                 understand synonyms — retry with different words before concluding \
+                 terms, falls back to close prefix/typo matches, and expands learned \
+                 synonyms (add_synonym) automatically — but it can't guess vocabulary it \
+                 was never taught, so retry with different words before concluding \
                  nothing is stored — then traverse from the best hit; use \
                  get_edges to inspect or retire a node's current relations.",
             )
