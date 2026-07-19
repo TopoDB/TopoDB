@@ -287,6 +287,33 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
+### Unreleased
+
+#### Added
+
+- **`remember`** — a composed, atomic storage verb: one call creates the memory, find-or-creates
+  each named entity (`create_entity` semantics: case/whitespace-insensitive across read scopes +
+  write scope + shared, alias-aware, oldest-id-wins; repeated names within one call collapse
+  first-spelling-wins), and links memory→entity (`about` by default, `edge_type` to override) —
+  all in a **single engine batch**, so a stored fact can never strand unlinked. Params:
+  `content`, `entities` (non-empty), `edge_type?`, `props?`, `scope?` (one scope for everything
+  the call creates). Tool count 19 → 20.
+
+#### Changed
+
+- Tool descriptions repositioned around `remember` as the primary storage verb:
+  `create_memory` (unlinked note), `create_entity` (props-carrying upsert), and `link`
+  (entity↔entity relations, supersede) are now described as its building blocks; `get_info`
+  instructions updated to match.
+
+#### Release checklist
+
+- Publish to npm, then **bump the Claude Code plugin's server pin**
+  (`plugins/claude-code/server-args.js`'s `SERVER_VERSION`) to this version, re-verify
+  `plugins/claude-code/test/broker.test.js` against the real published package, and re-point the
+  plugin's `SKILL.md` + `/remember` command at the `remember` tool **in the same commit as the
+  pin bump** — the plugin must never document tools its pinned server doesn't have.
+
 ### 0.0.10 — 2026-07-18
 
 #### Fixed

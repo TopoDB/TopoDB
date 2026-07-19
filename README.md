@@ -98,7 +98,7 @@ and scoped recall as a library call.
 | Access stats (recall-driven counters) | engine | ✅ |
 | Change feed (`subscribe` / `ops_since`) + op-log compaction | engine | ✅ |
 | Versioned on-disk format ([FORMAT.md](FORMAT.md)) | engine | ✅ |
-| MCP server (19 tools) | `topodb-mcp` | ✅ |
+| MCP server (20 tools) | `topodb-mcp` | ✅ |
 | CLI (all 17 engine operations) | `topodb-cli` | ✅ v1 |
 | One-command Pi install | `@topodb/pi` | ✅ |
 | Vector search exposed over MCP / CLI | layers | ✅ |
@@ -143,10 +143,10 @@ single-process access only).
 
 ### topodb-mcp
 
-`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 19 MCP tools over
+`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 20 MCP tools over
 stdio JSON-RPC — `db_info` (now also reporting embeddings status); scoped reads (`get_node`,
 `find_by_prop`, `search_memories` — hybrid BM25 + vector + graph recall, RRF-fused —, `traverse`,
-`access_stats`, `search_vectors`); writes (`create_memory`, `create_entity`, `add_alias`,
+`access_stats`, `search_vectors`); writes (`remember`, `create_memory`, `create_entity`, `add_alias`,
 `add_synonym`, `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`,
 `submit_batch`); and `get_changes`, the one unscoped read, which replays the op log across every
 scope and is therefore off unless you pass `--allow-unscoped-changes`. Reads filter by a *set* of
