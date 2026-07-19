@@ -7,6 +7,9 @@ members = [
     "crates/topodb-cli",
     "crates/topodb-sgh",
 ]
+exclude = [
+    "benchmarks",
+]
 
 # The profile that 'dist' will build with
 [profile.dist]
