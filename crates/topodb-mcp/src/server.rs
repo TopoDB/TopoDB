@@ -1587,7 +1587,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Store a new memory. Call this when the user or task produces information worth remembering later. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id — then LINK it to the entities it concerns (create_entity + link), every time: an unlinked memory can only ever be found by keyword search, never by traversing from the people/projects it is about."
+        description = "Low-level: store an UNLINKED memory node. Prefer remember, which stores AND links in one atomic call — an unlinked memory can only ever be found by keyword search, never by traversing from the people/projects it concerns. Use this directly only for a deliberately standalone note. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id."
     )]
     fn create_memory(
         &self,
@@ -1615,7 +1615,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Find-or-create an entity node (person, project, concept). Safe to call whenever something worth attaching memories to is mentioned: the name is matched case- and whitespace-insensitively across the read scopes, the write scope, AND shared — if the entity already exists anywhere visible, its id is returned with created: false and NO duplicate is made (any new props keys are merged; existing keys are never overwritten). Use one canonical name form per entity (prefer the fullest name you know, e.g. 'Drew Powell' over 'Drew') so future mentions keep resolving to the same node."
+        description = "Find-or-create an entity node (person, project, concept). remember calls this resolution for you when storing a fact; call it directly when an entity needs extra props, or to get an id for entity↔entity link calls. The name is matched case- and whitespace-insensitively across the read scopes, the write scope, AND shared — if the entity already exists anywhere visible, its id is returned with created: false and NO duplicate is made (any new props keys are merged; existing keys are never overwritten). Use one canonical name form per entity (prefer the fullest name you know, e.g. 'Drew Powell' over 'Drew') so future mentions keep resolving to the same node."
     )]
     fn create_entity(
         &self,
@@ -1865,7 +1865,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Create (or reuse) a typed, time-aware edge between two existing nodes. ALWAYS link what you store: a memory to the entities it concerns ('about'), entities to each other ('works_on', 'works_at') — an unlinked memory is invisible to traverse. edge_type is normalized (lowercased; spaces/hyphens collapse to '_', so 'Works At' == 'works_at'); reuse existing type names rather than inventing synonyms ('works_at', not also 'employed_by'). Calling link again with the same from/to/type returns the existing open edge (created: false) instead of a duplicate. When the new fact REPLACES the old one for a to-one relation (moved teams, changed employer), pass supersede: true to atomically close the other open same-type edges from this node. Errors if either node doesn't exist. When linking shared-scope nodes, pass scope: 'shared' or the edge is invisible outside this project."
+        description = "Create (or reuse) a typed, time-aware edge between two existing nodes. remember already links memories to their entities — use this for entity↔entity relations ('works_on', 'works_at') and custom memory links. edge_type is normalized (lowercased; spaces/hyphens collapse to '_', so 'Works At' == 'works_at'); reuse existing type names rather than inventing synonyms ('works_at', not also 'employed_by'). Calling link again with the same from/to/type returns the existing open edge (created: false) instead of a duplicate. When the new fact REPLACES the old one for a to-one relation (moved teams, changed employer), pass supersede: true to atomically close the other open same-type edges from this node. Errors if either node doesn't exist. When linking shared-scope nodes, pass scope: 'shared' or the edge is invisible outside this project."
     )]
     fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<Json<LinkResult>, ErrorData> {
         let from = parse_node_id(&p.from_id)?;
@@ -2126,10 +2126,11 @@ impl ServerHandler for TopoServer {
                  exactly ONE scope (per-call `scope: string`, or the server's default write \
                  scope when omitted). The default read set can be WIDER than the default write \
                  scope. Start with db_info to confirm wiring — it reports both defaults \
-                 separately. Storing well: create_entity is find-or-create (safe to call \
-                 repeatedly; never duplicates), link is idempotent per (from, to, type) and \
-                 takes supersede: true when a to-one fact changes, and every memory should be \
-                 linked to the entities it concerns. Recalling well: search_memories stems \
+                 separately. Storing well: use remember (one atomic call: memory + \
+                 find-or-create entities + links); the primitives remain for the exceptions — \
+                 create_memory for a deliberately unlinked note, create_entity when an entity \
+                 needs extra props, link for entity↔entity relations and supersede: true when \
+                 a to-one fact changes. Recalling well: search_memories stems \
                  terms, falls back to close prefix/typo matches, and expands learned \
                  synonyms (add_synonym) automatically — but it can't guess vocabulary it \
                  was never taught, so retry with different words before concluding \
