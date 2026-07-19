@@ -410,3 +410,13 @@ fn remember_schema_requires_content_and_nonempty_entities() {
         "entities must advertise minItems 1: {entities}"
     );
 }
+
+/// recent_memories advertises the k bounds the runtime enforces.
+#[test]
+fn recent_memories_k_bounds_are_advertised() {
+    let (_dir, tools) = tools();
+    let props = properties(&tools, "recent_memories");
+    let k = &props["k"];
+    assert_eq!(k["minimum"], 1, "k schema: {k}");
+    assert_eq!(k["maximum"], 100, "k schema: {k}");
+}

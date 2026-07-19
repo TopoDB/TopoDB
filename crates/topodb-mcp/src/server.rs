@@ -592,6 +592,39 @@ struct FindByPropResult {
     nodes: Vec<Value>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RecentMemoriesParams {
+    /// How many memories to return. Default 8.
+    #[serde(default = "default_recent_k")]
+    #[schemars(range(min = 1, max = 100))]
+    k: u32,
+    /// Scope to read: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
+    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
+    /// Omit both to use the server's configured default read scopes. Must not
+    /// be empty when present — an empty set admits nothing (there is no
+    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
+    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+fn default_recent_k() -> u32 {
+    8
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RecentMemoriesResult {
+    /// The newest `Memory` nodes in the scope set, most recent first
+    /// (id/scope/label/props each).
+    memories: Vec<Value>,
+}
+
 fn default_search_k() -> usize {
     10
 }
@@ -1248,6 +1281,34 @@ impl TopoServer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(FindByPropResult { nodes }))
+    }
+
+    #[tool(
+        description = "The newest memories in the read scopes, most recent first. For orientation ('what was I doing?', session-start context), not search — use search_memories when you know what you're looking for. k defaults to 8 (max 100)."
+    )]
+    fn recent_memories(
+        &self,
+        Parameters(p): Parameters<RecentMemoriesParams>,
+    ) -> Result<Json<RecentMemoriesResult>, ErrorData> {
+        if !(1..=100).contains(&p.k) {
+            return Err(ErrorData::invalid_params(
+                format!("k must be between 1 and 100, got {}", p.k),
+                None,
+            ));
+        }
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        // Full label scan (engine has no per-label index yet — acceptable at
+        // session-start scale; the label-index follow-up is tracked as F10).
+        let mut nodes = self.db.nodes_by_label(&scope_set, MEMORY_LABEL);
+        // ULIDs sort by mint time: descending id = newest first.
+        nodes.sort_by_key(|node| std::cmp::Reverse(node.id));
+        nodes.truncate(p.k as usize);
+        let memories = nodes
+            .iter()
+            .map(convert::node_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(Json(RecentMemoriesResult { memories }))
     }
 
     #[tool(

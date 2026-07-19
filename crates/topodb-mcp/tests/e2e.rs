@@ -45,14 +45,15 @@ fn end_to_end_scenario_over_stdio() {
     let tools = server.tools_list(DEFAULT_TIMEOUT);
     assert_eq!(
         tools.len(),
-        20,
-        "expected exactly 20 tools (db_info + 8 read + 11 write), got: {tools:#?}"
+        21,
+        "expected exactly 21 tools (db_info + 9 read + 11 write), got: {tools:#?}"
     );
     for name in [
         "db_info",
         "get_node",
         "find_by_prop",
         "search_memories",
+        "recent_memories",
         "traverse",
         "access_stats",
         "get_changes",
