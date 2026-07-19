@@ -64,7 +64,12 @@ pub(crate) const EMBEDDINGS: TableDefinition<&[u8], &[u8]> = TableDefinition::ne
 /// permanent, per-model-only rule).
 pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_dims");
 
-pub const FORMAT_VERSION: u32 = 5;
+/// (label_id BE ++ scope_id BE ++ node_id) -> slot. Derived state:
+/// rebuilt from ops; migrated v5->v6 by one NODES scan. ULID key tail
+/// makes per-(label,scope) key order = mint-time order.
+pub(crate) const LABEL_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("label_index");
+
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -154,6 +159,7 @@ impl Storage {
             tx.open_table(OUT_ADJ).map_err(storage_err)?;
             tx.open_table(IN_ADJ).map_err(storage_err)?;
             tx.open_table(PROP_INDEX).map_err(storage_err)?;
+            tx.open_table(LABEL_INDEX).map_err(storage_err)?;
             let meta = tx.open_table(META).map_err(storage_err)?;
             let version = match meta.get("format_version").map_err(storage_err)? {
                 Some(v) => {
@@ -173,7 +179,20 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(5) => {}
+            Some(6) => {}
+            Some(5) => {
+                // v5 -> v6 adds exactly one derived table (LABEL_INDEX) with
+                // no other layout changes: a single NODES scan, decoding
+                // each row's already-interned `label`/`scope` ids straight
+                // off `NodeRecordDiskV3` (no `Dicts`/`ScopeRegistry`
+                // resolution needed — see `migrate_v6.rs`), then a version
+                // stamp. Deliberately far smaller than the v3->v4/v4->v5
+                // hops: no dual-write era, no re-encoding of existing rows.
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(4) => {
                 // v4 -> v5 changes no table layout — only the PROP_INDEX key
                 // scheme (Str values are now keyed by `normalize_str`, see
@@ -181,9 +200,13 @@ impl Storage {
                 // `ensure_index_spec` below: its `prop_index_norm_version`
                 // check sees a missing stamp on every pre-v5 file and drains +
                 // rebuilds the index. All this arm does is stamp the version
-                // so pre-v5 builds (which compute raw-byte lookup keys)
-                // refuse the file instead of silently missing every Str probe.
+                // (after also running the v5->v6 LABEL_INDEX backfill below —
+                // this arm jumps straight from 4 to the CURRENT
+                // `FORMAT_VERSION`, so it must do v6's table work itself
+                // rather than falling through to the `Some(5)` arm above,
+                // which only ever runs for a file genuinely stamped 5).
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
+                crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -218,6 +241,7 @@ impl Storage {
                     )?;
                 } // `nodes`/`embeddings` guards drop here, before delete_table.
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
+                crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -300,6 +324,7 @@ impl Storage {
                 drop(nodes);
                 drop(embeddings);
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
+                crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -394,6 +419,7 @@ impl Storage {
                 drop(nodes);
                 drop(embeddings);
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
+                crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -1111,6 +1137,7 @@ impl Storage {
                 let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
                 let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                let mut label_index = tx.open_table(LABEL_INDEX).map_err(storage_err)?;
                 for op in &resolved {
                     // `pre` carries (id, scope, pre_slot, old_text). For CreateNode
                     // the scope comes from the op and the slot isn't allocated yet
@@ -1173,6 +1200,7 @@ impl Storage {
                         &mut in_adj,
                         &mut scopes_table,
                         scope_registry,
+                        &mut label_index,
                         op,
                         journal,
                     )?;
@@ -1581,6 +1609,7 @@ impl Storage {
                 let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
                 let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                let mut label_index = tx.open_table(LABEL_INDEX).map_err(storage_err)?;
                 let mut counters = tx.open_table(COUNTERS).map_err(storage_err)?;
                 // The text index is derived from state, so it is drained and rebuilt
                 // alongside NODES/EDGES through the very same `fts_update` used on the
@@ -1623,6 +1652,7 @@ impl Storage {
                 out_adj.retain(|_, _| false).map_err(storage_err)?;
                 in_adj.retain(|_, _| false).map_err(storage_err)?;
                 prop_index.retain(|_, _| false).map_err(storage_err)?;
+                label_index.retain(|_, _| false).map_err(storage_err)?;
                 counters.retain(|_, _| false).map_err(storage_err)?;
                 seed_shared(&mut scopes_table)?;
                 *scope_registry = ScopeRegistry::load_table_for_rebuild(&scopes_table)?;
@@ -1683,6 +1713,7 @@ impl Storage {
                         &mut in_adj,
                         &mut scopes_table,
                         &mut scope_registry,
+                        &mut label_index,
                         &op,
                         &mut journal,
                     )?;
@@ -1828,6 +1859,17 @@ pub(crate) fn node_key(id: NodeId) -> [u8; 16] {
 /// before they're re-keyed).
 pub(crate) fn slot_key(slot: u64) -> [u8; 8] {
     slot.to_be_bytes()
+}
+
+/// LABEL_INDEX key: `label_id BE (4) ++ scope_id BE (4) ++ node_id BE (16)`.
+/// The ULID tail means two rows sharing a `(label_id, scope_id)` prefix sort
+/// by mint time (a later-minted node's key is byte-greater).
+pub(crate) fn label_index_key(label_id: u32, scope_id: u32, node_id: NodeId) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[0..4].copy_from_slice(&label_id.to_be_bytes());
+    key[4..8].copy_from_slice(&scope_id.to_be_bytes());
+    key[8..24].copy_from_slice(&node_id.as_u128().to_be_bytes());
+    key
 }
 
 /// Reads META `"oldest_seq"` (u64 LE) from an already-open META table; an
@@ -2214,6 +2256,7 @@ fn apply_op(
     in_adj: &mut Table<'_, &'static [u8], &'static [u8]>,
     scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
     scope_registry: &mut ScopeRegistry,
+    label_index: &mut Table<'_, &'static [u8], u64>,
     op: &Op,
     journal: &mut InternJournal,
 ) -> Result<(), TopoError> {
@@ -2224,7 +2267,7 @@ fn apply_op(
             label,
             props,
         } => {
-            alloc_node_slot(slot_meta, node_slots, node_ids, *id)?;
+            let slot = alloc_node_slot(slot_meta, node_slots, node_ids, *id)?;
             let rec = NodeRecord {
                 id: *id,
                 scope: *scope,
@@ -2241,7 +2284,17 @@ fn apply_op(
                 node_slots,
                 &rec,
                 journal,
-            )
+            )?;
+            // `put_node` (via `node_to_disk_v3`) already interned `label`/
+            // `scope` — both `intern` calls below are idempotent lookups,
+            // not fresh allocations, so this never diverges from what got
+            // written to NODES a few lines up.
+            let label_id = dicts.intern(dict, DictKind::Label, label, journal)?;
+            let scope_id = scope_registry.intern(scopes_table, *scope, journal)?;
+            label_index
+                .insert(label_index_key(label_id, scope_id, *id).as_slice(), slot)
+                .map_err(storage_err)?;
+            Ok(())
         }
         Op::SetNodeProps { id, props } => {
             let mut rec = read_node(
@@ -2342,11 +2395,27 @@ fn apply_op(
                 .ok_or_else(|| TopoError::Rejected(format!("RemoveNode: node {id:?} not found")))?;
             let key = slot_key(removed_slot);
             let removed = nodes.remove(key.as_slice()).map_err(storage_err)?;
-            if removed.is_none() {
-                return Err(TopoError::Encoding(
-                    "RemoveNode: node slot present but record row missing".into(),
-                ));
+            let removed = match removed {
+                Some(guard) => guard,
+                None => {
+                    return Err(TopoError::Encoding(
+                        "RemoveNode: node slot present but record row missing".into(),
+                    ))
+                }
+            };
+            // LABEL_INDEX maintenance: `label`/`scope` come straight off the
+            // just-removed row's already-interned `NodeRecordDiskV3` fields —
+            // no `Dicts`/`ScopeRegistry` resolution needed, mirroring
+            // `migrate_v6.rs`'s decode.
+            {
+                let raw = crate::codec::unframe_value(removed.value())?;
+                let disk: crate::disk::NodeRecordDiskV3 = postcard::from_bytes(raw.as_ref())
+                    .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                label_index
+                    .remove(label_index_key(disk.label, disk.scope, *id).as_slice())
+                    .map_err(storage_err)?;
             }
+            drop(removed);
 
             // v4: no-op if the node was never embedded.
             vector_store::remove_vector(vectors, embedding_ref, removed_slot)?;
@@ -3979,6 +4048,179 @@ mod tests {
         assert_eq!(
             refs_rows, expected_live_embeddings,
             "embedding_ref row count must equal the number of currently-live embedded nodes — no orphans"
+        );
+    }
+
+    // --- LABEL_INDEX (F9-11 Task 7) ---
+
+    /// Pure key-ordering unit test: within the same `(label_id, scope_id)`
+    /// prefix, a later-minted node's key must sort AFTER an earlier one's —
+    /// the ULID tail preserves mint-time order, per `label_index_key`'s doc
+    /// comment. `NodeId::from_u128` gives full control over the "mint order"
+    /// (a genuine ULID's high bits are a timestamp, so a numerically larger
+    /// `u128` is exactly "minted later").
+    #[test]
+    fn label_index_key_orders_by_mint_time_within_label_scope() {
+        let earlier = NodeId::from_u128(100);
+        let later = NodeId::from_u128(200);
+        let k1 = label_index_key(1, 1, earlier);
+        let k2 = label_index_key(1, 1, later);
+        assert!(
+            k1 < k2,
+            "later-minted node's key must sort after the earlier one's within the same (label, scope)"
+        );
+
+        // A different label or scope prefix dominates the comparison
+        // regardless of mint order — the BE-encoded (label_id, scope_id)
+        // fields are the leading bytes.
+        let other_label = label_index_key(2, 1, earlier);
+        assert!(k1 < other_label, "label_id is the primary sort key");
+        let other_scope = label_index_key(1, 2, earlier);
+        assert!(k1 < other_scope, "scope_id is the secondary sort key");
+    }
+
+    /// `apply_op`'s CreateNode/RemoveNode maintenance, checked directly
+    /// against the on-disk LABEL_INDEX table (not through any read API,
+    /// which on this branch (Task 7) doesn't consult LABEL_INDEX yet — see
+    /// `determinism.rs`'s `label_reads_are_identical_before_and_after_rebuild`
+    /// for the read-path-level proof). Two nodes under the same label/scope,
+    /// one under a different label: three rows after create, minus one after
+    /// removing one of the same-label-and-scope pair.
+    #[test]
+    fn apply_op_maintains_label_index_on_create_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b, c) = (NodeId::new(), NodeId::new(), NodeId::new());
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id: a,
+                    scope,
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope,
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: c,
+                    scope,
+                    label: "Memory".into(),
+                    props: Default::default(),
+                },
+            ],
+            1,
+        )
+        .unwrap();
+
+        let count_rows = |s: &Storage| -> usize {
+            let tx = s.db.begin_read().unwrap();
+            let t = tx.open_table(LABEL_INDEX).unwrap();
+            t.iter().unwrap().count()
+        };
+        assert_eq!(count_rows(&s), 3, "one LABEL_INDEX row per created node");
+
+        // The specific row for `a` must exist, keyed by (label_id, scope_id, a).
+        {
+            let tx = s.db.begin_read().unwrap();
+            let t = tx.open_table(LABEL_INDEX).unwrap();
+            let dicts = s.dicts.read().unwrap();
+            let scope_registry = s.scope_registry.read().unwrap();
+            let label_id = dicts.id_of(DictKind::Label, "Entity").unwrap();
+            let scope_id = scope_registry.id_of(scope).unwrap();
+            let key = label_index_key(label_id, scope_id, a);
+            assert!(
+                t.get(key.as_slice()).unwrap().is_some(),
+                "a's LABEL_INDEX row must exist under (Entity, scope, a)"
+            );
+        }
+
+        s.apply_batch(vec![Op::RemoveNode { id: a }], 2).unwrap();
+        assert_eq!(
+            count_rows(&s),
+            2,
+            "removing a drops exactly its LABEL_INDEX row"
+        );
+        {
+            let tx = s.db.begin_read().unwrap();
+            let t = tx.open_table(LABEL_INDEX).unwrap();
+            let dicts = s.dicts.read().unwrap();
+            let scope_registry = s.scope_registry.read().unwrap();
+            let label_id = dicts.id_of(DictKind::Label, "Entity").unwrap();
+            let scope_id = scope_registry.id_of(scope).unwrap();
+            let key = label_index_key(label_id, scope_id, a);
+            assert!(
+                t.get(key.as_slice()).unwrap().is_none(),
+                "a's LABEL_INDEX row must be gone after RemoveNode"
+            );
+            let key_b = label_index_key(label_id, scope_id, b);
+            assert!(
+                t.get(key_b.as_slice()).unwrap().is_some(),
+                "b's LABEL_INDEX row must be untouched by a's removal"
+            );
+        }
+    }
+
+    /// `rebuild_state_from_ops` must clear and repopulate LABEL_INDEX from
+    /// the op log, not leave it stale — directly checked (unlike
+    /// `determinism.rs`'s `label_reads_are_identical_before_and_after_rebuild`,
+    /// which only proves the still-full-scan `nodes_by_label` read path
+    /// doesn't regress). A create-then-remove corpus, so a rebuild that
+    /// forgot to clear the table first would leave `a`'s row behind even
+    /// though `a` is dead.
+    #[test]
+    fn rebuild_state_from_ops_repopulates_label_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope = Scope::Id(ScopeId::new());
+        let (a, b) = (NodeId::new(), NodeId::new());
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id: a,
+                    scope,
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
+                Op::CreateNode {
+                    id: b,
+                    scope,
+                    label: "Entity".into(),
+                    props: Default::default(),
+                },
+            ],
+            1,
+        )
+        .unwrap();
+        s.apply_batch(vec![Op::RemoveNode { id: a }], 2).unwrap();
+
+        let dump = |s: &Storage| -> Vec<(Vec<u8>, u64)> {
+            let tx = s.db.begin_read().unwrap();
+            let t = tx.open_table(LABEL_INDEX).unwrap();
+            let mut out: Vec<(Vec<u8>, u64)> = t
+                .iter()
+                .unwrap()
+                .map(|e| {
+                    let (k, v) = e.unwrap();
+                    (k.value().to_vec(), v.value())
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let before = dump(&s);
+        assert_eq!(before.len(), 1, "only b survives the create+remove corpus");
+
+        s.rebuild_state_from_ops().unwrap();
+
+        let after = dump(&s);
+        assert_eq!(
+            before, after,
+            "rebuild must reproduce LABEL_INDEX exactly, not leave a's row stale or drop b's"
         );
     }
 }

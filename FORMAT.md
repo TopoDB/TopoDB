@@ -1,7 +1,7 @@
-# TopoDB on-disk format (v5)
+# TopoDB on-disk format (v6)
 
 This is the durable contract for a TopoDB redb file. Code wins if it differs
-from this document. Eight fixtures under `crates/topodb/tests/fixtures/` pin
+from this document. Nine fixtures under `crates/topodb/tests/fixtures/` pin
 this contract:
 
 - `v1.redb`, `v2.redb`, `v2-workload.redb` — FROZEN pre-v3 migration corpora,
@@ -26,12 +26,29 @@ this contract:
 - `v4.redb` — the native v4 fixture, FROZEN since the v5 flip (no build on
   this branch can stamp a fresh file at 4), exercised by
   `v4_fixture_opens_and_reads` as the v4 migration-input file.
-- `v5.redb` — the native v5 fixture, and the ONLY fixture this build can
-  actually regenerate (`format_fixture.rs::regenerate_v5_fixture`).
+- `v5.redb` — the native v5 fixture, FROZEN since the v6 flip (no build on
+  this branch can stamp a fresh file at 5), exercised by
+  `v5_fixture_migrates_to_v6_and_reads` as the v5 migration-input file.
+- `v6.redb` — the native v6 fixture, and the ONLY fixture this build can
+  actually regenerate (`format_fixture.rs::regenerate_v6_fixture`).
 
 ## Version and migration
 
-`storage::FORMAT_VERSION` is **5**. v5 changed **no table layout** relative to
+`storage::FORMAT_VERSION` is **6**. v6 adds exactly **one new table**,
+`LABEL_INDEX` (`(label_id, scope_id, node_id) -> slot`, see "Tables," below) —
+a derived index over each node's already-interned label and scope, maintained
+incrementally by `apply_op` (insert on `CreateNode`, remove on `RemoveNode`;
+labels are immutable, so there is no update case) and rebuilt wholesale by
+`rebuild_state_from_ops`. No existing table's layout changes. A pre-v6 file's
+`LABEL_INDEX` is built by `migrate_v6::migrate_v5_to_v6`: a single scan of
+`NODES`, decoding each row's already-interned `label`/`scope` fields straight
+off `disk::NodeRecordDiskV3` (no `Dicts`/`ScopeRegistry` resolution needed —
+those ids are already exactly what the key wants) and inserting one
+`LABEL_INDEX` row per node. This is deliberately the simplest hop in the
+file's history: one derived table, one scan, no re-encoding of anything else,
+no dual-write era.
+
+v5 changed **no table layout** relative to
 v4 — only the `prop_index` key scheme: `Str` values are keyed by their
 *normalized* form (`prop_index::normalize_str` — whitespace-trimmed/collapsed,
 Unicode-lowercased) instead of their raw bytes, making equality-index probes
@@ -53,14 +70,24 @@ transaction, committed once at the very end:
 
 | stored version | on open |
 |---|---|
-| absent (brand-new file) | stamp `FORMAT_VERSION` (5) directly — `storage.rs: Storage::open_with_options`, `None` arm |
-| 5 | open directly, no rewrite — `Some(5) => {}` |
-| 4 | stamp 5 (no table work; the PROP_INDEX rebuild happens in `ensure_index_spec` via the norm-version check) — `Some(4)` arm |
-| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, stamp 5 — `Some(3)` arm |
-| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, stamp 5 — `Some(2)` arm, chained in one call |
-| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, stamp 5 — `Some(1)` arm, chained in one call |
-| > 5 | `TopoError::UnsupportedFormat { found, supported: 5 }` — `Some(found) if found > FORMAT_VERSION` |
+| absent (brand-new file) | stamp `FORMAT_VERSION` (6) directly — `storage.rs: Storage::open_with_options`, `None` arm |
+| 6 | open directly, no rewrite — `Some(6) => {}` |
+| 5 | `migrate_v6::migrate_v5_to_v6` (one NODES scan, builds `LABEL_INDEX`), stamp 6 — `Some(5)` arm |
+| 4 | `migrate_v6::migrate_v5_to_v6`, stamp 6 directly (this arm jumps straight from 4 to the current `FORMAT_VERSION`, so it must do v6's table work itself rather than falling through to the `Some(5)` arm, which only runs for a file genuinely stamped 5; the PROP_INDEX rebuild still happens separately, in `ensure_index_spec`, via the norm-version check) — `Some(4)` arm |
+| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 6 — `Some(3)` arm |
+| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 6 — `Some(2)` arm, chained in one call |
+| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 6 — `Some(1)` arm, chained in one call |
+| > 6 | `TopoError::UnsupportedFormat { found, supported: 6 }` — `Some(found) if found > FORMAT_VERSION` |
 | anything else (currently only 0, which can't occur since real versions start at 1) | `TopoError::Encoding` — `Some(found)` catch-all arm |
+
+Every arm above except the fast `Some(6) => {}` path calls
+`migrate_v6::migrate_v5_to_v6` — not just the `Some(5)` arm — because arms for
+versions further back stamp `FORMAT_VERSION` directly rather than falling
+through a chain of one-version-at-a-time steps; each must therefore perform
+v6's table work itself. `migrate_v5_to_v6` is idempotent (re-inserting the
+same key/value is a no-op), so calling it unconditionally on every non-fast
+path is safe regardless of how many other migrations ran first in the same
+open.
 
 Because table creation, migration, and the version stamp all happen inside the
 single write transaction `open_with_options` opens at its top and commits once
@@ -187,6 +214,16 @@ Migration rewrites are scoped precisely:
   `one_model_two_dims_across_scopes_rejects_not_encoding` (`migrate_v4.rs`,
   exercising the migration function directly).
 
+- **v5 → v6** (`migrate_v6::migrate_v5_to_v6`, new this version): a single
+  scan of `NODES`, no other table read or written (besides `LABEL_INDEX`
+  itself). Each row's `disk::NodeRecordDiskV3.label`/`.scope` fields are
+  already the interned ids `LABEL_INDEX`'s key wants, so this step needs no
+  `Dicts`/`ScopeRegistry` lookups — just a raw decode-and-insert per node.
+  Idempotent, so every historic version arm above calls it unconditionally
+  (see the version-dispatch table's note). By far the smallest migration hop
+  in this document's history: no dual-write era, no re-encoding of an
+  existing table, no key-shape discrimination.
+
 Redb free space means the on-disk file size need not shrink even where
 logical row bytes do — e.g. a v1 file's per-node embedded embeddings become
 smaller externalized rows after migration, but the file itself may stay the
@@ -197,7 +234,7 @@ step never run automatically by `open_with`.
 
 ## Tables
 
-`storage.rs: Storage::open_with_options` unconditionally opens **twenty**
+`storage.rs: Storage::open_with_options` unconditionally opens **twenty-one**
 tables on every open (verified from its `existing` block, `OPS` through
 `META`) — this is the complete set. `EMBEDDINGS` is deliberately NOT in this
 list (see "Version and migration," above) — it exists only mid-migration on a
@@ -225,6 +262,7 @@ pre-v4 file and is gone by the time the opening write transaction commits.
 | `out_adj` | `[slot:8][edge_type:4][chunk:4]` (16 bytes) | framed adjacency block | `adj.rs: OUT_ADJ` |
 | `in_adj` | `[slot:8][edge_type:4][chunk:4]` (16 bytes) | framed adjacency block | `adj.rs: IN_ADJ` |
 | `prop_index` | `[prop_key:4][tag:1][canonical value][slot:8]` | empty (existence-only key) | `prop_index.rs: PROP_INDEX` |
+| `label_index` | `[label_id:4 BE][scope_id:4 BE][node_id:16 BE]` (24 bytes, `storage.rs: label_index_key`) | 8-byte native `u64` node slot (not framed) | `storage.rs: LABEL_INDEX` |
 
 `node_key`/`edge_key` (16-byte BE ULID keys, `storage.rs`) are NOT part of the
 live v4 read/write path — they remain in use only by `migrate.rs`'s frozen
@@ -268,13 +306,28 @@ on every `open_with` and by every rebuild/migration path;
 `ScopeRegistry::load_table_for_rebuild` refuses to load a table where id `0`
 isn't `Shared`. Interning is append-only, same doctrine as the dictionary.
 
+**Label index** (v6, `storage.rs: LABEL_INDEX`/`label_index_key`): key is
+`[label_id:4 BE][scope_id:4 BE][node_id:16 BE]` (24 bytes); value is the raw
+`u64` node slot. Purely derived state — reconstructible from `NODES` alone
+(see "Version and migration"'s v5→v6 description, and "Rebuild determinism,"
+below) — maintained incrementally by `apply_op`: inserted once a `CreateNode`
+has allocated its slot, removed on `RemoveNode` using the label/scope read
+straight off the just-removed row (labels are immutable — there is no
+`SetNodeProps`-driven update case). The `node_id` tail means every row
+sharing a `(label_id, scope_id)` prefix sorts in mint-time order (a ULID's
+leading bits are a timestamp), so a bounded prefix scan over that key range
+visits a label's nodes within a scope oldest-first — the property the future
+label-scoped read path (not yet wired up as of this table's introduction) is
+expected to lean on.
+
 **Value frame** (`codec.rs`): every `nodes`, `edges`, `vectors`, `postings`
 chunk, and adjacency (`out_adj`/`in_adj`) block value is wrapped in a 1-byte
 codec-tag frame (`codec::frame_value`/`unframe_value`) — verified by grepping
 every `frame_value`/`unframe_value` call site in `src/`. `counters`,
-`fts_docs`, `fts_stats`, `dict`, `scopes`, `prop_index`, `vector_dims`, and
-`embedding_ref` are plain (unframed) postcard or raw bytes; `ops` and `meta`
-are untouched raw postcard/bytes. The codec byte is an **APPEND-ONLY**
+`fts_docs`, `fts_stats`, `dict`, `scopes`, `prop_index`, `vector_dims`,
+`label_index`, and `embedding_ref` are plain (unframed) postcard or raw
+bytes; `ops` and `meta` are untouched raw postcard/bytes. The codec byte is
+an **APPEND-ONLY**
 registry: `0x00` (`CODEC_RAW`) uncompressed postcard; `0x01` unused (skipped
 in the numbering, available for a future codec); `0x02` (`CODEC_LZ4`) an
 `lz4_flex` size-prepended block. `frame_value` only attempts lz4 for raw
@@ -520,9 +573,9 @@ This is deliberate: the op log is self-describing, so replay
 (`Storage::rebuild_state_from_ops`) never depends on what dictionary ids,
 scope ids, or slots happened to be assigned when the log was first written.
 Every other table in this document — dictionaries, the scope registry, slots,
-adjacency, the prop index, the vector tables, and the FTS tables — is
-*derived* state, reconstructible from `OPS` plus (for v1/v2/v3 files) a
-one-time migration.
+adjacency, the prop index, the label index, the vector tables, and the FTS
+tables — is *derived* state, reconstructible from `OPS` plus (for v1–v5
+files) a one-time migration.
 
 ## Corruption contract
 
@@ -540,11 +593,14 @@ vs. `VECTORS` (see "Vectors," above).
 
 `Storage::rebuild_state_from_ops` drains `NODES`, `EDGES`, `VECTOR_DIMS`,
 `VECTORS`, `EMBEDDING_REF`, `DICT`, `SCOPES`, `NODE_SLOTS`, `NODE_IDS`,
-`EDGE_SLOTS`, `EDGE_IDS`, `OUT_ADJ`, `IN_ADJ`, `PROP_INDEX`, `POSTINGS`,
-`FTS_DOCS`, and `FTS_STATS` — every table this document calls *derived* —
-then replays `OPS` from seq 1 through the same `apply_op` the normal write
-path (`apply_batch`) uses, so there is no parallel mutation logic to drift
-out of sync. `COUNTERS` is preserved across the rebuild — access statistics
+`EDGE_SLOTS`, `EDGE_IDS`, `OUT_ADJ`, `IN_ADJ`, `PROP_INDEX`, `LABEL_INDEX`,
+`POSTINGS`, `FTS_DOCS`, and `FTS_STATS` — every table this document calls
+*derived* — then replays `OPS` from seq 1 through the same `apply_op` the
+normal write path (`apply_batch`) uses, so there is no parallel mutation
+logic to drift out of sync: `LABEL_INDEX` in particular is repopulated
+exactly the way `apply_op`'s `CreateNode`/`RemoveNode` arms maintain it
+incrementally on the live write path, not by a separate rebuild-only code
+path. `COUNTERS` is preserved across the rebuild — access statistics
 are auxiliary telemetry outside the op log, never appended to `OPS`, so a
 rebuild must not reset them to zero — but preservation is keyed by **node
 identity (ULID)**, not by slot number: replay reassigns dense slots in
@@ -561,6 +617,40 @@ simply hits `check_or_pin_dim`'s `Ok` branch the same way a fresh write would.
 Refuses with `TopoError::Compacted { oldest }` once `oldest_seq > 1`, since a
 compacted log is no longer a full history and replay from genesis is
 impossible by definition.
+
+## Write atomicity (group commit)
+
+`Storage::apply_batches` (F9c) applies every batch handed to it in one
+"group" through a SINGLE shared write transaction and a SINGLE `tx.commit()`
+(one fsync), rather than one transaction per batch — `apply_batch` is a thin
+`apply_batches(vec![ops], now_ms)` wrapper, so a caller submitting one batch
+at a time sees no change in behavior or durability. The applier's
+drained-job path (`db.rs`) is what actually forms multi-batch groups: when
+several `Job::Apply`s are already queued by the time the applier thread picks
+up work, it drains and applies all of them as one group instead of one
+transaction each.
+
+This changes the crash-atomicity unit from "one batch" to "one group": if the
+process is killed before that single `tx.commit()` returns, **every batch in
+the group is lost together** — not just the one that happened to be
+mid-flight — and on reopen the log holds exactly the pre-group state, same as
+any other transaction that never committed (see "Version and migration,"
+above, for the identical single-commit argument applied to migration). A
+crash can never leave the group PARTIALLY applied: `apply_ops_in_txn` mutates
+the shared transaction's tables incrementally as it walks the group, but
+nothing in that transaction is durable — visible to a REOPENED file — until
+the one `tx.commit()` at the end succeeds. This is coarser atomicity than
+per-batch commit, deliberately: grouping trades "a crash loses at most one
+batch" for "a crash loses at most one group, but N batches share one fsync,"
+and the direction of that trade is a hard invariant — a future change may
+grow the group (coarser still), but must never commit part of a group without
+committing all of it (finer than one atomic unit per group is the one thing
+this design forbids). Concurrent readers are unaffected either way: they see
+either the pre-group state or the fully-committed post-group state, never
+an in-between (`apply_batches`' in-memory `Dicts`/`ScopeRegistry` mirror
+guards are held across the whole group and dropped only once every batch has
+resolved successfully, immediately before the commit — see `apply_batches`'
+doc comment in `storage.rs`).
 
 ## Evolution policy
 
@@ -581,6 +671,6 @@ an existing value's meaning may never be repurposed, only new values added:
 The op log deliberately retains full strings and no frame so replay stays
 independent of dictionary/scope-registry assignment order (see "The `ops`
 table," above). `Storage::rebuild_state_from_ops` drains and regenerates every
-derived v4 table — dictionaries, the scope registry, slots, adjacency, the
-prop index, the vector tables, and FTS — while replaying this self-describing
-log (see "Rebuild determinism," above).
+derived table — dictionaries, the scope registry, slots, adjacency, the prop
+index, the label index, the vector tables, and FTS — while replaying this
+self-describing log (see "Rebuild determinism," above).

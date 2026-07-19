@@ -412,6 +412,12 @@ proptest! {
         let vectors_raw_before = db.debug_dump_vectors().unwrap();
         let embedding_ref_raw_before = db.debug_dump_embedding_ref().unwrap();
         let vector_dims_raw_before = db.debug_dump_vector_dims().unwrap();
+        // LABEL_INDEX (F9-11 Task 7): derived purely from NODES, so this
+        // dump's before/after parity below is the raw-table-level proof (to
+        // go with the `nodes_by_label`-based explicit rebuild test) that
+        // `rebuild_state_from_ops` repopulates it byte-for-byte, not just
+        // "close enough" to keep query results looking right.
+        let label_index_raw_before = db.debug_dump_label_index().unwrap();
 
         // Recall-layer parity, BEFORE rebuild. `text_k` is computed from the
         // pre-rebuild live count (rebuild never changes the live set — that's
@@ -464,6 +470,8 @@ proptest! {
         prop_assert_eq!(embedding_ref_raw_before, embedding_ref_raw_after);
         let vector_dims_raw_after = db.debug_dump_vector_dims().unwrap();
         prop_assert_eq!(vector_dims_raw_before, vector_dims_raw_after);
+        let label_index_raw_after = db.debug_dump_label_index().unwrap();
+        prop_assert_eq!(label_index_raw_before, label_index_raw_after);
 
         // Recall-layer parity, AFTER rebuild. Equality/vector re-assert the
         // same "finds it" property against the rebuilt state; FTS asserts the
@@ -475,4 +483,109 @@ proptest! {
             WORDS.iter().map(|w| fts_hit_ids(&db, &scopes, w, text_k)).collect();
         prop_assert_eq!(fts_before, fts_after);
     }
+}
+
+/// F9-11 Task 7: `nodes_by_label` results (still a full `NODES` scan on this
+/// branch — Task 8 rewires the read path onto `LABEL_INDEX`) must be
+/// identical before and after `rebuild_state_from_ops`, over a corpus that
+/// mixes two labels, two scopes, and a create-then-remove that leaves one
+/// node dead — proving `LABEL_INDEX` (via `debug_dump_label_index`'s exact
+/// byte parity above) AND the still-full-scan read path agree, rather than
+/// merely proving the two never diverge by construction. Falsifiable: skip
+/// `apply_op`'s `label_index.insert`/`.remove` calls, or drop `label_index`
+/// from the tables `rebuild_state_from_ops` clears/repopulates, and this
+/// still passes (nothing here reads `LABEL_INDEX` directly) — the
+/// `label_index_raw_before`/`label_index_raw_after` proptest assertion above
+/// is what catches that. This test instead pins the observable contract:
+/// whatever `LABEL_INDEX` is FOR, the plain node-scan read it will one day
+/// replace must keep agreeing with it.
+#[test]
+fn label_reads_are_identical_before_and_after_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+
+    let scope_a = ScopeId::new();
+    let scope_b = ScopeId::new();
+    let (e1, e2, e3, m1, doomed) = (
+        NodeId::new(),
+        NodeId::new(),
+        NodeId::new(),
+        NodeId::new(),
+        NodeId::new(),
+    );
+    db.submit(vec![
+        Op::CreateNode {
+            id: e1,
+            scope: Scope::Id(scope_a),
+            label: "Entity".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: e2,
+            scope: Scope::Id(scope_a),
+            label: "Entity".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: e3,
+            scope: Scope::Id(scope_b),
+            label: "Entity".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: m1,
+            scope: Scope::Id(scope_a),
+            label: "M".into(),
+            props: Default::default(),
+        },
+        Op::CreateNode {
+            id: doomed,
+            scope: Scope::Id(scope_a),
+            label: "Entity".into(),
+            props: Default::default(),
+        },
+    ])
+    .unwrap();
+    db.submit(vec![Op::RemoveNode { id: doomed }]).unwrap();
+
+    let scopes = ScopeSet::of(&[scope_a, scope_b]);
+    let mut before_entity: Vec<NodeId> = db
+        .nodes_by_label(&scopes, "Entity")
+        .iter()
+        .map(|n| n.id)
+        .collect();
+    let mut before_m: Vec<NodeId> = db
+        .nodes_by_label(&scopes, "M")
+        .iter()
+        .map(|n| n.id)
+        .collect();
+    before_entity.sort();
+    before_m.sort();
+    // Sanity on the corpus itself: `doomed` must not survive as an "Entity" hit.
+    assert_eq!(before_entity, {
+        let mut v = vec![e1, e2, e3];
+        v.sort();
+        v
+    });
+    assert_eq!(before_m, vec![m1]);
+
+    db.rebuild_state_from_ops().unwrap();
+
+    let mut after_entity: Vec<NodeId> = db
+        .nodes_by_label(&scopes, "Entity")
+        .iter()
+        .map(|n| n.id)
+        .collect();
+    let mut after_m: Vec<NodeId> = db
+        .nodes_by_label(&scopes, "M")
+        .iter()
+        .map(|n| n.id)
+        .collect();
+    after_entity.sort();
+    after_m.sort();
+    assert_eq!(
+        before_entity, after_entity,
+        "Entity hits must survive rebuild unchanged"
+    );
+    assert_eq!(before_m, after_m, "M hits must survive rebuild unchanged");
 }

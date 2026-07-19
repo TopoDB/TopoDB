@@ -986,6 +986,40 @@ impl Db {
         out.sort_unstable();
         Ok(out)
     }
+
+    /// Test/inspection helper: every `LABEL_INDEX` row currently in storage,
+    /// decoded as `(label_id, scope_id, node_id, slot)` from the raw
+    /// `label_id BE ++ scope_id BE ++ node_id BE` key and `u64` slot value
+    /// (`storage::label_index_key`) — sorted by that same tuple, which is
+    /// also the on-disk key order (mint-time order within a `(label,
+    /// scope)` prefix — see `LABEL_INDEX`'s doc comment). `#[doc(hidden)]` —
+    /// see `all_edges_between`. Exists so tests can assert byte-level
+    /// LABEL_INDEX parity across `rebuild_state_from_ops`, the same role
+    /// `debug_dump_postings`/`debug_dump_vectors`/etc. play for the other
+    /// derived/recall tables.
+    #[doc(hidden)]
+    pub fn debug_dump_label_index(&self) -> Result<Vec<LabelIndexDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::storage::LABEL_INDEX)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key: [u8; 24] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad label_index key".into()))?;
+            let label_id = u32::from_be_bytes(key[0..4].try_into().expect("4-byte slice"));
+            let scope_id = u32::from_be_bytes(key[4..8].try_into().expect("4-byte slice"));
+            let node_id = u128::from_be_bytes(key[8..24].try_into().expect("16-byte slice"));
+            out.push((label_id, scope_id, node_id, v.value()));
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
 }
 
 /// One decoded adjacency entry from [`Db::debug_dump_adjacency`]:
@@ -1014,6 +1048,11 @@ pub type EmbeddingRefDumpRow = (u64, u32, u32);
 /// `(model_id, dim)`.
 #[doc(hidden)]
 pub type VectorDimsDumpRow = (u32, u32);
+
+/// One decoded `LABEL_INDEX` row from [`Db::debug_dump_label_index`]:
+/// `(label_id, scope_id, node_id, slot)`.
+#[doc(hidden)]
+pub type LabelIndexDumpRow = (u32, u32, u128, u64);
 
 /// The node ids that `validate::prevalidate_edge_scopes` needs pre-batch
 /// storage state (scope) for: `CreateEdge`'s endpoints. A same-batch
