@@ -33,6 +33,69 @@ fn text_only(scopes: &ScopeSet, query: &str, k: usize) -> RecallQuery {
     }
 }
 
+// --- labels-filter test support -------------------------------------------
+
+/// Index spec covering both `Memory` and `Entity` labels' `content` prop, so
+/// a query can lexically match nodes of either label.
+fn spec_with_entity() -> IndexSpec {
+    IndexSpec {
+        equality: vec![],
+        text: vec![
+            PropIndex {
+                label: "Memory".into(),
+                prop: "content".into(),
+            },
+            PropIndex {
+                label: "Entity".into(),
+                prop: "content".into(),
+            },
+        ],
+    }
+}
+
+fn entity(content: &str, scope: Scope) -> (NodeId, Op) {
+    let id = NodeId::new();
+    let mut props = Props::new();
+    props.insert("content".into(), PropValue::Str(content.into()));
+    (
+        id,
+        Op::CreateNode {
+            id,
+            scope,
+            label: "Entity".into(),
+            props,
+        },
+    )
+}
+
+/// A stable scope shared by every labels-filter test in this file, so
+/// `scopes()` (called independently of corpus construction, mirroring the
+/// task brief's test bodies) always names the scope the corpus was built
+/// under.
+fn labels_filter_scope() -> ScopeId {
+    static SCOPE: std::sync::OnceLock<ScopeId> = std::sync::OnceLock::new();
+    *SCOPE.get_or_init(ScopeId::new)
+}
+
+fn scopes() -> ScopeSet {
+    ScopeSet::of(&[labels_filter_scope()])
+}
+
+/// Builds a fresh db with one `Memory` node and one `Entity` node, both
+/// lexically matching `term`, and deliberately UNLINKED (no edge between
+/// them) so the graph leg cannot re-introduce one via adjacency and muddy
+/// the label-filter precondition.
+fn corpus_with_memory_and_entity_matching(term: &str) -> (Db, NodeId, NodeId) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.keep().join("t.redb");
+    let db = Db::open_with(db_path, spec_with_entity()).unwrap();
+    let s = labels_filter_scope();
+    let (memory_id, op_m) = memory(&format!("{term} memory note"), Scope::Id(s));
+    let (entity_id, op_e) = entity(&format!("{term} entity record"), Scope::Id(s));
+    db.submit(vec![op_m, op_e]).unwrap();
+    (db, memory_id, entity_id)
+}
+
 #[test]
 fn text_only_recall_orders_like_search_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -334,4 +397,72 @@ fn expansion_token_matching_exact_hit_does_not_re_add() {
         (with_exp - base).abs() < 1e-5,
         "expansion equal to an exact-hit term must be a no-op: {base} vs {with_exp}"
     );
+}
+
+#[test]
+fn labels_filter_excludes_non_matching_labels() {
+    // Corpus: a Memory and an Entity that BOTH match the query tokens,
+    // built unlinked so the graph leg can't muddy the precondition.
+    let (db, memory_id, entity_id) = corpus_with_memory_and_entity_matching("shared term");
+
+    let unfiltered = db
+        .recall(&topodb::RecallQuery {
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    let ids: Vec<_> = unfiltered.iter().map(|(n, _)| n.id).collect();
+    assert!(
+        ids.contains(&memory_id) && ids.contains(&entity_id),
+        "precondition: both fuse in"
+    );
+
+    let filtered = db
+        .recall(&topodb::RecallQuery {
+            labels: Some(vec!["Memory".into()]),
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    assert!(filtered.iter().any(|(n, _)| n.id == memory_id));
+    assert!(
+        filtered.iter().all(|(n, _)| n.label == "Memory"),
+        "no non-Memory label may survive the filter"
+    );
+}
+
+#[test]
+fn labels_filter_all_filtered_is_empty_not_error() {
+    let (db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
+    let out = db
+        .recall(&topodb::RecallQuery {
+            labels: Some(vec!["NoSuchLabel".into()]),
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn zeroed_effective_legs_is_empty_not_error() {
+    // Spec's degenerate-but-honest case: validation passes (graph_weight
+    // is > 0) but no leg with weight actually runs — text zeroed, no
+    // vector supplied, graph_boost off. Must be Ok(empty), not Rejected.
+    let (db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
+    let out = db
+        .recall(&topodb::RecallQuery {
+            text_weight: 0.0,
+            graph_boost: false,
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn labels_none_is_unfiltered() {
+    let (db, memory_id, entity_id) = corpus_with_memory_and_entity_matching("shared term");
+    let out = db
+        .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
+        .unwrap();
+    let ids: Vec<_> = out.iter().map(|(n, _)| n.id).collect();
+    assert!(ids.contains(&memory_id) && ids.contains(&entity_id));
 }

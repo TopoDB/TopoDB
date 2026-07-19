@@ -245,7 +245,14 @@ impl Db {
         // An unknown model or a scope with no vectors is an EMPTY leg —
         // legitimately no data — never an error (contrast the empty-vector
         // rejection above, which is a host bug).
-        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = vec![(q.text_weight, text_ids)];
+        // A zero-weight leg contributes nothing to a fused score but its ids
+        // would still ride along at score 0.0 if the list were included
+        // unconditionally — exclude it so "weight says on, nothing actually
+        // ran" degenerates to Ok(empty) rather than a ghost result.
+        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = Vec::new();
+        if q.text_weight > 0.0 {
+            lists.push((q.text_weight, text_ids));
+        }
         if let Some((model, vector)) = &q.vector {
             let vhits = self.search_vector(&crate::VectorQuery {
                 scopes: q.scopes.clone(),
@@ -301,6 +308,12 @@ impl Db {
             .into_iter()
             .filter_map(|(id, score)| records.remove(&id).map(|n| (n, score)))
             .collect();
+        // Post-fusion label allowlist (spec: filter BEFORE adjustments so
+        // counter reads aren't spent on filtered nodes; leg depth >> k, so
+        // filtering rarely starves k — and legitimately may).
+        if let Some(labels) = &q.labels {
+            out.retain(|(n, _)| labels.iter().any(|l| n.label == l.as_str()));
+        }
         apply_recency(&mut out, &q.options);
         out.truncate(q.k);
         Ok(out)
