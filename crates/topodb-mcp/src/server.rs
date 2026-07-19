@@ -378,6 +378,19 @@ fn classify_topo_error(e: TopoError) -> ErrorData {
     }
 }
 
+/// In-call dedup key for `remember`'s entity names: whitespace-collapsed,
+/// lowercased — mirroring the engine's prop-index normalization
+/// (`prop_index::normalize_str`, which is pub(crate) and thus can't be
+/// called from here). Drift between the two only weakens IN-CALL dedup
+/// (["Drew", "drew"] in one call); cross-call dedup always goes through the
+/// engine's own normalized index via find_existing_entity.
+fn entity_dedup_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Schema stand-in for a props map. The tool bodies keep taking a raw
 /// [`Value`] (so `convert::json_to_props` owns validation and its error
 /// messages), but the *advertised* schema must say "object" — see
@@ -1493,7 +1506,15 @@ impl TopoServer {
             ops: Vec<Op>,
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(p.entities.len());
-        for name in &p.entities {
+        // In-call dedup: ["Drew Powell", " drew   powell "] is ONE entity and
+        // ONE edge; the first spelling is the one echoed back.
+        let mut seen = std::collections::BTreeSet::new();
+        let names: Vec<&String> = p
+            .entities
+            .iter()
+            .filter(|n| seen.insert(entity_dedup_key(n)))
+            .collect();
+        for name in names {
             match self.find_existing_entity(scope, name)? {
                 Some(node) => resolved.push(Resolved {
                     name: name.clone(),

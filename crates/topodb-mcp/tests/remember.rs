@@ -74,3 +74,87 @@ fn remember_stores_memory_entities_and_links_in_one_call() {
         assert_eq!(n["node"]["label"], "Entity");
     }
 }
+
+#[test]
+fn remember_reuses_existing_entities_and_aliases() {
+    let (_dir, mut server) = fresh_server();
+
+    // Pre-existing entity + an alias for it.
+    let drew = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "Drew Powell" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.call_tool_ok(
+        "add_alias",
+        serde_json::json!({ "entity_id": drew, "alias": "Drew" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Case-variant of the ALIAS must resolve to the canonical entity.
+    let res = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "prefers spec-first development",
+            "entities": ["drew"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let ents = res["entities"].as_array().unwrap();
+    assert_eq!(ents.len(), 1);
+    assert_eq!(ents[0]["id"].as_str().unwrap(), drew);
+    assert_eq!(ents[0]["created"], false);
+}
+
+#[test]
+fn remember_collapses_repeated_names_in_one_call() {
+    let (_dir, mut server) = fresh_server();
+
+    let res = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "dedup within a single call",
+            "entities": ["Drew Powell", " drew   powell "],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let ents = res["entities"].as_array().unwrap();
+    assert_eq!(ents.len(), 1, "case/whitespace variants collapse: {res}");
+    assert_eq!(ents[0]["name"], "Drew Powell", "first spelling wins");
+    assert_eq!(res["edge_ids"].as_array().unwrap().len(), 1);
+
+    // Exactly one edge out of the memory.
+    let memory_id = res["memory_id"].as_str().unwrap();
+    let edges = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": memory_id }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(edges["edges"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn remember_normalizes_custom_edge_types() {
+    let (_dir, mut server) = fresh_server();
+    let res = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "custom edge type",
+            "entities": ["Spec"],
+            "edge_type": "Mentioned In",
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_id = res["memory_id"].as_str().unwrap();
+    let edges = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": memory_id }),
+        DEFAULT_TIMEOUT,
+    );
+    let arr = edges["edges"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["type"], "mentioned_in", "link-style normalization");
+}
