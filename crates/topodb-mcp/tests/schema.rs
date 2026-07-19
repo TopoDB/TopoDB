@@ -380,3 +380,33 @@ fn no_tool_param_is_typeless() {
          encode them: {offenders:#?}"
     );
 }
+
+/// `remember`'s advertised schema must carry the runtime contract: content
+/// and entities required, entities a non-empty string array (`minItems: 1`
+/// is the advertised half of the runtime empty-check, the same dual
+/// enforcement `scopes` params use).
+#[test]
+fn remember_schema_requires_content_and_nonempty_entities() {
+    let (_dir, tools) = tools();
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "remember")
+        .expect("tools/list must include remember");
+
+    let required: Vec<&str> = tool["inputSchema"]["required"]
+        .as_array()
+        .expect("remember must declare required params")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"content"), "required: {required:?}");
+    assert!(required.contains(&"entities"), "required: {required:?}");
+
+    let props = properties(&tools, "remember");
+    let entities = &props["entities"];
+    assert_eq!(entities["type"], "array", "entities schema: {entities}");
+    assert_eq!(
+        entities["minItems"], 1,
+        "entities must advertise minItems 1: {entities}"
+    );
+}
