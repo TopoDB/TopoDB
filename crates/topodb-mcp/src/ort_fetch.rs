@@ -94,6 +94,136 @@ pub(crate) fn artifact_url(a: &OrtArtifact) -> String {
 
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum OrtRuntime {
+    /// ORT_DYLIB_PATH is set and loadable — ort resolves it itself.
+    EnvOverride,
+    /// A system runtime is on the loader search path — ort finds it.
+    System,
+    /// A cached/downloaded dylib at this path — point ort at it via init_from.
+    Local(PathBuf),
+    /// No runtime; the String is the one stderr line's reason text.
+    Unavailable(String),
+}
+
+fn platform_soname() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    }
+}
+
+/// Probes whether a single candidate dylib is loadable. Returns `Ok` if
+/// libloading can successfully load it, `Err` with the failure reason otherwise.
+#[allow(dead_code)]
+pub(crate) fn probe_loadable(candidate: &str) -> Result<(), String> {
+    // SAFETY: loading a shared library runs its initializers; this is
+    // the exact load ort itself performs immediately after a successful
+    // probe, so no new code runs that wouldn't have run anyway.
+    match unsafe { libloading::Library::new(candidate) } {
+        Ok(lib) => {
+            drop(lib);
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Strict precedence per the design spec: env override (exclusive) →
+/// system soname → cached download → fetch (if enabled) → Unavailable.
+/// `fetch` is injected so unit tests never touch the network.
+#[allow(dead_code)]
+pub(crate) fn resolve(
+    model_dir: &Path,
+    download_enabled: bool,
+    fetch: &dyn Fn(&str, &Path) -> Result<(), String>,
+) -> OrtRuntime {
+    // 1. Explicit override: the ONLY candidate, never download (matches
+    //    ort's own resolution — no fallback past an explicit path).
+    if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
+        if !p.is_empty() {
+            return match probe_loadable(&p) {
+                Ok(()) => OrtRuntime::EnvOverride,
+                Err(e) => {
+                    OrtRuntime::Unavailable(format!("ORT_DYLIB_PATH is set but not loadable: {e}"))
+                }
+            };
+        }
+    }
+    // 2. System runtime on the loader search path.
+    if probe_loadable(platform_soname()).is_ok() {
+        return OrtRuntime::System;
+    }
+    let Some(artifact) = current_artifact() else {
+        return OrtRuntime::Unavailable(
+            "no ONNX Runtime found and no pinned artifact exists for this platform; \
+             install ONNX Runtime or set ORT_DYLIB_PATH"
+                .into(),
+        );
+    };
+    let ort_root = model_dir.join("ort");
+    let cached = ort_root.join(ORT_VERSION).join(artifact.dylib_file);
+    // 3. Previously downloaded.
+    if cached.exists() {
+        return match probe_loadable(&cached.to_string_lossy()) {
+            Ok(()) => OrtRuntime::Local(cached),
+            Err(e) => OrtRuntime::Unavailable(format!(
+                "cached ONNX Runtime at {} is not loadable: {e}; delete it to re-download",
+                cached.display()
+            )),
+        };
+    }
+    // 4/5. Fetch, or explain why not.
+    if !download_enabled {
+        return OrtRuntime::Unavailable(
+            "no ONNX Runtime found and auto-download is disabled (--no-ort-download); \
+             install ONNX Runtime, set ORT_DYLIB_PATH, or drop the flag"
+                .into(),
+        );
+    }
+    let url = artifact_url(artifact);
+    if let Err(e) = std::fs::create_dir_all(&ort_root) {
+        return OrtRuntime::Unavailable(format!("cannot create {}: {e}", ort_root.display()));
+    }
+    let tmp = match tempfile::Builder::new()
+        .prefix("download-")
+        .tempfile_in(&ort_root)
+    {
+        Ok(t) => t,
+        Err(e) => return OrtRuntime::Unavailable(format!("temp file: {e}")),
+    };
+    if let Err(e) = fetch(&url, tmp.path()) {
+        return OrtRuntime::Unavailable(format!("download of {url} failed: {e}"));
+    }
+    match install_from_archive(tmp.path(), artifact, &ort_root) {
+        Ok(dylib) => match probe_loadable(&dylib.to_string_lossy()) {
+            Ok(()) => OrtRuntime::Local(dylib),
+            Err(e) => OrtRuntime::Unavailable(format!(
+                "downloaded ONNX Runtime at {} failed the load probe: {e}",
+                dylib.display()
+            )),
+        },
+        Err(e) => OrtRuntime::Unavailable(e),
+    }
+}
+
+/// Streaming download to `dest` over the ureq stack hf-hub already uses.
+#[allow(dead_code)]
+pub(crate) fn http_fetch(url: &str, dest: &Path) -> Result<(), String> {
+    let resp = ureq::get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let mut reader = resp.into_body().into_reader();
+    let mut out =
+        std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    std::io::copy(&mut reader, &mut out).map_err(|e| format!("stream {url}: {e}"))?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub(crate) fn sha256_hex(path: &Path) -> Result<String, String> {
     use sha2::Digest;
@@ -203,6 +333,8 @@ pub(crate) fn all_artifacts() -> [&'static OrtArtifact; 4] {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn artifact_table_is_fully_pinned() {
@@ -365,5 +497,88 @@ mod tests {
             .collect();
         assert!(paths.windows(2).all(|w| w[0] == w[1]));
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"race");
+    }
+
+    fn no_fetch(_url: &str, _dest: &std::path::Path) -> Result<(), String> {
+        panic!("fetch must not be called in this scenario");
+    }
+
+    #[test]
+    fn env_override_wins_and_never_downloads() {
+        // ORT_DYLIB_PATH pointing at garbage: resolver must report
+        // Unavailable (probe fails) WITHOUT attempting a download —
+        // an explicit override is never second-guessed. Env-var tests are
+        // process-global: set/remove inside, and don't parallel-panic —
+        // cargo runs #[test]s in threads, so serialize via a lock.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ORT_DYLIB_PATH", "/definitely/not/a/real/dylib");
+        let dir = tempfile::tempdir().unwrap();
+        let r = resolve(dir.path(), true, &no_fetch);
+        std::env::remove_var("ORT_DYLIB_PATH");
+        assert!(matches!(r, OrtRuntime::Unavailable(_)), "{r:?}");
+    }
+
+    #[test]
+    fn cached_dylib_short_circuits_the_fetch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ORT_DYLIB_PATH");
+        let Some(a) = current_artifact() else {
+            // Platform without a pinned artifact (e.g., Intel Mac): skip this test
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cached_dir = dir.path().join("ort").join(ORT_VERSION);
+        std::fs::create_dir_all(&cached_dir).unwrap();
+        // A file that EXISTS but is not loadable: the resolver must find
+        // it, probe it, fail the probe, and land Unavailable — still
+        // without fetching. On a host that has a SYSTEM ONNX Runtime the
+        // resolver legitimately stops earlier at System (also without
+        // fetching); accept both — `no_fetch`'s panic is the invariant.
+        std::fs::write(cached_dir.join(a.dylib_file), b"not a dylib").unwrap();
+        let r = resolve(dir.path(), true, &no_fetch);
+        assert!(
+            matches!(r, OrtRuntime::Unavailable(_) | OrtRuntime::System),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_downloads_never_fetch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ORT_DYLIB_PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let r = resolve(dir.path(), false, &no_fetch);
+        // On a host WITH a system ORT this legitimately resolves System;
+        // on a host without one it must be Unavailable and the message must
+        // name the flag. Either way no_fetch proves no download attempt.
+        match r {
+            OrtRuntime::System => {}
+            OrtRuntime::Unavailable(msg) => {
+                assert!(msg.contains("--no-ort-download"), "{msg}")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_failure_degrades_with_reason() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ORT_DYLIB_PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let called = std::sync::atomic::AtomicUsize::new(0);
+        let failing = |_url: &str, _dest: &std::path::Path| -> Result<(), String> {
+            called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("simulated network failure".into())
+        };
+        let r = resolve(dir.path(), true, &failing);
+        match r {
+            // Host with a system ORT: resolver stops at System, fetch not called.
+            OrtRuntime::System => assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 0),
+            OrtRuntime::Unavailable(msg) => {
+                assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(msg.contains("simulated network failure"), "{msg}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
