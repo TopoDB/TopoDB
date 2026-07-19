@@ -332,6 +332,39 @@ impl TopoServer {
         out.dedup_by_key(|n| n.id);
         Ok(out)
     }
+
+    /// Find-or-create lookup shared by `create_entity` and `remember`.
+    ///
+    /// The lookup set is everything this session can SEE plus everything it
+    /// could COLLIDE with: the default read set, the write scope, and shared.
+    /// Without shared here, a shared entity would be invisible to a
+    /// project-scoped check and get a project-local twin — the single most
+    /// common duplicate-entity path.
+    ///
+    /// Oldest id wins (ULIDs sort by mint time): when duplicates already
+    /// exist from before upsert semantics, every new link converges on one
+    /// canonical node instead of scattering further. Resolves through any
+    /// alias registered for `name`, so an alias mention finds the canonical
+    /// entity rather than minting a duplicate.
+    ///
+    /// `Ok(None)` means "create it" — covering both no-visible-match and a
+    /// custom spec without the (Entity, name) equality index (`Rejected`),
+    /// which degrades to create-always rather than failing the write.
+    fn find_existing_entity(
+        &self,
+        write_scope: Scope,
+        name: &str,
+    ) -> Result<Option<topodb::NodeRecord>, ErrorData> {
+        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup_scopes.push(write_scope);
+        lookup_scopes.push(Scope::Shared);
+        let lookup_set = convert::scopes_to_scope_set(&lookup_scopes);
+        match self.resolve_entities_by_name(&lookup_set, name) {
+            Ok(hits) => Ok(hits.into_iter().min_by_key(|n| n.id)),
+            Err(TopoError::Rejected(_)) => Ok(None),
+            Err(e) => Err(classify_topo_error(e)),
+        }
+    }
 }
 
 /// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
@@ -1390,28 +1423,7 @@ impl TopoServer {
         .map_err(|e| ErrorData::invalid_params(e, None))?;
         let scope = self.resolve_scope(p.scope.as_deref())?;
 
-        // Dedup lookup runs against everything this session can SEE plus
-        // everything it could COLLIDE with: the default read set, the write
-        // scope, and shared. Without shared here, a shared entity would be
-        // invisible to a project-scoped check and get a project-local twin —
-        // the single most common duplicate-entity path.
-        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
-        lookup_scopes.push(scope);
-        lookup_scopes.push(Scope::Shared);
-        let lookup_set = convert::scopes_to_scope_set(&lookup_scopes);
-        // Oldest id wins (ULIDs sort by mint time): when duplicates already
-        // exist from before upsert semantics, every new link converges on
-        // one canonical node instead of scattering further. This also
-        // resolves through any alias registered for `p.name` (Task 8), so an
-        // alias mention finds the canonical entity rather than minting a
-        // duplicate.
-        let existing = match self.resolve_entities_by_name(&lookup_set, &p.name) {
-            Ok(hits) => hits.into_iter().min_by_key(|n| n.id),
-            // A custom spec without (Entity, name) equality-indexed can't
-            // dedup — degrade to create-always rather than failing the write.
-            Err(TopoError::Rejected(_)) => None,
-            Err(e) => return Err(classify_topo_error(e)),
-        };
+        let existing = self.find_existing_entity(scope, &p.name)?;
 
         if let Some(node) = existing {
             // Merge only NEW metadata keys onto the existing entity; never
