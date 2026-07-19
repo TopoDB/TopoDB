@@ -324,18 +324,39 @@ impl Db {
         if let Some(labels) = &q.labels {
             out.retain(|(n, _)| labels.iter().any(|l| n.label == l.as_str()));
         }
-        apply_recency(&mut out, &q.options);
+        apply_adjustments(&mut out, &q.options, q.access_weight, &|id| {
+            self.access_count_unbumped(id)
+        });
         out.truncate(q.k);
         Ok(out)
     }
 }
 
-/// Post-fusion recency: the same `(1-w) + w·2^(-age/half_life)` factor
-/// `search_text_with` uses, applied once to fused scores, then re-sorted
-/// (score desc, id asc). No-op at weight 0.
-pub(crate) fn apply_recency(out: &mut [(NodeRecord, f32)], options: &SearchOptions) {
+/// Post-fusion access factor: neutral at count 0, log-damped (recall's own
+/// reads bump the counters this reads — damping keeps the loop from
+/// running away), bounded below `1 + weight`. See the design spec.
+pub(crate) fn access_factor(weight: f32, count: u64) -> f32 {
+    if weight <= 0.0 || count == 0 {
+        return 1.0;
+    }
+    let l = ((count as f32) + 1.0).ln();
+    1.0 + weight * l / (1.0 + l)
+}
+
+/// Combined post-fusion adjustment: recency (the same
+/// `(1-w) + w·2^(-age/half_life)` factor `search_text_with` uses) and the
+/// opt-in access boost (`access_factor`) multiply into one factor per
+/// candidate, applied once to fused scores, then re-sorted (score desc, id
+/// asc). No-op — and no counter reads — when both weights are 0, preserving
+/// today's early-return shape and the byte-identical-defaults requirement.
+pub(crate) fn apply_adjustments(
+    out: &mut [(NodeRecord, f32)],
+    options: &SearchOptions,
+    access_weight: f32,
+    counts: &dyn Fn(crate::NodeId) -> u64,
+) {
     let w = options.recency_weight;
-    if w <= 0.0 {
+    if w <= 0.0 && access_weight <= 0.0 {
         return;
     }
     let now = options.now_ms.unwrap_or_else(|| {
@@ -346,14 +367,42 @@ pub(crate) fn apply_recency(out: &mut [(NodeRecord, f32)], options: &SearchOptio
     });
     let half_life = options.recency_half_life_ms as f32;
     for (rec, score) in out.iter_mut() {
-        let age = (now - rec.id.timestamp_ms() as i64).max(0) as f32;
-        *score *= (1.0 - w) + w * (-(age / half_life)).exp2();
+        let mut factor = 1.0f32;
+        if w > 0.0 {
+            let age = (now - rec.id.timestamp_ms() as i64).max(0) as f32;
+            factor *= (1.0 - w) + w * (-(age / half_life)).exp2();
+        }
+        factor *= access_factor(
+            access_weight,
+            if access_weight > 0.0 {
+                counts(rec.id)
+            } else {
+                0
+            },
+        );
+        *score *= factor;
     }
     out.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.id.cmp(&b.0.id))
     });
+}
+
+#[cfg(test)]
+mod adjustment_tests {
+    use super::*;
+
+    #[test]
+    fn access_factor_is_neutral_monotone_bounded() {
+        let f = |w: f32, count: u64| access_factor(w, count);
+        assert_eq!(f(1.0, 0), 1.0, "neutral at zero count");
+        assert_eq!(f(0.0, 1_000_000), 1.0, "neutral at zero weight");
+        assert!(f(1.0, 1) > f(1.0, 0));
+        assert!(f(1.0, 100) > f(1.0, 10));
+        assert!(f(1.0, u64::MAX) < 2.0, "bounded below 1 + weight");
+        assert!(f(0.5, u64::MAX) < 1.5);
+    }
 }
 
 #[cfg(test)]

@@ -424,6 +424,20 @@ impl Db {
         ))
     }
 
+    /// Access count for scoring: NO existence/scope gate (recall's
+    /// candidates are already scope-filtered by the legs) and NO bump —
+    /// a raw COUNTERS read. 0 on absent or on read error: a counter read
+    /// must never fail a recall.
+    pub(crate) fn access_count_unbumped(&self, id: NodeId) -> u64 {
+        self.inner
+            .storage
+            .read_counter(id)
+            .ok()
+            .flatten()
+            .map(|s| s.access_count)
+            .unwrap_or(0)
+    }
+
     /// Submits a batch of ops for application, blocking until the applier
     /// thread has processed it. Safe to call from any thread; batches from
     /// concurrent callers serialize through the single applier. Uses the

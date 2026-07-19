@@ -1,5 +1,14 @@
 //! Behavioral tests for Db::recall — the production hybrid fusion API.
+use std::time::Duration;
 use topodb::*;
+
+/// Bumps are async (batched ~100ms / 256-item flush threshold, see
+/// `crates/topodb/tests/counters.rs`). Sleep past a flush interval instead
+/// of polling a specific id/count — the access-boost tests need "whatever
+/// bumps are pending have landed," not a per-id deadline poll.
+fn settle_counters(_db: &Db) {
+    std::thread::sleep(Duration::from_millis(300));
+}
 
 fn spec() -> IndexSpec {
     IndexSpec {
@@ -94,6 +103,57 @@ fn corpus_with_memory_and_entity_matching(term: &str) -> (Db, NodeId, NodeId) {
     let (entity_id, op_e) = entity(&format!("{term} entity record"), Scope::Id(s));
     db.submit(vec![op_m, op_e]).unwrap();
     (db, memory_id, entity_id)
+}
+
+/// Two `Memory` nodes with equal textual standing for `term` (same content
+/// shape, different id), so any ranking difference between them must come
+/// from a post-fusion adjustment (recency/access), not from BM25.
+fn corpus_with_two_equal_memories(term: &str) -> (Db, NodeId, NodeId) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.keep().join("t.redb");
+    let db = Db::open_with(db_path, spec_with_entity()).unwrap();
+    let s = labels_filter_scope();
+    let (a_id, op_a) = memory(&format!("{term} memory note"), Scope::Id(s));
+    let (b_id, op_b) = memory(&format!("{term} memory note"), Scope::Id(s));
+    db.submit(vec![op_a, op_b]).unwrap();
+    (db, a_id, b_id)
+}
+
+/// One node backdated ~7 days via an explicit `NodeId::from_u128` id (high
+/// 48 bits = ULID timestamp, inverting `NodeId::timestamp_ms`'s encoding —
+/// see `recency_applies_once_post_fusion`'s `ulid_at` for the same trick),
+/// and one freshly-minted node, both matching `term` equally on text.
+fn corpus_with_backdated_and_fresh_memory(term: &str) -> (Db, NodeId, NodeId) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.keep().join("t.redb");
+    let db = Db::open_with(db_path, spec_with_entity()).unwrap();
+    let s = labels_filter_scope();
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+    // 7 days, not the deeper backdate `recency_applies_once_post_fusion`
+    // uses: at `recency_weight = 0.9` / the default 30-day half-life, a
+    // 7-day gap still leaves recency decay shallow enough (~0.87x) for the
+    // access boost (bounded below `1 + weight`, i.e. < 2x) to overcome it,
+    // while still being deep enough that recency alone picks the fresh node.
+    let old_id = NodeId::from_u128(ulid_at(now - 7 * DAY_MS, 1));
+    let (fresh_id, op_fresh) = memory(&format!("{term} memory note"), Scope::Id(s));
+    let mut props = Props::new();
+    props.insert(
+        "content".into(),
+        PropValue::Str(format!("{term} memory note")),
+    );
+    let op_old = Op::CreateNode {
+        id: old_id,
+        scope: Scope::Id(s),
+        label: "Memory".into(),
+        props,
+    };
+    db.submit(vec![op_old, op_fresh]).unwrap();
+    (db, old_id, fresh_id)
 }
 
 #[test]
@@ -576,4 +636,119 @@ fn zero_weight_graph_leg_does_not_ghost_in_neighbor() {
         ids1.contains(&linked),
         "graph_weight > 0.0 must let the 1-hop neighbor join: {ids1:?}"
     );
+}
+
+#[test]
+fn access_weight_zero_is_byte_identical() {
+    let (db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
+    let a = db
+        .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
+        .unwrap();
+    let b = db
+        .recall(&topodb::RecallQuery {
+            access_weight: 0.0,
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    let pairs =
+        |v: &[(topodb::NodeRecord, f32)]| v.iter().map(|(n, s)| (n.id, *s)).collect::<Vec<_>>();
+    assert_eq!(pairs(&a), pairs(&b), "same ids, same scores, same order");
+}
+
+#[test]
+fn access_boost_lifts_a_frequently_read_node() {
+    // Two memories with equal textual standing for the query; bump one's
+    // access counter by reading it (db.node() bumps) several times, then
+    // recall with access_weight 1.0 and assert the bumped one ranks first.
+    let (db, a_id, b_id) = corpus_with_two_equal_memories("shared term");
+    for _ in 0..8 {
+        let _ = db.node(&scopes(), a_id);
+    }
+    settle_counters(&db);
+    let out = db
+        .recall(&topodb::RecallQuery {
+            access_weight: 1.0,
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    let first = out.first().map(|(n, _)| n.id);
+    assert_eq!(
+        first,
+        Some(a_id),
+        "bumped node must outrank its equal twin (b={b_id:?})"
+    );
+}
+
+#[test]
+fn recency_and_access_factors_multiply() {
+    // One OLD node with bumped access vs one FRESH node with none, equal
+    // textual standing. With recency_weight high and access_weight 0 the
+    // fresh node wins; adding access_weight 1.0 (old node heavily bumped)
+    // must lift the old node past it — proving the two factors compose
+    // multiplicatively rather than one overwriting the other.
+    let (db, old_id, fresh_id) = corpus_with_backdated_and_fresh_memory("shared term");
+    for _ in 0..32 {
+        let _ = db.node(&scopes(), old_id);
+    }
+    settle_counters(&db);
+    let mut base = topodb::RecallQuery::new(scopes(), "shared term", 10);
+    base.options.recency_weight = 0.9;
+    // Pin "now" to the fresh node's mint time: the old node's age is then
+    // exactly its backdate (~7 days), the fresh node's is ~0.
+    base.options.now_ms = Some(fresh_id.timestamp_ms() as i64);
+    let recency_only = db.recall(&base).unwrap();
+    assert_eq!(recency_only.first().map(|(n, _)| n.id), Some(fresh_id));
+    let both = db
+        .recall(&topodb::RecallQuery {
+            access_weight: 1.0,
+            ..base.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        both.first().map(|(n, _)| n.id),
+        Some(old_id),
+        "access boost must be able to overcome recency when counts warrant"
+    );
+}
+
+#[test]
+fn scoring_reads_do_not_bump_counters() {
+    let (db, a_id, _b) = corpus_with_two_equal_memories("shared term");
+    settle_counters(&db);
+    let before = db
+        .access_stats(&scopes(), a_id)
+        .unwrap()
+        .unwrap()
+        .access_count;
+    // recall with the boost ON reads counters for scoring — which must not bump.
+    // NOTE: the LEGS' reads may bump through their own read paths exactly as
+    // they do today; to isolate the SCORING read, compare a boosted recall
+    // against an unboosted one: the counter delta must be identical.
+    let _ = db
+        .recall(&topodb::RecallQuery {
+            access_weight: 1.0,
+            ..topodb::RecallQuery::new(scopes(), "shared term", 10)
+        })
+        .unwrap();
+    settle_counters(&db);
+    let after_boosted = db
+        .access_stats(&scopes(), a_id)
+        .unwrap()
+        .unwrap()
+        .access_count;
+    let _ = db
+        .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
+        .unwrap();
+    settle_counters(&db);
+    let after_plain = db
+        .access_stats(&scopes(), a_id)
+        .unwrap()
+        .unwrap()
+        .access_count;
+    assert_eq!(
+        after_boosted - before,
+        after_plain - after_boosted,
+        "the scoring read must add nothing beyond what recall's legs always add"
+    );
+    let _ = before;
 }
