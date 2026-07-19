@@ -68,6 +68,18 @@ fn node_kw(id: usize) -> String {
     format!(":n{id}")
 }
 
+/// Default facts per `(transact [...])` call during `insert_corpus`.
+/// Overridable via `MINIGRAF_TRANSACT_BATCH` so the batch size can be swept.
+const DEFAULT_TRANSACT_BATCH: usize = 5_000;
+
+fn transact_batch_facts() -> usize {
+    std::env::var("MINIGRAF_TRANSACT_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_TRANSACT_BATCH)
+}
+
 impl Engine for MinigrafDriver {
     fn open(path: &Path) -> Result<Self, EngineError> {
         let db = minigraf::OpenOptions::new()
@@ -85,34 +97,53 @@ impl Engine for MinigrafDriver {
         // no entity-existence marker, no type/label triple, no bookkeeping
         // facts of any kind. See the task report's fact-count section for
         // the arithmetic proving this matches `Corpus::translation_ratio().facts`.
-        let mut node_facts = String::new();
-        for n in &corpus.nodes {
-            let e = node_kw(n.id);
-            node_facts.push_str(&format!(
-                r#"[{e} :node/name "{}"] [{e} :node/kind "{}"] [{e} :node/note "{}"] [{e} :node/rank {}] [{e} :node/active {}] "#,
-                q(&n.name),
-                q(&n.kind),
-                q(&n.note),
-                n.rank,
-                n.active,
-            ));
-        }
-        self.db
-            .execute(&format!("(transact [{node_facts}])"))
-            .map_err(err)?;
+        //
+        // Batched: a single `(transact [...])` call over the *entire*
+        // corpus means minigraf's Datalog parser lexes one multi-tens-of-MB
+        // string in one call at 1M-fact scale, which is a pathological
+        // insert shape, not a representative one -- it produced multi-minute
+        // inserts with the process mostly idle on I/O rather than CPU-bound
+        // parsing. `transact_batch_facts()` (overridable via
+        // `MINIGRAF_TRANSACT_BATCH`, default `DEFAULT_TRANSACT_BATCH`) caps
+        // how many facts go into each `execute()` call. This changes nothing
+        // about what is asserted (still write-once, still exactly
+        // `translation_ratio().facts` facts total) -- only how many calls it
+        // takes to assert it.
+        let batch_facts = transact_batch_facts();
+        let batch_nodes = (batch_facts / crate::corpus::PROP_NAMES.len()).max(1);
 
-        let mut edge_facts = String::new();
-        for e in &corpus.edges {
-            edge_facts.push_str(&format!(
-                "[{} :edge/{} {}] ",
-                node_kw(e.from),
-                e.ty.to_lowercase(),
-                node_kw(e.to),
-            ));
+        for chunk in corpus.nodes.chunks(batch_nodes) {
+            let mut node_facts = String::new();
+            for n in chunk {
+                let e = node_kw(n.id);
+                node_facts.push_str(&format!(
+                    r#"[{e} :node/name "{}"] [{e} :node/kind "{}"] [{e} :node/note "{}"] [{e} :node/rank {}] [{e} :node/active {}] "#,
+                    q(&n.name),
+                    q(&n.kind),
+                    q(&n.note),
+                    n.rank,
+                    n.active,
+                ));
+            }
+            self.db
+                .execute(&format!("(transact [{node_facts}])"))
+                .map_err(err)?;
         }
-        self.db
-            .execute(&format!("(transact [{edge_facts}])"))
-            .map_err(err)?;
+
+        for chunk in corpus.edges.chunks(batch_facts.max(1)) {
+            let mut edge_facts = String::new();
+            for e in chunk {
+                edge_facts.push_str(&format!(
+                    "[{} :edge/{} {}] ",
+                    node_kw(e.from),
+                    e.ty.to_lowercase(),
+                    node_kw(e.to),
+                ));
+            }
+            self.db
+                .execute(&format!("(transact [{edge_facts}])"))
+                .map_err(err)?;
+        }
 
         Ok(())
     }

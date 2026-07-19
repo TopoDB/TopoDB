@@ -26,7 +26,13 @@ fn err<E: std::fmt::Display>(e: E) -> EngineError {
 impl Engine for TopoDbDriver {
     fn open(path: &Path) -> Result<Self, EngineError> {
         let db = Db::open(path).map_err(err)?;
-        let sid = ScopeId::new();
+        // Deterministic, not `ScopeId::new()`: a random scope id here would
+        // only ever match the scope actually written to disk if this same
+        // process instance also performed the insert. A genuinely fresh
+        // reopen (the "cold" case in the point_query benchmark) needs to
+        // land on the exact scope used at insert time, so the id is fixed
+        // rather than randomly minted per `open()` call.
+        let sid = ScopeId::from_u128(0xB0F0);
         Ok(TopoDbDriver {
             db,
             path: path.to_path_buf(),
@@ -41,7 +47,15 @@ impl Engine for TopoDbDriver {
         // clock, so the run is reproducible.
         let mut ops = Vec::with_capacity(corpus.nodes.len());
         for n in &corpus.nodes {
-            let id = NodeId::new();
+            // Deterministic, not `NodeId::new()`: the logical id -> engine id
+            // map otherwise lives only in this process's `self.ids`, which a
+            // fresh `Engine::open` (a genuinely cold reopen, e.g. in the
+            // point_query benchmark) cannot reconstruct from disk alone.
+            // Deriving the engine id from the logical id makes `point_lookup`
+            // and `k_hop` work correctly against a freshly opened handle with
+            // an empty `self.ids`, which is what a real "cold" measurement
+            // requires.
+            let id = NodeId::from_u128(n.id as u128);
             self.ids.insert(n.id, id);
 
             let mut props = Props::new();
@@ -77,9 +91,10 @@ impl Engine for TopoDbDriver {
     }
 
     fn point_lookup(&self, id: usize) -> Result<Option<Payload>, EngineError> {
-        let Some(&node_id) = self.ids.get(&id) else {
-            return Ok(None);
-        };
+        // Deterministic id derivation (see `insert_corpus`) so this works
+        // against a freshly opened handle whose `self.ids` is empty, not
+        // just the instance that performed the insert.
+        let node_id = NodeId::from_u128(id as u128);
         let Some(rec) = self.db.node(&self.scopes, node_id) else {
             return Ok(None);
         };
@@ -96,9 +111,7 @@ impl Engine for TopoDbDriver {
     }
 
     fn k_hop(&self, seed: usize, depth: u8) -> Result<usize, EngineError> {
-        let Some(&node_id) = self.ids.get(&seed) else {
-            return Ok(0);
-        };
+        let node_id = NodeId::from_u128(seed as u128);
         let sub = self
             .db
             .traverse(&TraversalQuery {
