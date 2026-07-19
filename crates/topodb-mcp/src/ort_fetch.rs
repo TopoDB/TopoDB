@@ -6,14 +6,10 @@
 /// The exact ONNX Runtime version ort-sys 2.0.0-rc.12 distributes (its
 /// build/download/dist.txt pins ms@1.24.2). Bumping ort => update this
 /// version and every sha256 below, nothing else.
-/// consumed from Task 3's resolver
-#[allow(dead_code)]
 pub(crate) const ORT_VERSION: &str = "1.24.2";
 
 /// One official Microsoft release artifact and the dylib inside it.
 /// sha256 is of the ARCHIVE, verified before extraction.
-/// consumed from Task 3's resolver
-#[allow(dead_code)]
 pub(crate) struct OrtArtifact {
     pub archive_name: &'static str,
     pub sha256: &'static str,
@@ -21,13 +17,10 @@ pub(crate) struct OrtArtifact {
     /// `onnxruntime-<platform>-<ver>/` directory).
     pub dylib_rel_path: &'static str,
     /// Bare filename the dylib is installed as.
-    /// consumed from Task 3's resolver
-    #[allow(dead_code)]
     pub dylib_file: &'static str,
     pub is_zip: bool,
 }
 
-#[allow(dead_code)]
 static MACOS_ARM64: OrtArtifact = OrtArtifact {
     archive_name: "onnxruntime-osx-arm64-1.24.2.tgz",
     sha256: "0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde",
@@ -35,7 +28,6 @@ static MACOS_ARM64: OrtArtifact = OrtArtifact {
     dylib_file: "libonnxruntime.1.24.2.dylib",
     is_zip: false,
 };
-#[allow(dead_code)]
 static LINUX_X64: OrtArtifact = OrtArtifact {
     archive_name: "onnxruntime-linux-x64-1.24.2.tgz",
     sha256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
@@ -43,7 +35,6 @@ static LINUX_X64: OrtArtifact = OrtArtifact {
     dylib_file: "libonnxruntime.so.1.24.2",
     is_zip: false,
 };
-#[allow(dead_code)]
 static LINUX_ARM64: OrtArtifact = OrtArtifact {
     archive_name: "onnxruntime-linux-aarch64-1.24.2.tgz",
     sha256: "6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e",
@@ -51,7 +42,6 @@ static LINUX_ARM64: OrtArtifact = OrtArtifact {
     dylib_file: "libonnxruntime.so.1.24.2",
     is_zip: false,
 };
-#[allow(dead_code)]
 static WIN_X64: OrtArtifact = OrtArtifact {
     archive_name: "onnxruntime-win-x64-1.24.2.zip",
     sha256: "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
@@ -67,8 +57,6 @@ static WIN_X64: OrtArtifact = OrtArtifact {
 /// Notably x86_64-apple-darwin: Microsoft ships no official 1.24.2 artifact
 /// for Intel Macs (nor does ort's own binary table) — those hosts keep the
 /// manual-install path (brew / ORT_DYLIB_PATH).
-/// consumed from Task 3's resolver
-#[allow(dead_code)]
 pub(crate) fn current_artifact() -> Option<&'static OrtArtifact> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some(&MACOS_ARM64)
@@ -83,8 +71,6 @@ pub(crate) fn current_artifact() -> Option<&'static OrtArtifact> {
     }
 }
 
-/// consumed from Task 3's resolver
-#[allow(dead_code)]
 pub(crate) fn artifact_url(a: &OrtArtifact) -> String {
     format!(
         "https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{}",
@@ -95,7 +81,6 @@ pub(crate) fn artifact_url(a: &OrtArtifact) -> String {
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum OrtRuntime {
     /// ORT_DYLIB_PATH is set and loadable — ort resolves it itself.
     EnvOverride,
@@ -119,7 +104,6 @@ fn platform_soname() -> &'static str {
 
 /// Probes whether a single candidate dylib is loadable. Returns `Ok` if
 /// libloading can successfully load it, `Err` with the failure reason otherwise.
-#[allow(dead_code)]
 pub(crate) fn probe_loadable(candidate: &str) -> Result<(), String> {
     // SAFETY: loading a shared library runs its initializers; this is
     // the exact load ort itself performs immediately after a successful
@@ -136,7 +120,6 @@ pub(crate) fn probe_loadable(candidate: &str) -> Result<(), String> {
 /// Strict precedence per the design spec: env override (exclusive) →
 /// system soname → cached download → fetch (if enabled) → Unavailable.
 /// `fetch` is injected so unit tests never touch the network.
-#[allow(dead_code)]
 pub(crate) fn resolve(
     model_dir: &Path,
     download_enabled: bool,
@@ -212,7 +195,6 @@ pub(crate) fn resolve(
 }
 
 /// Streaming download to `dest` over the ureq stack hf-hub already uses.
-#[allow(dead_code)]
 pub(crate) fn http_fetch(url: &str, dest: &Path) -> Result<(), String> {
     let resp = ureq::get(url)
         .call()
@@ -224,7 +206,6 @@ pub(crate) fn http_fetch(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn sha256_hex(path: &Path) -> Result<String, String> {
     use sha2::Digest;
     let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -248,7 +229,6 @@ pub(crate) fn sha256_hex(path: &Path) -> Result<String, String> {
 /// Staging happens in a fresh temp dir INSIDE `ort_root` (same filesystem,
 /// so the final `rename` is atomic); a concurrent winner is adopted, never
 /// clobbered. Nothing ever sits partially written at the final path.
-#[allow(dead_code)]
 pub(crate) fn install_from_archive(
     archive: &Path,
     a: &OrtArtifact,
@@ -288,7 +268,6 @@ pub(crate) fn install_from_archive(
 /// Extract the single entry whose path ends with `a.dylib_rel_path` to
 /// `dest`. Archives lay content under a top-level
 /// `onnxruntime-<platform>-<ver>/` directory, so we match on suffix.
-#[allow(dead_code)]
 fn extract_dylib(archive: &Path, a: &OrtArtifact, dest: &Path) -> Result<(), String> {
     let f = std::fs::File::open(archive).map_err(|e| format!("open {}: {e}", archive.display()))?;
     if a.is_zip {

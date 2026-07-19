@@ -3,7 +3,7 @@
 //! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!      [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
 //!      [--allow-unscoped-changes] [--embeddings <off|model>]
-//!      [--model-dir <path>]`
+//!      [--model-dir <path>] [--no-ort-download]`
 //! - `--scope`: the default **write** scope — the scope a created node/edge is
 //!   stamped with when a write tool omits `scope`. `"shared"` (case-insensitive)
 //!   or omitted => [`Scope::Shared`]; any other value is parsed as a ULID.
@@ -30,8 +30,10 @@
 //!   start the server.
 //! - `--model-dir <path>`: overrides where the embedding model is
 //!   downloaded/cached. Omitted => `default_model_cache_dir()` (`main.rs`).
+//! - `--no-ort-download`: disable the automatic ONNX Runtime dylib download;
+//!   embeddings then require a system runtime or `ORT_DYLIB_PATH`.
 //!
-//! Arg parsing is hand-rolled: the surface is seven flags, so `clap` would add
+//! Arg parsing is hand-rolled: the surface is eight flags, so `clap` would add
 //! a dependency and a proc-macro build for no real gain here.
 
 use std::error::Error;
@@ -112,6 +114,9 @@ pub struct Config {
     /// `--model-dir <path>`: overrides the embedding model cache directory.
     /// `None` => `default_model_cache_dir()` in `main`.
     pub model_dir: Option<PathBuf>,
+    /// --no-ort-download: disable the automatic ONNX Runtime dylib download;
+    /// embeddings then require a system runtime or ORT_DYLIB_PATH.
+    pub no_ort_download: bool,
 }
 
 /// The built-in default index spec used when `--spec` is omitted: equality on
@@ -177,6 +182,7 @@ impl Config {
         let mut allow_unscoped_changes = false;
         let mut embeddings: Option<String> = None;
         let mut model_dir: Option<PathBuf> = None;
+        let mut no_ort_download = false;
 
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
@@ -216,9 +222,12 @@ impl Config {
                             .into(),
                     );
                 }
+                "--no-ort-download" => {
+                    no_ort_download = true;
+                }
                 other => {
                     return Err(format!(
-                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|model>] [--model-dir <path>]"
+                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|model>] [--model-dir <path>] [--no-ort-download]"
                     )
                     .into());
                 }
@@ -253,6 +262,7 @@ impl Config {
             allow_unscoped_changes,
             embeddings,
             model_dir,
+            no_ort_download,
         })
     }
 }
@@ -428,5 +438,17 @@ mod tests {
     fn unscoped_changes_flag_is_a_bare_toggle() {
         let cfg = Config::from_args(argv(&["--db", "t.redb", "--allow-unscoped-changes"])).unwrap();
         assert!(cfg.allow_unscoped_changes);
+    }
+
+    #[test]
+    fn ort_download_is_on_by_default() {
+        let cfg = Config::from_args(argv(&["--db", "x.redb"])).unwrap();
+        assert!(!cfg.no_ort_download);
+    }
+
+    #[test]
+    fn no_ort_download_flag_is_a_bare_toggle() {
+        let cfg = Config::from_args(argv(&["--db", "x.redb", "--no-ort-download"])).unwrap();
+        assert!(cfg.no_ort_download);
     }
 }

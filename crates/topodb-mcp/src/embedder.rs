@@ -20,41 +20,6 @@ use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
 
-/// Probes for a loadable ONNX Runtime dynamic library the same way ort's
-/// `load-dynamic` will resolve it next: an explicit `ORT_DYLIB_PATH` wins
-/// outright (and is the ONLY candidate when set — matching ort, which does
-/// not fall back past an explicit override); otherwise the platform's
-/// conventional soname via the system loader search path. `Ok` means ort's
-/// own load should succeed; `Err` carries every candidate's failure.
-fn ort_dylib_available() -> Result<(), String> {
-    let candidates: Vec<String> = match std::env::var("ORT_DYLIB_PATH") {
-        Ok(p) if !p.is_empty() => vec![p],
-        _ => {
-            if cfg!(target_os = "windows") {
-                vec!["onnxruntime.dll".into()]
-            } else if cfg!(target_os = "macos") {
-                vec!["libonnxruntime.dylib".into()]
-            } else {
-                vec!["libonnxruntime.so".into()]
-            }
-        }
-    };
-    let mut errs = Vec::new();
-    for candidate in &candidates {
-        // SAFETY: loading a shared library runs its initializers; this is
-        // the exact load ort itself performs immediately after a successful
-        // probe, so no new code runs that wouldn't have run anyway.
-        match unsafe { libloading::Library::new(candidate) } {
-            Ok(lib) => {
-                drop(lib);
-                return Ok(());
-            }
-            Err(e) => errs.push(format!("{candidate}: {e}")),
-        }
-    }
-    Err(errs.join("; "))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbedderStatus {
@@ -107,8 +72,10 @@ impl Embedder {
     /// [`DEFAULT_MODEL`] still constructs an `Embedder` — it just can't
     /// resolve to a known `fastembed` model, so it degrades straight to
     /// `Failed` with a clear stderr line instead of refusing to start the
-    /// server.
-    pub fn start(model: Option<String>, cache_dir: PathBuf) -> Self {
+    /// server. `ort_download` gates whether the init thread's ONNX Runtime
+    /// resolver (`ort_fetch::resolve`) may download a runtime on a miss —
+    /// `false` for `--no-ort-download`.
+    pub fn start(model: Option<String>, cache_dir: PathBuf, ort_download: bool) -> Self {
         let model_name = model.unwrap_or_else(|| DEFAULT_MODEL.into());
         let e = Self {
             inner: Arc::new(Inner {
@@ -135,28 +102,47 @@ impl Embedder {
         // across this thread boundary — a failed model must degrade to
         // `Failed`, never crash the process.
         std::thread::spawn(move || {
-            // PRE-FLIGHT, load-bearing: confirm an ONNX Runtime dylib is
-            // loadable BEFORE any call into ort. ort's load-dynamic FAILURE
-            // path re-enters its own OnceLock while constructing the error
-            // (upstream bug), permanently deadlocking this thread — and its
-            // `release_env_on_exit` atexit handler then blocks `exit()` on
-            // the mutex that deadlocked thread holds, so the process never
-            // dies and holds the redb lock forever (the 0.0.9 broker
-            // idle-exit `DatabaseAlreadyOpen` CI failure). A failed probe
-            // here lands `Failed` cleanly without ort ever running.
-            // Upstream: fixed on ort main (17ed727, #560) but unreleased as
-            // of rc.12 — release request tracked at pykeio/ort#604. This
-            // probe stays even after an ort upgrade (defense in depth).
-            if let Err(err) = ort_dylib_available() {
-                *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
-                eprintln!(
-                    "topodb-mcp: embedding model {model_name} unavailable (no loadable \
-                     ONNX Runtime dynamic library: {err}); running text-only. Install \
-                     ONNX Runtime (e.g. `brew install onnxruntime` on macOS, an \
-                     onnxruntime package on Linux) or point ORT_DYLIB_PATH at the \
-                     library."
-                );
-                return;
+            // Resolve an ONNX Runtime BEFORE any call into ort (the
+            // pykeio/ort#604 deadlock defense now lives inside the
+            // resolver's probes — see `ort_fetch::probe_loadable`). May
+            // download on first run — that is why this runs here, under the
+            // Downloading status, off the async runtime.
+            match crate::ort_fetch::resolve(&cache_dir, ort_download, &crate::ort_fetch::http_fetch)
+            {
+                crate::ort_fetch::OrtRuntime::EnvOverride
+                | crate::ort_fetch::OrtRuntime::System => {}
+                crate::ort_fetch::OrtRuntime::Local(dylib) => {
+                    // Point ort at the cached/downloaded dylib
+                    // programmatically — no env mutation (racy) needed.
+                    // `init_from` returns `Result` (the dylib load itself,
+                    // matching the resolver's own probe); `commit()` on the
+                    // resulting builder is infallible (`bool`: false only
+                    // means an environment was already configured, which is
+                    // harmless here — this is the first ort call on this
+                    // thread).
+                    match ort::init_from(&dylib) {
+                        Ok(builder) => {
+                            builder.commit();
+                        }
+                        Err(e) => {
+                            *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
+                            eprintln!(
+                                "topodb-mcp: embedding model {model_name} unavailable (ort \
+                                 init from {} failed: {e}); running text-only",
+                                dylib.display()
+                            );
+                            return;
+                        }
+                    }
+                }
+                crate::ort_fetch::OrtRuntime::Unavailable(reason) => {
+                    *init.inner.status.lock().unwrap() = EmbedderStatus::Failed;
+                    eprintln!(
+                        "topodb-mcp: embedding model {model_name} unavailable ({reason}); \
+                         running text-only"
+                    );
+                    return;
+                }
             }
             let result = std::panic::catch_unwind(|| {
                 fastembed::TextEmbedding::try_new(
@@ -223,7 +209,11 @@ mod tests {
     #[test]
     fn unknown_model_degrades_to_failed_without_crashing() {
         let dir = tempfile::tempdir().unwrap();
-        let e = Embedder::start(Some("not-a-real-model".into()), dir.path().to_path_buf());
+        let e = Embedder::start(
+            Some("not-a-real-model".into()),
+            dir.path().to_path_buf(),
+            true,
+        );
         // The init "thread" for an unresolvable model name runs synchronously
         // (no fastembed/network call needed to know it's unresolvable), so
         // status is already terminal by the time `start` returns.

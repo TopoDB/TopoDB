@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .model_dir
                 .clone()
                 .unwrap_or_else(default_model_cache_dir),
+            !config.no_ort_download,
         ),
         other => embedder::Embedder::start(
             other.map(str::to_string),
@@ -110,6 +111,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .model_dir
                 .clone()
                 .unwrap_or_else(default_model_cache_dir),
+            !config.no_ort_download,
         ),
     };
 
