@@ -13,8 +13,9 @@ project** plus a **`shared`** layer that crosses projects.
 When the user refers to earlier work — "what did we decide about X", "who owns
 Y", "last time we tried this" — call `search_memories` **before** answering from
 the conversation alone. Reads already span this project and `shared`; you do not
-pass a scope to read. Recent project memories are auto-injected at session start —
-search for *specifics* rather than re-fetching what is already in context.
+pass a scope to read. Recent project memories are auto-injected at session start
+(requires server 0.0.11+; presently disabled) — search for *specifics* rather
+than re-fetching what is already in context.
 
 Search stems words ("databases" matches "database"), splits camelCase
 identifiers, and recovers typos and prefixes when a term matches nothing.

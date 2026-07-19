@@ -35,7 +35,9 @@ rather than ever blocking a session:
   begins with up to 8 recent memories for this project injected as
   context — ranked by access within the recent window, capped well under
   2k tokens. No broker running yet (the very first session of a project)
-  means no injection; it appears from the next session on.
+  means no injection; it appears from the next session on. Requires server
+  version 0.0.11+; with the currently pinned 0.0.10 this silently does
+  nothing until the pin bumps.
 - **Episode capture:** the plugin records which memories each
   `search_memories`/`traverse`/`recent_memories` call returned and, at
   session end, writes an `Episode` node with `RetrievalEvent`s marking
@@ -127,11 +129,14 @@ Two consequences are deliberate and worth knowing before you rely on this:
 
 ## What this plugin does not do
 
-- No hooks, no automatic episode recording. Recall and storage are both
-  explicit — the agent decides to call `search_memories` / `create_memory`
-  (guided by the bundled skill), nothing runs on a session-lifecycle hook.
-  (`@topodb/pi`'s episode recorder has since shipped there; whether to bring
-  the equivalent here is open, tracked separately from this plugin.)
+- No LLM consolidation, summarization, or decay in the hooks. Hooks run
+  observational capture only (no `model_call`, no async agent). Session-start
+  injection pulls what's already stored, ranked by recency; session-end episode
+  capture judges what the transcript used — both fail silently if the broker is
+  down. The hooks also do not capture in subagent sessions (only main, `startup`
+  and `clear` sources). No automatic "forget" or summarize-old-memories pass.
+  (`@topodb/pi`'s episode consolidation is a reference implementation; whether
+  to bring a host-side consolidation loop here is open.)
 - No embeddings configuration knob. The server the plugin launches runs
   embeddings **on by default** (`bge-small-en-v1.5`, downloaded once to
   `~/.cache/topodb/models`), so `search_memories` gets a semantic-recall leg
