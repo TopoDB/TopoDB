@@ -2,6 +2,7 @@ use proptest::prelude::*;
 use topodb::Db;
 use topodb_sgh::executor::Executor;
 use topodb_sgh::recovery::Repairer;
+use topodb_sgh::runner::command::MockCommandRunner;
 use topodb_sgh::runner::mock::MockRunner;
 use topodb_sgh::runner::NodeOutcome;
 use topodb_sgh::schema::bound::worst_case;
@@ -29,12 +30,15 @@ impl Repairer for PromptOnlyRepairer {
 /// so acyclicity holds by construction and every generated case is valid —
 /// the same trick `determinism.rs` uses with modulo indices.
 ///
-/// Node kind is `Agent` or `Gate`, never `Command`: after Fix 1,
-/// `Executor::run` refuses any graph containing a command node outright, so
-/// generating one would make the run error rather than exercise these
-/// properties. Command refusal has its own targeted tests in
-/// `tests/executor.rs`; that's where it belongs, not diluted into a property
-/// that would just short-circuit on it.
+/// Node kind is `Agent`, `Gate`, or `Command` (roughly a third of nodes land
+/// on each of the latter two). `Executor::run` refuses any graph containing
+/// a command node unless a `CommandRunner` is configured, so every property
+/// below that drives `dag()` through an `Executor` wires one up via
+/// `.with_command_runner(..)` even when it doesn't otherwise care about
+/// commands — otherwise those properties would start failing the moment the
+/// generator produces a command node, for a reason unrelated to what they
+/// assert. Command *refusal itself* has its own targeted tests in
+/// `tests/executor.rs`.
 ///
 /// `needs` is deliberately **not** deduped: duplicated entries are exactly
 /// the input that used to break the validator (see Fix 2 in
@@ -44,8 +48,9 @@ fn dag() -> impl Strategy<Value = Graph> {
     (1usize..8).prop_flat_map(|n| {
         let deps = prop::collection::vec(prop::collection::vec(any::<u8>(), 0..3), n);
         let budgets = prop::collection::vec((0u32..3, 0u32..2), n);
-        let is_gate = prop::collection::vec(any::<bool>(), n);
-        (Just(n), deps, budgets, is_gate).prop_map(|(n, deps, budgets, is_gate)| {
+        // 0 => Agent, 1 => Gate, 2 => Command: roughly a third each.
+        let kind_pick = prop::collection::vec(0u8..3, n);
+        (Just(n), deps, budgets, kind_pick).prop_map(|(n, deps, budgets, kind_pick)| {
             let nodes = (0..n)
                 .map(|i| {
                     let needs = if i == 0 {
@@ -58,17 +63,22 @@ fn dag() -> impl Strategy<Value = Graph> {
                         d.sort();
                         d
                     };
-                    let gate = is_gate[i];
+                    let kind = match kind_pick[i] {
+                        0 => NodeKind::Agent,
+                        1 => NodeKind::Gate,
+                        _ => NodeKind::Command,
+                    };
+                    let (prompt, run) = match kind {
+                        NodeKind::Agent => (Some("p".into()), None),
+                        NodeKind::Gate => (None, None),
+                        NodeKind::Command => (None, Some("true".into())),
+                    };
                     Node {
                         id: format!("n{i}"),
-                        kind: if gate {
-                            NodeKind::Gate
-                        } else {
-                            NodeKind::Agent
-                        },
+                        kind,
                         needs,
-                        prompt: if gate { None } else { Some("p".into()) },
-                        run: None,
+                        prompt,
+                        run,
                         output: None,
                         budget: Budget {
                             retries: budgets[i].0,
@@ -116,20 +126,35 @@ proptest! {
         let store = RunStore::create(&db, "r", &v, 1).unwrap();
 
         let mut runner = MockRunner::new();
+        let mut commands = MockCommandRunner::new();
         for (i, node) in v.graph.nodes.iter().enumerate() {
             if mask[i % mask.len()] {
-                runner = runner.script(
-                    &node.id,
-                    vec![NodeOutcome::Failed { error: "injected".into() }],
-                );
+                match node.kind {
+                    NodeKind::Command => {
+                        commands = commands.script(
+                            &node.id,
+                            vec![NodeOutcome::Failed { error: "injected".into() }],
+                        );
+                    }
+                    _ => {
+                        runner = runner.script(
+                            &node.id,
+                            vec![NodeOutcome::Failed { error: "injected".into() }],
+                        );
+                    }
+                }
             }
         }
 
         // A contract-preserving repairer, not the executor's default
         // `NoopRepairer`, so failing nodes actually climb to the REPAIR rung
         // and the `2*repairs` term of the bound is exercised rather than
-        // dead weight.
-        let mut ex = Executor::new(store, v.clone(), &runner).with_repairer(&PromptOnlyRepairer);
+        // dead weight. A command runner is wired up too, since `dag()` now
+        // emits `Command` nodes and the executor refuses those outright
+        // without one.
+        let mut ex = Executor::new(store, v.clone(), &runner)
+            .with_repairer(&PromptOnlyRepairer)
+            .with_command_runner(&commands);
         let report = ex.run(10).unwrap();
 
         // Terminal: every node ended in exactly one terminal state.
@@ -156,13 +181,23 @@ proptest! {
         let store = RunStore::create(&db, "r", &v, 1).unwrap();
 
         let mut runner = MockRunner::new();
+        let mut commands = MockCommandRunner::new();
         for (i, node) in v.graph.nodes.iter().enumerate() {
             if mask[i % mask.len()] {
-                runner = runner.script(&node.id, vec![NodeOutcome::Failed { error: "x".into() }]);
+                match node.kind {
+                    NodeKind::Command => {
+                        commands =
+                            commands.script(&node.id, vec![NodeOutcome::Failed { error: "x".into() }]);
+                    }
+                    _ => {
+                        runner =
+                            runner.script(&node.id, vec![NodeOutcome::Failed { error: "x".into() }]);
+                    }
+                }
             }
         }
 
-        let mut ex = Executor::new(store, v.clone(), &runner);
+        let mut ex = Executor::new(store, v.clone(), &runner).with_command_runner(&commands);
         let report = ex.run(10).unwrap();
 
         let ran: std::collections::HashSet<&String> =
@@ -193,7 +228,8 @@ proptest! {
             let db = Db::open(dir.path().join("t.redb")).unwrap();
             let store = RunStore::create(&db, "r", &v, 1).unwrap();
             let runner = MockRunner::new();
-            let mut ex = Executor::new(store, v.clone(), &runner);
+            let commands = MockCommandRunner::new();
+            let mut ex = Executor::new(store, v.clone(), &runner).with_command_runner(&commands);
             ex.run(10).unwrap();
             schedules.push(runner.calls());
         }
@@ -222,9 +258,10 @@ proptest! {
         let db = Db::open(dir.path().join("t.redb")).unwrap();
         let store = RunStore::create(&db, "r", &v, 1).unwrap();
         let runner = MockRunner::new();
+        let commands = MockCommandRunner::new();
 
         let all_ids: Vec<String> = v.topo_order.clone();
-        let mut ex = Executor::new(store, v.clone(), &runner);
+        let mut ex = Executor::new(store, v.clone(), &runner).with_command_runner(&commands);
         ex.run(10).unwrap();
 
         // Reconstructed via the store, which is the only as_of-capable path.
@@ -234,5 +271,85 @@ proptest! {
             let past = ex.store_ref().state_at(id, 10).unwrap();
             prop_assert_eq!(past, Some(NodeState::Pending), "node {} lost its historical PENDING state", id);
         }
+    }
+
+    /// COMMAND BOUND: command executions never exceed the command_runs the
+    /// graph budgeted, and command nodes never consume model calls.
+    #[test]
+    fn command_runs_stay_within_the_computed_bound(g in dag(), mask in failure_mask()) {
+        let v = validate(&g).expect("generated graphs are valid by construction");
+        let bound = worst_case(&v);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.redb")).unwrap();
+        let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+        let mut agents = MockRunner::new();
+        let mut commands = MockCommandRunner::new();
+        for (i, node) in v.graph.nodes.iter().enumerate() {
+            if mask[i % mask.len()] {
+                match node.kind {
+                    NodeKind::Command => {
+                        commands = commands.script(
+                            &node.id,
+                            vec![NodeOutcome::Failed { error: "injected".into() }],
+                        );
+                    }
+                    _ => {
+                        agents = agents.script(
+                            &node.id,
+                            vec![NodeOutcome::Failed { error: "injected".into() }],
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut ex = Executor::new(store, v.clone(), &agents).with_command_runner(&commands);
+        let report = ex.run(10).unwrap();
+
+        prop_assert!(
+            report.command_runs <= bound.command_runs,
+            "ran {} command(s), bound promised at most {}",
+            report.command_runs,
+            bound.command_runs
+        );
+        prop_assert!(report.model_calls <= bound.agent_calls);
+
+        let total = report.succeeded.len() + report.blocked.len() + report.skipped.len();
+        prop_assert_eq!(total, v.graph.nodes.len(), "every node reached a terminal state");
+    }
+}
+
+/// PLANNER BOUND: the planner's retry loop is bounded by max_attempts, no
+/// matter how many times the backend produces an invalid graph.
+#[test]
+fn planner_retry_loop_is_bounded() {
+    use std::sync::Mutex;
+    use topodb_sgh::planner::claude::{ClaudePlanner, PlanBackend};
+    use topodb_sgh::planner::{PlanRequest, Planner, PlannerError};
+
+    struct AlwaysInvalid {
+        calls: Mutex<u32>,
+    }
+    impl PlanBackend for AlwaysInvalid {
+        fn complete(&self, _prompt: &str) -> Result<String, PlannerError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok("version: 1\ngoal: g\nnodes:\n  - {id: a, kind: agent, needs: [ghost], budget: {retries: 0, repairs: 0}}\n".into())
+        }
+    }
+
+    for max in [1u32, 2, 5] {
+        let backend = std::sync::Arc::new(AlwaysInvalid { calls: Mutex::new(0) });
+        let p = ClaudePlanner::with_backend(Box::new(backend.clone()), max);
+        let err = p
+            .plan(&PlanRequest { goal: "g".into(), context: None })
+            .expect_err("never validates");
+        assert!(matches!(err, PlannerError::Exhausted { .. }));
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            max,
+            "exactly max_attempts backend calls, never more"
+        );
     }
 }
