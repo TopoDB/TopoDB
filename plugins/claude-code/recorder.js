@@ -1,7 +1,7 @@
 // recorder.js — pure episode-recording core: no external imports except node fs/path
 // Everything here is deterministic and unit-tested.
 
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync, readdirSync, statSync, existsSync } from "node:fs";
 import path from "node:path";
 
 // State-file helpers (replacing EpisodeBuffer class)
@@ -17,7 +17,13 @@ export function appendRetrieval(dataDir, sessionId, record, contents) {
   const state = readState(dataDir, sessionId) ?? { startedAt: Date.now(), retrievals: [], contents: {} };
   state.retrievals.push(record);
   for (const [id, text] of contents) state.contents[id] = text;
-  writeFileSync(file, JSON.stringify(state));
+  // Atomic replace: write to a per-process temp file in the same dir, then
+  // rename over the final path. A concurrent PostToolUse racing us can still
+  // lose an update (last rename wins), but readers never observe a torn
+  // (partially-written) file — renameSync is atomic on the same filesystem.
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state));
+  renameSync(tmp, file);
 }
 
 export function readState(dataDir, sessionId) {
@@ -28,6 +34,7 @@ export function readState(dataDir, sessionId) {
     if (!Array.isArray(state.retrievals)) throw new Error("shape");
     return state;
   } catch {
+    console.error(`topodb hooks: discarding malformed state file ${file}`);
     try { unlinkSync(file); } catch { /* already gone */ }
     return null;
   }
@@ -84,6 +91,30 @@ export function isUsed(memContent, text) {
   return hits / mem.size >= 0.5;
 }
 
+/** Normalize a raw PostToolUse `tool_output`/`tool_response` payload into the
+ * parsed structured result `toRetrievalRecord` expects. Real MCP hook
+ * payloads may deliver: a `structuredContent` object; a content-block array
+ * (or an envelope with a `content` array) whose first `{type:"text"}` block
+ * holds a JSON string; or (today's tests) the already-parsed object. Never
+ * throws — returns undefined on anything it can't make sense of. */
+export function normalizeToolResult(raw) {
+  if (raw === null || raw === undefined) return undefined;
+  if (typeof raw === "object" && !Array.isArray(raw) && raw.structuredContent && typeof raw.structuredContent === "object") {
+    return raw.structuredContent;
+  }
+  const blocks = Array.isArray(raw) ? raw : Array.isArray(raw?.content) ? raw.content : null;
+  if (blocks) {
+    const textBlock = blocks.find((b) => b && typeof b === "object" && b.type === "text");
+    if (!textBlock || typeof textBlock.text !== "string") return undefined;
+    try {
+      return JSON.parse(textBlock.text);
+    } catch {
+      return undefined;
+    }
+  }
+  return raw;
+}
+
 // Retrieval record building
 
 /** Helper to collect a node into the returned list and contents map. */
@@ -137,9 +168,12 @@ export function toRetrievalRecord(tool, args, result) {
 
 /** Assemble the single atomic submit_batch command array for one episode.
  * `used` maps retrieval index -> the set of memory ids judged used.
- * This is the Claude Code version: goal "", tokens 0, turns from state.retrievals.length, no policy block. */
+ * This is the Claude Code version: goal "", tokens 0, turns from state.retrievals.length, no policy block.
+ * `reason` (optional, default "") carries the SessionEnd hook's `reason` field
+ * through as an additional Episode prop — additive, so pi's schema readers
+ * tolerate it. */
 export function buildEpisodeBatch(args) {
-  const { state, outcome, failure, endedAt, used } = args;
+  const { state, outcome, failure, endedAt, used, reason = "" } = args;
   const cmds = [
     {
       op: "create_node",
@@ -154,6 +188,7 @@ export function buildEpisodeBatch(args) {
         tokens: 0,
         confidence: 0.5,
         failure,
+        reason,
       },
     },
   ];

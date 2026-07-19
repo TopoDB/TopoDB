@@ -2,6 +2,7 @@
 // SessionStart: inject the project's recent memories as context.
 // HARD RULES: exit 0 no matter what; nothing on stdout except the payload;
 // self-deadline (this hook BLOCKS session start); main sessions only.
+import { pathToFileURL } from "node:url";
 import { connectForProject } from "../broker-client.js";
 
 const DEADLINE_MS = 2500;
@@ -51,7 +52,6 @@ async function main() {
     const nodes = Array.isArray(recent.memories) ? recent.memories : [];
     if (!nodes.length) return;
 
-    const now = Date.now();
     const enriched = [];
     for (const n of nodes) {
       if (typeof n?.id !== "string" || typeof n?.props?.content !== "string") continue;
@@ -79,6 +79,9 @@ async function main() {
     enriched.sort((a, b) => b.accessCount - a.accessCount);
     const out = renderInjection(enriched.slice(0, KEEP));
     if (out) {
+      // CHAR_CAP (6000) keeps this comfortably under the ~64KB pipe buffer,
+      // so the process.exit(0) in finally() below can never truncate the
+      // write mid-flight. Revisit this assumption if CHAR_CAP grows a lot.
       process.stdout.write(
         JSON.stringify({
           hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: out },
@@ -91,7 +94,10 @@ async function main() {
 }
 
 // Only run main() when executed as a script — the test imports renderInjection.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compared via pathToFileURL (not a hand-built `file://` template) so this
+// holds for paths with spaces and on Windows, where a template string
+// mismatches the URL's percent-encoding/drive-letter form.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const guard = setTimeout(() => process.exit(0), DEADLINE_MS);
   main()
     .catch(() => {})

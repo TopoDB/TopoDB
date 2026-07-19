@@ -73,6 +73,7 @@ async function main() {
     failure: "",
     endedAt: Date.now(),
     used,
+    reason: typeof p.reason === "string" ? p.reason : "",
   });
 
   const projectDir = process.env.CLAUDE_PROJECT_DIR ?? p.cwd;

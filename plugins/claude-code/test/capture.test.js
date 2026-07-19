@@ -2,11 +2,11 @@
 // builds and submits the Episode batch through a real broker and cleans up.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readState, stateFilePath } from "../recorder.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -113,5 +113,127 @@ test("session-end flushes an episode through a real broker and deletes state", a
     shim.kill();
     rmSync(dataDir, { recursive: true, force: true });
     rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+// Real MCP hook payloads may not deliver the pre-parsed structured result
+// toRetrievalRecord expects — normalizeToolResult (recorder.js) has to
+// unwrap structuredContent / content-block-array / envelope shapes before
+// capture can happen at all. Exercise each shape through the real hook.
+test("post-tool-use normalizes every documented tool_output shape", () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-norm-"));
+  try {
+    const basePayload = {
+      cwd: "/tmp", hook_event_name: "PostToolUse",
+      tool_name: "mcp__plugin_topodb_topodb__search_memories",
+      tool_input: { query: "auth flow" },
+    };
+    const structured = { hits: [{ node: { id: "01M", props: { content: "auth uses tokens" } }, score: 0.02 }] };
+
+    // 1. structuredContent envelope.
+    runHook("post-tool-use.js", {
+      ...basePayload, session_id: "sess-sc",
+      tool_output: { structuredContent: structured },
+    }, { CLAUDE_PLUGIN_DATA: dataDir });
+    assert.equal(readState(dataDir, "sess-sc").retrievals.length, 1);
+
+    // 2. raw content-block array.
+    runHook("post-tool-use.js", {
+      ...basePayload, session_id: "sess-arr",
+      tool_output: [{ type: "text", text: JSON.stringify(structured) }],
+    }, { CLAUDE_PLUGIN_DATA: dataDir });
+    assert.equal(readState(dataDir, "sess-arr").retrievals.length, 1);
+
+    // 3. envelope with a `content` array.
+    runHook("post-tool-use.js", {
+      ...basePayload, session_id: "sess-env",
+      tool_output: { content: [{ type: "text", text: JSON.stringify(structured) }] },
+    }, { CLAUDE_PLUGIN_DATA: dataDir });
+    assert.equal(readState(dataDir, "sess-env").retrievals.length, 1);
+
+    // 4. already-parsed object (today's shape) keeps working.
+    runHook("post-tool-use.js", {
+      ...basePayload, session_id: "sess-parsed",
+      tool_output: structured,
+    }, { CLAUDE_PLUGIN_DATA: dataDir });
+    assert.equal(readState(dataDir, "sess-parsed").retrievals.length, 1);
+
+    // Garbage text block: records nothing, exits cleanly (no throw above).
+    assert.equal(runHook("post-tool-use.js", {
+      ...basePayload, session_id: "sess-garbage",
+      tool_output: { content: [{ type: "text", text: "not json at all" }] },
+    }, { CLAUDE_PLUGIN_DATA: dataDir }), "");
+    assert.equal(readState(dataDir, "sess-garbage"), null);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("post-tool-use debug escape dumps the raw payload", () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-dbg-"));
+  try {
+    const payload = {
+      session_id: "sess-dbg", cwd: "/tmp", hook_event_name: "PostToolUse",
+      tool_name: "mcp__plugin_topodb_topodb__search_memories",
+      tool_input: { query: "auth flow" },
+      tool_output: { hits: [] },
+    };
+    assert.equal(
+      runHook("post-tool-use.js", payload, { CLAUDE_PLUGIN_DATA: dataDir, TOPODB_HOOK_DEBUG: "1" }),
+      "",
+    );
+    const dumped = path.join(dataDir, "episodes", "debug-last-payload.json");
+    assert.ok(existsSync(dumped), "debug payload file should exist");
+    assert.deepEqual(JSON.parse(readFileSync(dumped, "utf8")), payload);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+// Concurrent PostToolUse processes are ordinary (parallel tool calls in one
+// session). appendRetrieval must never leave a torn (partially-written)
+// state file behind — a torn read makes readState UNLINK the whole
+// session's state, destroying every writer's work, not just the racer's.
+// Lost updates (last rename wins) are accepted; torn files are not.
+test("concurrent appendRetrieval calls never tear the state file", async () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-race-"));
+  try {
+    const sessionId = "sess-race";
+    const WRITERS = 4;
+    const APPENDS_PER_WRITER = 8;
+    const childScript = `
+      import { appendRetrieval } from ${JSON.stringify(path.join(HERE, "..", "recorder.js"))};
+      const dataDir = process.argv[1];
+      const sessionId = process.argv[2];
+      const n = Number(process.argv[3]);
+      for (let i = 0; i < n; i++) {
+        appendRetrieval(dataDir, sessionId, { query: "q" + i, at: Date.now(), channel: "text", returned: [] }, new Map());
+      }
+    `;
+    const runWriter = () =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", childScript, "--", dataDir, sessionId, String(APPENDS_PER_WRITER)]);
+        let stderr = "";
+        child.stderr.on("data", (d) => (stderr += d));
+        child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`writer exited ${code}: ${stderr}`))));
+        child.on("error", reject);
+      });
+
+    await Promise.all(Array.from({ length: WRITERS }, runWriter));
+
+    // The file must parse cleanly (no torn JSON) and readState must not
+    // have discarded it as corrupt.
+    const state = readState(dataDir, sessionId);
+    assert.ok(state, "state file must survive concurrent writers intact");
+    assert.ok(Array.isArray(state.retrievals));
+    // Also verify the on-disk bytes parse directly (belt and suspenders —
+    // readState's own JSON.parse is the real assertion above).
+    const raw = readFileSync(stateFilePath(dataDir, sessionId), "utf8");
+    JSON.parse(raw); // throws (failing the test) if torn
+    // No zero-loss guarantee under races — at least one writer's records
+    // must have survived, but we do not assert full retention.
+    assert.ok(state.retrievals.length >= 1, "at least one append must have survived");
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
   }
 });

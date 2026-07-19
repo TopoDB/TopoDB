@@ -575,7 +575,9 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   on; `TOPODB_RECORDING=0` disables. Hooks never spawn the broker and always exit 0 — every
   failure degrades to exactly the pre-hook behavior. NOTE: injection requires a server with
   `recent_memories` (0.0.11) — with the currently pinned 0.0.10 it silently degrades to no
-  injection; capture works against 0.0.10. Ships fully with the 0.0.11 pin bump.
+  injection; capture works against 0.0.10. Ships fully with the 0.0.11 pin bump. At that pin bump,
+  also remove SKILL.md's "presently disabled" phrasing and capture a real PostToolUse payload
+  fixture (`TOPODB_HOOK_DEBUG=1`) to confirm the normalizer's branch against production shape.
 
 ---
 
