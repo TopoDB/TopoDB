@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+// SessionStart: inject the project's recent memories as context.
+// HARD RULES: exit 0 no matter what; nothing on stdout except the payload;
+// self-deadline (this hook BLOCKS session start); main sessions only.
+import { connectForProject } from "../broker-client.js";
+
+const DEADLINE_MS = 2500;
+const K = 10;
+const KEEP = 8;
+const CHAR_CAP = 6000;
+
+export function renderInjection(memories) {
+  if (!memories.length) return null;
+  const lines = ["## TopoDB memory (this project)"];
+  for (const m of memories) {
+    const content = m.content.length > 140 ? `${m.content.slice(0, 139)}…` : m.content;
+    const ents = m.entities.length ? ` [entities: ${m.entities.slice(0, 3).join(", ")}]` : "";
+    const days = Math.floor(m.ageMs / 86400000);
+    const age = days > 0 ? ` (${days}d ago)` : " (today)";
+    const line = `- ${content}${ents}${age}`;
+    if (lines.join("\n").length + line.length > CHAR_CAP) break;
+    lines.push(line);
+  }
+  lines.push("Deeper recall: search_memories / traverse. Store: remember.");
+  return lines.join("\n");
+}
+
+async function main() {
+  const raw = await new Promise((r) => {
+    let buf = "";
+    process.stdin.on("data", (d) => (buf += d));
+    process.stdin.on("end", () => r(buf));
+  });
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (payload.agent_id || payload.agent_type) return; // main sessions only
+  if (payload.source !== "startup" && payload.source !== "clear") return;
+
+  const dataDir = process.env.CLAUDE_PLUGIN_DATA;
+  const projectDir = process.env.CLAUDE_PROJECT_DIR ?? payload.cwd;
+  if (!dataDir || !projectDir) return;
+
+  const client = await connectForProject({ projectDir, dataDir });
+  if (!client) return; // no broker yet — first-ever session; next one has it
+  try {
+    const recent = await client.call("recent_memories", { k: K });
+    const nodes = Array.isArray(recent.memories) ? recent.memories : [];
+    if (!nodes.length) return;
+
+    const now = Date.now();
+    const enriched = [];
+    for (const n of nodes) {
+      if (typeof n?.id !== "string" || typeof n?.props?.content !== "string") continue;
+      let accessCount = 0;
+      try {
+        const stats = await client.call("access_stats", { id: n.id }, 800);
+        if (stats.found && typeof stats.access_count === "number") accessCount = stats.access_count;
+      } catch { /* stats are a ranking nicety, never load-bearing */ }
+      const entities = [];
+      try {
+        const edges = await client.call("get_edges", { from_id: n.id }, 800);
+        for (const e of (edges.edges ?? []).slice(0, 3)) {
+          try {
+            const t = await client.call("get_node", { id: e.to }, 800);
+            const name = t?.node?.props?.name;
+            if (typeof name === "string") entities.push(name);
+          } catch { /* skip */ }
+        }
+      } catch { /* entity names are decoration */ }
+      // ULID timestamp: first 10 chars are Crockford-base32 time — cheap
+      // decode not worth it; approximate age from access stats' last read
+      // is wrong too. Use 0 and render "today" rather than decode ULIDs.
+      enriched.push({ id: n.id, content: n.props.content, entities, ageMs: 0, accessCount });
+    }
+    enriched.sort((a, b) => b.accessCount - a.accessCount);
+    const out = renderInjection(enriched.slice(0, KEEP));
+    if (out) {
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: out },
+        }),
+      );
+    }
+  } finally {
+    client.close();
+  }
+}
+
+// Only run main() when executed as a script — the test imports renderInjection.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const guard = setTimeout(() => process.exit(0), DEADLINE_MS);
+  main()
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(guard);
+      process.exit(0);
+    });
+}

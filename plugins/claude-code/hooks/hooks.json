@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/session-start.js" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__(plugin_topodb_)?topodb__(search_memories|traverse|recent_memories)",
+        "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-use.js" }]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/session-end.js" }]
+      }
+    ]
+  }
+}
