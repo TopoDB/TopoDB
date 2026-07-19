@@ -16,7 +16,7 @@
 //!   scope-registry id, and edge endpoints are `u64` node slots. These are
 //!   what `storage.rs`'s NODES/EDGES read/write paths and `migrate_v3.rs`'s
 //!   v2->v3 re-keying use.
-use crate::dict::{DictKind, Dicts};
+use crate::dict::{DictKind, Dicts, InternJournal};
 use crate::error::TopoError;
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::props::PropValue;
@@ -47,15 +47,16 @@ pub(crate) fn node_to_disk(
     r: &NodeRecord,
     t: &mut Table<'_, &'static [u8], &'static str>,
     d: &mut Dicts,
+    journal: &mut InternJournal,
 ) -> Result<NodeRecordDisk, TopoError> {
     let mut p = BTreeMap::new();
     for (k, v) in &r.props {
-        p.insert(d.intern(t, DictKind::PropKey, k)?, v.clone());
+        p.insert(d.intern(t, DictKind::PropKey, k, journal)?, v.clone());
     }
     Ok(NodeRecordDisk {
         id: r.id,
         scope: r.scope,
-        label: d.intern(t, DictKind::Label, r.label.as_str())?,
+        label: d.intern(t, DictKind::Label, r.label.as_str(), journal)?,
         props: p,
     })
 }
@@ -63,15 +64,16 @@ pub(crate) fn edge_to_disk(
     r: &EdgeRecord,
     t: &mut Table<'_, &'static [u8], &'static str>,
     d: &mut Dicts,
+    journal: &mut InternJournal,
 ) -> Result<EdgeRecordDisk, TopoError> {
     let mut p = BTreeMap::new();
     for (k, v) in &r.props {
-        p.insert(d.intern(t, DictKind::PropKey, k)?, v.clone());
+        p.insert(d.intern(t, DictKind::PropKey, k, journal)?, v.clone());
     }
     Ok(EdgeRecordDisk {
         id: r.id,
         scope: r.scope,
-        ty: d.intern(t, DictKind::EdgeType, r.ty.as_str())?,
+        ty: d.intern(t, DictKind::EdgeType, r.ty.as_str(), journal)?,
         from: r.from,
         to: r.to,
         props: p,
@@ -108,15 +110,16 @@ pub(crate) fn node_to_disk_v3(
     d: &mut Dicts,
     scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
     scopes: &mut ScopeRegistry,
+    journal: &mut InternJournal,
 ) -> Result<NodeRecordDiskV3, TopoError> {
     let mut p = BTreeMap::new();
     for (k, v) in &r.props {
-        p.insert(d.intern(t, DictKind::PropKey, k)?, v.clone());
+        p.insert(d.intern(t, DictKind::PropKey, k, journal)?, v.clone());
     }
     Ok(NodeRecordDiskV3 {
         id: r.id,
-        scope: scopes.intern(scopes_table, r.scope)?,
-        label: d.intern(t, DictKind::Label, r.label.as_str())?,
+        scope: scopes.intern(scopes_table, r.scope, journal)?,
+        label: d.intern(t, DictKind::Label, r.label.as_str(), journal)?,
         props: p,
     })
 }
@@ -150,10 +153,11 @@ pub(crate) fn edge_to_disk_v3(
     scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
     scopes: &mut ScopeRegistry,
     node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    journal: &mut InternJournal,
 ) -> Result<EdgeRecordDiskV3, TopoError> {
     let mut p = BTreeMap::new();
     for (k, v) in &r.props {
-        p.insert(d.intern(t, DictKind::PropKey, k)?, v.clone());
+        p.insert(d.intern(t, DictKind::PropKey, k, journal)?, v.clone());
     }
     let from = crate::slots::node_slot(node_slots, r.from)?
         .ok_or_else(|| TopoError::Encoding("edge_to_disk_v3: missing from slot".into()))?;
@@ -161,8 +165,8 @@ pub(crate) fn edge_to_disk_v3(
         .ok_or_else(|| TopoError::Encoding("edge_to_disk_v3: missing to slot".into()))?;
     Ok(EdgeRecordDiskV3 {
         id: r.id,
-        scope: scopes.intern(scopes_table, r.scope)?,
-        ty: d.intern(t, DictKind::EdgeType, r.ty.as_str())?,
+        scope: scopes.intern(scopes_table, r.scope, journal)?,
+        ty: d.intern(t, DictKind::EdgeType, r.ty.as_str(), journal)?,
         from,
         to,
         props: p,

@@ -1,4 +1,5 @@
 //! Small append-only registry mapping scopes to compact u32 ids for v3 rows.
+use crate::dict::InternJournal;
 use crate::error::{storage_err, TopoError};
 use crate::ids::{Scope, ScopeId};
 use crate::storage::scope_key;
@@ -71,6 +72,7 @@ impl ScopeRegistry {
         &mut self,
         t: &mut Table<'_, &'static [u8], &'static [u8]>,
         scope: Scope,
+        journal: &mut InternJournal,
     ) -> Result<u32, TopoError> {
         if let Some(id) = self.by_scope.get(&scope) {
             return Ok(*id);
@@ -84,7 +86,19 @@ impl ScopeRegistry {
             .map_err(storage_err)?;
         self.by_scope.insert(scope, id);
         self.by_id.insert(id, scope);
+        journal.scope_ids.push(id);
         Ok(id)
+    }
+    /// See `Dicts::revert`: same reverse-order counter-restoration argument
+    /// applies here (one registry, one monotonic counter, one guarded writer
+    /// at a time).
+    pub(crate) fn revert(&mut self, journal: &InternJournal) {
+        for &id in journal.scope_ids.iter().rev() {
+            if let Some(scope) = self.by_id.remove(&id) {
+                self.by_scope.remove(&scope);
+            }
+            self.next = id;
+        }
     }
     pub(crate) fn resolve(&self, id: u32) -> Result<Scope, TopoError> {
         self.by_id
@@ -124,9 +138,10 @@ mod tests {
             let mut t = tx.open_table(SCOPES).unwrap();
             seed_shared(&mut t).unwrap();
             let mut r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
-            assert_eq!(r.intern(&mut t, Scope::Shared).unwrap(), 0);
+            let mut journal = InternJournal::default();
+            assert_eq!(r.intern(&mut t, Scope::Shared, &mut journal).unwrap(), 0);
             let a = Scope::Id(ScopeId::from_u128(1));
-            assert_eq!(r.intern(&mut t, a).unwrap(), 1);
+            assert_eq!(r.intern(&mut t, a, &mut journal).unwrap(), 1);
             assert_eq!(r.resolve(1).unwrap(), a);
         }
         tx.commit().unwrap();

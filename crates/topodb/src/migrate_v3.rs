@@ -6,7 +6,7 @@
 
 use crate::adj::{adj_insert, AdjEntryDisk};
 use crate::codec::unframe_value;
-use crate::dict::{DictKind, Dicts};
+use crate::dict::{DictKind, Dicts, InternJournal};
 use crate::error::{storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
@@ -148,6 +148,12 @@ pub(crate) fn migrate_v2_to_v3(
     vectors: &mut Table<'_, &'static [u8], &'static [u8]>,
     embedding_ref: &mut Table<'_, &'static [u8], &'static [u8]>,
 ) -> Result<(), TopoError> {
+    // `dicts`/`scopes` here are loaded fresh for this one-shot on-open
+    // migration (see the callers in `storage.rs`), not the live `apply_batch`
+    // mirrors — a failure aborts the whole `open` before those mirrors are
+    // ever installed, so there is nothing to revert; this journal exists only
+    // to satisfy `intern`'s signature.
+    let mut journal = InternJournal::default();
     let (node_rows, edge_rows) = collect_v2_rows(nodes, edges, dicts)?;
 
     // Snapshot the old ULID-keyed EMBEDDINGS/COUNTERS rows before anything is
@@ -190,8 +196,14 @@ pub(crate) fn migrate_v2_to_v3(
             .ok_or_else(|| TopoError::Encoding("missing migrated node slot".into()))?;
         index_node(prop_index, &spec, dicts, node, slot)?;
 
-        let disk_node =
-            crate::disk::node_to_disk_v3(node, dict_table, dicts, scopes_table, &mut scopes)?;
+        let disk_node = crate::disk::node_to_disk_v3(
+            node,
+            dict_table,
+            dicts,
+            scopes_table,
+            &mut scopes,
+            &mut journal,
+        )?;
         // `node_to_disk_v3` just interned `node.scope` (idempotent past the
         // first node in this scope) — reuse that same id for the FTS rebuild
         // below rather than resolving it a second time.
@@ -237,7 +249,7 @@ pub(crate) fn migrate_v2_to_v3(
             let raw = crate::codec::unframe_value(bytes)?;
             let (model, vector): (String, Vec<f32>) = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            let model_id = dicts.intern(dict_table, DictKind::Model, &model)?;
+            let model_id = dicts.intern(dict_table, DictKind::Model, &model, &mut journal)?;
             crate::storage::check_or_pin_dim(vector_dims, model_id, vector.len()).map_err(|e| {
                 match e {
                     TopoError::Rejected(msg) => TopoError::Rejected(format!(
@@ -270,7 +282,7 @@ pub(crate) fn migrate_v2_to_v3(
         let edge_type = dicts
             .id_of(DictKind::EdgeType, edge.ty.as_str())
             .ok_or_else(|| TopoError::Encoding("missing migrated edge type id".into()))?;
-        let scope_id = scopes.intern(scopes_table, edge.scope)?;
+        let scope_id = scopes.intern(scopes_table, edge.scope, &mut journal)?;
         adj_insert(
             out_adj,
             from_slot,
@@ -303,6 +315,7 @@ pub(crate) fn migrate_v2_to_v3(
             scopes_table,
             &mut scopes,
             node_slots,
+            &mut journal,
         )?)
         .map_err(|e| TopoError::Encoding(e.to_string()))?;
         let framed = crate::codec::frame_value(raw);
@@ -451,10 +464,13 @@ mod tests {
         {
             let mut dict_table = tx.open_table(crate::dict::DICT).unwrap();
             let mut dicts = Dicts::default();
+            let mut journal = crate::dict::InternJournal::default();
             {
                 let mut nodes_table = tx.open_table(NODES).unwrap();
                 for n in nodes {
-                    let disk = crate::disk::node_to_disk(n, &mut dict_table, &mut dicts).unwrap();
+                    let disk =
+                        crate::disk::node_to_disk(n, &mut dict_table, &mut dicts, &mut journal)
+                            .unwrap();
                     let raw = postcard::to_allocvec(&disk).unwrap();
                     let framed = crate::codec::frame_value(raw);
                     nodes_table
@@ -465,7 +481,9 @@ mod tests {
             {
                 let mut edges_table = tx.open_table(EDGES).unwrap();
                 for e in edges {
-                    let disk = crate::disk::edge_to_disk(e, &mut dict_table, &mut dicts).unwrap();
+                    let disk =
+                        crate::disk::edge_to_disk(e, &mut dict_table, &mut dicts, &mut journal)
+                            .unwrap();
                     let raw = postcard::to_allocvec(&disk).unwrap();
                     let framed = crate::codec::frame_value(raw);
                     edges_table

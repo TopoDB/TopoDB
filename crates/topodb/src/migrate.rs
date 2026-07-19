@@ -1,6 +1,6 @@
 //! One-shot v1 to v2 migration. The v1 types are frozen copies of the old rows.
 use crate::codec::frame_value;
-use crate::dict::Dicts;
+use crate::dict::{Dicts, InternJournal};
 use crate::error::{storage_err, TopoError};
 use crate::ids::{EdgeId, NodeId, Scope};
 use crate::props::Props;
@@ -36,6 +36,11 @@ pub(crate) fn migrate_v1_to_v2(
     dict_table: &mut Table<'_, &'static [u8], &'static str>,
     dicts: &mut Dicts,
 ) -> Result<(), TopoError> {
+    // `dicts` is a fresh, migration-local `Dicts::default()` (see the sole
+    // caller in `storage.rs`), never the live write-path mirror, so there
+    // is nothing to revert on failure — this journal exists only to satisfy
+    // `intern`'s signature.
+    let mut journal = InternJournal::default();
     let vals = nodes
         .iter()
         .map_err(storage_err)?
@@ -63,8 +68,13 @@ pub(crate) fn migrate_v1_to_v2(
             props: old.props,
             embedding: None,
         };
-        let raw = postcard::to_allocvec(&crate::disk::node_to_disk(&n, dict_table, dicts)?)
-            .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        let raw = postcard::to_allocvec(&crate::disk::node_to_disk(
+            &n,
+            dict_table,
+            dicts,
+            &mut journal,
+        )?)
+        .map_err(|e| TopoError::Encoding(e.to_string()))?;
         let f = frame_value(raw);
         nodes
             .insert(crate::storage::node_key(n.id).as_slice(), f.as_slice())
@@ -89,8 +99,13 @@ pub(crate) fn migrate_v1_to_v2(
             valid_from: old.valid_from,
             valid_to: old.valid_to,
         };
-        let raw = postcard::to_allocvec(&crate::disk::edge_to_disk(&e, dict_table, dicts)?)
-            .map_err(|e| TopoError::Encoding(e.to_string()))?;
+        let raw = postcard::to_allocvec(&crate::disk::edge_to_disk(
+            &e,
+            dict_table,
+            dicts,
+            &mut journal,
+        )?)
+        .map_err(|e| TopoError::Encoding(e.to_string()))?;
         let f = frame_value(raw);
         edges
             .insert(e.id.as_u128().to_be_bytes().as_slice(), f.as_slice())

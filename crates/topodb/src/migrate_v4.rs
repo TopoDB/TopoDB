@@ -75,7 +75,7 @@
 //! correctness hazard, and simpler than threading a "was this already
 //! written by migrate_v2_to_v3" flag through the call chain.
 use crate::codec::unframe_value;
-use crate::dict::{DictKind, Dicts};
+use crate::dict::{DictKind, Dicts, InternJournal};
 use crate::error::{storage_err, TopoError};
 use crate::storage::{check_or_pin_dim, slot_key};
 use crate::vector_store::put_vector;
@@ -154,6 +154,12 @@ pub(crate) fn migrate_v3_to_v4(
     postings: &mut Table<'_, &'static [u8], &'static [u8]>,
     postings_already_chunked: bool,
 ) -> Result<(), TopoError> {
+    // `dicts` here is loaded fresh for this one-shot on-open migration (see
+    // the callers in `storage.rs`), not the live `apply_batch` mirror — a
+    // failure aborts the whole `open` before that mirror is installed, so
+    // there is nothing to revert; this journal exists only to satisfy
+    // `intern`'s signature.
+    let mut journal = InternJournal::default();
     // -- vectors pass: embeddings (slot-keyed) -> vectors/embedding_ref ----
     for entry in embeddings.iter().map_err(storage_err)? {
         let (k, v) = entry.map_err(storage_err)?;
@@ -180,7 +186,7 @@ pub(crate) fn migrate_v3_to_v4(
         let scope_id = disk.scope;
         drop(node_v);
 
-        let model_id = dicts.intern(dict_table, DictKind::Model, &model)?;
+        let model_id = dicts.intern(dict_table, DictKind::Model, &model, &mut journal)?;
         check_or_pin_dim(vector_dims, model_id, vector.len()).map_err(|e| match e {
             TopoError::Rejected(msg) => {
                 TopoError::Rejected(format!("migrating v3 embedding for model {model:?}: {msg}"))
@@ -301,12 +307,14 @@ mod tests {
                     props: Default::default(),
                     embedding: None,
                 };
+                let mut journal = InternJournal::default();
                 let disk = node_to_disk_v3(
                     &rec,
                     &mut dict_table,
                     &mut dicts,
                     &mut scopes_table,
                     &mut scopes,
+                    &mut journal,
                 )
                 .unwrap();
                 scope_id = disk.scope;
@@ -407,6 +415,7 @@ mod tests {
                 let mut scopes = ScopeRegistry::load_table_for_rebuild(&scopes_table).unwrap();
                 let mut dict_table = tx.open_table(DICT).unwrap();
                 let mut dicts = Dicts::default();
+                let mut journal = InternJournal::default();
                 let mut nodes = tx.open_table(NODES).unwrap();
                 let scope_x = Scope::Id(crate::ids::ScopeId::from_u128(10));
                 let scope_y = Scope::Id(crate::ids::ScopeId::from_u128(20));
@@ -424,6 +433,7 @@ mod tests {
                         &mut dicts,
                         &mut scopes_table,
                         &mut scopes,
+                        &mut journal,
                     )
                     .unwrap();
                     let raw = postcard::to_allocvec(&disk).unwrap();
@@ -432,8 +442,12 @@ mod tests {
                         .insert(slot_key(slot).as_slice(), framed.as_slice())
                         .unwrap();
                 }
-                scope_a = scopes.intern(&mut scopes_table, scope_x).unwrap();
-                scope_b = scopes.intern(&mut scopes_table, scope_y).unwrap();
+                scope_a = scopes
+                    .intern(&mut scopes_table, scope_x, &mut journal)
+                    .unwrap();
+                scope_b = scopes
+                    .intern(&mut scopes_table, scope_y, &mut journal)
+                    .unwrap();
 
                 let mut embeddings = tx.open_table(EMBEDDINGS).unwrap();
                 for (slot, dim) in [(slot_a, 2usize), (slot_b, 3usize)] {

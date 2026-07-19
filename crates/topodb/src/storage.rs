@@ -2,7 +2,7 @@ use crate::adj::{
     adj_close, adj_insert, adj_remove_all, adj_remove_edge, AdjEntryDisk, IN_ADJ, OUT_ADJ,
 };
 use crate::counters::AccessStats;
-use crate::dict::{DictKind, Dicts, DICT};
+use crate::dict::{DictKind, Dicts, InternJournal, DICT};
 use crate::error::{storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope};
@@ -910,57 +910,62 @@ impl Storage {
         let resolved: Vec<Op> = ops.into_iter().map(|op| resolve_op(op, now_ms)).collect();
 
         let mut dicts = self.dicts.write().expect("dict lock poisoned");
-        // A failed prior write transaction may have interned only in memory.
-        // Refresh from committed rows before each write so aborted batches cannot
-        // leave phantom ids that a later batch would reference.
-        let dict_read = self.db.begin_read().map_err(storage_err)?;
-        *dicts = Dicts::load(&dict_read)?;
-        drop(dict_read);
         let mut scope_registry = self
             .scope_registry
             .write()
             .expect("scope registry lock poisoned");
-        let scope_read = self.db.begin_read().map_err(storage_err)?;
-        *scope_registry = ScopeRegistry::load(&scope_read)?;
-        drop(scope_read);
-        let tx = self.db.begin_write().map_err(storage_err)?;
-        // Text-index edits collected during the op loop and applied AFTER every
-        // op has succeeded — still inside this transaction, so the postings
-        // ride the batch's atomicity (a later failing op aborts the whole txn,
-        // leaving the index untouched). `old_text` is captured BEFORE `apply_op`
-        // mutates the record.
-        // Each edit also carries the node's interned scope id and dense slot
-        // (immutable — old and new scope/slot are always identical), needed to
-        // key per-scope-id, per-slot postings/stats/docs (v3 FTS layout).
-        let mut fts_edits: Vec<(u32, u64, Option<String>, Option<String>)> = Vec::new();
-        {
-            let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
-            let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
-            let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
-            let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
-            let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
-            let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
-            let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
-            let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
-            let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
-            let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
-            let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
-            let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
-            let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
-            let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
-            let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
-            for op in &resolved {
-                // `pre` carries (id, scope, pre_slot, old_text). For CreateNode
-                // the scope comes from the op and the slot isn't allocated yet
-                // (resolved after `apply_op` below); for existing-node ops
-                // scope/slot come from the record/mapping read before mutation
-                // — captured HERE for RemoveNode specifically, because
-                // `apply_op` erases the NODE_SLOTS mapping as part of removal,
-                // so the slot is unrecoverable afterward.
-                let pre: Option<(NodeId, Scope, Option<u64>, Option<String>)> = match op {
-                    Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
-                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => {
-                        match read_node(
+        // Invariant (replaces the old per-batch `Dicts::load`/
+        // `ScopeRegistry::load` reload): from here down, the `dicts`/
+        // `scope_registry` in-memory mirrors are mutated ONLY through
+        // `journal`-recording `intern` calls. Every fallible step in
+        // `result` below — the op loop, the FTS-edit application, the
+        // op-log append, and `tx.commit()` itself — is one closure so ANY
+        // `Err` return, from ANY of those steps, reaches the `if
+        // result.is_err()` below and reverts exactly this batch's journaled
+        // ids from both mirrors before the error propagates. The old scheme
+        // paid two extra read transactions + an O(vocabulary) decode on
+        // EVERY batch, successful or not, to heal phantom ids left by a
+        // PRIOR aborted batch; this pays O(new interns) and only when THIS
+        // batch actually fails.
+        let mut journal = InternJournal::default();
+        let result: Result<AppliedBatch, TopoError> = (|| {
+            let tx = self.db.begin_write().map_err(storage_err)?;
+            // Text-index edits collected during the op loop and applied AFTER every
+            // op has succeeded — still inside this transaction, so the postings
+            // ride the batch's atomicity (a later failing op aborts the whole txn,
+            // leaving the index untouched). `old_text` is captured BEFORE `apply_op`
+            // mutates the record.
+            // Each edit also carries the node's interned scope id and dense slot
+            // (immutable — old and new scope/slot are always identical), needed to
+            // key per-scope-id, per-slot postings/stats/docs (v3 FTS layout).
+            let mut fts_edits: Vec<(u32, u64, Option<String>, Option<String>)> = Vec::new();
+            {
+                let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
+                let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
+                let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
+                let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+                let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+                let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
+                let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
+                let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
+                let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+                let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
+                let mut edge_ids = tx.open_table(EDGE_IDS).map_err(storage_err)?;
+                let mut scopes_table = tx.open_table(SCOPES).map_err(storage_err)?;
+                let mut out_adj = tx.open_table(OUT_ADJ).map_err(storage_err)?;
+                let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
+                let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
+                for op in &resolved {
+                    // `pre` carries (id, scope, pre_slot, old_text). For CreateNode
+                    // the scope comes from the op and the slot isn't allocated yet
+                    // (resolved after `apply_op` below); for existing-node ops
+                    // scope/slot come from the record/mapping read before mutation
+                    // — captured HERE for RemoveNode specifically, because
+                    // `apply_op` erases the NODE_SLOTS mapping as part of removal,
+                    // so the slot is unrecoverable afterward.
+                    let pre: Option<(NodeId, Scope, Option<u64>, Option<String>)> = match op {
+                        Op::CreateNode { id, scope, .. } => Some((*id, *scope, None, None)),
+                        Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => match read_node(
                             &nodes,
                             &vectors,
                             &embedding_ref,
@@ -974,158 +979,175 @@ impl Storage {
                                 Some((*id, rec.scope, slot, doc_text(&self.spec, &rec)))
                             }
                             None => None,
-                        }
-                    }
-                    // SetEmbedding never changes text; edge ops carry none.
-                    _ => None,
-                };
-                let old_index_node = match op {
-                    Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => read_node(
-                        &nodes,
-                        &vectors,
-                        &embedding_ref,
-                        &dicts,
-                        &scope_registry,
-                        &node_slots,
-                        *id,
-                    )?,
-                    _ => None,
-                };
-                if let Some(node) = &old_index_node {
-                    if let Some(slot) = crate::slots::node_slot(&node_slots, node.id)? {
-                        unindex_node(&mut prop_index, &self.spec, &dicts, node, slot)?;
-                    }
-                }
-                apply_op(
-                    &mut nodes,
-                    &mut edges,
-                    &mut vector_dims,
-                    &mut vectors,
-                    &mut embedding_ref,
-                    &mut dict_table,
-                    &mut dicts,
-                    &mut slot_meta,
-                    &mut node_slots,
-                    &mut node_ids,
-                    &mut edge_slots,
-                    &mut edge_ids,
-                    &mut out_adj,
-                    &mut in_adj,
-                    &mut scopes_table,
-                    &mut scope_registry,
-                    op,
-                )?;
-                if !matches!(op, Op::RemoveNode { .. }) {
-                    let id = match op {
-                        Op::CreateNode { id, .. } | Op::SetNodeProps { id, .. } => Some(*id),
+                        },
+                        // SetEmbedding never changes text; edge ops carry none.
                         _ => None,
                     };
-                    if let Some(id) = id {
-                        if let Some(node) = read_node(
+                    let old_index_node = match op {
+                        Op::SetNodeProps { id, .. } | Op::RemoveNode { id } => read_node(
                             &nodes,
                             &vectors,
                             &embedding_ref,
                             &dicts,
                             &scope_registry,
                             &node_slots,
-                            id,
-                        )? {
-                            if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
-                                index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
+                            *id,
+                        )?,
+                        _ => None,
+                    };
+                    if let Some(node) = &old_index_node {
+                        if let Some(slot) = crate::slots::node_slot(&node_slots, node.id)? {
+                            unindex_node(&mut prop_index, &self.spec, &dicts, node, slot)?;
+                        }
+                    }
+                    apply_op(
+                        &mut nodes,
+                        &mut edges,
+                        &mut vector_dims,
+                        &mut vectors,
+                        &mut embedding_ref,
+                        &mut dict_table,
+                        &mut dicts,
+                        &mut slot_meta,
+                        &mut node_slots,
+                        &mut node_ids,
+                        &mut edge_slots,
+                        &mut edge_ids,
+                        &mut out_adj,
+                        &mut in_adj,
+                        &mut scopes_table,
+                        &mut scope_registry,
+                        op,
+                        &mut journal,
+                    )?;
+                    if !matches!(op, Op::RemoveNode { .. }) {
+                        let id = match op {
+                            Op::CreateNode { id, .. } | Op::SetNodeProps { id, .. } => Some(*id),
+                            _ => None,
+                        };
+                        if let Some(id) = id {
+                            if let Some(node) = read_node(
+                                &nodes,
+                                &vectors,
+                                &embedding_ref,
+                                &dicts,
+                                &scope_registry,
+                                &node_slots,
+                                id,
+                            )? {
+                                if let Some(slot) = crate::slots::node_slot(&node_slots, id)? {
+                                    index_node(&mut prop_index, &self.spec, &dicts, &node, slot)?;
+                                }
                             }
                         }
                     }
+                    if let Some((id, scope, pre_slot, old_text)) = pre {
+                        let new_text = match op {
+                            Op::RemoveNode { .. } => None,
+                            _ => read_node(
+                                &nodes,
+                                &vectors,
+                                &embedding_ref,
+                                &dicts,
+                                &scope_registry,
+                                &node_slots,
+                                id,
+                            )?
+                            .and_then(|rec| doc_text(&self.spec, &rec)),
+                        };
+                        // CreateNode's slot is allocated inside `apply_op` above,
+                        // so it only resolves now; every other op captured its
+                        // slot pre-mutation (see the `pre` comment above).
+                        let slot = match pre_slot {
+                            Some(s) => s,
+                            None => crate::slots::node_slot(&node_slots, id)?.ok_or_else(|| {
+                                TopoError::Encoding(
+                                    "fts edit: node slot missing after CreateNode".into(),
+                                )
+                            })?,
+                        };
+                        // Idempotent: CreateNode/SetNodeProps already interned
+                        // this exact scope via `put_node` a few lines up (inside
+                        // `apply_op`), so this is a HashMap lookup, not a fresh
+                        // allocation — except for RemoveNode, where it's the
+                        // scope's only remaining reference in this op, but the
+                        // scope was necessarily interned when the node was
+                        // created, so it still resolves to the same id.
+                        let scope_id =
+                            scope_registry.intern(&mut scopes_table, scope, &mut journal)?;
+                        fts_edits.push((scope_id, slot, old_text, new_text));
+                    }
                 }
-                if let Some((id, scope, pre_slot, old_text)) = pre {
-                    let new_text = match op {
-                        Op::RemoveNode { .. } => None,
-                        _ => read_node(
-                            &nodes,
-                            &vectors,
-                            &embedding_ref,
-                            &dicts,
-                            &scope_registry,
-                            &node_slots,
-                            id,
-                        )?
-                        .and_then(|rec| doc_text(&self.spec, &rec)),
-                    };
-                    // CreateNode's slot is allocated inside `apply_op` above,
-                    // so it only resolves now; every other op captured its
-                    // slot pre-mutation (see the `pre` comment above).
-                    let slot = match pre_slot {
-                        Some(s) => s,
-                        None => crate::slots::node_slot(&node_slots, id)?.ok_or_else(|| {
-                            TopoError::Encoding(
-                                "fts edit: node slot missing after CreateNode".into(),
-                            )
-                        })?,
-                    };
-                    // Idempotent: CreateNode/SetNodeProps already interned
-                    // this exact scope via `put_node` a few lines up (inside
-                    // `apply_op`), so this is a HashMap lookup, not a fresh
-                    // allocation — except for RemoveNode, where it's the
-                    // scope's only remaining reference in this op, but the
-                    // scope was necessarily interned when the node was
-                    // created, so it still resolves to the same id.
-                    let scope_id = scope_registry.intern(&mut scopes_table, scope)?;
-                    fts_edits.push((scope_id, slot, old_text, new_text));
+            }
+            {
+                let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
+                let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
+                let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
+                for (scope_id, slot, old_text, new_text) in &fts_edits {
+                    fts_update(
+                        &mut postings,
+                        &mut docs,
+                        &mut stats,
+                        *scope_id,
+                        *slot,
+                        old_text.as_deref(),
+                        new_text.as_deref(),
+                    )?;
                 }
             }
-        }
-        {
-            let mut postings = tx.open_table(POSTINGS).map_err(storage_err)?;
-            let mut docs = tx.open_table(FTS_DOCS).map_err(storage_err)?;
-            let mut stats = tx.open_table(FTS_STATS).map_err(storage_err)?;
-            for (scope_id, slot, old_text, new_text) in &fts_edits {
-                fts_update(
-                    &mut postings,
-                    &mut docs,
-                    &mut stats,
-                    *scope_id,
-                    *slot,
-                    old_text.as_deref(),
-                    new_text.as_deref(),
-                )?;
-            }
-        }
 
-        let (first_seq, last_seq);
-        {
-            // Same floor clamp as `append_ops`, same rationale: after an
-            // empty-log compaction the seq high-water mark lives only in META
-            // `"oldest_seq"` — deriving `next` from `OPS.last()` alone would
-            // restart at 1, committing ops BELOW the floor (permanently
-            // unreadable via `read_ops` and breaking seq monotonicity). Read
-            // inside this write txn so the clamp is atomic with the append.
-            let floor = {
-                let meta = tx.open_table(META).map_err(storage_err)?;
-                read_oldest_seq(&meta)?
-            };
-            let mut table = tx.open_table(OPS).map_err(storage_err)?;
-            let next = table
-                .last()
-                .map_err(storage_err)?
-                .map(|(k, _)| k.value() + 1)
-                .unwrap_or(1)
-                .max(floor);
-            first_seq = next;
-            last_seq = next + resolved.len() as u64 - 1;
-            for (i, op) in resolved.iter().enumerate() {
-                let bytes =
-                    postcard::to_allocvec(op).map_err(|e| TopoError::Encoding(e.to_string()))?;
-                table
-                    .insert(next + i as u64, bytes.as_slice())
-                    .map_err(storage_err)?;
+            let (first_seq, last_seq);
+            {
+                // Same floor clamp as `append_ops`, same rationale: after an
+                // empty-log compaction the seq high-water mark lives only in META
+                // `"oldest_seq"` — deriving `next` from `OPS.last()` alone would
+                // restart at 1, committing ops BELOW the floor (permanently
+                // unreadable via `read_ops` and breaking seq monotonicity). Read
+                // inside this write txn so the clamp is atomic with the append.
+                let floor = {
+                    let meta = tx.open_table(META).map_err(storage_err)?;
+                    read_oldest_seq(&meta)?
+                };
+                let mut table = tx.open_table(OPS).map_err(storage_err)?;
+                let next = table
+                    .last()
+                    .map_err(storage_err)?
+                    .map(|(k, _)| k.value() + 1)
+                    .unwrap_or(1)
+                    .max(floor);
+                first_seq = next;
+                last_seq = next + resolved.len() as u64 - 1;
+                for (i, op) in resolved.iter().enumerate() {
+                    let bytes = postcard::to_allocvec(op)
+                        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                    table
+                        .insert(next + i as u64, bytes.as_slice())
+                        .map_err(storage_err)?;
+                }
             }
-        }
 
-        tx.commit().map_err(storage_err)?;
-        Ok(AppliedBatch {
-            first_seq,
-            last_seq,
-            resolved,
-        })
+            tx.commit().map_err(storage_err)?;
+            Ok(AppliedBatch {
+                first_seq,
+                last_seq,
+                resolved,
+            })
+        })();
+
+        // Every failure path between the first intern above and a
+        // successful commit lands here: op-loop errors (validation
+        // rejections, encoding errors), FTS-edit errors, op-log append
+        // errors, and `tx.commit()` errors all return `Err` from the
+        // closure without having mutated anything outside `dicts`/
+        // `scope_registry` — redb's write transaction is simply dropped
+        // (never committed), so NODES/EDGES/DICT/SCOPES on disk are
+        // untouched. Reverting the journal here is what keeps the in-memory
+        // mirrors consistent with that untouched disk state.
+        if result.is_err() {
+            dicts.revert(&journal);
+            scope_registry.revert(&journal);
+        }
+        result
     }
 
     /// One-transaction indexed lookup: PROP_INDEX prefix scan + record fetches
@@ -1395,10 +1417,13 @@ impl Storage {
         // memory ahead of the failure (`dicts.clear()` and the scope-registry
         // reload both happen before the ops replay that can itself fail). On
         // any error, both in-memory mirrors are reloaded from the last
-        // COMMITTED rows so they never drift from what's actually on disk —
-        // the same recovery `apply_batch` performs on ENTRY (via a fresh
-        // `Dicts::load`/`ScopeRegistry::load` read, storage.rs:705-718)
-        // applied here on the error EXIT instead.
+        // COMMITTED rows so they never drift from what's actually on disk.
+        // This is its own recovery scheme, distinct from `apply_batch`'s
+        // (which journals+reverts individual interns instead of reloading):
+        // a full-log replay already touches every kind of state in one
+        // shot, so a whole-mirror reload on failure is no more expensive
+        // than the journal bookkeeping would be, and this function has no
+        // per-batch-success path to keep cheap.
         let result: Result<(), TopoError> = (|| {
             let tx = self.db.begin_write().map_err(storage_err)?;
             {
@@ -1467,6 +1492,11 @@ impl Storage {
                 stats.retain(|_, _| false).map_err(storage_err)?;
 
                 let ops_table = tx.open_table(OPS).map_err(storage_err)?;
+                // Thrown away after each op: this function's error recovery
+                // reloads both mirrors WHOLESALE on failure (see the comment
+                // above `result`), so there is nothing to revert per-op —
+                // `apply_op`/`intern` just need a journal to write into.
+                let mut journal = InternJournal::default();
                 for entry in ops_table.iter().map_err(storage_err)? {
                     let (_, v) = entry.map_err(storage_err)?;
                     let op: Op = postcard::from_bytes(v.value())
@@ -1515,6 +1545,7 @@ impl Storage {
                         &mut scopes_table,
                         &mut scope_registry,
                         &op,
+                        &mut journal,
                     )?;
                     if !matches!(op, Op::RemoveNode { .. }) {
                         let id = match &op {
@@ -1562,7 +1593,8 @@ impl Storage {
                         // Idempotent re-intern — see `apply_batch`'s identical
                         // comment; the scope was already interned when the node
                         // was created (or an earlier op on the same node).
-                        let scope_id = scope_registry.intern(&mut scopes_table, scope)?;
+                        let scope_id =
+                            scope_registry.intern(&mut scopes_table, scope, &mut journal)?;
                         fts_update(
                             &mut postings,
                             &mut docs,
@@ -1846,6 +1878,7 @@ fn put_node(
     scopes: &mut ScopeRegistry,
     node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
     rec: &NodeRecord,
+    journal: &mut InternJournal,
 ) -> Result<(), TopoError> {
     let slot = crate::slots::node_slot(node_slots, rec.id)?
         .ok_or_else(|| TopoError::Encoding("put_node: missing node slot".into()))?;
@@ -1855,6 +1888,7 @@ fn put_node(
         dicts,
         scopes_table,
         scopes,
+        journal,
     )?)
     .map_err(|e| TopoError::Encoding(e.to_string()))?;
     let f = crate::codec::frame_value(raw);
@@ -1874,6 +1908,7 @@ fn put_edge(
     edge_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
     node_slots: &impl ReadableTable<&'static [u8], &'static [u8]>,
     rec: &EdgeRecord,
+    journal: &mut InternJournal,
 ) -> Result<(), TopoError> {
     let slot = crate::slots::edge_slot(edge_slots, rec.id)?
         .ok_or_else(|| TopoError::Encoding("put_edge: missing edge slot".into()))?;
@@ -1884,6 +1919,7 @@ fn put_edge(
         scopes_table,
         scopes,
         node_slots,
+        journal,
     )?)
     .map_err(|e| TopoError::Encoding(e.to_string()))?;
     let f = crate::codec::frame_value(raw);
@@ -1960,6 +1996,7 @@ fn apply_op(
     scopes_table: &mut Table<'_, &'static [u8], &'static [u8]>,
     scope_registry: &mut ScopeRegistry,
     op: &Op,
+    journal: &mut InternJournal,
 ) -> Result<(), TopoError> {
     match op {
         Op::CreateNode {
@@ -1984,6 +2021,7 @@ fn apply_op(
                 scope_registry,
                 node_slots,
                 &rec,
+                journal,
             )
         }
         Op::SetNodeProps { id, props } => {
@@ -2015,6 +2053,7 @@ fn apply_op(
                 scope_registry,
                 node_slots,
                 &rec,
+                journal,
             )
         }
         Op::SetEmbedding { id, model, vector } => {
@@ -2056,7 +2095,7 @@ fn apply_op(
             // per-(model, scope) check) — a mismatch here rejects the whole
             // batch since the caller's write transaction never commits on
             // this `Err`.
-            let model_id = dicts.intern(dict, DictKind::Model, model)?;
+            let model_id = dicts.intern(dict, DictKind::Model, model, journal)?;
             // `check_or_pin_dim` only has the interned id in scope, but the
             // caller submitted a STRING model name — re-annotate the
             // rejection with it here. The interned id stays in the inner
@@ -2076,7 +2115,7 @@ fn apply_op(
             let slot = crate::slots::node_slot(node_slots, *id)?.ok_or_else(|| {
                 TopoError::Encoding("SetEmbedding: missing node slot after read_node hit".into())
             })?;
-            let scope_id = scope_registry.intern(scopes_table, rec.scope)?;
+            let scope_id = scope_registry.intern(scopes_table, rec.scope, journal)?;
             vector_store::put_vector(vectors, embedding_ref, model_id, scope_id, slot, vector)
         }
         Op::RemoveNode { id } => {
@@ -2194,13 +2233,13 @@ fn apply_op(
                 .ok_or_else(|| TopoError::Encoding("missing from slot".into()))?;
             let to_slot = crate::slots::node_slot(node_slots, *to)?
                 .ok_or_else(|| TopoError::Encoding("missing to slot".into()))?;
-            let edge_type = dicts.intern(dict, DictKind::EdgeType, ty)?;
+            let edge_type = dicts.intern(dict, DictKind::EdgeType, ty, journal)?;
             // Intern (not `id_of`): an edge's scope can be its first
             // appearance in the file — e.g. a project-scoped edge between two
             // Shared nodes — so it may not be registered yet. Idempotent for
             // already-seen scopes; `put_edge` below re-interns the same scope
             // internally, also a no-op.
-            let scope_id = scope_registry.intern(scopes_table, *scope)?;
+            let scope_id = scope_registry.intern(scopes_table, *scope, journal)?;
             let rec = EdgeRecord {
                 id: *id,
                 scope: *scope,
@@ -2221,6 +2260,7 @@ fn apply_op(
                 edge_slots,
                 node_slots,
                 &rec,
+                journal,
             )?;
             let entry = AdjEntryDisk {
                 target: to_slot,
@@ -2264,6 +2304,7 @@ fn apply_op(
                 edge_slots,
                 node_slots,
                 &rec,
+                journal,
             )?;
             let edge_slot = crate::slots::edge_slot(edge_slots, *id)?
                 .ok_or_else(|| TopoError::Encoding("missing edge slot".into()))?;
@@ -2271,7 +2312,7 @@ fn apply_op(
                 .ok_or_else(|| TopoError::Encoding("missing from slot".into()))?;
             let to_slot = crate::slots::node_slot(node_slots, rec.to)?
                 .ok_or_else(|| TopoError::Encoding("missing to slot".into()))?;
-            let edge_type = dicts.intern(dict, DictKind::EdgeType, rec.ty.as_str())?;
+            let edge_type = dicts.intern(dict, DictKind::EdgeType, rec.ty.as_str(), journal)?;
             let valid_to = rec.valid_to.expect("set above");
             if !adj_close(out_adj, from_slot, edge_type, edge_slot, valid_to)?
                 || !adj_close(in_adj, to_slot, edge_type, edge_slot, valid_to)?
