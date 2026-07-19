@@ -1,0 +1,58 @@
+use topodb_sgh::planner::mock::MockPlanner;
+use topodb_sgh::planner::{build_plan_prompt, PlanRequest, Planner, PlannerError};
+use topodb_sgh::schema::validate::ValidationError;
+
+fn req() -> PlanRequest {
+    PlanRequest { goal: "port the analyzer".into(), context: None }
+}
+
+#[test]
+fn prompt_states_the_goal_and_teaches_the_schema() {
+    let p = build_plan_prompt(&req(), &[], None);
+    assert!(p.contains("port the analyzer"));
+    assert!(p.contains("kind"), "must describe node kinds");
+    assert!(p.contains("budget"), "budget is required on every node");
+    assert!(p.contains("needs"), "must describe dependencies");
+    assert!(p.contains("version: 1"), "must show the expected top-level shape");
+}
+
+#[test]
+fn prompt_includes_optional_context_when_given() {
+    let r = PlanRequest {
+        goal: "g".into(),
+        context: Some("the tokenizer lives in crates/topodb/src/fts.rs".into()),
+    };
+    assert!(build_plan_prompt(&r, &[], None).contains("crates/topodb/src/fts.rs"));
+}
+
+#[test]
+fn retry_prompt_feeds_back_the_errors_and_the_rejected_yaml() {
+    let errs = vec![
+        ValidationError::DanglingNeed { node: "b".into(), missing: "ghost".into() },
+        ValidationError::MissingPrompt("a".into()),
+    ];
+    let p = build_plan_prompt(&req(), &errs, Some("version: 1\ngoal: g\nnodes: []\n"));
+
+    assert!(p.contains("ghost"), "the specific dangling id must be fed back");
+    assert!(p.contains("has no prompt"), "the specific error must be fed back");
+    assert!(p.contains("nodes: []"), "the rejected document must be shown");
+}
+
+#[test]
+fn mock_planner_returns_scripted_graphs_in_order() {
+    let p = MockPlanner::new(vec![
+        Ok("version: 1\ngoal: g\nnodes:\n  - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n".to_string()),
+    ]);
+    let g = p.plan(&req()).expect("plans");
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(g.nodes[0].id, "a");
+}
+
+#[test]
+fn mock_planner_surfaces_scripted_failures() {
+    let p = MockPlanner::new(vec![Err("model unavailable".to_string())]);
+    match p.plan(&req()) {
+        Err(PlannerError::Runner(msg)) => assert!(msg.contains("unavailable")),
+        other => panic!("expected a runner error, got {other:?}"),
+    }
+}
