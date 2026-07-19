@@ -31,9 +31,20 @@ enum Cmd {
         graph: PathBuf,
         #[arg(long)]
         model: Option<String>,
-        /// Skip the approval prompt.
+        /// Skip the approval prompt for the graph given on the command
+        /// line. Does NOT cover replan revisions: once `--replan` is in
+        /// play, a model can rewrite the graph's `run:` strings, and a
+        /// human seeing that text before it executes is the only control —
+        /// so every revision still prompts, even with `--yes`. Use
+        /// `--yes-including-revisions` for the fully unattended case.
         #[arg(long)]
         yes: bool,
+        /// Skip the approval prompt for EVERY graph, including replan
+        /// revisions that a model has authored and this process has not
+        /// shown you yet. This approves shell commands a model has not yet
+        /// written. Implies `--yes`.
+        #[arg(long)]
+        yes_including_revisions: bool,
         /// Seconds a single command node may run before it is killed.
         #[arg(long, default_value_t = 120)]
         command_timeout: u64,
@@ -80,6 +91,36 @@ fn command_preview(v: &Validated) -> Vec<String> {
 /// bound on autonomous work is visible rather than implicit.
 fn replan_banner(attempt: u32, max: u32) -> String {
     format!("\n=== replan {attempt} of {max} ===")
+}
+
+/// Whether the approval gate must prompt before this iteration's graph
+/// executes.
+///
+/// `--yes` covers only the graph the operator supplied on the command line
+/// (`is_revision == false`); a replan revision is authored by a model and
+/// must always be shown to a human first, regardless of `--yes` — that is
+/// the one control this project relies on for model-authored shell. Only
+/// `--yes-including-revisions` (which implies `--yes`) skips the prompt for
+/// a revision, and its help text says plainly that doing so approves shell
+/// commands a model has not yet written.
+fn needs_prompt(is_revision: bool, yes: bool, yes_including_revisions: bool) -> bool {
+    if yes_including_revisions {
+        return false;
+    }
+    if is_revision {
+        return true;
+    }
+    !yes
+}
+
+/// Whether every node the run halted on is a gate rather than a real
+/// failure. When true, the run stopped exactly as designed — a checkpoint
+/// was reached, not a failure — and replanning must not be attempted: doing
+/// so would spend replan budget on a run that didn't actually fail, and
+/// would hand the planner a "failure" to avoid that was in fact intentional
+/// (see `replan::build_replan_goal`'s gated-checkpoint section).
+fn all_blocked_are_gates(ctx: &topodb_sgh::replan::FailureContext) -> bool {
+    ctx.blocked.is_empty() && !ctx.gated.is_empty()
 }
 
 /// The decision made after a run halts: succeed, give up, or propose another
@@ -136,10 +177,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             graph,
             model,
             yes,
+            yes_including_revisions,
             command_timeout,
             replan,
             max_replans,
         } => {
+            // `--yes-including-revisions` implies `--yes` for anything else
+            // in this command that reads `yes` (there is nothing else today,
+            // but keeping the invariant explicit here means a future reader
+            // of `yes` doesn't have to know about the other flag).
+            let yes = yes || yes_including_revisions;
             let src = std::fs::read_to_string(&graph)?;
             let g = Graph::from_yaml(&src)?;
             let v = match validate(&g) {
@@ -159,6 +206,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut current = v;
             let mut replans_used = 0u32;
+            // False for the graph supplied on the command line; set true
+            // once a revision replaces `current` at the bottom of the loop.
+            // Drives `needs_prompt` — the gate `--yes` alone must never
+            // skip.
+            let mut is_revision = false;
 
             loop {
                 let bound = worst_case(&current);
@@ -174,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if !yes {
+                if needs_prompt(is_revision, yes, yes_including_revisions) {
                     println!("\nProceed? [y/N]");
                     let mut line = String::new();
                     std::io::stdin().read_line(&mut line)?;
@@ -204,8 +256,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.command_runs, bound.command_runs
                 );
 
-                match next_step(report.blocked.is_empty(), replan, replans_used, max_replans) {
-                    Step::Success => return Ok(()),
+                if report.blocked.is_empty() {
+                    return Ok(());
+                }
+
+                // Compute failure context before touching the replan budget:
+                // a gate-only halt must not consume it (see
+                // `all_blocked_are_gates`), so this has to happen before
+                // `next_step` would otherwise increment `replans_used`.
+                let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
+
+                if all_blocked_are_gates(&ctx) {
+                    println!(
+                        "\nrun halted at an intentional checkpoint, not a failure: {:?}",
+                        ctx.gated
+                    );
+                    println!(
+                        "no replan attempted — this is the run stopping as designed; the \
+                         replan budget was not spent."
+                    );
+                    return Ok(());
+                }
+
+                match next_step(false, replan, replans_used, max_replans) {
+                    Step::Success => {
+                        unreachable!("report.blocked was already checked non-empty above")
+                    }
                     Step::Exhausted => {
                         if replan {
                             eprintln!(
@@ -220,7 +296,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("{}", replan_banner(replans_used, max_replans));
 
-                let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
                 let planner = ClaudePlanner::new(model.clone(), 3);
                 let revised = match propose_revision(&planner, &current, &ctx) {
                     Ok(g) => g,
@@ -242,14 +317,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
+                // Stamp strictly after every write the run itself made
+                // (`ex.clock()` is the executor's logical clock after
+                // `run()` returns), not `now + 2` — the executor's clock
+                // ticks on every state write and can reach well past that by
+                // the time the run halts, so a fixed `now + 2` recorded the
+                // revision as existing *during* the run that produced it.
                 let revised_yaml = serde_yaml::to_string(&revised)?;
                 ex.store_ref().record_revision(
                     &revised_yaml,
                     &format!("blocked: {:?}", report.blocked),
-                    now + 2,
+                    ex.clock() + 1,
                 )?;
 
                 current = validated;
+                is_revision = true;
 
                 println!("proposed revision:\n{revised_yaml}");
                 // Loop back: the revision re-enters the gate exactly like the
@@ -381,5 +463,68 @@ mod tests {
     #[test]
     fn next_step_exhausts_immediately_when_max_replans_is_zero_no_planner_calls() {
         assert_eq!(next_step(false, true, 0, 0), Step::Exhausted);
+    }
+
+    // needs_prompt: the gate-decision truth table. `--yes` covers only the
+    // original graph; a revision always prompts unless
+    // `--yes-including-revisions` is set.
+    #[test]
+    fn needs_prompt_original_graph_with_yes_skips_the_prompt() {
+        assert!(!needs_prompt(false, true, false));
+    }
+
+    #[test]
+    fn needs_prompt_revision_with_yes_still_prompts() {
+        assert!(needs_prompt(true, true, false));
+    }
+
+    #[test]
+    fn needs_prompt_revision_with_yes_including_revisions_skips_the_prompt() {
+        assert!(!needs_prompt(true, false, true));
+        assert!(!needs_prompt(true, true, true));
+    }
+
+    #[test]
+    fn needs_prompt_with_no_flags_always_prompts() {
+        assert!(needs_prompt(false, false, false), "original graph, no flags");
+        assert!(needs_prompt(true, false, false), "revision, no flags");
+    }
+
+    #[test]
+    fn needs_prompt_original_graph_with_yes_including_revisions_skips_the_prompt() {
+        // yes_including_revisions implies yes, so the original graph is
+        // covered too.
+        assert!(!needs_prompt(false, false, true));
+    }
+
+    // all_blocked_are_gates: whether a halted run stopped only at intentional
+    // checkpoints, in which case replanning must not be attempted at all.
+    fn ctx(blocked: Vec<&str>, gated: Vec<&str>) -> topodb_sgh::replan::FailureContext {
+        topodb_sgh::replan::FailureContext {
+            blocked: blocked.into_iter().map(String::from).collect(),
+            gated: gated.into_iter().map(String::from).collect(),
+            skipped: vec![],
+            attempts: vec![],
+            descriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn all_blocked_are_gates_true_when_only_gates_blocked() {
+        assert!(all_blocked_are_gates(&ctx(vec![], vec!["checkpoint"])));
+    }
+
+    #[test]
+    fn all_blocked_are_gates_false_when_a_real_failure_is_present() {
+        assert!(!all_blocked_are_gates(&ctx(vec!["a"], vec!["checkpoint"])));
+        assert!(!all_blocked_are_gates(&ctx(vec!["a"], vec![])));
+    }
+
+    #[test]
+    fn all_blocked_are_gates_false_when_nothing_blocked() {
+        // Not the case this predicate is meant to answer (the caller already
+        // returns success before reaching it), but it must not report a
+        // gate-only halt when there was no halt at all.
+        assert!(!all_blocked_are_gates(&ctx(vec![], vec![])));
     }
 }

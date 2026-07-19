@@ -10,8 +10,12 @@ pub const LABEL_STATE: &str = "SghState";
 pub const LABEL_OUTPUT: &str = "SghOutput";
 pub const LABEL_ATTEMPT: &str = "SghAttempt";
 /// A proposed successor graph for a run, written by the replan step and
-/// linked `SghRevision -[REVISION_OF]-> SghRun`. Superseding, so a run
+/// linked `SghRun -[REVISION_OF]-> SghRevision`. Superseding, so a run
 /// carries at most one open proposal while earlier ones stay in history.
+/// The edge is keyed from the run, not the revision, because supersession
+/// keys on `(from, ty)` and must be anchored on the run's stable node id —
+/// a fresh revision id would never match a prior edge, so it could never
+/// close it out.
 pub const LABEL_REVISION: &str = "SghRevision";
 
 pub const EDGE_DEPENDS_ON: &str = "DEPENDS_ON";
@@ -36,9 +40,8 @@ pub enum SghError {
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error(
-        "command nodes are not supported until v0.0.2: {nodes:?}; command execution has no \
-         shell path yet and dispatching them through AgentRunner would send the shell command \
-         to a model as a prompt"
+        "graph contains command nodes but no CommandRunner was configured: {nodes:?}; call \
+         Executor::with_command_runner"
     )]
-    UnsupportedNodeKind { nodes: Vec<String> },
+    NoCommandRunner { nodes: Vec<String> },
 }

@@ -106,15 +106,45 @@ impl Planner for ClaudePlanner {
 
 /// Models often wrap YAML in code fences despite instructions. Strip one
 /// leading/trailing fence rather than failing the attempt over formatting.
+/// Both the `yaml` and the short `yml` language tags are recognized — a
+/// model using the short tag would otherwise cost a full retry attempt.
 fn strip_fences(raw: &str) -> String {
     let t = raw.trim();
     let Some(rest) = t.strip_prefix("```") else {
         return t.to_string();
     };
-    let rest = rest.strip_prefix("yaml").unwrap_or(rest);
+    let rest = rest
+        .strip_prefix("yaml")
+        .or_else(|| rest.strip_prefix("yml"))
+        .unwrap_or(rest);
     rest.trim_start_matches('\n')
         .strip_suffix("```")
         .unwrap_or(rest)
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod strip_fences_tests {
+    use super::strip_fences;
+
+    #[test]
+    fn strips_yaml_fence() {
+        assert_eq!(strip_fences("```yaml\nversion: 1\n```"), "version: 1");
+    }
+
+    #[test]
+    fn strips_short_yml_fence() {
+        assert_eq!(strip_fences("```yml\nversion: 1\n```"), "version: 1");
+    }
+
+    #[test]
+    fn strips_bare_fence_with_no_language_tag() {
+        assert_eq!(strip_fences("```\nversion: 1\n```"), "version: 1");
+    }
+
+    #[test]
+    fn leaves_unfenced_yaml_untouched() {
+        assert_eq!(strip_fences("version: 1"), "version: 1");
+    }
 }

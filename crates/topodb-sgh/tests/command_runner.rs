@@ -48,6 +48,22 @@ fn nonzero_exit_is_a_failed_outcome_carrying_stderr() {
 }
 
 #[test]
+fn a_failing_command_with_non_utf8_stdout_reports_exit_status_not_a_utf8_error() {
+    // Regression: stdout must never be decoded before the exit status is
+    // checked. A failing command's non-UTF-8 stdout must not surface as
+    // RunnerError::Utf8, shadowing the informative "exited with N: <stderr>"
+    // that the recovery ladder and replan context depend on.
+    let r = req("printf 'boom' >&2; printf '\\xff\\xfe' ; exit 7");
+    match runner().run(&r).unwrap() {
+        NodeOutcome::Failed { error } => {
+            assert!(error.contains("exited with 7"), "exit code must be reported: {error}");
+            assert!(error.contains("boom"), "stderr must survive: {error}");
+        }
+        other => panic!("expected a Failed outcome, not an Err, got {other:?}"),
+    }
+}
+
+#[test]
 fn declared_inputs_are_exported_as_environment_variables() {
     let mut inputs = BTreeMap::new();
     inputs.insert("survey".to_string(), r#"{"sites":2}"#.to_string());

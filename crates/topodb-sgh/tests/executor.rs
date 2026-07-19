@@ -131,14 +131,14 @@ fn run_refuses_a_graph_containing_a_command_node() {
     let err = ex.run(10).unwrap_err();
 
     match err {
-        SghError::UnsupportedNodeKind { nodes } => {
+        SghError::NoCommandRunner { nodes } => {
             assert_eq!(
                 nodes,
                 vec!["b".to_string()],
                 "the command node is named in the error"
             )
         }
-        other => panic!("expected UnsupportedNodeKind, got {other:?}"),
+        other => panic!("expected NoCommandRunner, got {other:?}"),
     }
     // Refused before any node executes: no model calls happened at all, not
     // even for `a`, which topologically precedes the offending node.
@@ -169,10 +169,10 @@ fn run_refuses_and_names_every_command_node() {
     let err = ex.run(10).unwrap_err();
 
     match err {
-        SghError::UnsupportedNodeKind { nodes } => {
+        SghError::NoCommandRunner { nodes } => {
             assert_eq!(nodes, vec!["a".to_string(), "b".to_string()])
         }
-        other => panic!("expected UnsupportedNodeKind, got {other:?}"),
+        other => panic!("expected NoCommandRunner, got {other:?}"),
     }
 }
 
@@ -304,7 +304,7 @@ fn a_command_node_is_still_refused_without_a_command_runner() {
 
     let mut ex = Executor::new(store, v, &agents);
     match ex.run(10) {
-        Err(topodb_sgh::store::SghError::UnsupportedNodeKind { nodes }) => {
+        Err(topodb_sgh::store::SghError::NoCommandRunner { nodes }) => {
             assert_eq!(nodes, vec!["b".to_string()]);
         }
         other => panic!("expected refusal without a command runner, got {other:?}"),

@@ -14,7 +14,19 @@ const DESCRIPTION_TRUNCATE_LEN: usize = 200;
 /// in-memory leftovers, so a proposal can be made from a stored run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FailureContext {
+    /// Blocked nodes that are *not* gates — i.e. actual failures the
+    /// recovery ladder gave up on. Gate nodes are reported separately in
+    /// `gated`: a gate blocking is the run stopping as designed, not a
+    /// failure, and must never be presented to the planner as something to
+    /// avoid repeating.
     pub blocked: Vec<String>,
+    /// Gate nodes that blocked the run. A gate always blocks today (there is
+    /// no interactive resume yet), so this is the run reaching an
+    /// intentional checkpoint, not a failure. Kept separate from `blocked` so
+    /// `build_replan_goal` can tell the planner to preserve these
+    /// checkpoints in the successor rather than treating them as something
+    /// to avoid.
+    pub gated: Vec<String>,
     pub skipped: Vec<String>,
     /// (node id, rung, error) for every recorded attempt on a blocked node.
     pub attempts: Vec<(String, String, String)>,
@@ -50,15 +62,37 @@ pub fn collect_failure_context(
     graph: &Validated,
     report: &RunReport,
 ) -> Result<FailureContext, SghError> {
-    let mut attempts = Vec::new();
+    // Partition blocked nodes into actual failures and gate checkpoints. A
+    // gate always blocks today (no interactive resume yet), so it lands in
+    // `report.blocked` alongside real failures, but it recorded no attempt
+    // and represents the run stopping as designed — it must not be treated
+    // as a failure to avoid repeating.
+    let is_gate = |node_id: &str| {
+        graph
+            .graph
+            .node(node_id)
+            .is_some_and(|n| n.kind == NodeKind::Gate)
+    };
+
+    let mut blocked = Vec::new();
+    let mut gated = Vec::new();
     for node in &report.blocked {
+        if is_gate(node) {
+            gated.push(node.clone());
+        } else {
+            blocked.push(node.clone());
+        }
+    }
+
+    let mut attempts = Vec::new();
+    for node in &blocked {
         for (rung, error) in store.attempts(node)? {
             attempts.push((node.clone(), rung, error));
         }
     }
 
     let mut descriptions = std::collections::BTreeMap::new();
-    for node_id in &report.blocked {
+    for node_id in report.blocked.iter() {
         if let Some(node) = graph.graph.node(node_id) {
             descriptions.insert(
                 node_id.clone(),
@@ -68,7 +102,8 @@ pub fn collect_failure_context(
     }
 
     Ok(FailureContext {
-        blocked: report.blocked.clone(),
+        blocked,
+        gated,
         skipped: report.skipped.clone(),
         attempts,
         descriptions,
@@ -85,12 +120,33 @@ pub fn build_replan_goal(original_goal: &str, ctx: &FailureContext) -> String {
     g.push_str(original_goal);
     g.push_str("\n\nA previous attempt at this goal halted and must be replaced with a different approach.\n\n");
 
-    g.push_str("Steps that failed:\n");
-    for node in &ctx.blocked {
-        match ctx.descriptions.get(node) {
-            Some(desc) => g.push_str(&format!("- {node}: {desc}\n")),
-            None => g.push_str(&format!("- {node}\n")),
+    if !ctx.blocked.is_empty() {
+        g.push_str("Steps that failed:\n");
+        for node in &ctx.blocked {
+            match ctx.descriptions.get(node) {
+                Some(desc) => g.push_str(&format!("- {node}: {desc}\n")),
+                None => g.push_str(&format!("- {node}\n")),
+            }
         }
+    }
+
+    if !ctx.gated.is_empty() {
+        g.push_str(
+            "\nThe run stopped at an intentional checkpoint (not a failure):\n",
+        );
+        for node in &ctx.gated {
+            match ctx.descriptions.get(node) {
+                Some(desc) => g.push_str(&format!("- {node}: {desc}\n")),
+                None => g.push_str(&format!("- {node}\n")),
+            }
+        }
+        g.push_str(
+            "These are gate nodes placed deliberately before a destructive or irreversible \
+             step. They are not the cause of the halt in the sense that a failure is — the run \
+             worked exactly as designed. The successor graph MUST preserve an equivalent \
+             checkpoint at the same point in the plan; do not remove it or let the destructive \
+             step it guards run unguarded.\n",
+        );
     }
 
     if !ctx.attempts.is_empty() {

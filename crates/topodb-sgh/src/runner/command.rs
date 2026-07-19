@@ -46,6 +46,14 @@ pub fn env_var_name(dep_id: &str) -> String {
 /// makes command nodes useful. The control on model-authored commands is the
 /// approval gate, which displays every `run:` string before any execution and
 /// which a replan revision must re-enter.
+///
+/// `--command-timeout` bounds how long *this harness* waits on the spawned
+/// `sh` before declaring the node failed and moving on — it kills only the
+/// immediate `sh` child, not its process group. A backgrounded or
+/// double-forked descendant (`cmd &`, `nohup`, etc.) can outlive the timeout
+/// and keep running after the node is reported as timed out. Process-group
+/// killing is deliberately out of scope for now; do not assume the timeout
+/// bounds the spawned work itself, only this harness's wait on it.
 pub struct ShellCommandRunner {
     timeout: Duration,
 }
@@ -188,7 +196,11 @@ impl CommandRunner for ShellCommandRunner {
         let out_snapshot = out_buf.lock().unwrap().clone();
         let err_snapshot = err_buf.lock().unwrap().clone();
 
-        let stdout = String::from_utf8(out_snapshot).map_err(|_| RunnerError::Utf8)?;
+        // Exit status is checked before stdout is ever decoded as UTF-8. A
+        // failing command's stdout is never inspected, so non-UTF-8 stdout
+        // from a *failing* command must not shadow the informative "exited
+        // with N: <stderr>" behind a Utf8 error — stderr is always
+        // lossy-decoded, so it can never itself produce that error.
         let stderr = String::from_utf8_lossy(&err_snapshot).into_owned();
 
         if !status.success() {
@@ -198,6 +210,7 @@ impl CommandRunner for ShellCommandRunner {
             });
         }
 
+        let stdout = String::from_utf8(out_snapshot).map_err(|_| RunnerError::Utf8)?;
         let trimmed = stdout.trim();
         let output = if req.output_schema.is_some() {
             // Declared schema: the executor validates stdout directly against

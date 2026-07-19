@@ -52,6 +52,7 @@ fn replan_goal_restates_the_original_and_the_failure() {
     // "plan", "failed", etc. regardless of whether the id is ever rendered).
     let ctx = FailureContext {
         blocked: vec!["locate-config-file".into()],
+        gated: vec![],
         skipped: vec!["downstream-step".into()],
         attempts: vec![("locate-config-file".into(), "block".into(), "no such file".into())],
         descriptions: std::collections::BTreeMap::new(),
@@ -73,6 +74,7 @@ fn replan_goal_includes_the_failed_node_s_description() {
     descriptions.insert("locate-config-file".to_string(), "agent: find the analyzer's config file in the repo root".to_string());
     let ctx = FailureContext {
         blocked: vec!["locate-config-file".into()],
+        gated: vec![],
         skipped: vec![],
         attempts: vec![("locate-config-file".into(), "block".into(), "no such file".into())],
         descriptions,
@@ -127,6 +129,7 @@ fn propose_revision_returns_a_validated_successor_graph() {
     let v = validate(&g).unwrap();
     let ctx = FailureContext {
         blocked: vec!["a".into()],
+        gated: vec![],
         skipped: vec!["b".into()],
         attempts: vec![("a".into(), "block".into(), "no such file".into())],
         descriptions: std::collections::BTreeMap::new(),
@@ -140,4 +143,84 @@ fn propose_revision_returns_a_validated_successor_graph() {
     assert_eq!(revised.nodes.len(), 1);
     assert_eq!(revised.nodes[0].id, "locate");
     assert!(validate(&revised).is_ok(), "a proposal must itself be valid");
+}
+
+#[test]
+fn a_gate_blocked_node_lands_in_gated_not_blocked() {
+    // A gate always blocks today (no interactive resume yet), so it appears
+    // in `report.blocked` alongside real failures — but it is not a failure,
+    // and `collect_failure_context` must partition it into `gated` instead.
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+         - {id: checkpoint, kind: gate, needs: [a], budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+    let runner = MockRunner::new();
+    let mut ex = Executor::new(store, v.clone(), &runner);
+    let report = ex.run(10).unwrap();
+    assert_eq!(report.blocked, vec!["checkpoint".to_string()]);
+
+    let ctx = collect_failure_context(ex.store_ref(), &v, &report).unwrap();
+    assert!(
+        ctx.blocked.is_empty(),
+        "a gate must not be reported as a failure: {:?}",
+        ctx.blocked
+    );
+    assert_eq!(ctx.gated, vec!["checkpoint".to_string()]);
+}
+
+#[test]
+fn a_mix_of_a_real_failure_and_a_gate_partitions_correctly() {
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+         - {id: checkpoint, kind: gate, budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+    let mut ex = Executor::new(store, v.clone(), &runner);
+    let report = ex.run(10).unwrap();
+
+    let ctx = collect_failure_context(ex.store_ref(), &v, &report).unwrap();
+    assert_eq!(ctx.blocked, vec!["a".to_string()]);
+    assert_eq!(ctx.gated, vec!["checkpoint".to_string()]);
+}
+
+#[test]
+fn replan_goal_instructs_preserving_gate_checkpoints_not_removing_them() {
+    let mut descriptions = std::collections::BTreeMap::new();
+    descriptions.insert("checkpoint".to_string(), "gate".to_string());
+    let ctx = FailureContext {
+        blocked: vec![],
+        gated: vec!["checkpoint".into()],
+        skipped: vec![],
+        attempts: vec![],
+        descriptions,
+    };
+    let goal = build_replan_goal("port the analyzer", &ctx);
+
+    assert!(goal.contains("checkpoint"), "the gate node must be named: {goal}");
+    assert!(
+        goal.to_lowercase().contains("intentional checkpoint"),
+        "the goal must state the halt was intentional, not a failure: {goal}"
+    );
+    assert!(
+        goal.to_lowercase().contains("preserve"),
+        "the goal must instruct the successor to preserve the checkpoint: {goal}"
+    );
+    assert!(
+        !goal.contains("Steps that failed:"),
+        "with no real failures, the failed-steps heading must not appear: {goal}"
+    );
 }

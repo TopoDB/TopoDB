@@ -74,6 +74,17 @@ impl<'r> Executor<'r> {
         &self.store
     }
 
+    /// The executor's current logical clock value, i.e. the timestamp of the
+    /// most recent state write `run()` made. Exposed so a caller recording
+    /// something that happened *after* the run (e.g. a replan revision) can
+    /// stamp it with a timestamp that is guaranteed to be later than every
+    /// write the run itself made, keeping the run's timeline strictly
+    /// increasing and any `as_of` reconstruction faithful to what actually
+    /// happened when.
+    pub fn clock(&self) -> i64 {
+        self.clock
+    }
+
     /// Every write advances a logical clock rather than reading wall time, so
     /// a run's timeline is reproducible.
     fn tick(&mut self) -> i64 {
@@ -85,12 +96,11 @@ impl<'r> Executor<'r> {
         // Command nodes have a shell path only when a CommandRunner is
         // configured. Without one, dispatching a command node through
         // `AgentRunner` would send a shell command to a model as a prompt —
-        // a real model call the cost bound never budgeted for. The CLI
-        // (`bin/sgh.rs`) already refuses these graphs with a friendlier
-        // message, but `Executor` is public, so the refusal must also live
-        // here — otherwise any other library caller could drive the
-        // executor straight past its own published bound without
-        // deliberately supplying a runner.
+        // a real model call the cost bound never budgeted for. `Executor` is
+        // public, so this refusal must live here rather than relying on a
+        // caller to remember `.with_command_runner(..)` — otherwise any
+        // other library caller could drive the executor straight past its
+        // own published bound without deliberately supplying a runner.
         if self.command_runner.is_none() {
             let offenders: Vec<String> = self
                 .graph
@@ -101,7 +111,7 @@ impl<'r> Executor<'r> {
                 .map(|n| n.id.clone())
                 .collect();
             if !offenders.is_empty() {
-                return Err(SghError::UnsupportedNodeKind { nodes: offenders });
+                return Err(SghError::NoCommandRunner { nodes: offenders });
             }
         }
 
