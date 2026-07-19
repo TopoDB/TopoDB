@@ -26,6 +26,25 @@ subprocess (see "How it works" below). `launch.js` downloads that server via
 (and `npm`) on `PATH`. This is the same constraint `@topodb/pi` has; if you
 already run Pi extensions, you already satisfy it.
 
+## What runs automatically
+
+Two hook-driven behaviors, both failing silently to "nothing happens"
+rather than ever blocking a session:
+
+- **Session-start recall:** each new session (fresh start or `/clear`)
+  begins with up to 8 recent memories for this project injected as
+  context — ranked by access within the recent window, capped well under
+  2k tokens. No broker running yet (the very first session of a project)
+  means no injection; it appears from the next session on.
+- **Episode capture:** the plugin records which memories each
+  `search_memories`/`traverse`/`recent_memories` call returned and, at
+  session end, writes an `Episode` node with `RetrievalEvent`s marking
+  which memories the session actually used (judged against the
+  transcript). This is observational — no model calls — and it is the
+  raw material future consolidation builds on. Set `TOPODB_RECORDING=0`
+  to turn capture off. In-flight session state lives under
+  `episodes/` in the plugin data dir and is swept after 7 days.
+
 ## How it works
 
 redb, the database engine behind `memory.redb`, allows only one process to
@@ -89,6 +108,11 @@ Two consequences are deliberate and worth knowing before you rely on this:
   project at once, not just the one you're working in. That blast radius is
   real and it is accepted in exchange for the cross-project `shared` scope —
   if you want hard per-project isolation instead, this plugin is not that.
+
+- **The database grows with every session** unless `TOPODB_RECORDING=0`.
+  Session-end episode capture writes nodes and edges to record which memories
+  were retrieved — intended for consolidation, but adds disk growth even if
+  no agent action is taken.
 
 - **The scope is derived from the absolute project path, and that derivation
   is not portable.** The scope id is `ULID(sha256(canonical absolute project

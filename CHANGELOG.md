@@ -298,6 +298,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   all in a **single engine batch**, so a stored fact can never strand unlinked. Params:
   `content`, `entities` (non-empty), `edge_type?`, `props?`, `scope?` (one scope for everything
   the call creates). Tool count 19 → 20.
+- **`recent_memories`** — newest-first orientation read (`k` ≤ 100, default 8), the no-query
+  recency read session-start injection needs. Tool count 20 → 21. Full `nodes_by_label` scan,
+  documented as acceptable pending a label index.
 - **ONNX Runtime auto-download** — on first run with embeddings enabled and no system runtime,
   the server fetches the official Microsoft ONNX Runtime build for the platform (pinned to
   **1.24.2**, the version ort-sys 2.0.0-rc.12 distributes; archive sha256 verified against
@@ -555,6 +558,24 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 - **`db_info` reported only the write scope, not the read set.** An agent following the server's
   own instructions would pass `scope: "shared"` on a read, which **narrows** the read set and
   silently drops every project result. `db_info` now reports the default read scopes.
+
+---
+
+## Claude Code plugin
+
+### Unreleased
+
+#### Added
+
+- **Hooks: session-start memory injection + observational episode capture.** SessionStart injects
+  up to 8 recent, access-ranked project memories (hard char cap, 2.5s deadline, main sessions
+  only, `startup`/`clear` sources only). PostToolUse records what each retrieval tool returned
+  into a session state file; SessionEnd judges which memories the transcript actually used and
+  writes the pi-vocabulary `Episode`/`RetrievalEvent` graph through the broker. Capture defaults
+  on; `TOPODB_RECORDING=0` disables. Hooks never spawn the broker and always exit 0 — every
+  failure degrades to exactly the pre-hook behavior. NOTE: injection requires a server with
+  `recent_memories` (0.0.11) — with the currently pinned 0.0.10 it silently degrades to no
+  injection; capture works against 0.0.10. Ships fully with the 0.0.11 pin bump.
 
 ---
 
