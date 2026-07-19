@@ -150,3 +150,50 @@ fn access_weight_plumbs_through() {
     assert_eq!(hits.len(), 1, "{res}");
     assert_eq!(hits[0]["node"]["id"], mem["id"]);
 }
+
+/// The alias→entity edge must let a query that matches ONLY the alias's name
+/// still surface the canonical entity — pulled in via `graph_boost`'s 1-hop
+/// traversal from the alias node (a preliminary-fusion seed) — while the
+/// Alias node itself stays hidden behind the default `["Memory","Entity"]`
+/// label filter (Task 2 / finding 6). If the alias→entity edge does not
+/// survive that 1-hop pull in practice, this test is expected to fail
+/// honestly rather than being loosened to force a pass.
+#[test]
+fn alias_query_surfaces_entity_via_graph_seed_not_alias() {
+    let (_dir, mut server) = fresh_server();
+    let ent = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "Nimbus" }),
+        DEFAULT_TIMEOUT,
+    );
+    server.call_tool_ok(
+        "add_alias",
+        serde_json::json!({ "entity_id": ent["id"], "alias": "nimbus cloudform" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // "cloudform" matches only the alias's name — not the entity's own name
+    // ("Nimbus") and nothing else in the corpus.
+    let res = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "cloudform", "k": 10 }),
+        DEFAULT_TIMEOUT,
+    );
+    let hits = res["hits"].as_array().unwrap();
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["node"]["id"].as_str().unwrap())
+        .collect();
+    let labels: Vec<&str> = hits
+        .iter()
+        .map(|h| h["node"]["label"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&ent["id"].as_str().unwrap()),
+        "the canonical entity must surface via the alias's graph adjacency: {res}"
+    );
+    assert!(
+        !labels.contains(&"Alias"),
+        "the Alias plumbing node must not surface in default results: {res}"
+    );
+}

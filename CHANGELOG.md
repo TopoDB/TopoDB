@@ -25,7 +25,8 @@ workspace are versioned and released independently (tags are per-package, e.g.
   count 0, log-damped, read without bumping. Recency and access apply in one combined
   post-fusion pass. Defaults are byte-identical to the previous behavior (MRR golden-set gate
   unchanged). Zero-weight legs now contribute nothing to fusion (previously a zero-weight leg still
-  injected its candidates at score 0 — a pre-existing ghost-entry bug fixed in this change).
+  injected its candidates at score 0 — a pre-existing ghost-entry bug fixed in this change); a
+  skipped zero-weight leg also no longer bumps access counters for hits it would have returned.
   **Breaking for struct-literal construction:** `RecallQuery` gained fields — use
   `RecallQuery::new(scopes, query, k)` with struct-update syntax so future additions don't
   break your call sites.
@@ -328,8 +329,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   arm64-only — Microsoft publishes no Intel-Mac 1.24.2 artifact, so Intel Macs keep the manual
   path (system runtime or ORT_DYLIB_PATH).
 - **`search_memories` tuning params** — `labels` (result label allowlist, **new default
-  `["Memory","Entity"]`**: Alias/Synonym plumbing nodes no longer surface in default results —
-  a behavior change; override to widen or narrow), `text_weight`/`vector_weight`/`graph_weight`
+  `["Memory","Entity"]`**: every label outside Memory/Entity — Alias/Synonym plumbing nodes and
+  any custom host labels alike — no longer surfaces in default results — a behavior change;
+  override to widen or narrow), `text_weight`/`vector_weight`/`graph_weight`
   (0-10, defaults 1/1/0.5), and `access_weight` (0-1, default 0): opt-in boost for
   frequently-recalled memories.
 

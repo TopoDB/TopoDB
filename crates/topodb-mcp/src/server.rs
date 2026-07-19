@@ -696,7 +696,9 @@ struct SearchMemoriesParams {
     /// Result label allowlist. Defaults to ["Memory","Entity"] — memories
     /// plus the named entities they link to; Alias/Synonym plumbing nodes
     /// never surface by default. Override to widen (e.g. add "Episode")
-    /// or narrow (["Memory"]). Must not be empty when present.
+    /// or narrow (["Memory"]). Must not be empty when present. A narrowing
+    /// filter is applied post-fusion, so a filtered search may return
+    /// fewer than `k` results.
     #[serde(default = "default_labels")]
     #[schemars(length(min = 1))]
     labels: Vec<String>,
@@ -1429,8 +1431,8 @@ impl TopoServer {
         // `recall` opens redb read transactions, so unlike the pure snapshot
         // reads it CAN fail with `Storage`/`Encoding` — only its
         // input-validation `Rejected` (k == 0, token-less query, bad recency
-        // tuning) maps to invalid_params; everything else is a server-side
-        // internal_error.
+        // tuning, weight/labels tuning violations) maps to invalid_params;
+        // everything else is a server-side internal_error.
         let hits = self.db.recall(&query).map_err(|e| match e {
             TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
             other => ErrorData::internal_error(other.to_string(), None),

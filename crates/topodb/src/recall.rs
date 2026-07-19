@@ -124,8 +124,12 @@ pub struct RecallQuery {
     pub vector_weight: f32,
     /// Graph leg's RRF weight. Defaults to `WEIGHT_GRAPH`.
     pub graph_weight: f32,
-    /// Post-fusion access boost, `0.0..=1.0`. `0.0` (the default) is off.
-    /// Behaviorally inert until the access-boost pipeline stage lands.
+    /// Opt-in post-fusion access boost (0.0-1.0, default 0 = off): each
+    /// hit's fused score is multiplied by
+    /// `1 + w·ln(1+count)/(1+ln(1+count))` using NON-BUMPING reads of the
+    /// access counters — neutral for never-recalled nodes, log-damped,
+    /// bounded below `1+w`. Live counters are db state: like wall-clock
+    /// recency, results may shift as counters move.
     pub access_weight: f32,
 }
 

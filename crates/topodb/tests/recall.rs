@@ -94,38 +94,38 @@ fn scopes() -> ScopeSet {
 /// lexically matching `term`, and deliberately UNLINKED (no edge between
 /// them) so the graph leg cannot re-introduce one via adjacency and muddy
 /// the label-filter precondition.
-fn corpus_with_memory_and_entity_matching(term: &str) -> (Db, NodeId, NodeId) {
+fn corpus_with_memory_and_entity_matching(term: &str) -> (tempfile::TempDir, Db, NodeId, NodeId) {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.keep().join("t.redb");
+    let db_path = dir.path().join("t.redb");
     let db = Db::open_with(db_path, spec_with_entity()).unwrap();
     let s = labels_filter_scope();
     let (memory_id, op_m) = memory(&format!("{term} memory note"), Scope::Id(s));
     let (entity_id, op_e) = entity(&format!("{term} entity record"), Scope::Id(s));
     db.submit(vec![op_m, op_e]).unwrap();
-    (db, memory_id, entity_id)
+    (dir, db, memory_id, entity_id)
 }
 
 /// Two `Memory` nodes with equal textual standing for `term` (same content
 /// shape, different id), so any ranking difference between them must come
 /// from a post-fusion adjustment (recency/access), not from BM25.
-fn corpus_with_two_equal_memories(term: &str) -> (Db, NodeId, NodeId) {
+fn corpus_with_two_equal_memories(term: &str) -> (tempfile::TempDir, Db, NodeId, NodeId) {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.keep().join("t.redb");
+    let db_path = dir.path().join("t.redb");
     let db = Db::open_with(db_path, spec_with_entity()).unwrap();
     let s = labels_filter_scope();
     let (a_id, op_a) = memory(&format!("{term} memory note"), Scope::Id(s));
     let (b_id, op_b) = memory(&format!("{term} memory note"), Scope::Id(s));
     db.submit(vec![op_a, op_b]).unwrap();
-    (db, a_id, b_id)
+    (dir, db, a_id, b_id)
 }
 
 /// One node backdated ~7 days via an explicit `NodeId::from_u128` id (high
 /// 48 bits = ULID timestamp, inverting `NodeId::timestamp_ms`'s encoding —
 /// see `recency_applies_once_post_fusion`'s `ulid_at` for the same trick),
 /// and one freshly-minted node, both matching `term` equally on text.
-fn corpus_with_backdated_and_fresh_memory(term: &str) -> (Db, NodeId, NodeId) {
+fn corpus_with_backdated_and_fresh_memory(term: &str) -> (tempfile::TempDir, Db, NodeId, NodeId) {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.keep().join("t.redb");
+    let db_path = dir.path().join("t.redb");
     let db = Db::open_with(db_path, spec_with_entity()).unwrap();
     let s = labels_filter_scope();
     const DAY_MS: i64 = 86_400_000;
@@ -153,7 +153,7 @@ fn corpus_with_backdated_and_fresh_memory(term: &str) -> (Db, NodeId, NodeId) {
         props,
     };
     db.submit(vec![op_old, op_fresh]).unwrap();
-    (db, old_id, fresh_id)
+    (dir, db, old_id, fresh_id)
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn expansion_token_matching_exact_hit_does_not_re_add() {
 fn labels_filter_excludes_non_matching_labels() {
     // Corpus: a Memory and an Entity that BOTH match the query tokens,
     // built unlinked so the graph leg can't muddy the precondition.
-    let (db, memory_id, entity_id) = corpus_with_memory_and_entity_matching("shared term");
+    let (_dir, db, memory_id, entity_id) = corpus_with_memory_and_entity_matching("shared term");
 
     let unfiltered = db
         .recall(&topodb::RecallQuery {
@@ -491,7 +491,7 @@ fn labels_filter_excludes_non_matching_labels() {
 
 #[test]
 fn labels_filter_all_filtered_is_empty_not_error() {
-    let (db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
+    let (_dir, db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
     let out = db
         .recall(&topodb::RecallQuery {
             labels: Some(vec!["NoSuchLabel".into()]),
@@ -506,7 +506,7 @@ fn zeroed_effective_legs_is_empty_not_error() {
     // Spec's degenerate-but-honest case: validation passes (graph_weight
     // is > 0) but no leg with weight actually runs — text zeroed, no
     // vector supplied, graph_boost off. Must be Ok(empty), not Rejected.
-    let (db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
+    let (_dir, db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
     let out = db
         .recall(&topodb::RecallQuery {
             text_weight: 0.0,
@@ -519,7 +519,7 @@ fn zeroed_effective_legs_is_empty_not_error() {
 
 #[test]
 fn labels_none_is_unfiltered() {
-    let (db, memory_id, entity_id) = corpus_with_memory_and_entity_matching("shared term");
+    let (_dir, db, memory_id, entity_id) = corpus_with_memory_and_entity_matching("shared term");
     let out = db
         .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
         .unwrap();
@@ -640,7 +640,7 @@ fn zero_weight_graph_leg_does_not_ghost_in_neighbor() {
 
 #[test]
 fn access_weight_zero_is_byte_identical() {
-    let (db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
+    let (_dir, db, _m, _e) = corpus_with_memory_and_entity_matching("shared term");
     let a = db
         .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
         .unwrap();
@@ -657,12 +657,23 @@ fn access_weight_zero_is_byte_identical() {
 
 #[test]
 fn access_boost_lifts_a_frequently_read_node() {
-    // Two memories with equal textual standing for the query; bump one's
-    // access counter by reading it (db.node() bumps) several times, then
-    // recall with access_weight 1.0 and assert the bumped one ranks first.
-    let (db, a_id, b_id) = corpus_with_two_equal_memories("shared term");
+    // Two memories with equal textual standing for the query; same-millisecond
+    // twins can tie-break either way by id, so recall UNBOOSTED first and
+    // bump whichever id ranked SECOND — that keeps the test deterministic
+    // instead of a coin-flip on regression.
+    let (_dir, db, a_id, b_id) = corpus_with_two_equal_memories("shared term");
+    let unboosted = db
+        .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
+        .unwrap();
+    assert_eq!(
+        unboosted.len(),
+        2,
+        "both twins must be found: {unboosted:?}"
+    );
+    let second = unboosted[1].0.id;
+    assert!(second == a_id || second == b_id);
     for _ in 0..8 {
-        let _ = db.node(&scopes(), a_id);
+        let _ = db.node(&scopes(), second);
     }
     settle_counters(&db);
     let out = db
@@ -674,8 +685,8 @@ fn access_boost_lifts_a_frequently_read_node() {
     let first = out.first().map(|(n, _)| n.id);
     assert_eq!(
         first,
-        Some(a_id),
-        "bumped node must outrank its equal twin (b={b_id:?})"
+        Some(second),
+        "bumped node must outrank its equal twin (a={a_id:?}, b={b_id:?})"
     );
 }
 
@@ -686,7 +697,7 @@ fn recency_and_access_factors_multiply() {
     // fresh node wins; adding access_weight 1.0 (old node heavily bumped)
     // must lift the old node past it — proving the two factors compose
     // multiplicatively rather than one overwriting the other.
-    let (db, old_id, fresh_id) = corpus_with_backdated_and_fresh_memory("shared term");
+    let (_dir, db, old_id, fresh_id) = corpus_with_backdated_and_fresh_memory("shared term");
     for _ in 0..32 {
         let _ = db.node(&scopes(), old_id);
     }
@@ -713,7 +724,7 @@ fn recency_and_access_factors_multiply() {
 
 #[test]
 fn scoring_reads_do_not_bump_counters() {
-    let (db, a_id, _b) = corpus_with_two_equal_memories("shared term");
+    let (_dir, db, a_id, _b) = corpus_with_two_equal_memories("shared term");
     settle_counters(&db);
     let before = db
         .access_stats(&scopes(), a_id)
