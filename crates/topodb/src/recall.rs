@@ -231,48 +231,58 @@ impl Db {
         }
         let depth = leg_depth(q.k);
 
-        // Text leg runs recency-free: recency applies once, post-fusion.
-        let mut leg_options = q.options.clone();
-        leg_options.recency_weight = 0.0;
-        let text_hits =
-            self.search_text_expanded(&q.scopes, &q.query, depth, &leg_options, &q.expansions)?;
-
+        // A zero-weight leg contributes nothing to a fused score but its ids
+        // would still ride along at score 0.0 if the list were included
+        // unconditionally (`rrf_fuse` does `entry().or_insert(0.0) += w /
+        // rank`, which inserts an entry even at `w == 0.0`) — so "weight
+        // says on, nothing actually ran" degenerates to Ok(empty)/ghost-free
+        // rather than a ghost result. Applied symmetrically across all
+        // three legs: skip the underlying read entirely when its weight is
+        // 0.0, not just the fusion push — a leg that cannot contribute
+        // shouldn't be paid for either.
         let mut records: std::collections::HashMap<crate::NodeId, NodeRecord> =
-            text_hits.iter().map(|(n, _)| (n.id, n.clone())).collect();
-        let text_ids: Vec<crate::NodeId> = text_hits.iter().map(|(n, _)| n.id).collect();
+            std::collections::HashMap::new();
+        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = Vec::new();
+
+        // Text leg runs recency-free: recency applies once, post-fusion.
+        if q.text_weight > 0.0 {
+            let mut leg_options = q.options.clone();
+            leg_options.recency_weight = 0.0;
+            let text_hits =
+                self.search_text_expanded(&q.scopes, &q.query, depth, &leg_options, &q.expansions)?;
+            let text_ids: Vec<crate::NodeId> = text_hits.iter().map(|(n, _)| n.id).collect();
+            for (n, _) in text_hits {
+                records.entry(n.id).or_insert(n);
+            }
+            lists.push((q.text_weight, text_ids));
+        }
 
         // Vector leg: cosine over the scoped clusters for the named model.
         // An unknown model or a scope with no vectors is an EMPTY leg —
         // legitimately no data — never an error (contrast the empty-vector
         // rejection above, which is a host bug).
-        // A zero-weight leg contributes nothing to a fused score but its ids
-        // would still ride along at score 0.0 if the list were included
-        // unconditionally — exclude it so "weight says on, nothing actually
-        // ran" degenerates to Ok(empty) rather than a ghost result.
-        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = Vec::new();
-        if q.text_weight > 0.0 {
-            lists.push((q.text_weight, text_ids));
-        }
-        if let Some((model, vector)) = &q.vector {
-            let vhits = self.search_vector(&crate::VectorQuery {
-                scopes: q.scopes.clone(),
-                model: model.clone(),
-                vector: vector.clone(),
-                k: depth,
-                candidates: None,
-            })?;
-            let vids: Vec<crate::NodeId> = vhits.iter().map(|(n, _)| n.id).collect();
-            for (n, _) in vhits {
-                records.entry(n.id).or_insert(n);
+        if q.vector_weight > 0.0 {
+            if let Some((model, vector)) = &q.vector {
+                let vhits = self.search_vector(&crate::VectorQuery {
+                    scopes: q.scopes.clone(),
+                    model: model.clone(),
+                    vector: vector.clone(),
+                    k: depth,
+                    candidates: None,
+                })?;
+                let vids: Vec<crate::NodeId> = vhits.iter().map(|(n, _)| n.id).collect();
+                for (n, _) in vhits {
+                    records.entry(n.id).or_insert(n);
+                }
+                lists.push((q.vector_weight, vids));
             }
-            lists.push((q.vector_weight, vids));
         }
         // Graph leg, two-stage (spec): preliminary text+vector fusion
         // picks GRAPH_SEEDS seeds; their 1-hop neighbors (deduped, seeds
         // and already-ranked nodes excluded from *seeding* but not from
         // membership) form a third list ordered by seed rank. Half weight:
         // adjacency is corroboration, not relevance.
-        if q.graph_boost {
+        if q.graph_boost && q.graph_weight > 0.0 {
             let prelim = rrf_fuse(&lists);
             let seeds: Vec<crate::NodeId> =
                 prelim.iter().take(GRAPH_SEEDS).map(|(id, _)| *id).collect();

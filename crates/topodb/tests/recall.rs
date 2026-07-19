@@ -466,3 +466,114 @@ fn labels_none_is_unfiltered() {
     let ids: Vec<_> = out.iter().map(|(n, _)| n.id).collect();
     assert!(ids.contains(&memory_id) && ids.contains(&entity_id));
 }
+
+#[test]
+fn zero_weight_vector_leg_does_not_ghost_in_vector_only_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    // A: lexical match only. B: vector match only (query points at [1,0]).
+    let (a, op_a) = memory("login password rotation policy", Scope::Id(s));
+    let (b, op_b) = memory("credential storage decision", Scope::Id(s));
+    db.submit(vec![op_a, op_b]).unwrap();
+    db.submit(vec![
+        Op::SetEmbedding {
+            id: a,
+            model: "m".into(),
+            vector: vec![0.0, 1.0],
+        },
+        Op::SetEmbedding {
+            id: b,
+            model: "m".into(),
+            vector: vec![1.0, 0.0],
+        },
+    ])
+    .unwrap();
+
+    // Precondition: with a live vector leg, the vector-only hit surfaces.
+    let mut q = text_only(&scopes, "login", 10);
+    q.vector = Some(("m".into(), vec![1.0, 0.0]));
+    let hits: Vec<NodeId> = db
+        .recall(&q)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(
+        hits.contains(&b),
+        "precondition: vector-only hit must surface with vector_weight > 0"
+    );
+
+    // vector_weight == 0.0: the same vector-only node must NOT ghost in at
+    // score 0 — it shares no tokens with the query, so only the (now inert)
+    // vector leg could have surfaced it.
+    let mut q0 = text_only(&scopes, "login", 10);
+    q0.vector = Some(("m".into(), vec![1.0, 0.0]));
+    q0.vector_weight = 0.0;
+    let hits0: Vec<NodeId> = db
+        .recall(&q0)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(
+        !hits0.contains(&b),
+        "vector_weight == 0.0 must not admit a vector-only hit: {hits0:?}"
+    );
+    assert_eq!(hits0, vec![a], "only the live text leg's hit remains");
+}
+
+#[test]
+fn zero_weight_graph_leg_does_not_ghost_in_neighbor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (hit, op_h) = memory("deployment pipeline broke on friday", Scope::Id(s));
+    // Linked context that shares NO tokens with the query:
+    let (linked, op_l) = memory("rollback procedure: revert then redeploy", Scope::Id(s));
+    db.submit(vec![op_h, op_l]).unwrap();
+    db.submit(vec![Op::CreateEdge {
+        id: EdgeId::new(),
+        scope: Scope::Id(s),
+        ty: "about".into(),
+        from: linked,
+        to: hit,
+        props: Props::new(),
+        valid_from: None,
+    }])
+    .unwrap();
+
+    // graph_weight == 0.0: the linked neighbor must NOT ghost in even
+    // though graph_boost is on and validation passes (graph_weight is a
+    // separate field from graph_boost).
+    let mut q0 = text_only(&scopes, "deployment friday", 10);
+    q0.graph_boost = true;
+    q0.graph_weight = 0.0;
+    let ids0: Vec<NodeId> = db
+        .recall(&q0)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(
+        !ids0.contains(&linked),
+        "graph_weight == 0.0 must not admit the 1-hop neighbor: {ids0:?}"
+    );
+
+    // With a live (non-zero) graph_weight, the same neighbor MAY join.
+    let mut q1 = text_only(&scopes, "deployment friday", 10);
+    q1.graph_boost = true;
+    q1.graph_weight = 0.5;
+    let ids1: Vec<NodeId> = db
+        .recall(&q1)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(
+        ids1.contains(&linked),
+        "graph_weight > 0.0 must let the 1-hop neighbor join: {ids1:?}"
+    );
+}
