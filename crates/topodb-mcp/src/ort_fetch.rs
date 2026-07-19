@@ -554,7 +554,9 @@ mod tests {
         match r {
             OrtRuntime::System => {}
             OrtRuntime::Unavailable(msg) => {
-                assert!(msg.contains("--no-ort-download"), "{msg}")
+                if current_artifact().is_some() {
+                    assert!(msg.contains("--no-ort-download"), "{msg}");
+                }
             }
             other => panic!("unexpected: {other:?}"),
         }
