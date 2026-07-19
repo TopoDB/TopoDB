@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use topodb::Db;
-use topodb_sgh::executor::Executor;
+use topodb_sgh::executor::{Executor, RunReport};
 use topodb_sgh::planner::claude::ClaudePlanner;
 use topodb_sgh::planner::{PlanRequest, Planner};
-use topodb_sgh::replan::{collect_failure_context, propose_revision};
+use topodb_sgh::replan::{collect_failure_context, propose_revision, FailureContext};
 use topodb_sgh::runner::claude::ClaudeCodeRunner;
 use topodb_sgh::runner::command::ShellCommandRunner;
 use topodb_sgh::schema::bound::worst_case;
@@ -27,6 +27,18 @@ enum Cmd {
     /// Validate a graph and print its worst-case bound.
     Validate { graph: PathBuf },
     /// Execute a graph after showing its bound.
+    ///
+    /// Exit codes a script may rely on:
+    ///   0 — the run completed with nothing blocked.
+    ///   1 — the run is blocked by a real failure (or the replan budget was
+    ///       exhausted while a real failure remained).
+    ///   2 — the graph (or a proposed revision) failed schema validation.
+    ///   3 — the run halted at an intentional checkpoint: every blocked node
+    ///       was a `gate`, not a failure. No replan was attempted and no
+    ///       replan budget was spent. Distinct from 0 because the run did not
+    ///       finish, and distinct from 1 because nothing actually failed —
+    ///       this lets `sgh run plan.yaml && next-step.sh` tell "stopped on
+    ///       purpose" apart from "broke".
     Run {
         graph: PathBuf,
         #[arg(long)]
@@ -121,6 +133,47 @@ fn needs_prompt(is_revision: bool, yes: bool, yes_including_revisions: bool) -> 
 /// (see `replan::build_replan_goal`'s gated-checkpoint section).
 fn all_blocked_are_gates(ctx: &topodb_sgh::replan::FailureContext) -> bool {
     ctx.blocked.is_empty() && !ctx.gated.is_empty()
+}
+
+/// What a completed `sgh run` invocation should report to its caller,
+/// decoupled from *how* — the process exit code — so the decision itself is
+/// unit-testable.
+///
+/// A gate-only halt (`HaltedAtCheckpoint`) is deliberately distinct from both
+/// `Completed` and `Blocked`: it must not consume replan budget or reach the
+/// planner (see `all_blocked_are_gates`), but it also must not report success
+/// — the run did not finish, and whatever the gate was guarding was not
+/// reached. See the `Run` subcommand's doc comment for the exit-code
+/// contract a script author can rely on.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Completed,
+    HaltedAtCheckpoint,
+    Blocked,
+}
+
+/// Classify a halted (or clean) run. A genuine failure always dominates: a
+/// mixed set containing both a real failure and a gate is `Blocked`, not
+/// `HaltedAtCheckpoint` — `all_blocked_are_gates` only returns true when
+/// `ctx.blocked` (the non-gate failures) is empty.
+fn outcome_of(report: &RunReport, ctx: &FailureContext) -> Outcome {
+    if report.blocked.is_empty() {
+        Outcome::Completed
+    } else if all_blocked_are_gates(ctx) {
+        Outcome::HaltedAtCheckpoint
+    } else {
+        Outcome::Blocked
+    }
+}
+
+/// The process exit code for each `Outcome`. See the `Run` subcommand's doc
+/// comment for the documented, script-facing contract this implements.
+fn exit_code(outcome: &Outcome) -> i32 {
+    match outcome {
+        Outcome::Completed => 0,
+        Outcome::HaltedAtCheckpoint => 3,
+        Outcome::Blocked => 1,
+    }
 }
 
 /// The decision made after a run halts: succeed, give up, or propose another
@@ -266,16 +319,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // `next_step` would otherwise increment `replans_used`.
                 let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
 
-                if all_blocked_are_gates(&ctx) {
-                    println!(
-                        "\nrun halted at an intentional checkpoint, not a failure: {:?}",
-                        ctx.gated
-                    );
-                    println!(
-                        "no replan attempted — this is the run stopping as designed; the \
-                         replan budget was not spent."
-                    );
-                    return Ok(());
+                match outcome_of(&report, &ctx) {
+                    Outcome::Completed => {
+                        unreachable!("report.blocked was already checked non-empty above")
+                    }
+                    Outcome::HaltedAtCheckpoint => {
+                        println!(
+                            "\nrun halted at an intentional checkpoint, not a failure: {:?}",
+                            ctx.gated
+                        );
+                        println!(
+                            "no replan attempted — this is the run stopping as designed; the \
+                             replan budget was not spent."
+                        );
+                        std::process::exit(exit_code(&Outcome::HaltedAtCheckpoint));
+                    }
+                    Outcome::Blocked => {
+                        eprintln!("\nrun blocked by a failure: {:?}", ctx.blocked);
+                    }
                 }
 
                 match next_step(false, replan, replans_used, max_replans) {
@@ -526,5 +587,59 @@ mod tests {
         // returns success before reaching it), but it must not report a
         // gate-only halt when there was no halt at all.
         assert!(!all_blocked_are_gates(&ctx(vec![], vec![])));
+    }
+
+    // outcome_of / exit_code: this is the regression pin. A previous fix
+    // wave made a gate-only halt `return Ok(())` (exit 0) unconditionally,
+    // which turned "the run stopped at a checkpoint" into a success signal
+    // for scripts chained with `&&`. These tests pin that a gate-only halt
+    // is neither `Completed` (0) nor `Blocked` (1), and that a genuine
+    // failure always dominates a mixed set.
+    fn report(blocked: Vec<&str>) -> RunReport {
+        RunReport {
+            succeeded: vec![],
+            blocked: blocked.into_iter().map(String::from).collect(),
+            skipped: vec![],
+            model_calls: 0,
+            command_runs: 0,
+        }
+    }
+
+    #[test]
+    fn outcome_of_clean_run_is_completed_exit_0() {
+        let outcome = outcome_of(&report(vec![]), &ctx(vec![], vec![]));
+        assert_eq!(outcome, Outcome::Completed);
+        assert_eq!(exit_code(&outcome), 0);
+    }
+
+    #[test]
+    fn outcome_of_gate_only_halt_is_halted_at_checkpoint_not_success() {
+        let outcome = outcome_of(&report(vec!["gate1"]), &ctx(vec![], vec!["gate1"]));
+        assert_eq!(outcome, Outcome::HaltedAtCheckpoint);
+        let code = exit_code(&outcome);
+        assert_ne!(code, 0, "a checkpoint halt must never look like success");
+        assert_ne!(code, 1, "a checkpoint halt must be distinguishable from a real failure");
+        assert_eq!(code, 3);
+    }
+
+    #[test]
+    fn outcome_of_real_failure_is_blocked_exit_1() {
+        let outcome = outcome_of(&report(vec!["a"]), &ctx(vec!["a"], vec![]));
+        assert_eq!(outcome, Outcome::Blocked);
+        assert_eq!(exit_code(&outcome), 1);
+    }
+
+    #[test]
+    fn outcome_of_mixed_failure_and_gate_is_blocked_because_failure_dominates() {
+        let outcome = outcome_of(
+            &report(vec!["a", "gate1"]),
+            &ctx(vec!["a"], vec!["gate1"]),
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Blocked,
+            "a genuine failure must dominate even when a gate also blocked"
+        );
+        assert_eq!(exit_code(&outcome), 1);
     }
 }
