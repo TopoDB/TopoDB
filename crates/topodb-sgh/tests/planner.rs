@@ -74,3 +74,83 @@ fn mock_planner_surfaces_scripted_failures() {
         other => panic!("expected a runner error, got {other:?}"),
     }
 }
+
+use std::sync::Mutex;
+use topodb_sgh::planner::claude::{ClaudePlanner, PlanBackend};
+
+/// A backend that returns scripted completions and records the prompts it saw.
+struct ScriptedBackend {
+    responses: Mutex<Vec<String>>,
+    seen: Mutex<Vec<String>>,
+}
+
+impl ScriptedBackend {
+    fn new(responses: Vec<&str>) -> Self {
+        ScriptedBackend {
+            responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+    fn prompts(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl PlanBackend for ScriptedBackend {
+    fn complete(&self, prompt: &str) -> Result<String, PlannerError> {
+        self.seen.lock().unwrap().push(prompt.to_string());
+        let mut r = self.responses.lock().unwrap();
+        if r.is_empty() {
+            return Err(PlannerError::Runner("script exhausted".into()));
+        }
+        Ok(r.remove(0))
+    }
+}
+
+const VALID: &str = "version: 1\ngoal: g\nnodes:\n  - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n";
+const DANGLING: &str = "version: 1\ngoal: g\nnodes:\n  - {id: a, kind: agent, prompt: p, needs: [ghost], budget: {retries: 0, repairs: 0}}\n";
+
+#[test]
+fn a_valid_first_attempt_costs_exactly_one_backend_call() {
+    let backend = ScriptedBackend::new(vec![VALID]);
+    let p = ClaudePlanner::with_backend(Box::new(backend), 3);
+    let g = p.plan(&req()).expect("plans");
+    assert_eq!(g.nodes.len(), 1);
+}
+
+#[test]
+fn an_invalid_attempt_is_retried_with_the_errors_fed_back() {
+    let backend = std::sync::Arc::new(ScriptedBackend::new(vec![DANGLING, VALID]));
+    let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
+
+    let g = p.plan(&req()).expect("recovers on the second attempt");
+    assert_eq!(g.nodes[0].id, "a");
+
+    let prompts = backend.prompts();
+    assert_eq!(prompts.len(), 2, "one initial attempt plus one retry");
+    assert!(!prompts[0].contains("rejected"), "first prompt is clean");
+    assert!(prompts[1].contains("ghost"), "retry must name the dangling dependency");
+}
+
+#[test]
+fn the_retry_loop_is_bounded_and_reports_exhaustion() {
+    let backend = std::sync::Arc::new(ScriptedBackend::new(vec![DANGLING, DANGLING, DANGLING, DANGLING]));
+    let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
+
+    match p.plan(&req()) {
+        Err(PlannerError::Exhausted { attempts, errors }) => {
+            assert_eq!(attempts, 3, "must stop at max_attempts, not keep going");
+            assert!(!errors.is_empty(), "the final validation errors must be reported");
+        }
+        other => panic!("expected exhaustion, got {other:?}"),
+    }
+    assert_eq!(backend.prompts().len(), 3, "exactly max_attempts backend calls, never more");
+}
+
+#[test]
+fn unparseable_yaml_is_retried_like_any_other_rejection() {
+    let backend = std::sync::Arc::new(ScriptedBackend::new(vec!["this is not yaml: [unclosed", VALID]));
+    let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
+    assert!(p.plan(&req()).is_ok());
+    assert_eq!(backend.prompts().len(), 2);
+}
