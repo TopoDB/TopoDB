@@ -107,6 +107,64 @@ fn remember_reuses_existing_entities_and_aliases() {
     assert_eq!(ents.len(), 1);
     assert_eq!(ents[0]["id"].as_str().unwrap(), drew);
     assert_eq!(ents[0]["created"], false);
+
+    // And the edge actually persisted, one edge into the pre-existing node.
+    let memory_id = res["memory_id"].as_str().unwrap();
+    let edges = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": memory_id }),
+        DEFAULT_TIMEOUT,
+    );
+    let arr = edges["edges"].as_array().unwrap();
+    assert_eq!(arr.len(), 1, "exactly one persisted edge: {edges}");
+    assert_eq!(arr[0]["to"].as_str().unwrap(), drew);
+}
+
+#[test]
+fn remember_collapses_alias_and_canonical_to_one_entity() {
+    let (_dir, mut server) = fresh_server();
+
+    let drew = server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "Drew Powell" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.call_tool_ok(
+        "add_alias",
+        serde_json::json!({ "entity_id": drew, "alias": "Drew" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Canonical name AND its alias in one call: both resolve to the same
+    // node — one row, one edge, not two.
+    let res = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "alias and canonical collapse",
+            "entities": ["Drew Powell", "Drew"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let ents = res["entities"].as_array().unwrap();
+    assert_eq!(ents.len(), 1, "same node = one row: {res}");
+    assert_eq!(ents[0]["id"].as_str().unwrap(), drew);
+    assert_eq!(ents[0]["name"], "Drew Powell", "first spelling wins");
+    assert_eq!(res["edge_ids"].as_array().unwrap().len(), 1);
+
+    let memory_id = res["memory_id"].as_str().unwrap();
+    let edges = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": memory_id }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        edges["edges"].as_array().unwrap().len(),
+        1,
+        "one edge, not a duplicate pair"
+    );
 }
 
 #[test]
@@ -189,6 +247,8 @@ fn rejected_remember_calls_write_nothing() {
         serde_json::json!({ "content": "c", "entities": ["X"], "contnet": "typo" }),
         // props colliding with the reserved content key.
         serde_json::json!({ "content": "c", "entities": ["X"], "props": { "content": "clash" } }),
+        // Invalid scope: not "shared" and not a ULID.
+        serde_json::json!({ "content": "c", "entities": ["X"], "scope": "not-a-ulid" }),
     ] {
         let resp = server.call_tool("remember", bad.clone(), DEFAULT_TIMEOUT);
         common::expect_tool_error(&resp);

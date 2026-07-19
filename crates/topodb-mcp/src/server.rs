@@ -1557,6 +1557,12 @@ impl TopoServer {
             props: memory_props,
         }];
         ops.extend(memory_embed);
+        // Id-level dedup: name-level dedup above only catches spelling
+        // variants of the SAME string. Two DIFFERENT names can still
+        // resolve to the SAME node (e.g. a canonical name and its alias),
+        // so collapse again on the resolved NodeId, first occurrence wins.
+        let mut seen_ids = std::collections::BTreeSet::new();
+        resolved.retain(|r| seen_ids.insert(r.id));
         let mut entities_out = Vec::with_capacity(resolved.len());
         let mut edge_ids = Vec::with_capacity(resolved.len());
         for r in resolved {
