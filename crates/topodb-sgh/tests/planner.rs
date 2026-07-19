@@ -17,6 +17,24 @@ fn prompt_states_the_goal_and_teaches_the_schema() {
 }
 
 #[test]
+fn prompt_teaches_output_schema_must_compile() {
+    let p = build_plan_prompt(&req(), &[], None);
+    assert!(
+        p.contains("must be a valid JSON Schema document that compiles"),
+        "must warn that an invalid output.schema rejects the whole graph"
+    );
+}
+
+#[test]
+fn prompt_explains_the_gate_kind() {
+    let p = build_plan_prompt(&req(), &[], None);
+    assert!(
+        p.contains("`kind: gate` halts the run before its dependents"),
+        "must explain what a gate node does and when to use it"
+    );
+}
+
+#[test]
 fn prompt_includes_optional_context_when_given() {
     let r = PlanRequest {
         goal: "g".into(),

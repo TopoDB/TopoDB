@@ -74,6 +74,15 @@ pub fn build_plan_prompt(
          - Every node id is unique, and every entry in `needs` names a node that exists.\n\
          - The graph must be acyclic.\n\
          - `kind: agent` requires `prompt`. `kind: command` requires `run`.\n\
+         - `kind: gate` halts the run before its dependents and requires neither `prompt` \
+         nor `run`. Today a gate always blocks — there is no interactive resume yet — so \
+         use it to stop the run before a destructive or irreversible step, not as a routine \
+         checkpoint.\n\
+         - `output.schema`, when present, must be a valid JSON Schema document that \
+         compiles — a schema that fails to compile rejects the whole graph, costing a retry. \
+         Declare it only when a step's result genuinely needs a machine-checkable shape; keep it to \
+         simple constructs (`type`, `properties`, `required`, `items`); when unsure, omit \
+         `output` entirely rather than guessing.\n\
          - `budget` is required on every node. Use `retries: 0` where a retry cannot help \
          (a deterministic failure), and small values elsewhere — the budget is the run's \
          worst-case cost and a human approves it before anything executes.\n\
