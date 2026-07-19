@@ -145,6 +145,79 @@ fn nodes_by_label_10k(c: &mut Criterion) {
     });
 }
 
+/// Selective-label win case (F9-11 Task 8 bench-review follow-up):
+/// `nodes_by_label_10k` above benches the WORST case for an index-scan+
+/// per-row-point-lookup design — a label ("Memory") matching 100% of the
+/// scanned corpus, where the old full-`NODES`-scan path had no per-row
+/// lookup overhead to pay. This bench is the case `LABEL_INDEX` is actually
+/// FOR: the same 10k-node corpus, PLUS 200 more nodes under a distinct
+/// "Landmark" label (~2% of the resulting 10,200-node corpus), measuring
+/// `nodes_by_label(&scopes, "Landmark")` — a LABEL_INDEX range scan that
+/// only ever touches its 200 matching rows, never the other 10,000.
+fn nodes_by_label_10k_selective(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("label-selective.redb");
+    let db = Db::open_with(&path, spec()).unwrap();
+    for b in batches(&WorkloadSpec {
+        memories: 10_000,
+        ..Default::default()
+    }) {
+        db.submit(b).unwrap();
+    }
+    let scope = Scope::Id(ScopeId::from_u128(1));
+    let landmark_ops: Vec<Op> = (0..200)
+        .map(|_| Op::CreateNode {
+            id: NodeId::new(),
+            scope,
+            label: "Landmark".into(),
+            props: Default::default(),
+        })
+        .collect();
+    db.submit(landmark_ops).unwrap();
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    let sanity = db.nodes_by_label(&scopes, "Landmark");
+    assert_eq!(
+        sanity.len(),
+        200,
+        "nodes_by_label_10k_selective fixture must return all 200 Landmark nodes"
+    );
+    c.bench_function("nodes_by_label_10k_selective", |b| {
+        b.iter(|| db.nodes_by_label(&scopes, "Landmark"))
+    });
+}
+
+/// `nodes_by_label_newest`'s bench instrument (F9-11 Task 8 bench-review
+/// follow-up): same 10k-"Memory" corpus as `nodes_by_label_10k`, but
+/// measuring the newest-first, k-bounded read (`k = 8`, matching
+/// `recent_memories`' default) instead of the full label scan — this is the
+/// near-O(k) read `nodes_by_label_10k`'s full-scan number was never meant to
+/// stand in for. No pre-index baseline exists for this exact call (it's a
+/// new entry point, not a rewire of a pre-existing one) — see the
+/// perf-baseline note for the qualitative comparison against the old
+/// hand-rolled `nodes_by_label` + sort + truncate it replaced in
+/// `topodb-mcp`'s `recent_memories`.
+fn nodes_by_label_newest_10k(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("label-newest.redb");
+    let db = Db::open_with(&path, spec()).unwrap();
+    for b in batches(&WorkloadSpec {
+        memories: 10_000,
+        ..Default::default()
+    }) {
+        db.submit(b).unwrap();
+    }
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    let sanity = db.nodes_by_label_newest(&scopes, "Memory", 8);
+    assert_eq!(
+        sanity.len(),
+        8,
+        "nodes_by_label_newest_10k fixture must return exactly k=8 hits"
+    );
+    c.bench_function("nodes_by_label_newest_10k", |b| {
+        b.iter(|| db.nodes_by_label_newest(&scopes, "Memory", 8))
+    });
+}
+
 /// Builds a 10k-memory workload fixture (default `WorkloadSpec`: embed_pct
 /// 20, matching the v1/v2 baseline workload) once, and resolves the seed
 /// node for `traverse_warm_10k`/`traverse_cold_10k` via the equality index
@@ -384,6 +457,8 @@ criterion_group!(
     write,
     concurrent_submit_16,
     nodes_by_label_10k,
+    nodes_by_label_10k_selective,
+    nodes_by_label_newest_10k,
     traverse_warm,
     traverse_cold,
     search_warm_10k_scope,
