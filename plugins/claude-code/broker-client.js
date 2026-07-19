@@ -28,11 +28,6 @@ export async function connectForProject({ projectDir, dataDir, connectTimeoutMs 
   });
   if (!conn) return null;
 
-  // Must be first on the wire, before any JSON-RPC — the broker refuses to
-  // forward a request from a connection whose scope it does not know (see
-  // test/broker.test.js's socketRpcClient for the working reference).
-  conn.write(helloFrame(sessionScopes({ projectDir })));
-
   let nextId = 1;
   const pending = new Map();
   conn.on(
@@ -80,20 +75,34 @@ export async function connectForProject({ projectDir, dataDir, connectTimeoutMs 
       conn.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     });
 
-  // MCP handshake: the broker treats each connection as a session. Params
-  // mirror test/broker.test.js's socketRpcClient exactly (protocolVersion,
-  // empty capabilities, clientInfo) — that raw-socket client is the working
-  // reference for what this broker accepts per-connection.
-  await rpc(
-    "initialize",
-    {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "topodb-hook", version: "0.1.0" },
-    },
-    2000,
-  );
-  conn.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  try {
+    // Must be first on the wire, before any JSON-RPC — the broker refuses to
+    // forward a request from a connection whose scope it does not know (see
+    // test/broker.test.js's socketRpcClient for the working reference).
+    conn.write(helloFrame(sessionScopes({ projectDir })));
+
+    // MCP handshake: the broker treats each connection as a session. Params
+    // mirror test/broker.test.js's socketRpcClient exactly (protocolVersion,
+    // empty capabilities, clientInfo) — that raw-socket client is the working
+    // reference for what this broker accepts per-connection.
+    await rpc(
+      "initialize",
+      {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "topodb-hook", version: "0.1.0" },
+      },
+      2000,
+    );
+    conn.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  } catch {
+    // A connection can succeed against a stale socket file, a non-broker
+    // process, or a broker that dies right after accept — none of those are
+    // this caller's problem to diagnose. Same "never throws" contract as the
+    // connect step above: destroy the socket and degrade to null.
+    conn.destroy();
+    return null;
+  }
 
   return {
     async call(name, args, timeoutMs = 2000) {
