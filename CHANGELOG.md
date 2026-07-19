@@ -30,6 +30,24 @@ workspace are versioned and released independently (tags are per-package, e.g.
   **Breaking for struct-literal construction:** `RecallQuery` gained fields — use
   `RecallQuery::new(scopes, query, k)` with struct-update syntax so future additions don't
   break your call sites.
+- **Write path: intern journal + group commit.** Batches no longer reload the dictionary/scope
+  registry from disk (aborted batches revert exactly their own interns); the in-memory mirrors'
+  write guards release before the commit fsync, so readers never block on an in-flight writer;
+  queued submits coalesce into one transaction (≤16 batches/4096 ops) with per-submit atomicity
+  preserved via individual replay on group failure. `ensure_index_spec` no longer commits on
+  no-op opens. Crash note: a crash during a group commit loses the whole group — coarser, never
+  finer, than before; no caller was ever promised its batch survived a crash that preceded its
+  reply.
+- **⚠️ ON-DISK FORMAT v6.** New `label_index` table (`(label, scope, ulid) → slot`, derived
+  state). **Every existing database migrates irreversibly on first open after this upgrade**
+  (one full node scan; see FORMAT.md §v6). `nodes_by_label` now loads only matching rows; new
+  `nodes_by_label_newest(scopes, label, k)` serves newest-first reads near-O(k) (session-start
+  injection's `recent_memories` uses it); float-range scans stop decoding embeddings. Unselective
+  full-label scans stay flat; selective-label scans run ~250x faster and newest-first k-bounded
+  reads ~1,400x faster on a 10k corpus (same-machine criterion numbers).
+- **`SetEmbedding` rejects non-finite components** (NaN/±Inf corrupt cosine scoring).
+- New tests: kill-during-commit crash recovery (25-round SIGKILL harness), read-during-write
+  latency, group-commit semantics, differential-oracle coverage for the label index.
 
 ### 0.0.8 — 2026-07-18
 
