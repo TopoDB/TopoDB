@@ -773,6 +773,68 @@ struct GetChangesResult {
     ops: Vec<ChangeEventJson>,
 }
 
+/// The default edge type `remember` links with when the call doesn't name one.
+const DEFAULT_REMEMBER_EDGE_TYPE: &str = "about";
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RememberParams {
+    /// The memory's full-text-searchable body (embedded for semantic recall
+    /// when embeddings are on) — same semantics as `create_memory.content`.
+    content: String,
+    /// Names of the entities this fact concerns. Each is resolved
+    /// find-or-create with `create_entity`'s exact semantics (case- and
+    /// whitespace-insensitive across the read scopes, the write scope, and
+    /// shared; alias-aware; never duplicates). At least one is required —
+    /// `remember` is the linked-fact verb; use `create_memory` for a
+    /// deliberately unlinked note. Repeated names within one call collapse
+    /// to a single entity and a single link.
+    #[schemars(length(min = 1))]
+    entities: Vec<String>,
+    /// One edge type applied to every memory→entity link. Defaults to
+    /// `"about"`. Normalized like `link` normalizes it (`Works At` ==
+    /// `works_at`).
+    #[serde(default)]
+    edge_type: Option<String>,
+    /// Structured metadata merged into the MEMORY node's props
+    /// (string/number/bool values). Must not include a `content` key — that
+    /// key is set from the `content` param above; a collision is rejected
+    /// rather than silently overwritten.
+    #[serde(default)]
+    #[schemars(with = "Option<PropsSchema>")]
+    props: Option<Value>,
+    /// Single write scope for EVERYTHING this call creates — the memory,
+    /// any new entity nodes, and all edges: `"shared"` or a scope ULID.
+    /// Defaults to the server's configured default scope. When the fact
+    /// concerns shared-scope entities and should be visible outside this
+    /// project, pass `"shared"` — a project-scoped edge to a shared entity
+    /// is invisible to other projects.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RememberedEntity {
+    /// The name as given in the call (first spelling wins when repeats
+    /// collapse).
+    name: String,
+    /// ULID of the entity this name resolved to (or the new node).
+    id: String,
+    /// `false` means the name resolved to an existing entity — no new node.
+    created: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RememberResult {
+    /// ULID of the newly created memory node.
+    memory_id: String,
+    /// One row per distinct entity, in input order.
+    entities: Vec<RememberedEntity>,
+    /// ULIDs of the created memory→entity edges, index-aligned with
+    /// `entities`.
+    edge_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CreateMemoryParams {
@@ -1378,6 +1440,129 @@ impl TopoServer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(GetChangesResult { ops }))
+    }
+
+    #[tool(
+        description = "Store a linked fact in ONE call: creates the memory, find-or-creates each named entity, and links memory→entity ('about' by default) — atomically, in a single write batch. This is the preferred way to store anything worth remembering. Use the lower-level create_memory / create_entity / link only when you need the pieces separately: an unlinked note, an entity carrying extra props, or entity↔entity relations (works_at, supersede)."
+    )]
+    fn remember(
+        &self,
+        Parameters(p): Parameters<RememberParams>,
+    ) -> Result<Json<RememberResult>, ErrorData> {
+        // Validate EVERYTHING before planning a single write: a rejected
+        // call must leave the database untouched. (`minItems: 1` is the
+        // advertised half of the non-empty rule; this is the runtime half,
+        // same dual enforcement as `scopes`.)
+        let ty = convert::normalize_edge_type(
+            p.edge_type.as_deref().unwrap_or(DEFAULT_REMEMBER_EDGE_TYPE),
+        )
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        if p.entities.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "entities must contain at least one name — use create_memory for a deliberately unlinked note".to_string(),
+                None,
+            ));
+        }
+        if p.entities.iter().any(|n| n.trim().is_empty()) {
+            return Err(ErrorData::invalid_params(
+                "entity names must be non-empty".to_string(),
+                None,
+            ));
+        }
+        let memory_id = NodeId::new();
+        // Embed before `p.content` moves into the props map below (same
+        // ordering create_memory uses).
+        let memory_embed = self.embed_op(memory_id, &p.content);
+        let memory_props = convert::merge_required_prop(
+            MEMORY_CONTENT_PROP,
+            PropValue::Str(p.content),
+            p.props.as_ref(),
+        )
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+
+        // Resolve every entity BEFORE the batch: existing entities
+        // contribute only their id (no per-entity props here, so unlike
+        // create_entity there is nothing to merge); new names get a planned
+        // CreateNode + best-effort embed. All reads precede the single
+        // submit below — failure anywhere in this loop writes nothing.
+        struct Resolved {
+            name: String,
+            id: NodeId,
+            created: bool,
+            ops: Vec<Op>,
+        }
+        let mut resolved: Vec<Resolved> = Vec::with_capacity(p.entities.len());
+        for name in &p.entities {
+            match self.find_existing_entity(scope, name)? {
+                Some(node) => resolved.push(Resolved {
+                    name: name.clone(),
+                    id: node.id,
+                    created: false,
+                    ops: Vec::new(),
+                }),
+                None => {
+                    let id = NodeId::new();
+                    let props = convert::merge_required_prop(
+                        ENTITY_NAME_PROP,
+                        PropValue::Str(name.clone()),
+                        None,
+                    )
+                    .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    let mut ops = vec![Op::CreateNode {
+                        id,
+                        scope,
+                        label: ENTITY_LABEL.into(),
+                        props,
+                    }];
+                    ops.extend(self.embed_op(id, name));
+                    resolved.push(Resolved {
+                        name: name.clone(),
+                        id,
+                        created: true,
+                        ops,
+                    });
+                }
+            }
+        }
+
+        // ONE batch: memory + new entities + links commit atomically — this
+        // call can never strand an unlinked memory the way the manual
+        // create_memory -> create_entity -> link sequence can.
+        let mut ops: Vec<Op> = vec![Op::CreateNode {
+            id: memory_id,
+            scope,
+            label: MEMORY_LABEL.into(),
+            props: memory_props,
+        }];
+        ops.extend(memory_embed);
+        let mut entities_out = Vec::with_capacity(resolved.len());
+        let mut edge_ids = Vec::with_capacity(resolved.len());
+        for r in resolved {
+            ops.extend(r.ops);
+            let edge_id = EdgeId::new();
+            ops.push(Op::CreateEdge {
+                id: edge_id,
+                scope,
+                ty: ty.clone().into(),
+                from: memory_id,
+                to: r.id,
+                props: Props::new(),
+                valid_from: None,
+            });
+            edge_ids.push(edge_id.to_string());
+            entities_out.push(RememberedEntity {
+                name: r.name,
+                id: r.id.to_string(),
+                created: r.created,
+            });
+        }
+        self.submit_write(ops)?;
+        Ok(Json(RememberResult {
+            memory_id: memory_id.to_string(),
+            entities: entities_out,
+            edge_ids,
+        }))
     }
 
     #[tool(

@@ -1,0 +1,76 @@
+//! Behavioral tests for the composed `remember` tool (spec:
+//! docs/superpowers/specs/2026-07-18-remember-verb-design.md).
+mod common;
+use common::{Server, DEFAULT_TIMEOUT};
+
+fn fresh_server() -> (tempfile::TempDir, Server) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("remember.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let mut server = Server::spawn(&db_path, &["--scope", scope.as_str()]);
+    server.initialize(DEFAULT_TIMEOUT);
+    (dir, server)
+}
+
+#[test]
+fn remember_stores_memory_entities_and_links_in_one_call() {
+    let (_dir, mut server) = fresh_server();
+
+    let res = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "Drew wants HNSW behind a feature flag",
+            "entities": ["Drew Powell", "TopoDB"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Result shape: input-ordered entities, index-aligned edge_ids.
+    let memory_id = res["memory_id"].as_str().unwrap().to_string();
+    let ents = res["entities"].as_array().unwrap();
+    assert_eq!(ents.len(), 2, "two entities in: {res}");
+    assert_eq!(ents[0]["name"], "Drew Powell");
+    assert_eq!(ents[1]["name"], "TopoDB");
+    assert_eq!(ents[0]["created"], true);
+    assert_eq!(ents[1]["created"], true);
+    let edge_ids = res["edge_ids"].as_array().unwrap();
+    assert_eq!(edge_ids.len(), 2);
+
+    // The memory node exists with label Memory and the content prop.
+    let node = server.call_tool_ok(
+        "get_node",
+        serde_json::json!({ "id": memory_id }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(node["found"], true);
+    assert_eq!(node["node"]["label"], "Memory");
+    assert_eq!(
+        node["node"]["props"]["content"],
+        "Drew wants HNSW behind a feature flag"
+    );
+
+    // Both links exist, open, default type "about", memory -> entity.
+    let entity_ids: Vec<String> = ents
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    let edges = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": memory_id }),
+        DEFAULT_TIMEOUT,
+    );
+    let arr = edges["edges"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "two about-edges out of the memory: {edges}");
+    for e in arr {
+        assert_eq!(e["type"], "about");
+        assert_eq!(e["valid_to"], serde_json::Value::Null);
+        assert!(entity_ids.contains(&e["to"].as_str().unwrap().to_string()));
+    }
+
+    // And each entity node really exists.
+    for id in &entity_ids {
+        let n = server.call_tool_ok("get_node", serde_json::json!({ "id": id }), DEFAULT_TIMEOUT);
+        assert_eq!(n["found"], true);
+        assert_eq!(n["node"]["label"], "Entity");
+    }
+}
