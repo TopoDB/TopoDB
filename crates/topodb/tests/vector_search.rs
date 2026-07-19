@@ -348,3 +348,38 @@ fn empty_embedding_in_a_batch_is_rejected_atomically() {
     // Atomic: the CreateNode must not have landed either.
     assert!(db.node(&ScopeSet::of(&[s]), a).is_none());
 }
+
+#[test]
+fn set_embedding_rejects_non_finite_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let node_id = NodeId::new();
+
+    db.submit(vec![Op::CreateNode {
+        id: node_id,
+        scope: Scope::Id(s),
+        label: "M".into(),
+        props: Default::default(),
+    }])
+    .unwrap();
+
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let res = db.submit(vec![Op::SetEmbedding {
+            id: node_id,
+            model: "m".into(),
+            vector: vec![1.0, bad, 3.0],
+        }]);
+        assert!(
+            matches!(res, Err(TopoError::Rejected(_))),
+            "must reject component {bad}"
+        );
+    }
+    // A finite vector still works.
+    db.submit(vec![Op::SetEmbedding {
+        id: node_id,
+        model: "m".into(),
+        vector: vec![1.0, 2.0, 3.0],
+    }])
+    .unwrap();
+}

@@ -2033,6 +2033,13 @@ fn apply_op(
                     "embedding for model {model:?} must have at least one dimension"
                 )));
             }
+            if vector.iter().any(|c| !c.is_finite()) {
+                return Err(TopoError::Rejected(
+                    "embedding contains a non-finite component (NaN or ±Inf) — these corrupt \
+                     cosine scoring; the host must not send them"
+                        .into(),
+                ));
+            }
             let rec = read_node(
                 nodes,
                 vectors,
