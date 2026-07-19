@@ -151,15 +151,12 @@ fn run_config(b: &Built, cfg: Config) -> (f64 /*MRR*/, Vec<String> /*per-query m
         };
         let hits =
             b.db.recall(&RecallQuery {
-                scopes: scopes.clone(),
-                query: q.query.clone(),
-                k: 10,
                 vector: cfg
                     .vector
                     .then(|| (b.corpus.model.clone(), q.vector.clone())),
                 expansions,
                 graph_boost: cfg.graph,
-                options: SearchOptions::default(),
+                ..RecallQuery::new(scopes.clone(), q.query.clone(), 10)
             })
             .unwrap_or_default();
         let expected: Vec<NodeId> = q.expect_top3.iter().map(|k| b.ids[k]).collect();

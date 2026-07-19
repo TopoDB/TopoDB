@@ -112,6 +112,21 @@ pub struct RecallQuery {
     /// for every time-sensitive part of one `recall` call, not two that
     /// could drift apart.
     pub options: SearchOptions,
+    /// Post-fusion label allowlist: when `Some`, only nodes carrying one of
+    /// these labels survive fusion. `None` = unfiltered (today's behavior).
+    /// `Some(vec![])` is `Rejected` — an empty allowlist admits nothing, so
+    /// it is almost certainly a caller bug; omit the field to search
+    /// unfiltered instead.
+    pub labels: Option<Vec<String>>,
+    /// Text leg's RRF weight. Defaults to `WEIGHT_TEXT`.
+    pub text_weight: f32,
+    /// Vector leg's RRF weight. Defaults to `WEIGHT_VECTOR`.
+    pub vector_weight: f32,
+    /// Graph leg's RRF weight. Defaults to `WEIGHT_GRAPH`.
+    pub graph_weight: f32,
+    /// Post-fusion access boost, `0.0..=1.0`. `0.0` (the default) is off.
+    /// Behaviorally inert until the access-boost pipeline stage lands.
+    pub access_weight: f32,
 }
 
 pub(crate) const WEIGHT_TEXT: f32 = 1.0;
@@ -124,6 +139,71 @@ pub(crate) const WEIGHT_GRAPH: f32 = 0.5;
 /// bounded so `graph_boost` costs a handful of 1-hop reads, not one per
 /// candidate in a potentially deep leg list.
 pub(crate) const GRAPH_SEEDS: usize = 5;
+
+impl RecallQuery {
+    /// A query with every tunable at its default: stock leg weights, no
+    /// label filter, no access boost, graph boost on, no vector leg, no
+    /// expansions, default search options. Prefer struct-update over this
+    /// (`RecallQuery { vector: …, ..RecallQuery::new(…) }`) so future
+    /// tunables don't break your construction site.
+    pub fn new(scopes: ScopeSet, query: impl Into<String>, k: usize) -> Self {
+        Self {
+            scopes,
+            query: query.into(),
+            k,
+            vector: None,
+            expansions: Vec::new(),
+            graph_boost: true,
+            options: SearchOptions::default(),
+            labels: None,
+            text_weight: WEIGHT_TEXT,
+            vector_weight: WEIGHT_VECTOR,
+            graph_weight: WEIGHT_GRAPH,
+            access_weight: 0.0,
+        }
+    }
+
+    /// Validates the tunable fields (weights, access_weight, labels shape).
+    /// `Rejected` on any violation — checked by `recall` before any leg
+    /// runs. Validation is over the WEIGHTS, not the effective legs: a
+    /// caller can zero every leg that actually runs and legitimately get
+    /// an empty result (degenerate-but-honest; see the design spec).
+    pub(crate) fn validate_tuning(&self) -> Result<(), TopoError> {
+        let weight_ok = |w: f32| w.is_finite() && (0.0..=10.0).contains(&w);
+        for (name, w) in [
+            ("text_weight", self.text_weight),
+            ("vector_weight", self.vector_weight),
+            ("graph_weight", self.graph_weight),
+        ] {
+            if !weight_ok(w) {
+                return Err(TopoError::Rejected(format!(
+                    "{name} must be finite and within 0.0..=10.0, got {w}"
+                )));
+            }
+        }
+        if self.text_weight == 0.0 && self.vector_weight == 0.0 && self.graph_weight == 0.0 {
+            return Err(TopoError::Rejected(
+                "at least one leg weight must be > 0.0".into(),
+            ));
+        }
+        if !(self.access_weight.is_finite() && (0.0..=1.0).contains(&self.access_weight)) {
+            return Err(TopoError::Rejected(format!(
+                "access_weight must be finite and within 0.0..=1.0, got {}",
+                self.access_weight
+            )));
+        }
+        if let Some(labels) = &self.labels {
+            if labels.is_empty() {
+                return Err(TopoError::Rejected(
+                    "labels must not be empty when present — an empty allowlist admits nothing; \
+                     omit it to search unfiltered"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 impl Db {
     /// Hybrid recall: BM25 text (+ expansions), cosine vector, and 1-hop
@@ -138,6 +218,7 @@ impl Db {
         if q.k == 0 {
             return Err(TopoError::Rejected("recall requires k > 0".into()));
         }
+        q.validate_tuning()?;
         // Check the CALLER's recency options before the leg call zeroes the
         // weight — see SearchOptions::validate_recency for why.
         q.options.validate_recency()?;
@@ -164,7 +245,7 @@ impl Db {
         // An unknown model or a scope with no vectors is an EMPTY leg —
         // legitimately no data — never an error (contrast the empty-vector
         // rejection above, which is a host bug).
-        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = vec![(WEIGHT_TEXT, text_ids)];
+        let mut lists: Vec<(f32, Vec<crate::NodeId>)> = vec![(q.text_weight, text_ids)];
         if let Some((model, vector)) = &q.vector {
             let vhits = self.search_vector(&crate::VectorQuery {
                 scopes: q.scopes.clone(),
@@ -177,7 +258,7 @@ impl Db {
             for (n, _) in vhits {
                 records.entry(n.id).or_insert(n);
             }
-            lists.push((WEIGHT_VECTOR, vids));
+            lists.push((q.vector_weight, vids));
         }
         // Graph leg, two-stage (spec): preliminary text+vector fusion
         // picks GRAPH_SEEDS seeds; their 1-hop neighbors (deduped, seeds
@@ -211,7 +292,7 @@ impl Db {
                 }
             }
             if !graph_ids.is_empty() {
-                lists.push((WEIGHT_GRAPH, graph_ids));
+                lists.push((q.graph_weight, graph_ids));
             }
         }
         let fused = rrf_fuse(&lists);
@@ -250,4 +331,73 @@ pub(crate) fn apply_recency(out: &mut [(NodeRecord, f32)], options: &SearchOptio
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.id.cmp(&b.0.id))
     });
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use crate::ids::ScopeSet;
+
+    fn q() -> RecallQuery {
+        RecallQuery::new(ScopeSet::of(&[crate::ids::ScopeId::new()]), "hello", 5)
+    }
+
+    #[test]
+    fn new_carries_todays_defaults() {
+        let q = q();
+        assert_eq!(q.text_weight, WEIGHT_TEXT);
+        assert_eq!(q.vector_weight, WEIGHT_VECTOR);
+        assert_eq!(q.graph_weight, WEIGHT_GRAPH);
+        assert_eq!(q.access_weight, 0.0);
+        assert!(q.labels.is_none());
+        assert!(q.graph_boost);
+        assert!(q.vector.is_none());
+    }
+
+    #[test]
+    fn weight_validation_rejects_bad_values() {
+        for build in [
+            |mut x: RecallQuery| {
+                x.text_weight = -0.1;
+                x
+            },
+            |mut x: RecallQuery| {
+                x.vector_weight = f32::NAN;
+                x
+            },
+            |mut x: RecallQuery| {
+                x.graph_weight = 10.1;
+                x
+            },
+            |mut x: RecallQuery| {
+                x.access_weight = 1.1;
+                x
+            },
+            |mut x: RecallQuery| {
+                x.access_weight = f32::INFINITY;
+                x
+            },
+            |mut x: RecallQuery| {
+                x.text_weight = 0.0;
+                x.vector_weight = 0.0;
+                x.graph_weight = 0.0;
+                x
+            },
+            |mut x: RecallQuery| {
+                x.labels = Some(vec![]);
+                x
+            },
+        ] {
+            let bad = build(q());
+            assert!(
+                matches!(bad.validate_tuning(), Err(crate::TopoError::Rejected(_))),
+                "must reject: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_tuning_validates() {
+        assert!(q().validate_tuning().is_ok());
+    }
 }

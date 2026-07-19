@@ -28,13 +28,8 @@ fn memory(content: &str, scope: Scope) -> (NodeId, Op) {
 
 fn text_only(scopes: &ScopeSet, query: &str, k: usize) -> RecallQuery {
     RecallQuery {
-        scopes: scopes.clone(),
-        query: query.into(),
-        k,
-        vector: None,
-        expansions: vec![],
         graph_boost: false,
-        options: SearchOptions::default(),
+        ..RecallQuery::new(scopes.clone(), query, k)
     }
 }
 

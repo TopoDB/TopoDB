@@ -1371,9 +1371,6 @@ impl TopoServer {
             fuzzy_fallback: p.fuzzy,
         };
         let query = RecallQuery {
-            scopes: scope_set,
-            query: p.query.clone(),
-            k: p.k,
             // None when the embedder isn't Ready (or errors on this text) —
             // recall then degrades to text/graph legs only.
             vector: self
@@ -1383,6 +1380,7 @@ impl TopoServer {
             expansions,
             graph_boost: p.graph_boost,
             options,
+            ..RecallQuery::new(scope_set, p.query.clone(), p.k)
         };
         // `recall` opens redb read transactions, so unlike the pure snapshot
         // reads it CAN fail with `Storage`/`Encoding` — only its
