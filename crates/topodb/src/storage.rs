@@ -928,7 +928,12 @@ impl Storage {
         // PRIOR aborted batch; this pays O(new interns) and only when THIS
         // batch actually fails.
         let mut journal = InternJournal::default();
-        let result: Result<AppliedBatch, TopoError> = (|| {
+        // Returns the still-open, not-yet-committed `tx` alongside the
+        // `AppliedBatch` it will yield: everything up through here needs the
+        // `dicts`/`scope_registry` guards (every name touched by the batch
+        // gets resolved), but the commit itself does not — see the drop
+        // site below.
+        let pre_commit: Result<(redb::WriteTransaction, AppliedBatch), TopoError> = (|| {
             let tx = self.db.begin_write().map_err(storage_err)?;
             // Text-index edits collected during the op loop and applied AFTER every
             // op has succeeded — still inside this transaction, so the postings
@@ -1126,28 +1131,77 @@ impl Storage {
                 }
             }
 
-            tx.commit().map_err(storage_err)?;
-            Ok(AppliedBatch {
-                first_seq,
-                last_seq,
-                resolved,
-            })
+            Ok((
+                tx,
+                AppliedBatch {
+                    first_seq,
+                    last_seq,
+                    resolved,
+                },
+            ))
         })();
 
-        // Every failure path between the first intern above and a
-        // successful commit lands here: op-loop errors (validation
-        // rejections, encoding errors), FTS-edit errors, op-log append
-        // errors, and `tx.commit()` errors all return `Err` from the
-        // closure without having mutated anything outside `dicts`/
-        // `scope_registry` — redb's write transaction is simply dropped
-        // (never committed), so NODES/EDGES/DICT/SCOPES on disk are
-        // untouched. Reverting the journal here is what keeps the in-memory
-        // mirrors consistent with that untouched disk state.
-        if result.is_err() {
-            dicts.revert(&journal);
-            scope_registry.revert(&journal);
+        let (tx, applied) = match pre_commit {
+            Err(e) => {
+                // Every failure path between the first intern above and here
+                // lands in this arm: op-loop errors (validation rejections,
+                // encoding errors), FTS-edit errors, and op-log append
+                // errors all return `Err` from the closure without having
+                // mutated anything outside `dicts`/`scope_registry` — the
+                // still-open `tx` is simply dropped (never committed), so
+                // NODES/EDGES/DICT/SCOPES on disk are untouched. The guards
+                // are still held here (never dropped on this path), so
+                // reverting the journal under them keeps the in-memory
+                // mirrors consistent with that untouched disk state.
+                dicts.revert(&journal);
+                scope_registry.revert(&journal);
+                return Err(e);
+            }
+            Ok(pair) => pair,
+        };
+
+        // All interning is done — every name the batch touches has already
+        // been resolved into `dicts`/`scope_registry` above. The guards'
+        // job is finished; only `tx.commit()` (the fsync) remains, and that
+        // doesn't touch either mirror. Drop them now, BEFORE the commit, so
+        // readers blocked on `dicts.read()`/`scope_registry.read()` are no
+        // longer serialized behind this batch's fsync.
+        //
+        // Reader-visible window: between this drop and `tx.commit()`
+        // returning, a concurrent reader can resolve an id/name that
+        // belongs to THIS about-to-be-durable — or about-to-abort — batch.
+        // If the commit succeeds, that's no different from a reader landing
+        // a moment later: the data is durable either way. If the commit
+        // FAILS, the reader briefly saw ids that resolve to absent rows on
+        // disk (the write transaction never committed, so NODES/EDGES/
+        // DICT/SCOPES are untouched) — indistinguishable from a read that
+        // simply ran BEFORE this batch started. The commit-failure arm
+        // below then reverts the journal, removing those ids from the
+        // mirrors and restoring the exact pre-batch state.
+        drop(dicts);
+        drop(scope_registry);
+
+        match tx.commit().map_err(storage_err) {
+            Ok(()) => Ok(applied),
+            Err(e) => {
+                // Commit failed AFTER the guards were dropped: re-take them
+                // to revert the journal. The disk mutation never landed
+                // (redb drops an uncommitted/failed write txn without
+                // applying it), so the in-memory dict/scope mirrors must
+                // roll back to match — same journal, same `revert` calls as
+                // the pre-commit failure arm above, just re-acquiring the
+                // guards first since this path runs after they were
+                // released.
+                let mut dicts = self.dicts.write().expect("dict lock poisoned");
+                let mut scope_registry = self
+                    .scope_registry
+                    .write()
+                    .expect("scope registry lock poisoned");
+                dicts.revert(&journal);
+                scope_registry.revert(&journal);
+                Err(e)
+            }
         }
-        result
     }
 
     /// One-transaction indexed lookup: PROP_INDEX prefix scan + record fetches

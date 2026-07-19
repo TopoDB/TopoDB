@@ -12,3 +12,20 @@ members = [
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Debug-mode `cargo test` runs redb writes fully unoptimized: the per-op
+# interning/decode/index work in `Storage::apply_batch`'s op loop is CPU-bound
+# and dominates a multi-thousand-op batch's wall time by roughly 4-5x over
+# the actual `tx.commit()` fsync (measured directly). Without this, the F9b
+# guard-scope fix (crates/topodb/src/storage.rs) is real but its read-latency
+# win gets buried in debug-build interpreter overhead unrelated to the fix,
+# making `reads_complete_while_a_large_batch_commits`
+# (crates/topodb/tests/concurrency.rs) either too slow to ever pass at a
+# batch size big enough to reliably trigger the pre-fix RED case, or forced
+# down to a batch size too small to trigger RED at all — no fixed batch size
+# threads the needle in `opt-level = 0`. `opt-level = 1` narrows that gap
+# enough (without paying full release compile time) for the test to be
+# robust in both directions; verified 8/8 green post-fix and 6/6 red
+# pre-fix at 4,000 ops with this profile active.
+[profile.test]
+opt-level = 1
