@@ -124,6 +124,14 @@ fn killed_mid_write_recovers_and_replays_identically() {
     let exe = std::env::current_exe().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("crash.redb");
+    // Cumulative node count across rounds: guards against a harness that
+    // passes vacuously because a round's kill landed before the child ever
+    // got a batch committed (verify_replay_equivalence alone can't tell
+    // "wrote nothing" apart from "wrote and survived correctly" — both
+    // dump-compare clean). From round 1 onward the count must strictly
+    // increase; round 0 is allowed to start from zero in case spawn latency
+    // ate the whole delay before the child even opened the db.
+    let mut prev_count = 0usize;
     for round in 0..25 {
         let mut child = Command::new(&exe)
             .args(["crash_writer_child", "--exact", "--nocapture"])
@@ -133,8 +141,14 @@ fn killed_mid_write_recovers_and_replays_identically() {
             .spawn()
             .unwrap();
         // Let it write for a pseudo-random slice (deterministic seed per
-        // round — no wall-clock randomness needed).
-        std::thread::sleep(Duration::from_millis(37 + (round * 61) % 211));
+        // round — no wall-clock randomness needed). Floor is well above
+        // this harness's measured process-spawn + first-`Db::open` +
+        // first-commit latency (~1.0-1.1s under the sandboxed environment
+        // this was authored in — process exec and initial redb table
+        // creation are the dominant cost, not the write loop itself), so a
+        // round's kill lands after the child has had a real chance to
+        // commit at least one batch, not just after it opened the db.
+        std::thread::sleep(Duration::from_millis(1300 + (round * 97) % 900));
         child.kill().unwrap(); // SIGKILL on unix
         child.wait().unwrap();
 
@@ -142,6 +156,25 @@ fn killed_mid_write_recovers_and_replays_identically() {
         let db = topodb::Db::open(&db_path).unwrap();
         // (b) …and the state equals a replay of the surviving op log.
         verify_replay_equivalence(&db);
+        let count = db.debug_dump_nodes().len();
+        eprintln!("round {round}: cumulative node count = {count}");
+        if round >= 1 {
+            assert!(
+                count > prev_count,
+                "round {round}: node count did not grow ({prev_count} -> {count}) — \
+                 the child may have been killed before writing anything, which would \
+                 make this round's equivalence check pass vacuously"
+            );
+        }
+        prev_count = count;
         drop(db);
     }
+    // Across the whole run, the writer must have landed a substantial
+    // number of batches — proof this harness actually exercised the
+    // kill-during-commit window many times over, not just once or twice.
+    assert!(
+        prev_count > 50,
+        "final cumulative node count {prev_count} is too small to show the child \
+         wrote meaningfully across the 25 rounds"
+    );
 }
