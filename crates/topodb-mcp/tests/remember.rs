@@ -158,3 +158,44 @@ fn remember_normalizes_custom_edge_types() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["type"], "mentioned_in", "link-style normalization");
 }
+
+/// db_info's current_seq — the op-log high-water mark. If a rejected call
+/// wrote anything at all, this moves.
+fn current_seq(server: &mut Server) -> u64 {
+    server.call_tool_ok("db_info", serde_json::json!({}), DEFAULT_TIMEOUT)["current_seq"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn rejected_remember_calls_write_nothing() {
+    let (_dir, mut server) = fresh_server();
+    // One good write so the baseline seq is nonzero.
+    server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "baseline", "entities": ["X"] }),
+        DEFAULT_TIMEOUT,
+    );
+    let seq_before = current_seq(&mut server);
+
+    for bad in [
+        // Empty entities: minItems 1 (schema) + runtime check.
+        serde_json::json!({ "content": "c", "entities": [] }),
+        // Blank entity name.
+        serde_json::json!({ "content": "c", "entities": ["   "] }),
+        // Invalid edge type (normalize_edge_type rejects empty).
+        serde_json::json!({ "content": "c", "entities": ["X"], "edge_type": "" }),
+        // Unknown field: deny_unknown_fields.
+        serde_json::json!({ "content": "c", "entities": ["X"], "contnet": "typo" }),
+        // props colliding with the reserved content key.
+        serde_json::json!({ "content": "c", "entities": ["X"], "props": { "content": "clash" } }),
+    ] {
+        let resp = server.call_tool("remember", bad.clone(), DEFAULT_TIMEOUT);
+        common::expect_tool_error(&resp);
+        assert_eq!(
+            current_seq(&mut server),
+            seq_before,
+            "rejected call must write nothing, but seq moved for: {bad}"
+        );
+    }
+}
