@@ -108,3 +108,30 @@ fn attempts_are_visible_even_when_the_run_is_stamped_far_in_the_future() {
         "attempts recorded with future timestamps must still be visible"
     );
 }
+
+#[test]
+fn a_run_starts_with_no_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+    assert_eq!(s.revision().unwrap(), None);
+}
+
+#[test]
+fn revisions_round_trip_and_supersede() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    s.record_revision("version: 1\ngoal: first\nnodes: []\n", "survey blocked", 500)
+        .unwrap();
+    let (yaml, reason) = s.revision().unwrap().expect("a revision exists");
+    assert!(yaml.contains("first"));
+    assert_eq!(reason, "survey blocked");
+
+    s.record_revision("version: 1\ngoal: second\nnodes: []\n", "build blocked", 600)
+        .unwrap();
+    let (yaml, reason) = s.revision().unwrap().expect("still exactly one open revision");
+    assert!(yaml.contains("second"), "the latest proposal wins");
+    assert_eq!(reason, "build blocked");
+}

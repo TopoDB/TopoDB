@@ -7,7 +7,8 @@ use topodb::{
 use super::supersede::link_superseding;
 use super::{
     SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED,
-    LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_RUN, LABEL_STATE,
+    EDGE_REVISION_OF, LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_REVISION, LABEL_RUN,
+    LABEL_STATE,
 };
 use crate::schema::validate::Validated;
 
@@ -380,5 +381,71 @@ impl RunStore {
             }
         }
         Ok(out)
+    }
+
+    /// Record a proposed successor graph for this run.
+    ///
+    /// Superseding: an earlier proposal is closed rather than deleted, so the
+    /// chain of what was proposed and when stays recoverable. The graph is
+    /// stored as YAML text because engine props are scalars only.
+    pub fn record_revision(&self, yaml: &str, reason: &str, now_ms: i64) -> Result<(), SghError> {
+        let id = NodeId::new();
+        let mut props = Props::new();
+        props.insert("yaml".into(), PropValue::Str(yaml.to_string()));
+        props.insert("reason".into(), PropValue::Str(reason.to_string()));
+        props.insert("at".into(), PropValue::DateTime(now_ms));
+
+        self.db.submit_at(
+            vec![Op::CreateNode {
+                id,
+                scope: self.scope,
+                label: LABEL_REVISION.into(),
+                props,
+            }],
+            now_ms,
+        )?;
+
+        link_superseding(
+            &self.db,
+            self.scope,
+            self.run_node,
+            id,
+            EDGE_REVISION_OF,
+            now_ms,
+        )?;
+        Ok(())
+    }
+
+    /// The currently-open proposed successor graph, if any, as `(yaml, reason)`.
+    ///
+    /// Uses `Db::edges_from(open_only: true)` — the engine's designated
+    /// supersession primitive — rather than the traverse-plus-sentinel
+    /// workaround the older reads in this file use. That method did not exist
+    /// when they were written; new code should prefer it.
+    pub fn revision(&self) -> Result<Option<(String, String)>, SghError> {
+        let open = self.db.edges_from(
+            &self.scopes,
+            self.run_node,
+            None,
+            Some(EDGE_REVISION_OF),
+            true,
+        )?;
+
+        let Some(edge) = open.first() else {
+            return Ok(None);
+        };
+        let Some(rec) = self.db.node(&self.scopes, edge.to) else {
+            return Ok(None);
+        };
+
+        let yaml = match rec.props.get("yaml") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => return Ok(None),
+        };
+        let reason = match rec.props.get("reason") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => String::new(),
+        };
+        Ok(Some((yaml, reason)))
     }
 }
