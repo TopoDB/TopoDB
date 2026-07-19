@@ -12,6 +12,7 @@
 
 mod config;
 mod embedder;
+mod ort_fetch;
 mod server;
 
 use std::error::Error;
