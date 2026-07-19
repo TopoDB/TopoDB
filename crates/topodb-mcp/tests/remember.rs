@@ -199,3 +199,58 @@ fn rejected_remember_calls_write_nothing() {
         );
     }
 }
+
+/// Externally-tagged Op JSON: the variant is the single top-level key.
+fn op_kind(op: &serde_json::Value) -> String {
+    op.as_object().unwrap().keys().next().unwrap().clone()
+}
+
+#[test]
+fn remember_lands_as_one_contiguous_op_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("remember-atomic.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let mut server = Server::spawn(
+        &db_path,
+        &["--scope", scope.as_str(), "--allow-unscoped-changes"],
+    );
+    server.initialize(DEFAULT_TIMEOUT);
+
+    let seq_before = current_seq(&mut server);
+    server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "atomic batch",
+            "entities": ["A", "B"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let changes = server.call_tool_ok(
+        "get_changes",
+        serde_json::json!({ "since_seq": seq_before + 1 }),
+        DEFAULT_TIMEOUT,
+    );
+    let ops = changes["ops"].as_array().unwrap();
+
+    // Contiguous: one batch, no gaps — nothing else interleaved.
+    let seqs: Vec<u64> = ops.iter().map(|o| o["seq"].as_u64().unwrap()).collect();
+    let expected: Vec<u64> = (seq_before + 1..=seq_before + seqs.len() as u64).collect();
+    assert_eq!(seqs, expected, "seqs must be contiguous: {ops:#?}");
+
+    // Exactly the call's writes: 3 CreateNode (1 Memory + 2 Entity) and
+    // 2 CreateEdge. SetEmbedding ops are host-dependent (present only when
+    // an ONNX runtime is available), so they're counted separately and
+    // otherwise ignored.
+    let kinds: Vec<String> = ops.iter().map(|o| op_kind(&o["op"])).collect();
+    let creates = kinds.iter().filter(|k| *k == "CreateNode").count();
+    let edges = kinds.iter().filter(|k| *k == "CreateEdge").count();
+    let embeds = kinds.iter().filter(|k| *k == "SetEmbedding").count();
+    assert_eq!(creates, 3, "1 memory + 2 entities: {kinds:?}");
+    assert_eq!(edges, 2, "one link per entity: {kinds:?}");
+    assert_eq!(
+        kinds.len(),
+        creates + edges + embeds,
+        "no unexpected op kinds: {kinds:?}"
+    );
+}
