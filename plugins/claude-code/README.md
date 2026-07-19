@@ -131,15 +131,9 @@ matching update here is worse than one that's a version behind — but it also
 means the pin can go stale if `topodb-mcp` publishes and this plugin doesn't
 bump in step.
 
-> **Release coordination (read this before publishing docs off this
-> branch).** The docs in this repo currently describe `topodb-mcp` 0.0.9,
-> which is **unreleased** — `server-args.js`'s `SERVER_VERSION` is still
-> pinned to `0.0.8` and must NOT be bumped until 0.0.9 is actually published
-> to npm (bumping early would point every installed plugin at a version that
-> doesn't exist). Until that pin is bumped, a plugin-launched server is
-> running 0.0.8 and does **not** have `get_edges`, `add_alias`,
-> `add_synonym`, hybrid (RRF-fused) recall, or embeddings — only the tools
-> and behavior 0.0.8 shipped with. Bumping `SERVER_VERSION` to `0.0.9` (and
-> re-verifying `plugins/claude-code/test/broker.test.js` against the real
-> published package) is a required step of the 0.0.9 release checklist — see
-> `CHANGELOG.md`'s `topodb-mcp` Unreleased section.
+> **Release coordination.** When `topodb-mcp` publishes a new version, do
+> NOT bump `SERVER_VERSION` until the package is actually on npm (bumping
+> early would point every installed plugin at a version that doesn't
+> exist), and re-verify `plugins/claude-code/test/broker.test.js` against
+> the real published package as part of the bump. Each `topodb-mcp` release
+> carries this as a checklist item in `CHANGELOG.md`.
