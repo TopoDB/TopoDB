@@ -1,0 +1,182 @@
+// recorder.js — pure episode-recording core: no external imports except node fs/path
+// Everything here is deterministic and unit-tested.
+
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs";
+import path from "node:path";
+
+// State-file helpers (replacing EpisodeBuffer class)
+
+export function stateFilePath(dataDir, sessionId) {
+  // sessionId is used as a filename: strip anything path-like defensively.
+  return path.join(dataDir, "episodes", `${String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+}
+
+export function appendRetrieval(dataDir, sessionId, record, contents) {
+  const file = stateFilePath(dataDir, sessionId);
+  mkdirSync(path.dirname(file), { recursive: true });
+  const state = readState(dataDir, sessionId) ?? { startedAt: Date.now(), retrievals: [], contents: {} };
+  state.retrievals.push(record);
+  for (const [id, text] of contents) state.contents[id] = text;
+  writeFileSync(file, JSON.stringify(state));
+}
+
+export function readState(dataDir, sessionId) {
+  const file = stateFilePath(dataDir, sessionId);
+  if (!existsSync(file)) return null;
+  try {
+    const state = JSON.parse(readFileSync(file, "utf8"));
+    if (!Array.isArray(state.retrievals)) throw new Error("shape");
+    return state;
+  } catch {
+    try { unlinkSync(file); } catch { /* already gone */ }
+    return null;
+  }
+}
+
+export function deleteState(dataDir, sessionId) {
+  try { unlinkSync(stateFilePath(dataDir, sessionId)); } catch { /* fine */ }
+}
+
+export function sweepStale(dataDir, maxAgeMs = 7 * 24 * 3600 * 1000) {
+  const dir = path.join(dataDir, "episodes");
+  let names;
+  try { names = readdirSync(dir); } catch { return; }
+  const cutoff = Date.now() - maxAgeMs;
+  for (const n of names) {
+    const p = path.join(dir, n);
+    try { if (statSync(p).mtimeMs < cutoff) unlinkSync(p); } catch { /* races are fine */ }
+  }
+}
+
+// Text helpers
+
+/** Message content -> plain text: strings pass through, block arrays
+ * contribute only their `type === "text"` blocks. Defensive: anything
+ * unrecognized contributes nothing. */
+export function extractText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((b) =>
+      b && typeof b === "object" && b.type === "text"
+        ? String(b.text ?? "")
+        : "",
+    )
+    .join("");
+}
+
+/** Spec tokenization: lowercase alphanumeric runs of length >= 3, deduped,
+ * insertion order preserved. */
+export function tokenize(text) {
+  const out = new Set();
+  for (const m of text.toLowerCase().matchAll(/[a-z0-9]{3,}/g)) out.add(m[0]);
+  return out;
+}
+
+/** Spec USED rule: >= 50% of the memory's tokens appear in the text. A
+ * memory with no tokens is never "used". */
+export function isUsed(memContent, text) {
+  const mem = tokenize(memContent);
+  if (mem.size === 0) return false;
+  const hay = tokenize(text);
+  let hits = 0;
+  for (const t of mem) if (hay.has(t)) hits++;
+  return hits / mem.size >= 0.5;
+}
+
+// Retrieval record building
+
+/** Helper to collect a node into the returned list and contents map. */
+function collect(node, i, score, out, contents) {
+  const id = node?.id;
+  if (typeof id !== "string") return;
+  out.push({ id, rank: i, score });
+  const content = node?.props?.content;
+  if (typeof content === "string") contents.set(id, content);
+}
+
+/** Map a `search_memories`/`traverse`/`recent_memories` tool result to a `RetrievalRecord` plus
+ * the memory contents it surfaced, or `undefined` when the tool isn't a
+ * retrieval call or the result doesn't match the expected wire shape (never
+ * throws — recording must never break the agent). Field names follow
+ * topodb-mcp's actual JSON (captured from the running server, not guessed):
+ * `search_memories` -> `{hits: [{node, score}]}`; `traverse` -> `{subgraph:
+ * {nodes, edges}}`; `recent_memories` -> `{memories: [node…]}`. */
+export function toRetrievalRecord(tool, args, result) {
+  const contents = new Map();
+  const returned = [];
+
+  if (tool === "search_memories") {
+    const hits = result?.hits;
+    if (!Array.isArray(hits)) return undefined;
+    hits.forEach((h, i) => {
+      const score = typeof h?.score === "number" ? h.score : 0;
+      collect(h?.node, i, score, returned, contents);
+    });
+    const query = typeof args.query === "string" ? args.query : "";
+    return { record: { query, at: Date.now(), channel: "text", returned }, contents };
+  }
+
+  if (tool === "traverse") {
+    const nodes = result?.subgraph?.nodes;
+    if (!Array.isArray(nodes)) return undefined;
+    nodes.forEach((n, i) => collect(n, i, 0, returned, contents));
+    const query = typeof args.seed_id === "string" ? args.seed_id : "";
+    return { record: { query, at: Date.now(), channel: "graph", returned }, contents };
+  }
+
+  if (tool === "recent_memories") {
+    const memories = result?.memories;
+    if (!Array.isArray(memories)) return undefined;
+    memories.forEach((n, i) => collect(n, i, 0, returned, contents));
+    return { record: { query: "", at: Date.now(), channel: "recent", returned }, contents };
+  }
+
+  return undefined;
+}
+
+/** Assemble the single atomic submit_batch command array for one episode.
+ * `used` maps retrieval index -> the set of memory ids judged used.
+ * This is the Claude Code version: goal "", tokens 0, turns from state.retrievals.length, no policy block. */
+export function buildEpisodeBatch(args) {
+  const { state, outcome, failure, endedAt, used } = args;
+  const cmds = [
+    {
+      op: "create_node",
+      label: "Episode",
+      props: {
+        goal: "",
+        strategy: "",
+        outcome,
+        started_at: state.startedAt,
+        ended_at: endedAt,
+        turns: state.retrievals.length,
+        tokens: 0,
+        confidence: 0.5,
+        failure,
+      },
+    },
+  ];
+  state.retrievals.forEach((r, i) => {
+    const evRef = `#${cmds.length}`;
+    cmds.push({
+      op: "create_node",
+      label: "RetrievalEvent",
+      props: { query: r.query, at: r.at },
+    });
+    cmds.push({ op: "link", from: "#0", to: evRef, type: "ISSUED" });
+    for (const m of r.returned) {
+      cmds.push({
+        op: "link",
+        from: evRef,
+        to: m.id,
+        type: "RETURNED",
+        props: { rank: m.rank, score: m.score, channel: r.channel },
+      });
+    }
+    for (const id of used.get(i) ?? []) {
+      cmds.push({ op: "link", from: evRef, to: id, type: "USED" });
+    }
+  });
+  return cmds;
+}
