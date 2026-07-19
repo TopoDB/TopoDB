@@ -10,6 +10,37 @@ use crate::engine::{AsOfSupport, Engine, EngineError, Payload};
 
 const LABEL: &str = "BenchNode";
 
+/// Default ops per `submit_at` call during `insert_corpus`. Mirrors
+/// `MinigrafDriver`'s `DEFAULT_TRANSACT_BATCH`/`MINIGRAF_TRANSACT_BATCH` so
+/// the two engines are comparable and both sweepable.
+///
+/// This was added on the hypothesis that a single `submit_at` covering every
+/// node (or every edge) produces a pathologically large redb copy-on-write
+/// dirty set, mirroring minigraf's unchunked-parse problem. A batch-size
+/// sweep (`TOPODB_SUBMIT_BATCH` in {1_000, 5_000, 20_000, 50_000,
+/// 1_000_000} at 20k nodes -- see
+/// `docs/superpowers/notes/2026-07-19-point-query-verification.md` and the
+/// task report) found the *opposite*: smaller batches are strictly slower
+/// for TopoDB, monotonically, with no floor reached in that range. Chunking
+/// at 5,000 costs roughly +20% at 20k nodes and +64% at 50k nodes versus the
+/// old two-giant-calls design. This points to `submit_at` carrying a
+/// meaningful per-call fixed cost (consistent with a redb commit/fsync per
+/// call) that dominates over any dirty-set-size effect at these scales, not
+/// the dirty-set blowup the hypothesis predicted. The default is still
+/// shipped here (rather than reverted) because the task that introduced it
+/// asked for symmetry with minigraf and explicitly forbade tuning the batch
+/// size to make TopoDB look faster; overridable via `TOPODB_SUBMIT_BATCH`
+/// for anyone who wants to reproduce or extend the sweep.
+const DEFAULT_SUBMIT_BATCH: usize = 5_000;
+
+fn submit_batch_ops() -> usize {
+    std::env::var("TOPODB_SUBMIT_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_SUBMIT_BATCH)
+}
+
 pub struct TopoDbDriver {
     db: Db,
     path: PathBuf,
@@ -43,50 +74,68 @@ impl Engine for TopoDbDriver {
     }
 
     fn insert_corpus(&mut self, corpus: &Corpus) -> Result<(), EngineError> {
-        // One batch for nodes, one for edges. Explicit timestamps, never wall
-        // clock, so the run is reproducible.
-        let mut ops = Vec::with_capacity(corpus.nodes.len());
-        for n in &corpus.nodes {
-            // Deterministic, not `NodeId::new()`: the logical id -> engine id
-            // map otherwise lives only in this process's `self.ids`, which a
-            // fresh `Engine::open` (a genuinely cold reopen, e.g. in the
-            // point_query benchmark) cannot reconstruct from disk alone.
-            // Deriving the engine id from the logical id makes `point_lookup`
-            // and `k_hop` work correctly against a freshly opened handle with
-            // an empty `self.ids`, which is what a real "cold" measurement
-            // requires.
-            let id = NodeId::from_u128(n.id as u128);
-            self.ids.insert(n.id, id);
+        // Chunked into `submit_batch_ops()`-sized `submit_at` calls rather
+        // than one giant call per op kind, for symmetry with
+        // `MinigrafDriver::insert_corpus` (see `DEFAULT_SUBMIT_BATCH` doc
+        // comment above for what the sweep actually found: chunking makes
+        // TopoDB slower here, not faster). This changes nothing about what
+        // is written -- still write-once, still the same five props per
+        // node and the same edges -- only how many `submit_at` calls it
+        // takes.
+        //
+        // Explicit timestamps, never wall clock, so the run is
+        // reproducible. All node batches are written at timestamp 1 and all
+        // edge batches at timestamp 2: nondecreasing across batches within
+        // each kind, and every node batch is strictly before every edge
+        // batch, so edges never reference a node that doesn't exist yet.
+        let batch = submit_batch_ops();
 
-            let mut props = Props::new();
-            props.insert("name".into(), PropValue::Str(n.name.clone()));
-            props.insert("kind".into(), PropValue::Str(n.kind.clone()));
-            props.insert("note".into(), PropValue::Str(n.note.clone()));
-            props.insert("rank".into(), PropValue::Int(n.rank));
-            props.insert("active".into(), PropValue::Bool(n.active));
+        for chunk in corpus.nodes.chunks(batch) {
+            let mut ops = Vec::with_capacity(chunk.len());
+            for n in chunk {
+                // Deterministic, not `NodeId::new()`: the logical id -> engine id
+                // map otherwise lives only in this process's `self.ids`, which a
+                // fresh `Engine::open` (a genuinely cold reopen, e.g. in the
+                // point_query benchmark) cannot reconstruct from disk alone.
+                // Deriving the engine id from the logical id makes `point_lookup`
+                // and `k_hop` work correctly against a freshly opened handle with
+                // an empty `self.ids`, which is what a real "cold" measurement
+                // requires.
+                let id = NodeId::from_u128(n.id as u128);
+                self.ids.insert(n.id, id);
 
-            ops.push(Op::CreateNode {
-                id,
-                scope: self.scope,
-                label: LABEL.into(),
-                props,
-            });
+                let mut props = Props::new();
+                props.insert("name".into(), PropValue::Str(n.name.clone()));
+                props.insert("kind".into(), PropValue::Str(n.kind.clone()));
+                props.insert("note".into(), PropValue::Str(n.note.clone()));
+                props.insert("rank".into(), PropValue::Int(n.rank));
+                props.insert("active".into(), PropValue::Bool(n.active));
+
+                ops.push(Op::CreateNode {
+                    id,
+                    scope: self.scope,
+                    label: LABEL.into(),
+                    props,
+                });
+            }
+            self.db.submit_at(ops, 1).map_err(err)?;
         }
-        self.db.submit_at(ops, 1).map_err(err)?;
 
-        let mut ops = Vec::with_capacity(corpus.edges.len());
-        for e in &corpus.edges {
-            ops.push(Op::CreateEdge {
-                id: EdgeId::new(),
-                scope: self.scope,
-                ty: e.ty.as_str().into(),
-                from: self.ids[&e.from],
-                to: self.ids[&e.to],
-                props: Props::new(),
-                valid_from: Some(2),
-            });
+        for chunk in corpus.edges.chunks(batch) {
+            let mut ops = Vec::with_capacity(chunk.len());
+            for e in chunk {
+                ops.push(Op::CreateEdge {
+                    id: EdgeId::new(),
+                    scope: self.scope,
+                    ty: e.ty.as_str().into(),
+                    from: self.ids[&e.from],
+                    to: self.ids[&e.to],
+                    props: Props::new(),
+                    valid_from: Some(2),
+                });
+            }
+            self.db.submit_at(ops, 2).map_err(err)?;
         }
-        self.db.submit_at(ops, 2).map_err(err)?;
         Ok(())
     }
 
