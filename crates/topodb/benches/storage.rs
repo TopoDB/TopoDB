@@ -6,6 +6,7 @@
 //! `tests/size_report.rs` as the resumable `build_open_fixture` /
 //! `open_report` pair instead (see that module's doc comment).
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use std::thread;
 use topodb::workload::{batches, WorkloadSpec};
 use topodb::{
     Db, Direction, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, ScopeId, ScopeSet,
@@ -60,6 +61,90 @@ fn write(c: &mut Criterion) {
         )
     });
 }
+/// Group-commit target (Task 1, engine write/read-path plan): 16 threads
+/// each submitting 16 single-`CreateNode` batches (256 submits total) —
+/// today, one applier-thread commit (with its own fsync) per submit; after
+/// Task 6's group commit, many of these should land in shared transactions.
+/// A fresh db is built per iteration via `iter_batched`, outside the timed
+/// closure (mirroring `write`'s per-iteration db construction above), so
+/// only the concurrent submit storm itself is measured.
+///
+/// Retuned down from the plan's original 16×64 (1,024 submits/iter): at
+/// criterion's default 100 samples that shape is fsync-bound to roughly
+/// 2,100s total (measured — `concurrent_submit_16`'s own warmup estimate),
+/// far past any reasonable command budget. 16×16 gets a full run down to a
+/// few minutes at `sample_size(10)`/`measurement_time(20s)`, in its own
+/// group (like `cold`, above) rather than the crate's default config. The
+/// exact shape only matters for being IDENTICAL across the before/after
+/// comparison this bench exists for — it's locked at 16×16 from this
+/// baseline forward.
+fn concurrent_submit_16(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(20));
+    group.bench_function("concurrent_submit_16", |b| {
+        b.iter_batched(
+            || {
+                let d = tempfile::tempdir().unwrap();
+                let db = Db::open_with(d.path().join("concurrent.redb"), spec()).unwrap();
+                (d, db)
+            },
+            |(_d, db)| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        let db = db.clone();
+                        thread::spawn(move || {
+                            for _ in 0..16 {
+                                db.submit(vec![Op::CreateNode {
+                                    id: NodeId::new(),
+                                    scope: Scope::Id(ScopeId::new()),
+                                    label: "Bench".into(),
+                                    props: Default::default(),
+                                }])
+                                .unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join().unwrap();
+                }
+            },
+            BatchSize::PerIteration,
+        )
+    });
+    group.finish();
+}
+
+/// Label-scan baseline (Task 1, engine write/read-path plan): the read
+/// side's before/after instrument for Task 7's new `LABEL_INDEX` — today
+/// `nodes_by_label` scans/filters `NODES` directly (see `read.rs`), which
+/// this bench captures pre-index. A 10k-memory `topodb::workload` corpus
+/// (default `WorkloadSpec`, seed 0xC0FFEE — matching `traversal_fixture`'s
+/// fixture above) is built ONCE outside the timing loop; only the repeated
+/// `nodes_by_label(&scopes, "Memory")` scan is measured.
+fn nodes_by_label_10k(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("label.redb");
+    let db = Db::open_with(&path, spec()).unwrap();
+    for b in batches(&WorkloadSpec {
+        memories: 10_000,
+        ..Default::default()
+    }) {
+        db.submit(b).unwrap();
+    }
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    let sanity = db.nodes_by_label(&scopes, "Memory");
+    assert_eq!(
+        sanity.len(),
+        10_000,
+        "nodes_by_label_10k fixture must return all 10k memory nodes"
+    );
+    c.bench_function("nodes_by_label_10k", |b| {
+        b.iter(|| db.nodes_by_label(&scopes, "Memory"))
+    });
+}
+
 /// Builds a 10k-memory workload fixture (default `WorkloadSpec`: embed_pct
 /// 20, matching the v1/v2 baseline workload) once, and resolves the seed
 /// node for `traverse_warm_10k`/`traverse_cold_10k` via the equality index
@@ -297,6 +382,8 @@ criterion_group!(
     benches,
     cold_open,
     write,
+    concurrent_submit_16,
+    nodes_by_label_10k,
     traverse_warm,
     traverse_cold,
     search_warm_10k_scope,
