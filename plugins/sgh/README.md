@@ -34,6 +34,9 @@ with prebuilt platform binaries is deliberately deferred.
   directly into a shell command line, so a goal containing shell metacharacters
   cannot be interpreted as shell syntax.
 
+  `/sgh:plan` writes `.sgh/goal.txt` and `.sgh/graph.yaml` into your project
+  directory as untracked files; you may want to add `.sgh/` to `.gitignore`.
+
 - `/sgh:run` — show the bound and every shell command for approval, then
   execute after you say yes. It takes **no argument**: it always runs the
   fixed path `.sgh/graph.yaml`, the file `/sgh:plan` writes. If you pass it a
@@ -44,10 +47,15 @@ with prebuilt platform binaries is deliberately deferred.
 
 ## The approval gate
 
-`/sgh:run` never executes anything you have not read. It runs `sgh validate`
-first — read-only — which prints every command node's exact `run:` string,
-shows you all of them verbatim, and waits for explicit approval before running
-anything.
+`/sgh:run` runs `sgh validate` first — read-only — which prints every
+**command** node's exact `run:` string, shows you all of them verbatim, and
+waits for explicit approval before running anything. That covers shell
+commands only. Graphs can also contain **agent** nodes, and those are not
+displayed by `validate` or by the gate: an agent node spawns `claude -p` with
+a model-authored prompt, and that prompt goes unread and runs under your
+existing Claude Code permission settings. The worst-case bound tells you how
+many agent calls can happen at most — it does not tell you what any of them
+will be asked to do.
 
 `--yes-including-revisions` is not used anywhere in this plugin, and `--replan`
 is off unless you ask for it by name. Both exist because a replan lets a model

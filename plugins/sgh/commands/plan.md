@@ -33,6 +33,6 @@ If the planner exits non-zero it failed to produce a valid graph within
 `--max-attempts` (default 3). Report what it said rather than retrying blindly;
 a goal that will not compile usually needs to be narrowed, not repeated.
 
-Finish by telling them the graph is at `.sgh/graph.yaml` and that `/sgh:run
-.sgh/graph.yaml` will execute it after showing every command for approval.
+Finish by telling them the graph is at `.sgh/graph.yaml` and that `/sgh:run`
+(no argument) will execute it after showing every command for approval.
 Do not run it yourself — planning and executing are deliberately separate.
