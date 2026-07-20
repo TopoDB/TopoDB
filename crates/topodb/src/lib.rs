@@ -25,6 +25,7 @@ mod scopes;
 mod slots;
 mod state;
 mod storage;
+mod suggest;
 mod validate;
 mod vector;
 mod vector_store;
@@ -45,6 +46,7 @@ pub use state::{EdgeRecord, NodeRecord};
 pub use storage::AppliedBatch;
 #[doc(hidden)]
 pub use storage::TableReport;
+pub use suggest::{LinkSuggestion, SuggestLinksQuery};
 pub use vector::VectorQuery;
 #[doc(hidden)]
 pub mod workload;
