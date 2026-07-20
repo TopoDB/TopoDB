@@ -99,6 +99,36 @@ fn command_preview(v: &Validated) -> Vec<String> {
         .collect()
 }
 
+/// Agent nodes with no declared `output.schema`.
+///
+/// The executor validates a node's output only when a schema is declared, so
+/// these nodes are accepted whatever they return. Their success is
+/// self-reported: the runner can now tell that a tool was denied, but not that
+/// an agent which was granted everything actually did the work rather than
+/// reporting that it had. Surfaced at the approval gate so "succeeded" on such
+/// a node is read as a claim, not as evidence.
+fn unconstrained_agents(v: &Validated) -> Vec<String> {
+    v.graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Agent && n.output.is_none())
+        .map(|n| n.id.clone())
+        .collect()
+}
+
+/// Report which agent nodes report their own success unchecked. Printed at
+/// the same moment as the command preview: both are things a person should
+/// weigh before approving a run.
+fn print_unconstrained(v: &Validated) {
+    let ids = unconstrained_agents(v);
+    if ids.is_empty() {
+        return;
+    }
+    println!("self-reported nodes ({}): {}", ids.len(), ids.join(", "));
+    println!("  these declare no output schema, so whatever they return is accepted —");
+    println!("  their `succeeded` is a claim, not evidence. Check the result yourself.");
+}
+
 /// Announce a replanning attempt and the ceiling it counts against, so the
 /// bound on autonomous work is visible rather than implicit.
 fn replan_banner(attempt: u32, max: u32) -> String {
@@ -217,6 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  {line}");
                         }
                     }
+                    print_unconstrained(&v);
                 }
                 Err(errors) => {
                     for e in &errors {
@@ -278,6 +309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  {line}");
                     }
                 }
+
+                print_unconstrained(&current);
 
                 if needs_prompt(is_revision, yes, yes_including_revisions) {
                     println!("\nProceed? [y/N]");
@@ -487,6 +520,36 @@ mod tests {
              - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n",
         );
         assert!(command_preview(&v).is_empty());
+    }
+
+    // An agent node with no declared `output.schema` is unconstrained: the
+    // executor validates output only when a schema is present, so whatever the
+    // node returns is accepted. Its success is self-reported. The gate should
+    // say so, because "succeeded" on such a node is not evidence of work.
+
+    #[test]
+    fn unconstrained_agents_lists_agent_nodes_with_no_declared_output() {
+        let v = validated(
+            "version: 1\ngoal: g\nnodes:\n\
+             - {id: survey, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+             - {id: build, kind: command, run: 'cargo build', budget: {retries: 0, repairs: 0}}\n\
+             - {id: checked, kind: agent, prompt: p, output: {schema: {type: object}}, budget: {retries: 0, repairs: 0}}\n",
+        );
+        assert_eq!(
+            unconstrained_agents(&v),
+            vec!["survey".to_string()],
+            "only agent nodes lacking an output schema are unconstrained"
+        );
+    }
+
+    #[test]
+    fn unconstrained_agents_is_empty_when_every_agent_declares_output() {
+        let v = validated(
+            "version: 1\ngoal: g\nnodes:\n\
+             - {id: a, kind: agent, prompt: p, output: {schema: {type: object}}, budget: {retries: 0, repairs: 0}}\n\
+             - {id: b, kind: command, run: 'true', budget: {retries: 0, repairs: 0}}\n",
+        );
+        assert!(unconstrained_agents(&v).is_empty());
     }
 
     #[test]
