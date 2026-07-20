@@ -36,8 +36,7 @@ rather than ever blocking a session:
   context — ranked by access within the recent window, capped well under
   2k tokens. No broker running yet (the very first session of a project)
   means no injection; it appears from the next session on. Requires server
-  version 0.0.11+; with the currently pinned 0.0.10 this silently does
-  nothing until the pin bumps.
+  version 0.0.11+, which is what the plugin pins, so this is live.
 - **Episode capture:** the plugin records which memories each
   `search_memories`/`traverse`/`recent_memories` call returned and, at
   session end, writes an `Episode` node with `RetrievalEvent`s marking

@@ -1,7 +1,9 @@
 // Unit: renderer. Integration: run the real hook script against a real
-// broker backed by the LOCALLY BUILT server (the pinned npm server is
-// 0.0.10 and lacks recent_memories — build with `cargo build -p topodb-mcp`
-// first; the test skips loudly if the binary is absent).
+// broker backed by the LOCALLY BUILT server (this test predates the 0.0.11
+// pin, when the pinned npm server lacked recent_memories; it still uses a
+// local build so it exercises the CURRENT server rather than the released
+// one — build with `cargo build -p topodb-mcp` first; the test skips loudly
+// if the binary is absent).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -40,9 +42,10 @@ test("renderInjection: caps, formats, and returns null when empty", () => {
 
 // --- integration fixture plumbing ---------------------------------------
 //
-// The pinned npm server (0.0.10, see server-args.js) does not have
-// recent_memories yet — it lands in the same release this plugin ships in,
-// but this repo's own devDependency is still on 0.0.10. So this test cannot
+// Written when the pinned npm server predated recent_memories. Both the pin
+// and the devDependency are now 0.0.11, which has it (see server-args.js),
+// but this test deliberately keeps using a local build so it tests the
+// server in THIS checkout rather than the last release. That means it cannot
 // go through launch.js's resolveServer (which insists on the pinned
 // version's REAL npm package). Instead it mirrors test/broker.test.js's
 // mkFakeCancelServerDataDir technique: a fake `@topodb/topodb-mcp` shim
