@@ -19,6 +19,11 @@ pub(crate) const PPR_EPSILON: f64 = 1e-9;
 /// top text/vector hit out of the eval's top-3 ("search index rebuilding
 /// tripling deploy time"). At 1 hop the membership matches the old flat
 /// leg — PPR improves the ORDERING only — and the full eval stays green.
+///
+/// Note: `traverse` collects edges only while expanding nodes within the
+/// hop budget, so at 1 hop the subgraph is the union of seed stars —
+/// neighbor↔neighbor edges are absent and PPR ranks by weighted
+/// seed-adjacency.
 pub(crate) const GRAPH_HOPS: u8 = 1;
 /// `suggest_links` traversal bound.
 pub(crate) const SUGGEST_HOPS: u8 = 3;

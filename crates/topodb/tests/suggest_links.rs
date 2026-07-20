@@ -104,7 +104,15 @@ fn shared_neighbors_predict_the_missing_edge_with_evidence() {
     );
     assert!(top.structural);
     assert!(!top.semantic, "no embeddings in this fixture");
-    // e (2 hops via d, one path) may follow, but never outrank b.
+    // e (2 hops via d, one converging path) may appear, but must never
+    // outrank b (two converging paths).
+    if let Some(e_pos) = out.iter().position(|s| s.node.id == f.e) {
+        let b_pos = out.iter().position(|s| s.node.id == f.b).unwrap();
+        assert!(
+            b_pos < e_pos,
+            "b (2 shared neighbors) must outrank e (1 path)"
+        );
+    }
 }
 
 #[test]

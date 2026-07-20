@@ -45,6 +45,9 @@ impl Db {
     /// `q.model`). Self and current 1-hop neighbors are never suggested.
     /// Unknown/out-of-scope target → `Ok(empty)` (mirrors `Db::node`'s
     /// absence semantics — no existence leak).
+    ///
+    /// Note: the target lookup goes through `Db::node`, which bumps the
+    /// node's access counter — deliberate, matching every scoped read.
     pub fn suggest_links(&self, q: &SuggestLinksQuery) -> Result<Vec<LinkSuggestion>, TopoError> {
         if q.k == 0 {
             return Err(TopoError::Rejected("suggest_links requires k > 0".into()));
