@@ -20,8 +20,25 @@ shells out to a locally built binary:
 cargo build --release -p topodb-sgh
 ```
 
-Point `SGH_BIN` at an existing binary to use one from elsewhere. npm packaging
-with prebuilt platform binaries is deliberately deferred.
+or `cargo install --path crates/topodb-sgh` to put `sgh` on your `PATH`.
+
+The plugin looks for the binary in this order:
+
+1. `$SGH_BIN`, if you set it — an explicit override always wins.
+2. `target/release/sgh` in the TopoDB checkout the plugin is running from. When
+   you are developing in the repo, the build you just made beats anything on
+   `PATH`.
+3. `sgh` on your `PATH`. This is the case that matters for an installed
+   plugin: installed from the marketplace, the plugin lives in a cache
+   directory with no repo above it, so step 2 finds nothing.
+4. `$CARGO_HOME/bin/sgh` (default `~/.cargo/bin/sgh`), for a `cargo install`
+   done in a shell whose `PATH` you have not reloaded.
+
+If none of those exist it tells you where it looked and stops — it never
+builds anything for you, because a slash command that silently starts a
+multi-minute compile is a bad surprise.
+
+npm packaging with prebuilt platform binaries is deliberately deferred.
 
 ## Commands
 

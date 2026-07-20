@@ -92,6 +92,36 @@ else
   fails=$((fails + 1))
 fi
 
+# 10. An in-repo release build is preferred over one on PATH: when you are
+# developing in the repo, the build you just made is the one you mean.
+repo="$(mktemp -d)"; mkdir -p "$repo/plugins/sgh" "$repo/target/release" "$repo/binstub"
+printf '#!/bin/sh\n' > "$repo/target/release/sgh"; chmod +x "$repo/target/release/sgh"
+printf '#!/bin/sh\n' > "$repo/binstub/sgh"; chmod +x "$repo/binstub/sgh"
+actual="$(env -u SGH_BIN PATH="$repo/binstub:$PATH" CLAUDE_PLUGIN_ROOT="$repo/plugins/sgh" \
+  bash -c "source '$LIB' >/dev/null && printf '%s' \"\$SGH_BIN\"")"
+check "in-repo build beats PATH" "$repo/target/release/sgh" "$actual"
+
+# 11. With no in-repo build, an `sgh` on PATH is used. This is the installed-
+# plugin case: the plugin lives in a cache dir with no repo above it.
+cache="$(mktemp -d)"; mkdir -p "$cache/plugins/sgh" "$cache/binstub"
+printf '#!/bin/sh\n' > "$cache/binstub/sgh"; chmod +x "$cache/binstub/sgh"
+actual="$(env -u SGH_BIN PATH="$cache/binstub:$PATH" CLAUDE_PLUGIN_ROOT="$cache/plugins/sgh" \
+  bash -c "source '$LIB' >/dev/null && printf '%s' \"\$SGH_BIN\"")"
+check "PATH is used when no in-repo build exists" "$cache/binstub/sgh" "$actual"
+
+# 12. Nothing anywhere still fails loudly with the build hint — the error path
+# must not be lost while adding fallbacks.
+empty="$(mktemp -d)"; mkdir -p "$empty/plugins/sgh"
+# PATH points at an empty (but real) dir so `sgh` is unfindable; bash is
+# invoked by absolute path so the shell itself stays reachable.
+nobin="$(mktemp -d)"
+out="$(env -u SGH_BIN PATH="$nobin" CLAUDE_PLUGIN_ROOT="$empty/plugins/sgh" \
+  /bin/bash -c "source '$LIB' 2>&1"; printf 'rc=%s' "$?")"
+case "$out" in
+  *"cargo build --release -p topodb-sgh"*rc=1*) echo "ok   - still errors with build hint when nothing is found" ;;
+  *) echo "FAIL - still errors with build hint when nothing is found"; echo "       got: $out"; fails=$((fails + 1)) ;;
+esac
+
 echo
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; fi
 exit "$fails"
