@@ -16,7 +16,7 @@ use crate::slots::{
 };
 use crate::state::{EdgeRecord, NodeRecord};
 use crate::vector_store::{self, EMBEDDING_REF, VECTORS};
-use redb::{Database, ReadableTable, Table, TableDefinition};
+use redb::{Database, ReadableTable, Table, TableDefinition, TableHandle};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -132,6 +132,23 @@ impl Storage {
             dicts: RwLock::new(Dicts::default()),
             scope_registry: RwLock::new(ScopeRegistry::default()),
         };
+        // Read-only precheck: the overwhelmingly common open is against a
+        // file already at the current format, with every table present and
+        // the shared scope seeded. For that file the write transaction below
+        // creates nothing, seeds nothing and stamps nothing — but its commit
+        // still fsyncs, and that fsync was measured as the entire remaining
+        // cost of a cold open (~22 ms of a ~43 ms open at 20k nodes, against
+        // a ~21 ms raw-redb floor). Deciding inside a `begin_read` lets that
+        // case skip the write transaction altogether.
+        //
+        // Mirrors the same precheck in `ensure_index_spec`. No TOCTOU: this
+        // `Database` was constructed two statements ago and no other handle
+        // to it exists yet, so nothing can invalidate the answer between the
+        // read here and the `begin_write` below.
+        if !Self::open_needs_write(&s.db)? {
+            return s.finish_open();
+        }
+
         let tx = s.db.begin_write().map_err(storage_err)?;
         let existing = {
             tx.open_table(OPS).map_err(storage_err)?;
@@ -436,14 +453,95 @@ impl Storage {
             }
         }
         tx.commit().map_err(storage_err)?;
-        let r = s.db.begin_read().map_err(storage_err)?;
-        *s.dicts.write().expect("dict lock poisoned") = Dicts::load(&r)?;
-        *s.scope_registry
+        s.finish_open()
+    }
+
+    /// The tables `open_with_options`'s write transaction opens (and so
+    /// creates when absent). `EMBEDDINGS` is deliberately excluded — it is
+    /// v3-and-earlier only, and the pre-v4 migration arms open it themselves.
+    fn open_tables() -> [&'static str; 21] {
+        [
+            OPS.name(),
+            NODES.name(),
+            EDGES.name(),
+            COUNTERS.name(),
+            POSTINGS.name(),
+            FTS_DOCS.name(),
+            FTS_STATS.name(),
+            VECTOR_DIMS.name(),
+            VECTORS.name(),
+            EMBEDDING_REF.name(),
+            DICT.name(),
+            NODE_SLOTS.name(),
+            NODE_IDS.name(),
+            EDGE_SLOTS.name(),
+            EDGE_IDS.name(),
+            SCOPES.name(),
+            OUT_ADJ.name(),
+            IN_ADJ.name(),
+            PROP_INDEX.name(),
+            LABEL_INDEX.name(),
+            META.name(),
+        ]
+    }
+
+    /// Whether opening this database requires a write transaction.
+    ///
+    /// True — the conservative answer — for a file with nothing committed
+    /// yet, a file at any other format version (a migration arm must run), a
+    /// file missing any table the open path would create, or one whose
+    /// shared-scope row was never seeded. False only when the write
+    /// transaction would provably be a no-op, so every "don't know" answer
+    /// (including an unreadable table) returns true and takes the old path.
+    fn open_needs_write(db: &Database) -> Result<bool, TopoError> {
+        let tx = match db.begin_read() {
+            Ok(tx) => tx,
+            // No committed transaction yet: a brand-new file.
+            Err(_) => return Ok(true),
+        };
+        let meta = match tx.open_table(META) {
+            Ok(t) => t,
+            Err(_) => return Ok(true),
+        };
+        match meta.get("format_version").map_err(storage_err)? {
+            Some(v) => {
+                let b: [u8; 4] = v
+                    .value()
+                    .try_into()
+                    .map_err(|_| TopoError::Encoding("bad format_version".into()))?;
+                if u32::from_le_bytes(b) != FORMAT_VERSION {
+                    return Ok(true);
+                }
+            }
+            None => return Ok(true),
+        }
+        let present: std::collections::HashSet<String> = tx
+            .list_tables()
+            .map_err(storage_err)?
+            .map(|h| h.name().to_string())
+            .collect();
+        if Self::open_tables().iter().any(|n| !present.contains(*n)) {
+            return Ok(true);
+        }
+        let scopes = match tx.open_table(SCOPES) {
+            Ok(t) => t,
+            Err(_) => return Ok(true),
+        };
+        Ok(!crate::scopes::shared_is_seeded(&scopes)?)
+    }
+
+    /// In-memory state every open needs, whichever path reached here. Kept in
+    /// one place so the read-only fast path and the write path cannot drift.
+    fn finish_open(self) -> Result<Self, TopoError> {
+        let r = self.db.begin_read().map_err(storage_err)?;
+        *self.dicts.write().expect("dict lock poisoned") = Dicts::load(&r)?;
+        *self
+            .scope_registry
             .write()
             .expect("scope registry lock poisoned") = ScopeRegistry::load(&r)?;
         drop(r);
-        s.ensure_index_spec()?;
-        Ok(s)
+        self.ensure_index_spec()?;
+        Ok(self)
     }
 
     /// Reconciles the on-disk text AND equality indexes with the `IndexSpec`

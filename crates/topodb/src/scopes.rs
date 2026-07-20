@@ -116,6 +116,17 @@ impl ScopeRegistry {
         self.by_scope.get(&scope).copied()
     }
 }
+/// Whether the shared-scope row is already present, readable without a write
+/// transaction. `open_with_options`'s read-only precheck needs to know
+/// whether [`seed_shared`] would actually insert anything, and asking that
+/// question must not itself require the write transaction it is trying to
+/// avoid.
+pub(crate) fn shared_is_seeded(
+    t: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<bool, TopoError> {
+    Ok(t.get(key(0).as_slice()).map_err(storage_err)?.is_some())
+}
+
 pub(crate) fn seed_shared(
     t: &mut Table<'_, &'static [u8], &'static [u8]>,
 ) -> Result<(), TopoError> {
