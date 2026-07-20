@@ -44,7 +44,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   `nodes_by_label_newest(scopes, label, k)` serves newest-first reads near-O(k) (session-start
   injection's `recent_memories` uses it); float-range scans stop decoding embeddings. Unselective
   full-label scans stay flat; selective-label scans run ~250x faster and newest-first k-bounded
-  reads ~1,400x faster on a 10k corpus (same-machine criterion numbers).
+  reads ~1,400x faster on a 10k corpus (same-machine criterion numbers). `recent_memories` (and any
+  other newest-k read going through `nodes_by_label_newest`) now bumps access counters only for the
+  `k` nodes actually returned, rather than for every node of the label — a deliberate narrowing.
 - **`SetEmbedding` rejects non-finite components** (NaN/±Inf corrupt cosine scoring).
 - New tests: kill-during-commit crash recovery (25-round SIGKILL harness), read-during-write
   latency, group-commit semantics, differential-oracle coverage for the label index.

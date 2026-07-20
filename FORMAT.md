@@ -316,9 +316,9 @@ straight off the just-removed row (labels are immutable — there is no
 `SetNodeProps`-driven update case). The `node_id` tail means every row
 sharing a `(label_id, scope_id)` prefix sorts in mint-time order (a ULID's
 leading bits are a timestamp), so a bounded prefix scan over that key range
-visits a label's nodes within a scope oldest-first — the property the future
-label-scoped read path (not yet wired up as of this table's introduction) is
-expected to lean on.
+visits a label's nodes within a scope oldest-first — the property the
+label-scoped read path (`Storage::load_nodes_by_label`/
+`load_nodes_by_label_newest`, wired up in Task 8) leans on.
 
 **Value frame** (`codec.rs`): every `nodes`, `edges`, `vectors`, `postings`
 chunk, and adjacency (`out_adj`/`in_adj`) block value is wrapped in a 1-byte

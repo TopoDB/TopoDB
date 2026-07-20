@@ -497,6 +497,33 @@ fn reference_model_matches_v2_engine_on_generated_workloads() {
         );
     }
 
+    // Final-review Finding 1's differential-oracle regression (adjudicated
+    // fix item 4): `CreateNode` ids are mint-once — a duplicate-id
+    // `CreateNode` is now rejected at live submit rather than silently
+    // upserted (see `validate.rs::prevalidate_create_node_ids`), and the old
+    // silent-upsert path is what left `LABEL_INDEX` permanently stale.
+    // Re-create a STILL-LIVE memory node's id (`1` isn't a multiple of 13,
+    // so it survived the `RemoveNode` loop above) under a different
+    // label/scope. `db.submit` must reject it, and the reference model must
+    // NOT apply it — treating a duplicate-id create as rejected, matching
+    // the new validation, is exactly what lets the oracle own this class of
+    // bug permanently rather than needing a one-off regression test.
+    let dup_target = memory_id(1);
+    let dup_err = db
+        .submit(vec![Op::CreateNode {
+            id: dup_target,
+            scope: Scope::Id(ScopeId::from_u128(1)),
+            label: "Impersonator".into(),
+            props: BTreeMap::new(),
+        }])
+        .unwrap_err();
+    assert!(
+        matches!(dup_err, TopoError::Rejected(_)),
+        "duplicate-id CreateNode must be rejected by live submit, got {dup_err:?}"
+    );
+    // No `model.apply` call: the reference model's job here is to agree
+    // that the op never happened, not to replicate it.
+
     let own = ScopeId::from_u128(1);
     let scope2 = ScopeId::from_u128(2);
     let scopes = [

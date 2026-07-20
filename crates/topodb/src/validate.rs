@@ -100,6 +100,44 @@ pub(crate) fn prevalidate_edge_scopes(
     Ok(())
 }
 
+/// Rejects any `CreateNode` in `ops` whose id already resolves to a node —
+/// either in `pre` (a storage read of pre-batch node state taken by the
+/// applier before `apply_batch`, keyed by every id this batch might
+/// reference, or the same-group overlay from an earlier batch in this
+/// group — see `db.rs::apply_group`) or earlier in the SAME `ops` slice (two
+/// `CreateNode`s for the same id in one batch).
+///
+/// Ids are mint-once: every in-tree writer (MCP, the batch DSL) always mints
+/// a fresh ULID, so a `CreateNode` for an id that already exists is not a
+/// legitimate "upsert" request — it was, until this check, silently accepted
+/// as one, and that upsert path left `LABEL_INDEX` (and, before this branch,
+/// FTS/prop-index state) permanently stale: the new `(label, scope, id)` key
+/// was inserted but the old one was never removed, so label reads could
+/// return wrong-label hits and leak a node across a scope boundary. Runs on
+/// live submit only, same as `prevalidate_edge_scopes` above and for the
+/// same reason: this must not run inside `apply_op`, which is shared with
+/// op-log replay, and a rule enforced there would retroactively condemn an
+/// already-committed historic log. Replay stays tolerant; `storage.rs`'s
+/// `load_nodes_by_label`/`load_nodes_by_label_newest` re-filter against the
+/// fetched record as defense for whatever a historic log still contains.
+pub(crate) fn prevalidate_create_node_ids(
+    pre: &HashMap<NodeId, NodeRecord>,
+    ops: &[Op],
+) -> Result<(), TopoError> {
+    let mut seen_in_batch: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for op in ops {
+        if let Op::CreateNode { id, .. } = op {
+            if pre.contains_key(id) || !seen_in_batch.insert(*id) {
+                return Err(TopoError::Rejected(format!(
+                    "CreateNode {id:?}: id already exists — ids are mint-once; use \
+                     SetNodeProps to update an existing node instead of re-creating it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn label(scope: Scope) -> String {
     match scope {
         Scope::Shared => "shared".to_string(),
@@ -141,5 +179,76 @@ mod tests {
         assert!(!edge_scope_is_valid(p, a, a));
         assert!(!edge_scope_is_valid(p, a, Scope::Shared));
         assert!(!edge_scope_is_valid(p, Scope::Shared, a));
+    }
+
+    fn node_record(id: NodeId, scope: Scope) -> NodeRecord {
+        NodeRecord {
+            id,
+            scope,
+            label: Default::default(),
+            props: Default::default(),
+            embedding: None,
+        }
+    }
+
+    fn create_op(id: NodeId) -> Op {
+        Op::CreateNode {
+            id,
+            scope: Scope::Shared,
+            label: "X".into(),
+            props: Default::default(),
+        }
+    }
+
+    /// Direct unit coverage of `prevalidate_create_node_ids` — the function
+    /// both `apply_one_job` and `apply_group` (`db.rs`) call. `apply_group`
+    /// feeds it `effective_pre`, which already has the same-group overlay
+    /// folded in (`Some(scope)` for an earlier batch's `CreateNode`), so
+    /// exercising "id present in `pre`" here covers that path's contract
+    /// too, without needing to force an actual optimistic group commit.
+    #[test]
+    fn fresh_id_is_accepted() {
+        let pre = HashMap::new();
+        let ops = vec![create_op(NodeId::new())];
+        assert!(prevalidate_create_node_ids(&pre, &ops).is_ok());
+    }
+
+    #[test]
+    fn id_already_present_in_pre_state_is_rejected() {
+        let id = NodeId::new();
+        let mut pre = HashMap::new();
+        pre.insert(id, node_record(id, Scope::Shared));
+        let ops = vec![create_op(id)];
+        assert!(matches!(
+            prevalidate_create_node_ids(&pre, &ops),
+            Err(TopoError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_id_within_the_same_ops_slice_is_rejected() {
+        let pre = HashMap::new();
+        let id = NodeId::new();
+        let ops = vec![create_op(id), create_op(id)];
+        assert!(matches!(
+            prevalidate_create_node_ids(&pre, &ops),
+            Err(TopoError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn distinct_ids_and_non_create_ops_are_unaffected() {
+        let pre = HashMap::new();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let ops = vec![
+            create_op(a),
+            create_op(b),
+            Op::SetNodeProps {
+                id: a,
+                props: Default::default(),
+            },
+        ];
+        assert!(prevalidate_create_node_ids(&pre, &ops).is_ok());
     }
 }

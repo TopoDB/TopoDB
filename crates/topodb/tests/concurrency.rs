@@ -433,6 +433,7 @@ fn failing_batch_in_a_group_poisons_nothing() {
     // replaying the surviving op log produces.
     let nodes_before = db.debug_dump_nodes();
     let edges_before = db.debug_dump_edges();
+    let label_index_before = db.debug_dump_label_index().unwrap();
     db.rebuild_state_from_ops().unwrap();
     assert_eq!(
         nodes_before,
@@ -443,5 +444,10 @@ fn failing_batch_in_a_group_poisons_nothing() {
         edges_before,
         db.debug_dump_edges(),
         "EDGES must equal a replay of the surviving op log"
+    );
+    assert_eq!(
+        label_index_before,
+        db.debug_dump_label_index().unwrap(),
+        "LABEL_INDEX must equal a replay of the surviving op log"
     );
 }

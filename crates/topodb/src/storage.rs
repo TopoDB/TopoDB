@@ -1458,7 +1458,19 @@ impl Storage {
                     &scope_registry,
                     slot.value(),
                 )? {
-                    out.push(rec);
+                    // Defense against stale LABEL_INDEX rows from a HISTORIC
+                    // op log: a duplicate-id `CreateNode` replayed from an
+                    // old log (live submit now rejects these, but replay
+                    // stays tolerant — see `validate.rs`) can leave a row
+                    // here that still points at this slot under the OLD
+                    // `(label, scope)` even though the record itself was
+                    // overwritten with a new label/scope. Re-check against
+                    // the fetched record rather than trusting the index key
+                    // — this makes the read correct regardless of what a
+                    // replayed log contains.
+                    if rec.label == label && scopes.contains(rec.scope) {
+                        out.push(rec);
+                    }
                 }
             }
         }
@@ -1521,8 +1533,18 @@ impl Storage {
                     &scope_registry,
                     slot.value(),
                 )? {
-                    candidates.push(rec);
-                    taken += 1;
+                    // See the matching comment in `load_nodes_by_label`: a
+                    // stale LABEL_INDEX row from a historic duplicate-id
+                    // `CreateNode` can point at a slot whose record no
+                    // longer matches this `(label, scope)`. Re-filter
+                    // against the fetched record instead of trusting the
+                    // index key. A stale row does not consume a `k` slot —
+                    // same treatment as the deleted-node tombstone case
+                    // below (`read_node_by_slot` returning `None`).
+                    if rec.label == label && scopes.contains(rec.scope) {
+                        candidates.push(rec);
+                        taken += 1;
+                    }
                 }
             }
         }
@@ -4414,6 +4436,162 @@ mod tests {
         assert_eq!(
             before, after,
             "rebuild must reproduce LABEL_INDEX exactly, not leave a's row stale or drop b's"
+        );
+    }
+
+    /// Final-review Finding 1/3 regression, MINIMUM variant per the plan
+    /// (constructing a full historic-replay corpus for this was judged
+    /// disproportionate — see the commit message / final-fix report): live
+    /// submit now rejects a duplicate-id `CreateNode` outright (see
+    /// `db.rs`/`validate.rs`), so a stale `LABEL_INDEX` row can only exist
+    /// from a HISTORIC op log predating that rejection. This manufactures
+    /// exactly that leftover — bypassing `apply_op` with a raw redb write,
+    /// the same idiom `open_rejects_unsupported_format_version` and
+    /// `v3_file_with_one_model_two_dims_across_scopes_rejects_migration_not_encoding`
+    /// use above — and checks the read-side re-filter added to
+    /// `load_nodes_by_label`/`load_nodes_by_label_newest` skips it: a row
+    /// whose key says `(label, scope)` but whose slot's CURRENT record
+    /// disagrees (because a duplicate-id create — legal when the row was
+    /// written — later overwrote that slot's record without anyone cleaning
+    /// up the old key) must not surface, neither as a wrong-label hit nor,
+    /// worse, leaked across a scope boundary.
+    #[test]
+    fn label_reads_skip_a_stale_index_row_whose_record_no_longer_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().join("t.redb")).unwrap();
+        let scope_a_id = ScopeId::new();
+        let scope_b_id = ScopeId::new();
+        let scope_a = Scope::Id(scope_a_id);
+        let scope_b = Scope::Id(scope_b_id);
+        let real_alpha = NodeId::new();
+        let recreated = NodeId::new();
+
+        s.apply_batch(
+            vec![
+                Op::CreateNode {
+                    id: real_alpha,
+                    scope: scope_a,
+                    label: "Alpha".into(),
+                    props: Default::default(),
+                },
+                // Stands in for a node that a historic log later
+                // duplicate-created under a NEW label/scope — its CURRENT
+                // record is Beta/scope_a; the stale Alpha/scope_a and
+                // Beta/scope_b rows inserted below simulate the old
+                // `LABEL_INDEX` keys that the historic re-create never
+                // cleaned up.
+                Op::CreateNode {
+                    id: recreated,
+                    scope: scope_a,
+                    label: "Beta".into(),
+                    props: Default::default(),
+                },
+                // Throwaway: exists only so `scope_b` is interned (an
+                // uninterned scope has no possible LABEL_INDEX rows, same
+                // "unknown scope contributes nothing" degrade as an unknown
+                // label — this test wants scope_b to be a REAL, known scope
+                // that the stale row incorrectly leaks into).
+                Op::CreateNode {
+                    id: NodeId::new(),
+                    scope: scope_b,
+                    label: "Unrelated".into(),
+                    props: Default::default(),
+                },
+            ],
+            1,
+        )
+        .unwrap();
+
+        let slot = {
+            let tx = s.db.begin_read().unwrap();
+            let node_slots = tx.open_table(NODE_SLOTS).unwrap();
+            crate::slots::node_slot(&node_slots, recreated)
+                .unwrap()
+                .expect("recreated must have a slot")
+        };
+
+        // Manually plant the two stale rows a leftover duplicate-create
+        // would have left behind: the OLD (label, scope) the id used to be
+        // filed under, both still pointing at `recreated`'s current slot.
+        {
+            let tx = s.db.begin_write().unwrap();
+            {
+                let mut label_index = tx.open_table(LABEL_INDEX).unwrap();
+                let dicts = s.dicts.read().unwrap();
+                let scope_registry = s.scope_registry.read().unwrap();
+                let alpha_id = dicts.id_of(DictKind::Label, "Alpha").unwrap();
+                let beta_id = dicts.id_of(DictKind::Label, "Beta").unwrap();
+                let scope_a_reg_id = scope_registry.id_of(scope_a).unwrap();
+                let scope_b_reg_id = scope_registry.id_of(scope_b).unwrap();
+                // Stale wrong-label row: (Alpha, scope_a, recreated) — the
+                // record at this slot is actually Beta now.
+                label_index
+                    .insert(
+                        label_index_key(alpha_id, scope_a_reg_id, recreated).as_slice(),
+                        slot,
+                    )
+                    .unwrap();
+                // Stale cross-scope row: (Beta, scope_b, recreated) — the
+                // record's real scope is scope_a, not scope_b.
+                label_index
+                    .insert(
+                        label_index_key(beta_id, scope_b_reg_id, recreated).as_slice(),
+                        slot,
+                    )
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Wrong-label stale row: querying "Alpha" in scope_a must return
+        // only the genuine Alpha node, never `recreated` (whose record says
+        // Beta).
+        let alpha_hits = s
+            .load_nodes_by_label(&ScopeSet::of(&[scope_a_id]), "Alpha")
+            .unwrap();
+        assert_eq!(
+            alpha_hits.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![real_alpha],
+            "a stale wrong-label LABEL_INDEX row must not surface as an Alpha hit"
+        );
+        let alpha_hits_newest = s
+            .load_nodes_by_label_newest(&ScopeSet::of(&[scope_a_id]), "Alpha", 10)
+            .unwrap();
+        assert_eq!(
+            alpha_hits_newest.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![real_alpha],
+            "newest-k must also skip the stale wrong-label row"
+        );
+
+        // Cross-scope leak: querying "Beta" in scope_b (a reader who never
+        // reads scope_a) must get NOTHING — `recreated`'s real scope is
+        // scope_a, so the stale row must not leak it to a scope_b reader.
+        let beta_leak = s
+            .load_nodes_by_label(&ScopeSet::of(&[scope_b_id]), "Beta")
+            .unwrap();
+        assert!(
+            beta_leak.is_empty(),
+            "a stale cross-scope LABEL_INDEX row must never leak a node into a scope its \
+             record doesn't actually belong to"
+        );
+        let beta_leak_newest = s
+            .load_nodes_by_label_newest(&ScopeSet::of(&[scope_b_id]), "Beta", 10)
+            .unwrap();
+        assert!(
+            beta_leak_newest.is_empty(),
+            "newest-k must also refuse to leak across the stale cross-scope row"
+        );
+
+        // Sanity: scope_a's OWN "Beta" read (via the real, non-stale row)
+        // still finds `recreated` — the re-filter must not be so aggressive
+        // it breaks the legitimate row.
+        let beta_real = s
+            .load_nodes_by_label(&ScopeSet::of(&[scope_a_id]), "Beta")
+            .unwrap();
+        assert_eq!(
+            beta_real.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![recreated],
+            "the real (non-stale) row must still resolve normally"
         );
     }
 }

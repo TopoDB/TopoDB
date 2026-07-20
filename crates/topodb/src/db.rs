@@ -1054,12 +1054,16 @@ pub type VectorDimsDumpRow = (u32, u32);
 #[doc(hidden)]
 pub type LabelIndexDumpRow = (u32, u32, u128, u64);
 
-/// The node ids that `validate::prevalidate_edge_scopes` needs pre-batch
-/// storage state (scope) for: `CreateEdge`'s endpoints. A same-batch
-/// `CreateNode` for one of these ids is resolved locally by
-/// `prevalidate_edge_scopes` (via its own scan of `ops`) and needs no
-/// storage lookup — this only has to cover ids that might ALREADY exist in
-/// storage before this batch runs.
+/// The node ids that `validate::prevalidate_edge_scopes` and
+/// `validate::prevalidate_create_node_ids` need pre-batch storage state for:
+/// `CreateEdge`'s endpoints (scope), and every `CreateNode`'s own id
+/// (existence — is this id already taken?). A same-batch `CreateNode` for a
+/// `CreateEdge` endpoint id is resolved locally by `prevalidate_edge_scopes`
+/// (via its own scan of `ops`) and needs no storage lookup for THAT purpose,
+/// but `CreateNode` ids still need a lookup here so
+/// `prevalidate_create_node_ids` can see whether the id already exists in
+/// storage (or in an earlier batch's overlay, in the group path) before this
+/// batch runs.
 ///
 /// Through Task 6 this also covered `SetEmbedding`'s target and
 /// `RemoveNode`'s target, for `VectorIndex::prevalidate_dims`/`maintain`
@@ -1069,12 +1073,45 @@ pub type LabelIndexDumpRow = (u32, u32, u128, u64);
 fn ids_needing_pre_state(ops: &[Op]) -> std::collections::HashSet<NodeId> {
     let mut ids = std::collections::HashSet::new();
     for op in ops {
-        if let Op::CreateEdge { from, to, .. } = op {
-            ids.insert(*from);
-            ids.insert(*to);
+        match op {
+            Op::CreateEdge { from, to, .. } => {
+                ids.insert(*from);
+                ids.insert(*to);
+            }
+            Op::CreateNode { id, .. } => {
+                ids.insert(*id);
+            }
+            _ => {}
         }
     }
     ids
+}
+
+/// Rebuilds a `TopoError` of the SAME kind as `e`, with `e`'s message folded
+/// into context about the group pre-validation read that produced it.
+/// `TopoError` isn't `Clone` (its `Storage` variant boxes a `redb::Error`,
+/// which isn't `Clone` either), so this exists to hand every job in a failed
+/// group its own error object without flattening every kind into `Rejected`
+/// — see the call site in `apply_group`. `Storage`'s inner `redb::Error`
+/// can't be reconstructed bit-for-bit without cloning it, so it's rebuilt as
+/// a synthetic `redb::Error::Corrupted` carrying the original message; the
+/// point isn't to preserve the exact redb sub-error, only the `TopoError`
+/// top-level kind (`Storage` vs. `Rejected` vs. ...) that downstream
+/// matches (e.g. `topodb-mcp`'s `server.rs`) actually branch on.
+fn group_pre_read_error(e: &TopoError) -> TopoError {
+    let msg = e.to_string();
+    let ctx = |m: String| format!("group pre-validation read failed: {m}");
+    match e {
+        TopoError::Storage(_) => TopoError::Storage(Box::new(redb::Error::Corrupted(ctx(msg)))),
+        TopoError::Encoding(m) => TopoError::Encoding(ctx(m.clone())),
+        TopoError::Rejected(m) => TopoError::Rejected(ctx(m.clone())),
+        TopoError::Compacted { oldest } => TopoError::Compacted { oldest: *oldest },
+        TopoError::Closed => TopoError::Closed,
+        TopoError::UnsupportedFormat { found, supported } => TopoError::UnsupportedFormat {
+            found: *found,
+            supported: *supported,
+        },
+    }
 }
 
 /// The single-batch apply path: pre-validate against real storage state,
@@ -1103,6 +1140,14 @@ fn apply_one_job(
     // `apply_batch` so storage is untouched. It must not live in `apply_op`,
     // which is shared with op-log replay.
     if let Err(e) = crate::validate::prevalidate_edge_scopes(&pre, &ops) {
+        let _ = reply.send(Err(e));
+        return;
+    }
+    // Same contract as `prevalidate_edge_scopes` immediately above: reject
+    // before `apply_batch` so storage is untouched, and never fold this into
+    // `apply_op` (shared with replay, which must stay tolerant of a historic
+    // log's duplicate-create ops).
+    if let Err(e) = crate::validate::prevalidate_create_node_ids(&pre, &ops) {
         let _ = reply.send(Err(e));
         return;
     }
@@ -1178,12 +1223,18 @@ fn apply_group(
         Err(e) => {
             // The read itself failed — not a per-batch validation rejection.
             // `TopoError` isn't `Clone`, so every job gets its own error
-            // built from the same message rather than the original value.
-            let msg = e.to_string();
+            // reconstructed from the same underlying failure rather than the
+            // original value. Earlier this collapsed every kind to
+            // `Rejected`, which reaches submitters (e.g. topodb-mcp's
+            // `server.rs`) as an `invalid_params`-shaped client error even
+            // when the real cause was a storage/IO failure — the same
+            // single-batch path (`apply_one_job`, just above) forwards `e`
+            // untouched, so the group path must not downgrade its kind.
+            // `group_pre_read_error` keeps the top-level variant (and any
+            // structured fields callers match on, like `Compacted::oldest`)
+            // and only the message gains this context.
             for (_, reply) in jobs {
-                let _ = reply.send(Err(TopoError::Rejected(format!(
-                    "group pre-validation read failed: {msg}"
-                ))));
+                let _ = reply.send(Err(group_pre_read_error(&e)));
             }
             return;
         }
@@ -1230,6 +1281,15 @@ fn apply_group(
         }
 
         if let Err(e) = crate::validate::prevalidate_edge_scopes(&effective_pre, &ops) {
+            let _ = reply.send(Err(e));
+            continue;
+        }
+        // Same-group defense-in-depth for Finding 1/3: `effective_pre`
+        // already carries prior same-group `CreateNode`s (via `overlay`, set
+        // to `Some(scope)` below) and omits prior same-group `RemoveNode`s
+        // (`None`), so this sees a duplicate-id create against BOTH real
+        // storage state and everything this group has done so far.
+        if let Err(e) = crate::validate::prevalidate_create_node_ids(&effective_pre, &ops) {
             let _ = reply.send(Err(e));
             continue;
         }

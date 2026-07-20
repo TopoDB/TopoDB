@@ -20,10 +20,19 @@ fn crash_writer_child() {
     };
     let db = topodb::Db::open(std::path::Path::new(&db_path)).unwrap();
     let scope = topodb::Scope::Shared;
+    // Finding 2: widen the op mix beyond pure `CreateNode`/`CreateEdge` so a
+    // SIGKILL lands mid-commit on more than the create path. Added here:
+    // `SetNodeProps` (every batch, on the memory node this same batch just
+    // created) and, periodically, `RemoveNode` of an EARLIER round's memory
+    // node — exercising LABEL_INDEX removal, not just insertion, under a
+    // kill. `SetEmbedding` is deliberately left out to keep the loop simple,
+    // per the brief.
+    let mut prior_memories: Vec<topodb::NodeId> = Vec::new();
+    let mut round: u64 = 0;
     loop {
         let m = topodb::NodeId::new();
         let e = topodb::NodeId::new();
-        let ops = vec![
+        let mut ops = vec![
             topodb::Op::CreateNode {
                 id: m,
                 scope,
@@ -52,8 +61,35 @@ fn crash_writer_child() {
                 props: Default::default(),
                 valid_from: None,
             },
+            topodb::Op::SetNodeProps {
+                id: m,
+                props: [(
+                    "content".to_string(),
+                    Some(topodb::PropValue::Str("crash corpus, revised".into())),
+                )]
+                .into_iter()
+                .collect(),
+            },
         ];
-        let _ = db.submit(ops); // keep looping even on transient errors
+        let removing = if round.is_multiple_of(5) && !prior_memories.is_empty() {
+            let old = prior_memories.remove(0);
+            ops.push(topodb::Op::RemoveNode { id: old });
+            Some(old)
+        } else {
+            None
+        };
+        if db.submit(ops).is_ok() {
+            prior_memories.push(m);
+            if prior_memories.len() > 32 {
+                prior_memories.remove(0);
+            }
+        } else if let Some(old) = removing {
+            // The batch (including the RemoveNode) didn't commit — put the
+            // target back so a later round retries it instead of silently
+            // dropping it from rotation forever.
+            prior_memories.insert(0, old);
+        }
+        round += 1;
     }
 }
 
@@ -79,6 +115,7 @@ fn verify_replay_equivalence(db: &topodb::Db) {
     let vectors_before = db.debug_dump_vectors().unwrap();
     let embedding_ref_before = db.debug_dump_embedding_ref().unwrap();
     let vector_dims_before = db.debug_dump_vector_dims().unwrap();
+    let label_index_before = db.debug_dump_label_index().unwrap();
 
     db.rebuild_state_from_ops().unwrap();
 
@@ -116,6 +153,11 @@ fn verify_replay_equivalence(db: &topodb::Db) {
         vector_dims_before,
         db.debug_dump_vector_dims().unwrap(),
         "VECTOR_DIMS must equal a replay of the surviving op log"
+    );
+    assert_eq!(
+        label_index_before,
+        db.debug_dump_label_index().unwrap(),
+        "LABEL_INDEX must equal a replay of the surviving op log"
     );
 }
 
