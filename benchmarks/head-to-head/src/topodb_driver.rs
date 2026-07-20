@@ -187,6 +187,28 @@ impl Engine for TopoDbDriver {
         Ok(std::fs::metadata(&self.path).map_err(err)?.len())
     }
 
+    /// Pages actually allocated, read straight from redb. Must be called with
+    /// no live `Db` handle on the file — redb locks it — so the harness
+    /// invokes this after dropping the driver.
+    ///
+    /// `stats()` lives on `WriteTransaction`, not `ReadTransaction`, so this
+    /// opens a write transaction and aborts it. Nothing is modified.
+    fn allocated_bytes(path: &Path) -> Result<Option<u64>, EngineError> {
+        let db = redb::Database::builder()
+            .create(path)
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let tx = db
+            .begin_write()
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let stats = tx
+            .stats()
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let allocated = stats.allocated_pages() * stats.page_size() as u64;
+        drop(stats);
+        tx.abort().map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(Some(allocated))
+    }
+
     fn as_of_support() -> AsOfSupport {
         // Node props are overwrite-only (`op.rs:19-20`), and `traverse(as_of)`
         // returns historical topology with present-day payloads. Not the same

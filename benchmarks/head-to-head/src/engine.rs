@@ -45,5 +45,23 @@ pub trait Engine: Sized {
 
     fn on_disk_bytes(&self) -> Result<u64, EngineError>;
 
+    /// Bytes the engine has actually allocated to pages, where it can report
+    /// that — as opposed to the size of the file on disk.
+    ///
+    /// These differ, and the difference is not a detail. TopoDB's redb file
+    /// grows by *doubling* (`page_manager.rs`: `usable_bytes() * 2`), so its
+    /// file size is quantized: 10k and 15k node corpora produce byte-identical
+    /// files, as do 20k and 30k. File utilization therefore swings between
+    /// ~59% just after a doubling and ~89% just before one, and a
+    /// single-corpus-size file-bytes comparison inherits that swing wholesale
+    /// — measured against minigraf, the same engines compare as 1.53x at 20k
+    /// nodes but 1.02-1.03x at 15k and 30k.
+    ///
+    /// Engines that cannot report allocation return `None` and are compared
+    /// on file bytes alone, with the caveat stated in the report.
+    fn allocated_bytes(_path: &Path) -> Result<Option<u64>, EngineError> {
+        Ok(None)
+    }
+
     fn as_of_support() -> AsOfSupport;
 }

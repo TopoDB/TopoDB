@@ -22,6 +22,16 @@ use head_to_head::topodb_driver::TopoDbDriver;
 
 const SEED: u64 = 20260719;
 const WARM_N: usize = 200;
+/// Fresh opens per engine in the cold phase. Overridable via `COLD_REPEATS`.
+const COLD_REPEATS_DEFAULT: usize = 5;
+
+fn cold_repeats() -> usize {
+    std::env::var("COLD_REPEATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(COLD_REPEATS_DEFAULT)
+}
 
 /// Search for the node count whose `translation_ratio().facts` is closest to
 /// `target`. The nodes/edges relationship is not perfectly linear (edges are
@@ -62,7 +72,13 @@ struct LoadResult {
 }
 
 struct ColdResult {
+    /// Median across `reopens` fresh opens, not a single sample. A single
+    /// sample of an fsync-bound operation is how a CPU-contended 196 ms
+    /// reading -- 2.7x inflated -- was once recorded here as fact.
     open_time: Duration,
+    open_min: Duration,
+    open_max: Duration,
+    reopens: usize,
     first_lookup_time: Duration,
     first_lookup_hit: bool,
 }
@@ -99,7 +115,7 @@ fn measure<E: Engine>(
     path: &Path,
     corpus: &Corpus,
     node_count: usize,
-) -> (LoadResult, ColdResult, WarmResult, u64) {
+) -> (LoadResult, ColdResult, WarmResult, u64, Option<u64>) {
     // --- Load ---
     let t0 = Instant::now();
     let mut db = E::open(path).expect("open for load");
@@ -107,16 +123,30 @@ fn measure<E: Engine>(
     let load_time = t0.elapsed();
     drop(db);
 
-    // --- Cold: fresh open, then exactly one lookup ---
-    let t0 = Instant::now();
-    let cold_db = E::open(path).expect("cold open");
-    let open_time = t0.elapsed();
-
+    // --- Cold: COLD_REPEATS fresh opens, each followed by exactly one
+    // lookup. Reported as medians. Opening is fsync-bound and so is highly
+    // sensitive to anything else touching the disk; one sample cannot tell a
+    // real number from a contended one.
     let cold_id = 0usize;
-    let t0 = Instant::now();
-    let cold_payload = cold_db.point_lookup(cold_id).expect("cold point_lookup");
-    let first_lookup_time = t0.elapsed();
-    let first_lookup_hit = cold_payload.is_some();
+    let mut open_times = Vec::with_capacity(cold_repeats());
+    let mut first_lookup_times = Vec::with_capacity(cold_repeats());
+    let mut first_lookup_hit = false;
+    for _ in 0..cold_repeats() {
+        let t0 = Instant::now();
+        let db = E::open(path).expect("cold open");
+        open_times.push(t0.elapsed());
+
+        let t0 = Instant::now();
+        let payload = db.point_lookup(cold_id).expect("cold point_lookup");
+        first_lookup_times.push(t0.elapsed());
+        first_lookup_hit = payload.is_some();
+        drop(db);
+    }
+    let (open_time, _, open_min, open_max) = median_mean(open_times);
+    let (first_lookup_time, _, _, _) = median_mean(first_lookup_times);
+
+    // The warm phase needs a live handle; the loop above dropped its own.
+    let cold_db = E::open(path).expect("open for warm phase");
 
     // --- Warm: same handle, WARM_N lookups of varied ids via a fixed stride ---
     // Stride chosen so ids are spread across the whole id space rather than
@@ -141,11 +171,17 @@ fn measure<E: Engine>(
     let (median, mean, min, max) = median_mean(durs);
 
     let on_disk = cold_db.on_disk_bytes().expect("on_disk_bytes");
+    // redb locks the file, so allocation can only be read with no live handle.
+    drop(cold_db);
+    let allocated = E::allocated_bytes(path).expect("allocated_bytes");
 
     (
         LoadResult { load_time },
         ColdResult {
             open_time,
+            open_min,
+            open_max,
+            reopens: cold_repeats(),
             first_lookup_time,
             first_lookup_hit,
         },
@@ -157,6 +193,7 @@ fn measure<E: Engine>(
             max,
         },
         on_disk,
+        allocated,
     )
 }
 
@@ -173,8 +210,8 @@ fn fmt_dur(d: Duration) -> String {
 struct ScaleReport {
     node_count: usize,
     facts: usize,
-    topo: (LoadResult, ColdResult, WarmResult, u64),
-    mini: (LoadResult, ColdResult, WarmResult, u64),
+    topo: (LoadResult, ColdResult, WarmResult, u64, Option<u64>),
+    mini: (LoadResult, ColdResult, WarmResult, u64, Option<u64>),
 }
 
 fn run_scale(node_count: usize, facts_hint: Option<usize>) -> ScaleReport {
@@ -229,9 +266,17 @@ fn print_scale(r: &ScaleReport) -> String {
         fmt_dur(r.mini.0.load_time)
     ));
     out.push_str(&format!(
-        "| Cold open | {} | {} |\n",
+        "| Cold open (median of {}) | {} | {} |\n",
+        r.topo.1.reopens,
         fmt_dur(r.topo.1.open_time),
         fmt_dur(r.mini.1.open_time)
+    ));
+    out.push_str(&format!(
+        "| Cold open min / max | {} / {} | {} / {} |\n",
+        fmt_dur(r.topo.1.open_min),
+        fmt_dur(r.topo.1.open_max),
+        fmt_dur(r.mini.1.open_min),
+        fmt_dur(r.mini.1.open_max)
     ));
     out.push_str(&format!(
         "| Cold first lookup (hit={}/{}) | {} | {} |\n",
@@ -260,9 +305,41 @@ fn print_scale(r: &ScaleReport) -> String {
         fmt_dur(r.mini.2.max)
     ));
     out.push_str(&format!(
-        "| On-disk bytes | {} | {} |\n",
+        "| On-disk bytes (file) | {} | {} |\n",
         r.topo.3, r.mini.3
     ));
+    let fmt_alloc = |a: Option<u64>, file: u64| match a {
+        Some(bytes) => format!("{bytes} ({:.1}% of file)", bytes as f64 / file as f64 * 100.0),
+        None => "not reported".to_string(),
+    };
+    out.push_str(&format!(
+        "| Allocated bytes | {} | {} |\n",
+        fmt_alloc(r.topo.4, r.topo.3),
+        fmt_alloc(r.mini.4, r.mini.3)
+    ));
+
+    out.push_str("\n### Measurement notes\n\n");
+    out.push_str(&format!(
+        "- Cold open is the median of {} fresh opens, with min/max shown. \
+It is fsync-bound and highly sensitive to any other disk activity; a single \
+sample cannot distinguish a real number from a contended one. Do not trust \
+any timing here taken while another job was running.\n",
+        r.topo.1.reopens
+    ));
+    out.push_str(
+        "- **File bytes are not directly comparable across engines.** TopoDB's \
+redb file grows by doubling, so its size is quantized: 10k and 15k node \
+corpora yield byte-identical files, as do 20k and 30k. File utilization \
+swings between ~59% just after a doubling and ~89% just before one, and the \
+ratio against minigraf swings with it -- 1.53x at 20k nodes, but 1.02-1.03x \
+at 15k and 30k, for the same engines storing the same corpus shape. Compare \
+allocated bytes, or sample several corpus sizes; a single file-bytes figure \
+at one size reports the quantization, not the engines.\n",
+    );
+    out.push_str(
+        "- \"Cold\" is a fresh handle within the same process; the file stays \
+in the OS page cache. Neither engine gets a true cold-cache open.\n",
+    );
     out
 }
 
