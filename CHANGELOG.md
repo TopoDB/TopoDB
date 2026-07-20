@@ -22,7 +22,8 @@ workspace are versioned and released independently (tags are per-package, e.g.
   (the semantic leg's raw cosine; `None` when the suggestion is structural-only), and
   `SuggestLinksQuery.min_semantic_similarity` optionally floors the semantic leg (validated
   `-1.0..=1.0`, `None` default = prior behavior byte-for-byte). RRF rank scores hid the
-  strong-vs-weak distinction; the raw cosine restores it.
+  strong-vs-weak distinction; the raw cosine restores it. **Breaking for struct-literal
+  construction** of `SuggestLinksQuery` (new field), same caveat as the `RecallQuery` entry.
 - **Recall tuning on `RecallQuery`** — `labels` (post-fusion allowlist, `None` = unfiltered),
   per-leg RRF weights (`text_weight`/`vector_weight`/`graph_weight`, defaults 1.0/1.0/0.5 — the
   former compile-time constants), and `access_weight` (0-1, default 0 = off): an opt-in

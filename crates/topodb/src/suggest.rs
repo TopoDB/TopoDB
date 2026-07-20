@@ -129,6 +129,11 @@ impl Db {
                         }
                         // Floor: a pure filter on the leg's own (descending)
                         // cosine — structural leg untouched by design.
+                        // `continue`, not `break`, deliberately: NaN cosines
+                        // (unvalidated embeddings) sort to the tail and fail
+                        // every `<` — continue keeps them exactly as the
+                        // no-floor path ranks them, instead of making their
+                        // inclusion depend on preceding finite scores.
                         if q.min_semantic_similarity.is_some_and(|floor| score < floor) {
                             continue;
                         }
