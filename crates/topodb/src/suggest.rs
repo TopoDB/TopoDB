@@ -22,6 +22,12 @@ pub struct SuggestLinksQuery {
     pub k: usize,
     pub model: Option<String>,
     pub as_of: Option<i64>,
+    /// Optional semantic-leg floor: candidates whose cosine against the
+    /// target's embedding falls below this never enter the semantic list.
+    /// `None` = no floor (previous behavior). `Some(v)` must be finite and
+    /// within -1.0..=1.0 — anything else is `Rejected` (a host bug should
+    /// be loud). The structural leg is never affected.
+    pub min_semantic_similarity: Option<f32>,
 }
 
 /// One suggested (but non-existent) edge endpoint, with evidence. Never a
@@ -36,6 +42,11 @@ pub struct LinkSuggestion {
     pub structural: bool,
     /// Appeared in the vector leg.
     pub semantic: bool,
+    /// Raw cosine between the target's embedding and this node's, under
+    /// the query's model — `Some` exactly when `semantic` is true (the
+    /// value the semantic leg ranked by). `None` for structural-only
+    /// suggestions: no extra vector reads are spent computing it.
+    pub similarity: Option<f32>,
 }
 
 impl Db {
@@ -51,6 +62,13 @@ impl Db {
     pub fn suggest_links(&self, q: &SuggestLinksQuery) -> Result<Vec<LinkSuggestion>, TopoError> {
         if q.k == 0 {
             return Err(TopoError::Rejected("suggest_links requires k > 0".into()));
+        }
+        if let Some(floor) = q.min_semantic_similarity {
+            if !floor.is_finite() || !(-1.0..=1.0).contains(&floor) {
+                return Err(TopoError::Rejected(format!(
+                    "min_semantic_similarity must be finite and within -1.0..=1.0, got {floor}"
+                )));
+            }
         }
         // Target, scoped: absent and out-of-scope are indistinguishably
         // empty, mirroring `Db::node`.
@@ -93,6 +111,7 @@ impl Db {
         // Semantic leg: the target's own embedding under q.model. A missing
         // or different-model embedding is an empty leg, never an error.
         let mut semantic: Vec<NodeId> = Vec::new();
+        let mut sim: HashMap<NodeId, f32> = HashMap::new();
         if let Some(model) = &q.model {
             if let Some((stored_model, vector)) = &target.embedding {
                 if stored_model == model {
@@ -104,12 +123,18 @@ impl Db {
                         k: depth + excluded.len(),
                         candidates: None,
                     })?;
-                    for (n, _) in hits {
+                    for (n, score) in hits {
                         if semantic.len() == depth {
                             break;
                         }
+                        // Floor: a pure filter on the leg's own (descending)
+                        // cosine — structural leg untouched by design.
+                        if q.min_semantic_similarity.is_some_and(|floor| score < floor) {
+                            continue;
+                        }
                         let nid = n.id;
                         if !excluded.contains(&nid) {
+                            sim.insert(nid, score);
                             records.entry(nid).or_insert(n);
                             semantic.push(nid);
                         }
@@ -156,6 +181,7 @@ impl Db {
                 common_neighbors: common,
                 structural: in_structural.contains(&id),
                 semantic: in_semantic.contains(&id),
+                similarity: sim.get(&id).copied(),
             });
         }
         Ok(out)

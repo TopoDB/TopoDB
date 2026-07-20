@@ -80,6 +80,58 @@ fn structural_fixture() -> StructFixture {
     }
 }
 
+/// p/q near-identical embeddings, far orthogonal; NO edges anywhere.
+struct SemanticFixture {
+    _dir: tempfile::TempDir,
+    db: Db,
+    scopes: ScopeSet,
+    p: NodeId,
+    q: NodeId,
+    far: NodeId,
+}
+
+fn semantic_fixture() -> SemanticFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let s = ScopeId::new();
+    let scope = Scope::Id(s);
+    let p = NodeId::new();
+    let q = NodeId::new();
+    let far = NodeId::new();
+    db.submit(vec![
+        mk_node(p, scope),
+        mk_node(q, scope),
+        mk_node(far, scope),
+    ])
+    .unwrap();
+    db.submit(vec![
+        Op::SetEmbedding {
+            id: p,
+            model: "m1".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.01],
+        },
+        Op::SetEmbedding {
+            id: q,
+            model: "m1".into(),
+            vector: vec![0.99, 0.01, 0.0, 0.0],
+        },
+        Op::SetEmbedding {
+            id: far,
+            model: "m1".into(),
+            vector: vec![0.0, 0.0, 1.0, 0.0],
+        },
+    ])
+    .unwrap();
+    SemanticFixture {
+        _dir: dir,
+        db,
+        scopes: ScopeSet::of(&[s]),
+        p,
+        q,
+        far,
+    }
+}
+
 fn q(scopes: &ScopeSet, node: NodeId, k: usize) -> SuggestLinksQuery {
     SuggestLinksQuery {
         scopes: scopes.clone(),
@@ -87,6 +139,7 @@ fn q(scopes: &ScopeSet, node: NodeId, k: usize) -> SuggestLinksQuery {
         k,
         model: None,
         as_of: None,
+        min_semantic_similarity: None,
     }
 }
 
@@ -130,54 +183,19 @@ fn self_and_existing_neighbors_are_never_suggested() {
 
 #[test]
 fn semantic_leg_bridges_disconnected_components() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = open(&dir);
-    let s = ScopeId::new();
-    let scope = Scope::Id(s);
-    let p = NodeId::new();
-    let qn = NodeId::new();
-    let far = NodeId::new();
-    db.submit(vec![
-        mk_node(p, scope),
-        mk_node(qn, scope),
-        mk_node(far, scope),
-    ])
-    .unwrap();
-    // p and qn: near-identical embeddings; far: orthogonal. NO edges at all.
-    db.submit(vec![
-        Op::SetEmbedding {
-            id: p,
-            model: "m1".into(),
-            vector: vec![1.0, 0.0, 0.0, 0.01],
-        },
-        Op::SetEmbedding {
-            id: qn,
-            model: "m1".into(),
-            vector: vec![0.99, 0.01, 0.0, 0.0],
-        },
-        Op::SetEmbedding {
-            id: far,
-            model: "m1".into(),
-            vector: vec![0.0, 0.0, 1.0, 0.0],
-        },
-    ])
-    .unwrap();
-    let scopes = ScopeSet::of(&[s]);
-    let out = db
-        .suggest_links(&SuggestLinksQuery {
-            scopes: scopes.clone(),
-            node: p,
-            k: 2,
+    let f = semantic_fixture();
+    let out =
+        f.db.suggest_links(&SuggestLinksQuery {
             model: Some("m1".into()),
-            as_of: None,
+            ..q(&f.scopes, f.p, 2)
         })
         .unwrap();
     assert_eq!(
-        out[0].node.id, qn,
+        out[0].node.id, f.q,
         "nearest embedding wins across components"
     );
     assert!(out[0].semantic);
-    assert!(!out[0].structural, "no graph path to qn exists");
+    assert!(!out[0].structural, "no graph path to q exists");
     assert!(out[0].common_neighbors.is_empty());
 }
 
@@ -256,6 +274,75 @@ fn k_zero_is_rejected() {
     match f.db.suggest_links(&q(&f.scopes, f.a, 0)) {
         Err(TopoError::Rejected(_)) => {}
         other => panic!("k == 0 must be Rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn floor_filters_weak_semantic_candidates() {
+    let f = semantic_fixture();
+    let out =
+        f.db.suggest_links(&SuggestLinksQuery {
+            model: Some("m1".into()),
+            min_semantic_similarity: Some(0.5),
+            ..q(&f.scopes, f.p, 3)
+        })
+        .unwrap();
+    assert!(
+        out.iter().all(|s| s.node.id != f.far),
+        "far (cosine ~0) must be floored out at 0.5"
+    );
+    let hit_q = out
+        .iter()
+        .find(|s| s.node.id == f.q)
+        .expect("q must survive");
+    let sim = hit_q
+        .similarity
+        .expect("semantic hit carries Some(similarity)");
+    assert!(sim > 0.9, "near-duplicate cosine should be ~1.0, got {sim}");
+}
+
+#[test]
+fn no_floor_preserves_previous_behavior() {
+    let f = semantic_fixture();
+    let out =
+        f.db.suggest_links(&SuggestLinksQuery {
+            model: Some("m1".into()),
+            ..q(&f.scopes, f.p, 3)
+        })
+        .unwrap();
+    assert!(
+        out.iter().any(|s| s.node.id == f.far),
+        "without a floor, the weak candidate still surfaces (pinned)"
+    );
+}
+
+#[test]
+fn similarity_is_none_for_structural_only_suggestions() {
+    let f = structural_fixture();
+    let out = f.db.suggest_links(&q(&f.scopes, f.a, 5)).unwrap();
+    assert!(!out.is_empty());
+    for s in &out {
+        assert!(s.structural && !s.semantic, "fixture has no embeddings");
+        assert!(
+            s.similarity.is_none(),
+            "structural-only suggestion must carry similarity: None"
+        );
+    }
+}
+
+#[test]
+fn invalid_floors_are_rejected() {
+    let f = semantic_fixture();
+    for bad in [f32::NAN, 1.5, -1.5, f32::INFINITY] {
+        let r = f.db.suggest_links(&SuggestLinksQuery {
+            model: Some("m1".into()),
+            min_semantic_similarity: Some(bad),
+            ..q(&f.scopes, f.p, 3)
+        });
+        match r {
+            Err(TopoError::Rejected(_)) => {}
+            other => panic!("floor {bad} must be Rejected, got {other:?}"),
+        }
     }
 }
 
