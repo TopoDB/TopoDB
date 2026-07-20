@@ -46,6 +46,19 @@ impl AgentRunner for ClaudeCodeRunner {
     fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
         let mut cmd = Command::new("claude");
         cmd.arg("-p").arg(build_prompt(req));
+        // Without a tool grant, an agent node runs under the default
+        // permission mode, where there is no one to approve a Write. The tool
+        // call is blocked, the agent explains that it was blocked, and
+        // `claude` still exits 0 — so the node is recorded as succeeded having
+        // changed nothing. An agent node whose purpose is to edit files needs
+        // the grant up front or it cannot do its job.
+        //
+        // Enumerated rather than `--permission-mode acceptEdits`: this is the
+        // smallest grant that lets a node read and edit source, and it
+        // withholds Bash, so an agent node still cannot run arbitrary
+        // commands. Shell execution stays with `command` nodes, whose `run:`
+        // strings pass through the /sgh:run approval gate.
+        cmd.arg("--allowedTools").arg("Read,Write,Edit");
         if let Some(m) = &self.model {
             cmd.arg("--model").arg(m);
         }
