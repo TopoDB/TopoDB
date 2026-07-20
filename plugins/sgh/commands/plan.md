@@ -4,16 +4,22 @@ description: Compile a goal into a validated sgh graph with a worst-case bound
 
 Compile this goal into an sgh graph: **$ARGUMENTS**
 
-Run:
+If the goal is empty, ask what they want done rather than invoking the planner
+with nothing.
+
+First create the `.sgh` directory if it does not exist, then write the goal
+above verbatim to `.sgh/goal.txt` using your file-writing tool (the Write
+tool). Do not write it via bash — no heredoc, no `echo`, no other shell
+command — since the goal can contain characters that would be interpreted as
+shell syntax if it ever passed through a shell command line. Writing it to a
+file first means the goal is never interpolated into a shell command.
+
+Then run:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/lib/sgh-env.sh" || exit 1
-mkdir -p .sgh
-"$SGH_BIN" --db "$SGH_DB" plan "$ARGUMENTS" --out .sgh/graph.yaml
+"$SGH_BIN" --db "$SGH_DB" plan "$(cat .sgh/goal.txt)" --out .sgh/graph.yaml
 ```
-
-If the goal is empty, ask what they want done rather than invoking the planner
-with nothing.
 
 `sgh plan` prints the worst-case bound — the maximum number of agent calls the
 graph can ever make. Show that number and say plainly what it means: the run
