@@ -108,3 +108,75 @@ fn rejects_malformed_output_schema() {
         .iter()
         .any(|e| matches!(e, ValidationError::InvalidSchema { .. })));
 }
+
+// A node that declares `output.schema` is claiming it produced or changed
+// something. The claim is the node's own word for it. Requiring a `command`
+// node downstream means every such claim has at least one deterministic check
+// standing behind it, rather than the graph accepting the assertion alone.
+
+#[test]
+fn rejects_a_claiming_agent_with_nothing_downstream_to_check_it() {
+    let g = graph(
+        "version: 1\n\
+         goal: g\n\
+         nodes:\n\
+         \x20\x20- id: writer\n\
+         \x20\x20\x20\x20kind: agent\n\
+         \x20\x20\x20\x20prompt: write the tests\n\
+         \x20\x20\x20\x20budget: {retries: 0, repairs: 0}\n\
+         \x20\x20\x20\x20output:\n\
+         \x20\x20\x20\x20\x20\x20schema: {type: object}\n",
+    );
+    let errs = validate(&g).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::UncheckedClaim { .. })),
+        "an agent declaring an output must have a command node downstream, got {errs:?}"
+    );
+}
+
+#[test]
+fn accepts_a_claiming_agent_checked_by_a_downstream_command() {
+    let g = graph(
+        "version: 1\n\
+         goal: g\n\
+         nodes:\n\
+         \x20\x20- id: writer\n\
+         \x20\x20\x20\x20kind: agent\n\
+         \x20\x20\x20\x20prompt: write the tests\n\
+         \x20\x20\x20\x20budget: {retries: 0, repairs: 0}\n\
+         \x20\x20\x20\x20output:\n\
+         \x20\x20\x20\x20\x20\x20schema: {type: object}\n\
+         \x20\x20- {id: check, kind: command, run: 'cargo test', needs: [writer], budget: {retries: 0, repairs: 0}}\n",
+    );
+    validate(&g).expect("a claim checked by a downstream command is valid");
+}
+
+#[test]
+fn accepts_a_claim_checked_transitively_not_only_directly() {
+    let g = graph(
+        "version: 1\n\
+         goal: g\n\
+         nodes:\n\
+         \x20\x20- id: writer\n\
+         \x20\x20\x20\x20kind: agent\n\
+         \x20\x20\x20\x20prompt: write the tests\n\
+         \x20\x20\x20\x20budget: {retries: 0, repairs: 0}\n\
+         \x20\x20\x20\x20output:\n\
+         \x20\x20\x20\x20\x20\x20schema: {type: object}\n\
+         \x20\x20- {id: middle, kind: agent, prompt: p, needs: [writer], budget: {retries: 0, repairs: 0}}\n\
+         \x20\x20- {id: check, kind: command, run: 'cargo test', needs: [middle], budget: {retries: 0, repairs: 0}}\n",
+    );
+    validate(&g).expect("a command anywhere downstream satisfies the check");
+}
+
+#[test]
+fn an_agent_declaring_no_output_is_left_alone() {
+    let g = graph(
+        "version: 1\n\
+         goal: g\n\
+         nodes:\n\
+         \x20\x20- {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n",
+    );
+    validate(&g).expect("a node that claims nothing needs nothing to check it");
+}

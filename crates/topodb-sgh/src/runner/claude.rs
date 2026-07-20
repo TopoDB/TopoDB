@@ -49,7 +49,10 @@ pub fn interpret_result(stdout: &str) -> NodeOutcome {
             // passing an unexamined string downstream as though it were a
             // result.
             return NodeOutcome::Failed {
-                error: format!("claude produced unparseable output ({e}): {}", elide(stdout)),
+                error: format!(
+                    "claude produced unparseable output ({e}): {}",
+                    elide(stdout)
+                ),
             };
         }
     };

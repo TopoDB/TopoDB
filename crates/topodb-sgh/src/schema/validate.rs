@@ -16,6 +16,11 @@ pub enum ValidationError {
     MissingRun(String),
     #[error("node {node} has a malformed output schema: {reason}")]
     InvalidSchema { node: String, reason: String },
+    #[error(
+        "agent node {node} declares an output but nothing downstream checks it — \
+         add a `kind: command` node that depends on it and verifies the claim"
+    )]
+    UncheckedClaim { node: String },
 }
 
 /// A graph that has passed validation. Only a `Validated` may be executed.
@@ -77,6 +82,30 @@ pub fn validate(graph: &Graph) -> Result<Validated, Vec<ValidationError>> {
         }
     }
 
+    // An agent node declaring `output.schema` is asserting it produced or
+    // changed something, in its own words. Requiring a `command` node
+    // somewhere downstream means the assertion has at least one deterministic
+    // check standing behind it before the graph is allowed to run.
+    //
+    // Only nodes that make a claim are constrained. An agent with no declared
+    // output asserts nothing checkable and is left alone — `sgh validate`
+    // reports those separately so a human sees which nodes are self-reporting.
+    //
+    // This is structural, not semantic: a downstream `run: 'true'` satisfies
+    // it. What the check actually verifies is left to the human reading every
+    // `run:` string at the approval gate. The rule removes the option of
+    // silently omitting a check, not the possibility of writing a vacuous one.
+    if !ids.is_empty() {
+        for n in &graph.nodes {
+            if n.kind != NodeKind::Agent || n.output.is_none() {
+                continue;
+            }
+            if !reaches_a_command(graph, &n.id) {
+                errors.push(ValidationError::UncheckedClaim { node: n.id.clone() });
+            }
+        }
+    }
+
     // Kahn's algorithm. Ties broken by declaration order for determinism.
     //
     // Indegree counts *distinct* existing dependencies per node, not raw
@@ -133,4 +162,29 @@ pub fn validate(graph: &Graph) -> Result<Validated, Vec<ValidationError>> {
     } else {
         Err(errors)
     }
+}
+
+/// Whether any `command` node is reachable downstream of `start`.
+///
+/// Walks dependents (nodes naming `start` transitively in `needs`), not
+/// dependencies: a check must run *after* the claim to be checking it. The
+/// visited set makes this safe on a cyclic graph — the cycle is reported
+/// separately, and this traversal must not hang before that happens.
+fn reaches_a_command(graph: &Graph, start: &str) -> bool {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(cur) = stack.pop() {
+        for n in &graph.nodes {
+            if !n.needs.iter().any(|d| d == cur) {
+                continue;
+            }
+            if n.kind == NodeKind::Command {
+                return true;
+            }
+            if seen.insert(n.id.as_str()) {
+                stack.push(n.id.as_str());
+            }
+        }
+    }
+    false
 }

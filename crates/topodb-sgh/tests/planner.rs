@@ -32,6 +32,28 @@ fn prompt_teaches_output_schema_must_compile() {
 }
 
 #[test]
+fn prompt_requires_artifact_producing_agents_to_declare_an_output() {
+    let p = build_plan_prompt(&req(), &[], None);
+    assert!(
+        p.contains("declare `output.schema`"),
+        "an agent node that produces something must be told to declare what it produced"
+    );
+}
+
+#[test]
+fn prompt_tells_the_planner_a_self_report_is_not_verification() {
+    let p = build_plan_prompt(&req(), &[], None);
+    assert!(
+        p.contains("is not evidence"),
+        "the planner must be told an agent's own claim does not verify the work"
+    );
+    assert!(
+        p.contains("kind: command"),
+        "and that a command node is what actually checks a claim"
+    );
+}
+
+#[test]
 fn prompt_explains_the_gate_kind() {
     let p = build_plan_prompt(&req(), &[], None);
     assert!(
