@@ -7,6 +7,11 @@
       "name": "topodb",
       "source": "./plugins/claude-code",
       "description": "Persistent agent memory: a temporal property graph, scoped per project with a shared layer."
+    },
+    {
+      "name": "sgh",
+      "source": "./plugins/sgh",
+      "description": "Plan and run agent work as a validated graph with a computable worst-case bound, instead of an open-ended loop."
     }
   ]
 }
