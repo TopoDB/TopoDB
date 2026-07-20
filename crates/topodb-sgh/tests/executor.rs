@@ -209,7 +209,8 @@ fn schema_mismatch_is_a_failure() {
     let g = Graph::from_yaml(
         "version: 1\ngoal: g\nnodes:\n  \
          - id: a\n    kind: agent\n    prompt: p\n    budget: {retries: 0, repairs: 0}\n    \
-         output:\n      schema:\n        type: object\n        required: [sites]\n",
+         output:\n      schema:\n        type: object\n        required: [sites]\n  \
+         - {id: check, kind: command, run: 'true', needs: [a], budget: {retries: 0, repairs: 0}}\n",
     )
     .unwrap();
     let v = validate(&g).unwrap();
@@ -223,14 +224,24 @@ fn schema_mismatch_is_a_failure() {
             output: "{}".into(),
         }],
     );
+    // `check` exists only so the graph validates (an agent declaring an output
+    // must have a command downstream). It never runs here: `a`'s output fails
+    // its schema, so `a` blocks and `check` is skipped.
+    let commands = topodb_sgh::runner::command::MockCommandRunner::new();
 
-    let mut ex = Executor::new(store, v, &runner);
+    let mut ex = Executor::new(store, v, &runner).with_command_runner(&commands);
     let report = ex.run(10).unwrap();
     assert_eq!(
         report.blocked,
         vec!["a".to_string()],
         "missing required field fails the node"
     );
+    assert_eq!(
+        report.skipped,
+        vec!["check".to_string()],
+        "the downstream check is skipped when the claim it guards fails"
+    );
+    assert!(commands.calls().is_empty(), "no command ran");
 }
 
 #[test]

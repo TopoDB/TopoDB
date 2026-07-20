@@ -533,7 +533,8 @@ mod tests {
             "version: 1\ngoal: g\nnodes:\n\
              - {id: survey, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
              - {id: build, kind: command, run: 'cargo build', budget: {retries: 0, repairs: 0}}\n\
-             - {id: checked, kind: agent, prompt: p, output: {schema: {type: object}}, budget: {retries: 0, repairs: 0}}\n",
+             - {id: checked, kind: agent, prompt: p, output: {schema: {type: object}}, budget: {retries: 0, repairs: 0}}\n\
+             - {id: verify, kind: command, run: 'cargo test', needs: [checked], budget: {retries: 0, repairs: 0}}\n",
         );
         assert_eq!(
             unconstrained_agents(&v),
@@ -547,7 +548,7 @@ mod tests {
         let v = validated(
             "version: 1\ngoal: g\nnodes:\n\
              - {id: a, kind: agent, prompt: p, output: {schema: {type: object}}, budget: {retries: 0, repairs: 0}}\n\
-             - {id: b, kind: command, run: 'true', budget: {retries: 0, repairs: 0}}\n",
+             - {id: b, kind: command, run: 'true', needs: [a], budget: {retries: 0, repairs: 0}}\n",
         );
         assert!(unconstrained_agents(&v).is_empty());
     }

@@ -90,11 +90,13 @@ pub fn build_plan_prompt(
          stating what it did — files written, tests added, defects fixed. A node with no \
          declared output is accepted whatever it returns, so its success means only that the \
          model replied, not that the work happened.\n\
-         - An agent's own report is not evidence. When a node claims work was done, add a \
-         `kind: command` node that depends on it and checks the claim independently. Pair \
-         \"wrote the tests\" with a command that runs them and fails when there are none; pair \
-         \"fixed the defect\" with the command that reproduces it. A check that passes when \
-         nothing happened is not a check — `cargo test` on a crate with zero tests exits 0.\n\
+         - An agent's own report is not evidence, and this is enforced: an agent node that \
+         declares `output.schema` with no `kind: command` node anywhere downstream of it is \
+         REJECTED, costing a retry. Every claim needs a command that depends on it and checks \
+         it. Pair \"wrote the tests\" with a command that runs them and fails when there are \
+         none; pair \"fixed the defect\" with the command that reproduces it. A check that \
+         passes when nothing happened is not a check — `cargo test` on a crate with zero tests \
+         exits 0, so assert a positive fact (a nonzero count) rather than a clean exit.\n\
          - `budget` is required on every node. Use `retries: 0` where a retry cannot help \
          (a deterministic failure), and small values elsewhere — the budget is the run's \
          worst-case cost and a human approves it before anything executes.\n\
