@@ -13,6 +13,14 @@ pub struct RunReport {
     pub succeeded: Vec<String>,
     pub blocked: Vec<String>,
     pub skipped: Vec<String>,
+    /// Why each *failed* blocked node blocked, keyed by node id: the last
+    /// error it produced before the recovery ladder gave up. A node that
+    /// blocked for a real failure has an entry; a `gate` blocks on purpose
+    /// (an intentional checkpoint, not a failure) and has none, which is how
+    /// a caller tells the two apart without re-deriving it. Without this, a
+    /// blocked id said only *that* a node stopped, never *why* — a tool-denied
+    /// node looked identical to any other block.
+    pub blocked_reasons: BTreeMap<String, String>,
     pub model_calls: u64,
     /// Shell command executions. Counted separately from `model_calls`
     /// because `Bound` budgets them as a distinct dimension.
@@ -36,6 +44,10 @@ pub struct Executor<'r> {
     clock: i64,
     model_calls: u64,
     command_runs: u64,
+    /// Why each failed node blocked, captured at the block point where the
+    /// error is still in hand. Read into `RunReport` by `report()`. Gate
+    /// blocks add no entry — they are checkpoints, not failures.
+    blocked_reasons: BTreeMap<String, String>,
 }
 
 impl<'r> Executor<'r> {
@@ -49,6 +61,7 @@ impl<'r> Executor<'r> {
             clock: 0,
             model_calls: 0,
             command_runs: 0,
+            blocked_reasons: BTreeMap::new(),
         }
     }
 
@@ -299,6 +312,7 @@ impl<'r> Executor<'r> {
                         }
                         _ => {
                             let t = self.tick();
+                            self.blocked_reasons.insert(id.to_string(), error.clone());
                             self.store.set_state(id, NodeState::Blocked, t)?;
                             return Ok(());
                         }
@@ -306,6 +320,7 @@ impl<'r> Executor<'r> {
                 }
                 Rung::Block => {
                     let t = self.tick();
+                    self.blocked_reasons.insert(id.to_string(), error.clone());
                     self.store.set_state(id, NodeState::Blocked, t)?;
                     return Ok(());
                 }
@@ -317,6 +332,7 @@ impl<'r> Executor<'r> {
         let mut r = RunReport {
             model_calls: self.model_calls,
             command_runs: self.command_runs,
+            blocked_reasons: self.blocked_reasons.clone(),
             ..Default::default()
         };
         for id in &self.graph.topo_order {
