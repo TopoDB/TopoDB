@@ -48,8 +48,22 @@ workspace are versioned and released independently (tags are per-package, e.g.
   other newest-k read going through `nodes_by_label_newest`) now bumps access counters only for the
   `k` nodes actually returned, rather than for every node of the label — a deliberate narrowing.
 - **`SetEmbedding` rejects non-finite components** (NaN/±Inf corrupt cosine scoring).
+- **`Db::suggest_links` — per-node link prediction.** Ranks the k likeliest missing edges from a
+  node: RRF fusion of a structural leg (PPR over the 3-hop neighborhood, self and live 1-hop
+  neighbors excluded) and a semantic leg (cosine against the node's own stored embedding), with
+  shared-neighbor evidence per suggestion. Read-only — edge creation and typing stay host policy.
 - New tests: kill-during-commit crash recovery (25-round SIGKILL harness), read-during-write
   latency, group-commit semantics, differential-oracle coverage for the label index.
+
+#### Changed
+
+- **Recall graph leg ranks by Personalized PageRank** — one 1-hop `Both` traversal from the top
+  `GRAPH_SEEDS` preliminary seeds together (was one traversal per seed), scored by deterministic
+  bounded power iteration with teleport weighted by preliminary fused score. Connectivity now
+  orders the leg — a node several seeds converge on outranks a node dangling off one — replacing
+  flat seed-rank concatenation. Membership stays 1-hop: the golden-set eval rejected 2-hop reach
+  (entity-fan-out hubs crowded correct hits out of top-3). Same `graph_boost` flag, half weight,
+  and determinism contract; eval green. No format change (v6).
 
 ### 0.0.8 — 2026-07-18
 
@@ -354,6 +368,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   override to widen or narrow), `text_weight`/`vector_weight`/`graph_weight`
   (0-10, defaults 1/1/0.5), and `access_weight` (0-1, default 0): opt-in boost for
   frequently-recalled memories.
+- **`suggest_links` tool** — surfaces the engine's link predictions (score, structural/semantic
+  flags, common-neighbor evidence) under the active embedder's model namespace. Suggestions only:
+  the agent reviews and `link`s the ones it agrees with.
 
 #### Changed
 
