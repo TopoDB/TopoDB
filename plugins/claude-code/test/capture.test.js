@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
 import { readState, stateFilePath } from "../recorder.js";
 
@@ -111,8 +111,13 @@ test("session-end flushes an episode through a real broker and deletes state", a
   } finally {
     client?.close();
     shim.kill();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(projectDir, { recursive: true, force: true });
+    // The broker outlives the shim until its idle window elapses, and it
+    // holds topodb-mcp.exe inside dataDir — Windows cannot unlink a running
+    // executable (EPERM). retryDelay backs off linearly, so these knobs
+    // wait out the idle exit on Windows and cost nothing elsewhere (the
+    // first attempt succeeds on platforms that allow the unlink).
+    rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });
 
@@ -201,8 +206,11 @@ test("concurrent appendRetrieval calls never tear the state file", async () => {
     const sessionId = "sess-race";
     const WRITERS = 4;
     const APPENDS_PER_WRITER = 8;
+    // file:// URL, not a bare path: on Windows an absolute path in an ESM
+    // specifier parses as a URL with protocol "d:" and the loader throws
+    // ERR_UNSUPPORTED_ESM_URL_SCHEME.
     const childScript = `
-      import { appendRetrieval } from ${JSON.stringify(path.join(HERE, "..", "recorder.js"))};
+      import { appendRetrieval } from ${JSON.stringify(pathToFileURL(path.join(HERE, "..", "recorder.js")).href)};
       const dataDir = process.argv[1];
       const sessionId = process.argv[2];
       const n = Number(process.argv[3]);

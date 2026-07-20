@@ -50,8 +50,13 @@ test("hook client connects, handshakes, and round-trips tool calls", async () =>
     }
   } finally {
     shim.kill();
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(projectDir, { recursive: true, force: true });
+    // The broker outlives the shim until its idle window elapses, and it
+    // holds topodb-mcp.exe inside dataDir — Windows cannot unlink a running
+    // executable (EPERM). retryDelay backs off linearly, so these knobs
+    // wait out the idle exit on Windows and cost nothing elsewhere (the
+    // first attempt succeeds on platforms that allow the unlink).
+    rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });
 

@@ -408,7 +408,12 @@ try {
       stdio: "ignore",
     }).unref();
 
-    for (let i = 0; i < 25 && !conn; i++) {
+    // 50 × 200ms = a 10s budget (the loop exits the moment the socket is
+    // up, so a fast boot pays nothing). The previous 5s budget was too
+    // tight for a Windows cold start — fresh exe copy + Defender scan +
+    // redb open routinely overran it, and the shim declared memory
+    // degraded while the broker was still coming up.
+    for (let i = 0; i < 50 && !conn; i++) {
       await new Promise((r) => setTimeout(r, 200));
       conn = await tryConnect(sock);
     }
