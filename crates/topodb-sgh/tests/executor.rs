@@ -339,3 +339,69 @@ fn a_command_node_is_still_refused_without_a_command_runner() {
     }
     assert_eq!(agents.call_count(), 0, "nothing ran");
 }
+
+#[test]
+fn a_blocked_node_reports_the_reason_it_failed() {
+    // A single agent node that always fails. Its failure text must survive
+    // into the report — a blocked id with no reason is the observability gap
+    // that made a tool-denied node indistinguishable from any other block.
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "claude was denied WebFetch".into(),
+        }],
+    );
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    assert_eq!(
+        report.blocked_reasons.get("a").map(String::as_str),
+        Some("claude was denied WebFetch"),
+        "the report must carry why a node blocked, not only that it did"
+    );
+}
+
+#[test]
+fn a_node_blocked_after_the_full_retry_repair_ladder_still_reports_its_reason() {
+    // Mirrors an agent node like triage-and-fix: retries and repairs both
+    // budgeted, so the block happens down the repair rung, not at the direct
+    // Rung::Block. The reason must survive that path too.
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 2, repairs: 2}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "claude was denied Bash".into(),
+        }],
+    );
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    assert_eq!(
+        report.blocked_reasons.get("a").map(String::as_str),
+        Some("claude was denied Bash"),
+        "a node blocked via the repair rung must still carry its reason"
+    );
+}

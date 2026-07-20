@@ -129,6 +129,19 @@ fn print_unconstrained(v: &Validated) {
     println!("  their `succeeded` is a claim, not evidence. Check the result yourself.");
 }
 
+/// Flatten a possibly multi-line failure reason to a single readable row.
+/// Newlines and runs of whitespace collapse to single spaces; anything past
+/// 200 chars is elided. The full text lives in the run store — this is the
+/// at-a-glance version printed under the blocked list.
+fn one_line(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 200 {
+        return flat;
+    }
+    let head: String = flat.chars().take(200).collect();
+    format!("{head}…")
+}
+
 /// Announce a replanning attempt and the ceiling it counts against, so the
 /// bound on autonomous work is visible rather than implicit.
 fn replan_banner(attempt: u32, max: u32) -> String {
@@ -333,6 +346,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  succeeded: {:?}", report.succeeded);
                 println!("  blocked:   {:?}", report.blocked);
                 println!("  skipped:   {:?}", report.skipped);
+                for id in &report.blocked {
+                    // A failed node prints its reason; a gate blocked on purpose
+                    // and has none — leave it to the exit-3 checkpoint message
+                    // below rather than labelling an intentional halt a failure.
+                    if let Some(reason) = report.blocked_reasons.get(id) {
+                        println!("    {id}: {}", one_line(reason));
+                    }
+                }
                 println!(
                     "  model calls: {} (bound was {})",
                     report.model_calls, bound.agent_calls
@@ -554,6 +575,23 @@ mod tests {
     }
 
     #[test]
+    fn one_line_collapses_newlines_so_a_reason_stays_one_row() {
+        assert_eq!(
+            one_line("denied WebFetch\n  and stopped"),
+            "denied WebFetch and stopped"
+        );
+    }
+
+    #[test]
+    fn one_line_truncates_a_long_reason() {
+        let long = "x".repeat(400);
+        let out = one_line(&long);
+        let chars = out.chars().count();
+        assert!(chars <= 201, "kept short enough to read: {chars}");
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
     fn replan_banner_states_which_attempt_and_the_ceiling() {
         let b = replan_banner(1, 2);
         assert!(b.contains('1'), "current attempt must be shown");
@@ -670,6 +708,7 @@ mod tests {
             succeeded: vec![],
             blocked: blocked.into_iter().map(String::from).collect(),
             skipped: vec![],
+            blocked_reasons: std::collections::BTreeMap::new(),
             model_calls: 0,
             command_runs: 0,
         }
