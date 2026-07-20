@@ -1,0 +1,10 @@
+{
+  "name": "sgh",
+  "displayName": "sgh — structured graph harness",
+  "version": "0.1.0",
+  "description": "Plan and run agent work as a validated graph with a computable worst-case bound, instead of an open-ended loop.",
+  "author": { "name": "TopoDB" },
+  "repository": "https://github.com/TopoDB/TopoDB",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["agent", "harness", "graph", "planning"]
+}
