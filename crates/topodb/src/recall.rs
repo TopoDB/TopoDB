@@ -281,39 +281,44 @@ impl Db {
                 lists.push((q.vector_weight, vids));
             }
         }
-        // Graph leg, two-stage (spec): preliminary text+vector fusion
-        // picks GRAPH_SEEDS seeds; their 1-hop neighbors (deduped, seeds
-        // and already-ranked nodes excluded from *seeding* but not from
-        // membership) form a third list ordered by seed rank. Half weight:
-        // adjacency is corroboration, not relevance.
+        // Graph leg (spec 2026-07-19): preliminary text+vector fusion picks
+        // GRAPH_SEEDS seeds; ONE GRAPH_HOPS-bounded Both-direction traversal
+        // (1 hop — eval-tuned, see ppr.rs) materializes their joint neighborhood;
+        // PPR with teleport weighted by each
+        // seed's preliminary score ranks it. Connectivity now orders the
+        // list — a node multiple seeds converge on outranks a node dangling
+        // off one seed — replacing the old flat seed-rank concatenation.
+        // Seeds stay excluded from the list (ppr_over_subgraph's contract);
+        // half weight as ever: adjacency is corroboration, not relevance.
         if q.graph_boost && q.graph_weight > 0.0 {
             let prelim = rrf_fuse(&lists);
-            let seeds: Vec<crate::NodeId> =
-                prelim.iter().take(GRAPH_SEEDS).map(|(id, _)| *id).collect();
-            let mut graph_ids: Vec<crate::NodeId> = Vec::new();
-            let mut seen: std::collections::HashSet<crate::NodeId> =
-                seeds.iter().copied().collect();
-            for seed in &seeds {
+            let seeds: Vec<(crate::NodeId, f32)> = prelim
+                .iter()
+                .take(GRAPH_SEEDS)
+                .map(|(id, score)| (*id, *score))
+                .collect();
+            if !seeds.is_empty() {
                 let sg = self.traverse(&crate::TraversalQuery {
                     scopes: q.scopes.clone(),
-                    seeds: vec![*seed],
-                    max_hops: 1,
+                    seeds: seeds.iter().map(|(id, _)| *id).collect(),
+                    max_hops: crate::ppr::GRAPH_HOPS,
                     edge_types: None,
                     direction: crate::Direction::Both,
                     as_of: q.options.now_ms,
                 })?;
-                // Deterministic within a seed: sort neighbors by id.
-                let mut neighbors: Vec<NodeRecord> = sg.nodes;
-                neighbors.sort_by_key(|n| n.id);
-                for n in neighbors {
-                    if seen.insert(n.id) {
-                        graph_ids.push(n.id);
-                        records.entry(n.id).or_insert(n);
+                let scored = crate::ppr::ppr_over_subgraph(&sg, &seeds);
+                let mut by_id: std::collections::HashMap<crate::NodeId, NodeRecord> =
+                    sg.nodes.into_iter().map(|n| (n.id, n)).collect();
+                let mut graph_ids: Vec<crate::NodeId> = Vec::new();
+                for (id, _) in scored {
+                    if let Some(rec) = by_id.remove(&id) {
+                        graph_ids.push(id);
+                        records.entry(id).or_insert(rec);
                     }
                 }
-            }
-            if !graph_ids.is_empty() {
-                lists.push((q.graph_weight, graph_ids));
+                if !graph_ids.is_empty() {
+                    lists.push((q.graph_weight, graph_ids));
+                }
             }
         }
         let fused = rrf_fuse(&lists);

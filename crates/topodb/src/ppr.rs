@@ -12,8 +12,14 @@ pub(crate) const ALPHA: f64 = 0.85;
 pub(crate) const PPR_MAX_ITERS: usize = 30;
 /// L1-delta early-exit threshold.
 pub(crate) const PPR_EPSILON: f64 = 1e-9;
-/// Recall graph-leg traversal bound (was effectively 1 pre-PPR).
-pub(crate) const GRAPH_HOPS: u8 = 2;
+/// Recall graph-leg traversal bound. Tuned DOWN from the design's
+/// initial 2 via the golden-set eval (the constants' stated tuning
+/// mechanism): at 2 hops, hub-adjacent nodes reached through entity fan-
+/// out picked up enough graph-leg RRF mass to push a correct-but-unlinked
+/// top text/vector hit out of the eval's top-3 ("search index rebuilding
+/// tripling deploy time"). At 1 hop the membership matches the old flat
+/// leg — PPR improves the ORDERING only — and the full eval stays green.
+pub(crate) const GRAPH_HOPS: u8 = 1;
 /// `suggest_links` traversal bound.
 pub(crate) const SUGGEST_HOPS: u8 = 3;
 /// `suggest_links` RRF weights: structural (PPR) / semantic (cosine) legs.
