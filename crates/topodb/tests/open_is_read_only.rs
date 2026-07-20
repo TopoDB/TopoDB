@@ -88,6 +88,83 @@ fn repeated_reopens_are_all_no_ops() {
     }
 }
 
+/// The read-only fast path must never swallow a migration. A v5 file has a
+/// stale `format_version` and no `LABEL_INDEX` table, so `open_needs_write`
+/// must report true and let `migrate_v5_to_v6` run; only the *second* open,
+/// once the file is genuinely current, may take the fast path.
+///
+/// This is the specific hazard the fast path introduces, and the existing
+/// `format_fixture.rs` coverage cannot see it: that test opens the fixture
+/// once and checks reads, which would still pass if a migration were skipped
+/// but the data happened to remain readable.
+#[test]
+fn v5_fixture_migrates_on_first_open_then_takes_the_fast_path() {
+    use topodb::{IndexSpec, PropIndex, ScopeSet};
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v5.redb");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v5.redb");
+    std::fs::copy(&src, &path).expect("copy fixture"); // never open the committed file read-write
+
+    // The spec the fixture was written with, so `ensure_index_spec` has no
+    // reindex of its own to do and the only reason to write is the migration.
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+
+    let before_migration = digest(&path);
+    {
+        let db = Db::open_with(&path, spec.clone()).expect("open v5 fixture");
+        let scopes = ScopeSet::of(&[topodb::ScopeId::from_u128(1)]);
+
+        // v6's whole point: the label index must exist and be populated. On a
+        // v5 file that can only be true if the migration actually ran.
+        let entities = db.nodes_by_label(&scopes, "Entity");
+        assert_eq!(
+            entities.len(),
+            1,
+            "LABEL_INDEX must be populated by the v5 -> v6 migration"
+        );
+        assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    }
+    let after_migration = digest(&path);
+
+    assert!(
+        before_migration.1 != after_migration.1,
+        "a v5 file must be migrated on open, not skipped by the read-only fast path"
+    );
+
+    // Now current: the second open has nothing to do and must not write.
+    {
+        let _db = Db::open_with(&path, spec.clone()).expect("reopen migrated file");
+    }
+    let after_reopen = digest(&path);
+    assert!(
+        after_migration.1 == after_reopen.1,
+        "reopening the migrated file must take the read-only fast path"
+    );
+
+    // And the migrated data must still be intact and queryable after that
+    // fast-path open.
+    let db = Db::open_with(&path, spec).expect("final open");
+    let scopes = ScopeSet::of(&[topodb::ScopeId::from_u128(1)]);
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(
+        db.search_text(&scopes, "databases", 10)
+            .expect("text search")
+            .len(),
+        1,
+        "text index survives migration + fast-path reopen"
+    );
+}
+
 #[test]
 fn a_reopened_database_still_reads_correctly() {
     // The fast path must not skip state the engine needs at runtime: the
