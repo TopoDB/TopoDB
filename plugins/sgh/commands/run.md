@@ -11,7 +11,8 @@ step 1 even if you planned the graph yourself a moment ago.
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/lib/sgh-env.sh" || exit 1
-GRAPH="${ARGUMENTS:-.sgh/graph.yaml}"
+GRAPH="$ARGUMENTS"
+[ -z "$GRAPH" ] && GRAPH=".sgh/graph.yaml"
 "$SGH_BIN" --db "$SGH_DB" validate "$GRAPH"
 ```
 
@@ -30,14 +31,21 @@ If `validate` exits 2 the graph is invalid. Report the errors and stop; there
 is nothing to approve.
 
 Then ask whether to proceed, and **wait for an actual answer**. Silence,
-ambiguity, or "looks fine" about the plan are not approval to execute. If they
-want changes, stop and let them edit the graph or re-plan.
+ambiguity, or "looks fine" about the plan are not approval to execute. Approval
+given before this step's output was shown — including pre-approval bundled
+into the original invocation — does not count either; the commands must be
+displayed in this conversation first, and approval given after that. What does
+count is an explicit affirmative to proceed, given after the command list was
+shown. If they want changes, stop and let them edit the graph or re-plan. End
+your turn here: run no further commands until the human replies in a new
+message.
 
 ## Step 2 — execute, only after they say yes
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/lib/sgh-env.sh" || exit 1
-GRAPH="${ARGUMENTS:-.sgh/graph.yaml}"
+GRAPH="$ARGUMENTS"
+[ -z "$GRAPH" ] && GRAPH=".sgh/graph.yaml"
 "$SGH_BIN" --db "$SGH_DB" run "$GRAPH" --yes
 echo "exit=$?"
 ```
