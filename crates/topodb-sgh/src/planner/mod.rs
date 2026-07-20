@@ -8,8 +8,13 @@ use crate::schema::Graph;
 pub enum PlannerError {
     #[error("planner produced unparseable yaml: {0}")]
     Yaml(String),
-    #[error("planner failed to produce a valid graph in {attempts} attempt(s); last errors: {errors:?}")]
-    Exhausted { attempts: u32, errors: Vec<ValidationError> },
+    #[error(
+        "planner failed to produce a valid graph in {attempts} attempt(s); last errors: {errors:?}"
+    )]
+    Exhausted {
+        attempts: u32,
+        errors: Vec<ValidationError>,
+    },
     #[error("planner backend error: {0}")]
     Runner(String),
 }

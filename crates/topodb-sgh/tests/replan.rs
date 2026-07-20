@@ -1,7 +1,9 @@
 use topodb::Db;
 use topodb_sgh::executor::Executor;
 use topodb_sgh::planner::mock::MockPlanner;
-use topodb_sgh::replan::{build_replan_goal, collect_failure_context, propose_revision, FailureContext};
+use topodb_sgh::replan::{
+    build_replan_goal, collect_failure_context, propose_revision, FailureContext,
+};
 use topodb_sgh::runner::mock::MockRunner;
 use topodb_sgh::runner::NodeOutcome;
 use topodb_sgh::schema::validate::validate;
@@ -25,7 +27,12 @@ fn failure_context_names_blocked_nodes_skipped_dependents_and_the_error() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let store = RunStore::create(&db, "r", &v, 1).unwrap();
 
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "no such file".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "no such file".into(),
+        }],
+    );
     let mut ex = Executor::new(store, v.clone(), &runner);
     let report = ex.run(10).unwrap();
 
@@ -33,7 +40,9 @@ fn failure_context_names_blocked_nodes_skipped_dependents_and_the_error() {
     assert_eq!(ctx.blocked, vec!["a".to_string()]);
     assert_eq!(ctx.skipped, vec!["b".to_string()]);
     assert!(
-        ctx.attempts.iter().any(|(node, _, err)| node == "a" && err.contains("no such file")),
+        ctx.attempts
+            .iter()
+            .any(|(node, _, err)| node == "a" && err.contains("no such file")),
         "the failing node's error must be carried into the context: {:?}",
         ctx.attempts
     );
@@ -54,14 +63,27 @@ fn replan_goal_restates_the_original_and_the_failure() {
         blocked: vec!["locate-config-file".into()],
         gated: vec![],
         skipped: vec!["downstream-step".into()],
-        attempts: vec![("locate-config-file".into(), "block".into(), "no such file".into())],
+        attempts: vec![(
+            "locate-config-file".into(),
+            "block".into(),
+            "no such file".into(),
+        )],
         descriptions: std::collections::BTreeMap::new(),
     };
     let goal = build_replan_goal("port the analyzer", &ctx);
 
-    assert!(goal.contains("port the analyzer"), "the original goal must survive");
-    assert!(goal.contains("locate-config-file"), "the blocked node must be named");
-    assert!(goal.contains("no such file"), "the failure must be explained");
+    assert!(
+        goal.contains("port the analyzer"),
+        "the original goal must survive"
+    );
+    assert!(
+        goal.contains("locate-config-file"),
+        "the blocked node must be named"
+    );
+    assert!(
+        goal.contains("no such file"),
+        "the failure must be explained"
+    );
     assert!(
         goal.to_lowercase().contains("different"),
         "the planner must be told to try a different approach, not repeat the same graph"
@@ -71,12 +93,19 @@ fn replan_goal_restates_the_original_and_the_failure() {
 #[test]
 fn replan_goal_includes_the_failed_node_s_description() {
     let mut descriptions = std::collections::BTreeMap::new();
-    descriptions.insert("locate-config-file".to_string(), "agent: find the analyzer's config file in the repo root".to_string());
+    descriptions.insert(
+        "locate-config-file".to_string(),
+        "agent: find the analyzer's config file in the repo root".to_string(),
+    );
     let ctx = FailureContext {
         blocked: vec!["locate-config-file".into()],
         gated: vec![],
         skipped: vec![],
-        attempts: vec![("locate-config-file".into(), "block".into(), "no such file".into())],
+        attempts: vec![(
+            "locate-config-file".into(),
+            "block".into(),
+            "no such file".into(),
+        )],
         descriptions,
     };
     let goal = build_replan_goal("port the analyzer", &ctx);
@@ -100,12 +129,20 @@ fn collect_failure_context_truncates_an_overlong_prompt() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let store = RunStore::create(&db, "r", &v, 1).unwrap();
 
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "no such file".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "no such file".into(),
+        }],
+    );
     let mut ex = Executor::new(store, v.clone(), &runner);
     let report = ex.run(10).unwrap();
 
     let ctx = collect_failure_context(ex.store_ref(), &v, &report).unwrap();
-    let desc = ctx.descriptions.get("a").expect("description recorded for blocked node");
+    let desc = ctx
+        .descriptions
+        .get("a")
+        .expect("description recorded for blocked node");
     assert!(
         !desc.contains(&long_prompt),
         "a 500-char prompt must not be carried into the description verbatim: {desc}"
@@ -142,7 +179,10 @@ fn propose_revision_returns_a_validated_successor_graph() {
     let revised = propose_revision(&planner, &v, &ctx).expect("proposes");
     assert_eq!(revised.nodes.len(), 1);
     assert_eq!(revised.nodes[0].id, "locate");
-    assert!(validate(&revised).is_ok(), "a proposal must itself be valid");
+    assert!(
+        validate(&revised).is_ok(),
+        "a proposal must itself be valid"
+    );
 }
 
 #[test]
@@ -188,7 +228,12 @@ fn a_mix_of_a_real_failure_and_a_gate_partitions_correctly() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let store = RunStore::create(&db, "r", &v, 1).unwrap();
 
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Failed { error: "boom".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Failed {
+            error: "boom".into(),
+        }],
+    );
     let mut ex = Executor::new(store, v.clone(), &runner);
     let report = ex.run(10).unwrap();
 
@@ -210,7 +255,10 @@ fn replan_goal_instructs_preserving_gate_checkpoints_not_removing_them() {
     };
     let goal = build_replan_goal("port the analyzer", &ctx);
 
-    assert!(goal.contains("checkpoint"), "the gate node must be named: {goal}");
+    assert!(
+        goal.contains("checkpoint"),
+        "the gate node must be named: {goal}"
+    );
     assert!(
         goal.to_lowercase().contains("intentional checkpoint"),
         "the goal must state the halt was intentional, not a failure: {goal}"

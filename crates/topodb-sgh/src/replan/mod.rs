@@ -131,9 +131,7 @@ pub fn build_replan_goal(original_goal: &str, ctx: &FailureContext) -> String {
     }
 
     if !ctx.gated.is_empty() {
-        g.push_str(
-            "\nThe run stopped at an intentional checkpoint (not a failure):\n",
-        );
+        g.push_str("\nThe run stopped at an intentional checkpoint (not a failure):\n");
         for node in &ctx.gated {
             match ctx.descriptions.get(node) {
                 Some(desc) => g.push_str(&format!("- {node}: {desc}\n")),
@@ -180,5 +178,8 @@ pub fn propose_revision(
     ctx: &FailureContext,
 ) -> Result<Graph, PlannerError> {
     let goal = build_replan_goal(&original.graph.goal, ctx);
-    planner.plan(&PlanRequest { goal, context: None })
+    planner.plan(&PlanRequest {
+        goal,
+        context: None,
+    })
 }

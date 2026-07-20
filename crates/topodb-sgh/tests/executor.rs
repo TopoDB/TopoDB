@@ -254,10 +254,20 @@ fn a_configured_command_runner_lets_command_nodes_execute() {
     let report = ex.run(10).unwrap();
 
     assert_eq!(report.succeeded, vec!["a".to_string(), "b".to_string()]);
-    assert_eq!(report.model_calls, 1, "only the agent node costs a model call");
-    assert_eq!(report.command_runs, 1, "the command node is counted separately");
+    assert_eq!(
+        report.model_calls, 1,
+        "only the agent node costs a model call"
+    );
+    assert_eq!(
+        report.command_runs, 1,
+        "the command node is counted separately"
+    );
     assert_eq!(commands.calls(), vec!["b".to_string()]);
-    assert_eq!(agents.calls(), vec!["a".to_string()], "the command never reaches the agent runner");
+    assert_eq!(
+        agents.calls(),
+        vec!["a".to_string()],
+        "the command never reaches the agent runner"
+    );
 }
 
 #[test]
@@ -276,8 +286,12 @@ fn command_runs_stay_within_the_computed_bound_under_retries() {
     let store = RunStore::create(&db, "r", &v, 1).unwrap();
 
     let agents = MockRunner::new();
-    let commands = topodb_sgh::runner::command::MockCommandRunner::new()
-        .script("b", vec![NodeOutcome::Failed { error: "nope".into() }]);
+    let commands = topodb_sgh::runner::command::MockCommandRunner::new().script(
+        "b",
+        vec![NodeOutcome::Failed {
+            error: "nope".into(),
+        }],
+    );
 
     let mut ex = Executor::new(store, v, &agents).with_command_runner(&commands);
     let report = ex.run(10).unwrap();
@@ -285,7 +299,10 @@ fn command_runs_stay_within_the_computed_bound_under_retries() {
     assert_eq!(report.blocked, vec!["b".to_string()]);
     assert_eq!(report.command_runs, 3, "1 initial + 2 retries");
     assert!(report.command_runs <= bound.command_runs);
-    assert_eq!(report.model_calls, 0, "a command node never costs a model call");
+    assert_eq!(
+        report.model_calls, 0,
+        "a command node never costs a model call"
+    );
 }
 
 #[test]

@@ -3,7 +3,10 @@ use topodb_sgh::planner::{build_plan_prompt, PlanRequest, Planner, PlannerError}
 use topodb_sgh::schema::validate::ValidationError;
 
 fn req() -> PlanRequest {
-    PlanRequest { goal: "port the analyzer".into(), context: None }
+    PlanRequest {
+        goal: "port the analyzer".into(),
+        context: None,
+    }
 }
 
 #[test]
@@ -13,7 +16,10 @@ fn prompt_states_the_goal_and_teaches_the_schema() {
     assert!(p.contains("kind"), "must describe node kinds");
     assert!(p.contains("budget"), "budget is required on every node");
     assert!(p.contains("needs"), "must describe dependencies");
-    assert!(p.contains("version: 1"), "must show the expected top-level shape");
+    assert!(
+        p.contains("version: 1"),
+        "must show the expected top-level shape"
+    );
 }
 
 #[test]
@@ -46,14 +52,26 @@ fn prompt_includes_optional_context_when_given() {
 #[test]
 fn retry_prompt_feeds_back_the_errors_and_the_rejected_yaml() {
     let errs = vec![
-        ValidationError::DanglingNeed { node: "b".into(), missing: "ghost".into() },
+        ValidationError::DanglingNeed {
+            node: "b".into(),
+            missing: "ghost".into(),
+        },
         ValidationError::MissingPrompt("a".into()),
     ];
     let p = build_plan_prompt(&req(), &errs, Some("version: 1\ngoal: g\nnodes: []\n"));
 
-    assert!(p.contains("ghost"), "the specific dangling id must be fed back");
-    assert!(p.contains("has no prompt"), "the specific error must be fed back");
-    assert!(p.contains("nodes: []"), "the rejected document must be shown");
+    assert!(
+        p.contains("ghost"),
+        "the specific dangling id must be fed back"
+    );
+    assert!(
+        p.contains("has no prompt"),
+        "the specific error must be fed back"
+    );
+    assert!(
+        p.contains("nodes: []"),
+        "the rejected document must be shown"
+    );
 }
 
 #[test]
@@ -129,27 +147,42 @@ fn an_invalid_attempt_is_retried_with_the_errors_fed_back() {
     let prompts = backend.prompts();
     assert_eq!(prompts.len(), 2, "one initial attempt plus one retry");
     assert!(!prompts[0].contains("rejected"), "first prompt is clean");
-    assert!(prompts[1].contains("ghost"), "retry must name the dangling dependency");
+    assert!(
+        prompts[1].contains("ghost"),
+        "retry must name the dangling dependency"
+    );
 }
 
 #[test]
 fn the_retry_loop_is_bounded_and_reports_exhaustion() {
-    let backend = std::sync::Arc::new(ScriptedBackend::new(vec![DANGLING, DANGLING, DANGLING, DANGLING]));
+    let backend = std::sync::Arc::new(ScriptedBackend::new(vec![
+        DANGLING, DANGLING, DANGLING, DANGLING,
+    ]));
     let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
 
     match p.plan(&req()) {
         Err(PlannerError::Exhausted { attempts, errors }) => {
             assert_eq!(attempts, 3, "must stop at max_attempts, not keep going");
-            assert!(!errors.is_empty(), "the final validation errors must be reported");
+            assert!(
+                !errors.is_empty(),
+                "the final validation errors must be reported"
+            );
         }
         other => panic!("expected exhaustion, got {other:?}"),
     }
-    assert_eq!(backend.prompts().len(), 3, "exactly max_attempts backend calls, never more");
+    assert_eq!(
+        backend.prompts().len(),
+        3,
+        "exactly max_attempts backend calls, never more"
+    );
 }
 
 #[test]
 fn unparseable_yaml_is_retried_like_any_other_rejection() {
-    let backend = std::sync::Arc::new(ScriptedBackend::new(vec!["this is not yaml: [unclosed", VALID]));
+    let backend = std::sync::Arc::new(ScriptedBackend::new(vec![
+        "this is not yaml: [unclosed",
+        VALID,
+    ]));
     let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
     assert!(p.plan(&req()).is_ok());
     assert_eq!(backend.prompts().len(), 2);

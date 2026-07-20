@@ -340,10 +340,15 @@ fn planner_retry_loop_is_bounded() {
     }
 
     for max in [1u32, 2, 5] {
-        let backend = std::sync::Arc::new(AlwaysInvalid { calls: Mutex::new(0) });
+        let backend = std::sync::Arc::new(AlwaysInvalid {
+            calls: Mutex::new(0),
+        });
         let p = ClaudePlanner::with_backend(Box::new(backend.clone()), max);
         let err = p
-            .plan(&PlanRequest { goal: "g".into(), context: None })
+            .plan(&PlanRequest {
+                goal: "g".into(),
+                context: None,
+            })
             .expect_err("never validates");
         assert!(matches!(err, PlannerError::Exhausted { .. }));
         assert_eq!(

@@ -66,7 +66,10 @@ impl ClaudePlanner {
     }
 
     pub fn with_backend(backend: Box<dyn PlanBackend>, max_attempts: u32) -> Self {
-        ClaudePlanner { backend, max_attempts: max_attempts.max(1) }
+        ClaudePlanner {
+            backend,
+            max_attempts: max_attempts.max(1),
+        }
     }
 }
 
@@ -100,7 +103,10 @@ impl Planner for ClaudePlanner {
             }
         }
 
-        Err(PlannerError::Exhausted { attempts: self.max_attempts, errors })
+        Err(PlannerError::Exhausted {
+            attempts: self.max_attempts,
+            errors,
+        })
     }
 }
 

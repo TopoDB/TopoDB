@@ -124,15 +124,26 @@ fn revisions_round_trip_and_supersede() {
     let db = Db::open(dir.path().join("t.redb")).unwrap();
     let s = store(&db);
 
-    s.record_revision("version: 1\ngoal: first\nnodes: []\n", "survey blocked", 500)
-        .unwrap();
+    s.record_revision(
+        "version: 1\ngoal: first\nnodes: []\n",
+        "survey blocked",
+        500,
+    )
+    .unwrap();
     let (yaml, reason) = s.revision().unwrap().expect("a revision exists");
     assert!(yaml.contains("first"));
     assert_eq!(reason, "survey blocked");
 
-    s.record_revision("version: 1\ngoal: second\nnodes: []\n", "build blocked", 600)
-        .unwrap();
-    let (yaml, reason) = s.revision().unwrap().expect("still exactly one open revision");
+    s.record_revision(
+        "version: 1\ngoal: second\nnodes: []\n",
+        "build blocked",
+        600,
+    )
+    .unwrap();
+    let (yaml, reason) = s
+        .revision()
+        .unwrap()
+        .expect("still exactly one open revision");
     assert!(yaml.contains("second"), "the latest proposal wins");
     assert_eq!(reason, "build blocked");
 
@@ -147,25 +158,40 @@ fn revisions_round_trip_and_supersede() {
     let all = db
         .edges_from(&scopes, s.run_node(), None, Some(EDGE_REVISION_OF), false)
         .unwrap();
-    assert_eq!(all.len(), 2, "both proposals survive as edges, none deleted");
+    assert_eq!(
+        all.len(),
+        2,
+        "both proposals survive as edges, none deleted"
+    );
 
     let open: Vec<_> = all.iter().filter(|e| e.valid_to.is_none()).collect();
     assert_eq!(open.len(), 1, "exactly one open revision edge");
-    let open_rec = db.node(&scopes, open[0].to).expect("open revision node exists");
+    let open_rec = db
+        .node(&scopes, open[0].to)
+        .expect("open revision node exists");
     match open_rec.props.get("yaml") {
-        Some(PropValue::Str(s)) => assert!(s.contains("second"), "open edge points at the latest revision"),
+        Some(PropValue::Str(s)) => assert!(
+            s.contains("second"),
+            "open edge points at the latest revision"
+        ),
         other => panic!("expected yaml prop, got {other:?}"),
     }
 
     let closed: Vec<_> = all.iter().filter(|e| e.valid_to.is_some()).collect();
-    assert_eq!(closed.len(), 1, "exactly one closed (superseded) revision edge");
+    assert_eq!(
+        closed.len(),
+        1,
+        "exactly one closed (superseded) revision edge"
+    );
     assert_eq!(
         closed[0].valid_to,
         Some(600),
         "superseded edge closed at the second call's timestamp"
     );
 
-    let superseded_rec = db.node(&scopes, closed[0].to).expect("superseded revision node exists");
+    let superseded_rec = db
+        .node(&scopes, closed[0].to)
+        .expect("superseded revision node exists");
     let superseded_yaml = match superseded_rec.props.get("yaml") {
         Some(PropValue::Str(s)) => s.clone(),
         other => panic!("expected yaml prop, got {other:?}"),

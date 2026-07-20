@@ -13,7 +13,10 @@ pub struct MockPlanner {
 
 impl MockPlanner {
     pub fn new(responses: Vec<Result<String, String>>) -> Self {
-        MockPlanner { responses: Mutex::new(responses), cursor: Mutex::new(0) }
+        MockPlanner {
+            responses: Mutex::new(responses),
+            cursor: Mutex::new(0),
+        }
     }
 }
 

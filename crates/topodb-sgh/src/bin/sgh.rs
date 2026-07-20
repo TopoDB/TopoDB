@@ -493,7 +493,10 @@ mod tests {
     fn replan_banner_states_which_attempt_and_the_ceiling() {
         let b = replan_banner(1, 2);
         assert!(b.contains('1'), "current attempt must be shown");
-        assert!(b.contains('2'), "the ceiling must be shown so the bound is visible");
+        assert!(
+            b.contains('2'),
+            "the ceiling must be shown so the bound is visible"
+        );
     }
 
     #[test]
@@ -547,7 +550,10 @@ mod tests {
 
     #[test]
     fn needs_prompt_with_no_flags_always_prompts() {
-        assert!(needs_prompt(false, false, false), "original graph, no flags");
+        assert!(
+            needs_prompt(false, false, false),
+            "original graph, no flags"
+        );
         assert!(needs_prompt(true, false, false), "revision, no flags");
     }
 
@@ -618,7 +624,10 @@ mod tests {
         assert_eq!(outcome, Outcome::HaltedAtCheckpoint);
         let code = exit_code(&outcome);
         assert_ne!(code, 0, "a checkpoint halt must never look like success");
-        assert_ne!(code, 1, "a checkpoint halt must be distinguishable from a real failure");
+        assert_ne!(
+            code, 1,
+            "a checkpoint halt must be distinguishable from a real failure"
+        );
         assert_eq!(code, 3);
     }
 
@@ -631,10 +640,7 @@ mod tests {
 
     #[test]
     fn outcome_of_mixed_failure_and_gate_is_blocked_because_failure_dominates() {
-        let outcome = outcome_of(
-            &report(vec!["a", "gate1"]),
-            &ctx(vec!["a"], vec!["gate1"]),
-        );
+        let outcome = outcome_of(&report(vec!["a", "gate1"]), &ctx(vec!["a"], vec!["gate1"]));
         assert_eq!(
             outcome,
             Outcome::Blocked,

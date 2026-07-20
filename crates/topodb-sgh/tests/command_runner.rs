@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use topodb_sgh::runner::command::{env_var_name, CommandRequest, CommandRunner, ShellCommandRunner};
+use topodb_sgh::runner::command::{
+    env_var_name, CommandRequest, CommandRunner, ShellCommandRunner,
+};
 use topodb_sgh::runner::NodeOutcome;
 
 fn req(run: &str) -> CommandRequest {
@@ -56,7 +58,10 @@ fn a_failing_command_with_non_utf8_stdout_reports_exit_status_not_a_utf8_error()
     let r = req("printf 'boom' >&2; printf '\\xff\\xfe' ; exit 7");
     match runner().run(&r).unwrap() {
         NodeOutcome::Failed { error } => {
-            assert!(error.contains("exited with 7"), "exit code must be reported: {error}");
+            assert!(
+                error.contains("exited with 7"),
+                "exit code must be reported: {error}"
+            );
             assert!(error.contains("boom"), "stderr must survive: {error}");
         }
         other => panic!("expected a Failed outcome, not an Err, got {other:?}"),
@@ -95,7 +100,11 @@ fn a_command_with_a_declared_schema_returns_stdout_verbatim() {
     match runner().run(&r).unwrap() {
         NodeOutcome::Succeeded { output } => {
             let v: serde_json::Value = serde_json::from_str(&output).expect("valid json");
-            assert_eq!(v, serde_json::json!({"sites": 2}), "output must not be wrapped");
+            assert_eq!(
+                v,
+                serde_json::json!({"sites": 2}),
+                "output must not be wrapped"
+            );
         }
         other => panic!("expected success, got {other:?}"),
     }
