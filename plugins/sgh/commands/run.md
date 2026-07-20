@@ -2,37 +2,22 @@
 description: Run an sgh graph, showing every shell command for approval first
 ---
 
-Run the sgh graph at: **$ARGUMENTS** (default `.sgh/graph.yaml` if empty)
+This command always runs the graph at the fixed path `.sgh/graph.yaml`, which
+`/sgh:plan` writes. It does not accept a path argument.
+
+If the user passed any argument to this command, do not silently run the
+default graph. Tell them this command only runs `.sgh/graph.yaml`, and ask
+them to copy their graph there (or re-run `/sgh:plan`) — then stop. Do not
+run either bash block below in that case.
 
 This is a two-step gate. Do not collapse it into one step, and do not skip
 step 1 even if you planned the graph yourself a moment ago.
-
-## Before running anything — sanitize the argument
-
-`$ARGUMENTS` is substituted directly into the `GRAPH="$ARGUMENTS"` line below
-before bash ever sees it, as literal text inside a double-quoted string. This
-happens before either step's block runs, and before any approval. So, before
-running either bash block:
-
-- Take only the **path** portion of the argument. Users sometimes bundle
-  extra text into the invocation, e.g. `/sgh:run graph.yaml — yes, go ahead`.
-  The path is just `graph.yaml`; the rest is not approval — this agrees with
-  the rule below that pre-approval bundled into the invocation does not count.
-- Refuse to run the block if that path contains any shell metacharacter:
-  double quote (`"`), single quote (`'`), backtick, `$`, `;`, `|`, `&`, `<`,
-  `>`, a newline, or a backslash. Say plainly why: the path is substituted
-  into a shell command literally, so any of these characters can execute
-  arbitrary code on the user's machine the moment the block runs. Ask the
-  user for a clean path instead — do not attempt to escape, quote, or
-  sanitize the value yourself and proceed anyway.
-- This check protects the same person the approval gate in step 1 protects,
-  and it applies even when you generated the path yourself a moment ago.
 
 ## Step 1 — preview, read-only
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/lib/sgh-env.sh" || exit 1
-GRAPH="$(printf '%s' "$ARGUMENTS" | tr -d '[:space:]')" ; [ -z "$GRAPH" ] && GRAPH=".sgh/graph.yaml" || GRAPH="$ARGUMENTS"
+GRAPH=".sgh/graph.yaml"
 "$SGH_BIN" --db "$SGH_DB" validate "$GRAPH"
 ```
 
@@ -64,7 +49,7 @@ message.
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/lib/sgh-env.sh" || exit 1
-GRAPH="$(printf '%s' "$ARGUMENTS" | tr -d '[:space:]')" ; [ -z "$GRAPH" ] && GRAPH=".sgh/graph.yaml" || GRAPH="$ARGUMENTS"
+GRAPH=".sgh/graph.yaml"
 "$SGH_BIN" --db "$SGH_DB" run "$GRAPH" --yes
 echo "exit=$?"
 ```
