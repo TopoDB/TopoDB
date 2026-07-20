@@ -57,6 +57,13 @@ node), and `link` reuses an existing open edge instead of duplicating it.
 Reuse edge-type names the graph already has (`works_at`, not also
 `employed_by`).
 
+After storing a memory or entity, consider `suggest_links` on it: the engine
+ranks nodes it should probably be connected to but isn't — structurally close
+(shared neighbors, converging paths) or semantically similar (embeddings) —
+with the shared neighbors as evidence. Review the suggestions and `link` only
+the ones you agree with, choosing the edge type yourself; nothing is ever
+created automatically.
+
 ## When a fact changes
 
 Facts supersede, they don't overwrite. When a to-one relation changes — new

@@ -806,6 +806,38 @@ struct TraverseResult {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SuggestLinksParams {
+    /// Node to suggest missing links for (ULID).
+    node_id: String,
+    /// How many suggestions. Default 5.
+    #[serde(default = "default_suggest_k")]
+    #[schemars(range(min = 1, max = 50))]
+    k: u32,
+    /// Scope to read: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Read across SEVERAL scopes at once (takes precedence over `scope`).
+    /// Must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+fn default_suggest_k() -> u32 {
+    5
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct SuggestLinksResult {
+    /// Suggested-but-nonexistent edges, best first: `{node, score,
+    /// common_neighbors, structural, semantic}` each. `common_neighbors`
+    /// are shared 1-hop node ULIDs — the evidence for the suggestion.
+    suggestions: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AccessStatsParams {
     /// ULID of the node.
     id: String,
@@ -1497,6 +1529,44 @@ impl TopoServer {
         let subgraph =
             convert::subgraph_to_json(&sg).map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(TraverseResult { subgraph }))
+    }
+
+    #[tool(
+        description = "Predict missing links: rank the k nodes this node should probably be connected to but isn't — structurally close (many converging paths) and/or semantically similar (embedding cosine), with shared-neighbor evidence. Suggestions only: nothing is created — review them and call link for the ones you agree with, choosing the edge type yourself. Empty when the node is unknown in the read scopes."
+    )]
+    fn suggest_links(
+        &self,
+        Parameters(p): Parameters<SuggestLinksParams>,
+    ) -> Result<Json<SuggestLinksResult>, ErrorData> {
+        let node = parse_node_id(&p.node_id)?;
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let query = topodb::SuggestLinksQuery {
+            scopes: scope_set,
+            node,
+            k: p.k as usize,
+            // Always the active model's namespace: if the embedder is off
+            // or the node has no vector, the engine degrades to
+            // structure-only — same "visible subset" rule as recall.
+            model: Some(self.embedder.model_name()),
+            as_of: None,
+        };
+        let hits = self.db.suggest_links(&query).map_err(classify_topo_error)?;
+        let suggestions = hits
+            .iter()
+            .map(|s| {
+                let node = convert::node_to_json(&s.node)?;
+                Ok(serde_json::json!({
+                    "node": node,
+                    "score": s.score,
+                    "common_neighbors":
+                        s.common_neighbors.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "structural": s.structural,
+                    "semantic": s.semantic,
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(Json(SuggestLinksResult { suggestions }))
     }
 
     #[tool(
