@@ -179,6 +179,20 @@ async function connectAndInit({ dataDir, projectDir, env, initTimeoutMs }) {
   return session;
 }
 
+/* Concurrent connectAndInit with leak-proof failure: if one session fails
+ * to initialize, the sibling that SUCCEEDED must still land in `sessions`
+ * so the test's killAll(finally) reaches it. A bare Promise.all rejection
+ * strands the winner's shim alive — its open stdio pipes keep this test
+ * process's event loop spinning after the failed test, and node --test
+ * then waits on the file forever (the intermittent multi-hour CI hang). */
+async function connectPairTracked(sessions, specA, specB) {
+  const settled = await Promise.allSettled([connectAndInit(specA), connectAndInit(specB)]);
+  for (const r of settled) if (r.status === "fulfilled") sessions.push(r.value);
+  const failed = settled.find((r) => r.status === "rejected");
+  if (failed) throw failed.reason;
+  return settled.map((r) => r.value);
+}
+
 function spawnRawServer(dbPath, scope) {
   const bin = require.resolve("@topodb/topodb-mcp/bin/topodb-mcp.js");
   return spawnRpcClient(process.execPath, [bin, "--db", dbPath, "--scope", scope, "--read-scopes", `${scope},shared`]);
@@ -398,11 +412,11 @@ test("two_concurrent_sessions_both_get_memory", async () => {
     // the second process to reach redb's exclusive lock died with
     // Storage(DatabaseAlreadyOpen) -- silently, while the skill still told the
     // agent to call search_memories.
-    const [a, b] = await Promise.all([
-      connectAndInit({ dataDir, projectDir: projA }),
-      connectAndInit({ dataDir, projectDir: projB }),
-    ]);
-    sessions.push(a, b);
+    const [a, b] = await connectPairTracked(
+      sessions,
+      { dataDir, projectDir: projA },
+      { dataDir, projectDir: projB },
+    );
 
     const [infoA, infoB] = await Promise.all([
       a.rpc("tools/call", { name: "db_info", arguments: {} }),
@@ -432,11 +446,11 @@ test("answers_do_not_cross_between_sessions", async () => {
   const projB = mkdtempSync(path.join(tmpdir(), "topodb-t2-projB-"));
   const sessions = [];
   try {
-    const [a, b] = await Promise.all([
-      connectAndInit({ dataDir, projectDir: projA }),
-      connectAndInit({ dataDir, projectDir: projB }),
-    ]);
-    sessions.push(a, b);
+    const [a, b] = await connectPairTracked(
+      sessions,
+      { dataDir, projectDir: projA },
+      { dataDir, projectDir: projB },
+    );
 
     const markerA = `marker-A-${randomUUID()}`;
     const markerB = `marker-B-${randomUUID()}`;
@@ -528,11 +542,11 @@ test("each_session_writes_to_its_own_project_scope", async () => {
     // it writes a marker per session and reads each back, which works fine
     // when both sessions sit in the same scope. Sharing a scope is invisible
     // to it. Only asserting the scope itself can see this.
-    const [a, b] = await Promise.all([
-      connectAndInit({ dataDir, projectDir: projA }),
-      connectAndInit({ dataDir, projectDir: projB }),
-    ]);
-    sessions.push(a, b);
+    const [a, b] = await connectPairTracked(
+      sessions,
+      { dataDir, projectDir: projA },
+      { dataDir, projectDir: projB },
+    );
 
     const [infoA, infoB] = await Promise.all([
       a.rpc("tools/call", { name: "db_info", arguments: {} }),
@@ -575,11 +589,11 @@ test("one_project_cannot_read_another_projects_memory", async () => {
     // above is the mechanism; this is the harm: with the scopes collapsed,
     // project B's agent can recall project A's private memories. The README
     // promises the opposite ("reads span this project's scope plus shared").
-    const [a, b] = await Promise.all([
-      connectAndInit({ dataDir, projectDir: projA }),
-      connectAndInit({ dataDir, projectDir: projB }),
-    ]);
-    sessions.push(a, b);
+    const [a, b] = await connectPairTracked(
+      sessions,
+      { dataDir, projectDir: projA },
+      { dataDir, projectDir: projB },
+    );
 
     const secretOfA = `project-A-private-${randomUUID()}`;
     const wrote = await a.rpc("tools/call", {
