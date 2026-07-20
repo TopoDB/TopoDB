@@ -53,6 +53,45 @@ case "$p1" in
   *) echo "ok   - SGH_DB lives outside the project dir" ;;
 esac
 
+# 7. The default binary-resolution path works when SGH_BIN is unset.
+# Users who don't set SGH_BIN explicitly should get the fallback behavior:
+# derive from CLAUDE_PLUGIN_ROOT and resolve to <repo>/target/release/sgh.
+tmp_repo="$(mktemp -d)"
+mkdir -p "$tmp_repo/plugins/sgh" "$tmp_repo/target/release"
+touch "$tmp_repo/target/release/sgh" && chmod +x "$tmp_repo/target/release/sgh"
+expected="$tmp_repo/target/release/sgh"
+actual="$(env -u SGH_BIN CLAUDE_PLUGIN_ROOT="$tmp_repo/plugins/sgh" bash -c "source '$LIB' >/dev/null && printf '%s' \"\$SGH_BIN\"")"
+check "default binary resolution from CLAUDE_PLUGIN_ROOT" "$expected" "$actual"
+
+# 8. Both SGH_BIN and SGH_DB are genuinely exported to child processes.
+# A previous reviewer deleted both export lines and all existing tests still passed
+# because they only read the variables in the same shell. This test ensures
+# the exports actually work — the variables must be visible to a child process.
+tmp_derive="$(mktemp -d)"
+mkdir -p "$tmp_derive/plugins/sgh" "$tmp_derive/target/release"
+touch "$tmp_derive/target/release/sgh" && chmod +x "$tmp_derive/target/release/sgh"
+expected_bin="$tmp_derive/target/release/sgh"
+# Test SGH_BIN export: derive it via CLAUDE_PLUGIN_ROOT, verify child sees it
+sgb_child="$(env -u SGH_BIN CLAUDE_PLUGIN_ROOT="$tmp_derive/plugins/sgh" bash -c "source '$LIB' >/dev/null && bash -c 'printf \"%s\" \"\$SGH_BIN\"'")"
+# Test SGH_DB export: derived from pwd, verify child sees it
+sgd_child="$(env -u SGH_BIN CLAUDE_PLUGIN_ROOT="$tmp_derive/plugins/sgh" bash -c "source '$LIB' >/dev/null && bash -c 'printf \"%s\" \"\$SGH_DB\"'")"
+if [ -n "$sgb_child" ] && [ "$sgb_child" = "$expected_bin" ]; then
+  echo "ok   - SGH_BIN is exported to child processes"
+else
+  echo "FAIL - SGH_BIN is exported to child processes"
+  echo "       expected: $expected_bin"
+  echo "       actual:   $sgb_child"
+  fails=$((fails + 1))
+fi
+if [ -n "$sgd_child" ]; then
+  echo "ok   - SGH_DB is exported to child processes"
+else
+  echo "FAIL - SGH_DB is exported to child processes"
+  echo "       expected: non-empty"
+  echo "       actual:   (empty)"
+  fails=$((fails + 1))
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; fi
 exit "$fails"
