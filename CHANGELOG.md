@@ -18,6 +18,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`suggest_links` similarity transparency** — each `LinkSuggestion` now carries `similarity`
+  (the semantic leg's raw cosine; `None` when the suggestion is structural-only), and
+  `SuggestLinksQuery.min_semantic_similarity` optionally floors the semantic leg (validated
+  `-1.0..=1.0`, `None` default = prior behavior byte-for-byte). RRF rank scores hid the
+  strong-vs-weak distinction; the raw cosine restores it.
 - **Recall tuning on `RecallQuery`** — `labels` (post-fusion allowlist, `None` = unfiltered),
   per-leg RRF weights (`text_weight`/`vector_weight`/`graph_weight`, defaults 1.0/1.0/0.5 — the
   former compile-time constants), and `access_weight` (0-1, default 0 = off): an opt-in
@@ -342,6 +347,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`suggest_links` evidence & similarity (breaking shape change)** — `common_neighbors`
+  entries are now `{id, label, name}` objects (name: the `name` prop, else `content`
+  truncated to 80 chars) instead of bare ULID strings, saving a `get_node` round-trip per
+  neighbor; each suggestion carries `similarity` (`null` = structural-only); new optional
+  `min_similarity` param floors the semantic signal. Breaking only for the days-old
+  `suggest_links` tool shape at 0.x.
 - **`remember`** — a composed, atomic storage verb: one call creates the memory, find-or-creates
   each named entity (`create_entity` semantics: case/whitespace-insensitive across read scopes +
   write scope + shared, alias-aware, oldest-id-wins; repeated names within one call collapse

@@ -479,6 +479,26 @@ fn validate_ms_timestamp(field: &str, v: i64) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Host display-name convention for evidence rendering: the `name` prop
+/// (Entity/Alias), else the first 80 CHARACTERS of `content` (Memory,
+/// char-boundary safe, `…` when truncated), else null. The engine
+/// deliberately knows nothing about these prop conventions.
+fn display_name(n: &topodb::NodeRecord) -> serde_json::Value {
+    if let Some(PropValue::Str(name)) = n.props.get("name") {
+        return serde_json::Value::String(name.to_string());
+    }
+    if let Some(PropValue::Str(content)) = n.props.get("content") {
+        let mut chars = content.chars();
+        let head: String = chars.by_ref().take(80).collect();
+        return serde_json::Value::String(if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        });
+    }
+    serde_json::Value::Null
+}
+
 /// The `db_info` result payload. `Json<DbInfo>` (below) makes it structured
 /// tool output.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -813,6 +833,13 @@ struct SuggestLinksParams {
     #[serde(default = "default_suggest_k")]
     #[schemars(range(min = 1, max = 50))]
     k: u32,
+    /// Semantic-leg floor: suggestions whose cosine (against the target's
+    /// own embedding) falls below this are dropped from the semantic
+    /// signal. Model-dependent — omit unless you know your embedder's
+    /// similarity distribution. No default.
+    #[serde(default)]
+    #[schemars(range(min = -1.0, max = 1.0))]
+    min_similarity: Option<f32>,
     /// Scope to read: `"shared"` or a scope ULID. Defaults to the server's
     /// configured default scope when omitted.
     #[serde(default)]
@@ -831,8 +858,10 @@ fn default_suggest_k() -> u32 {
 #[derive(Debug, Serialize, JsonSchema)]
 struct SuggestLinksResult {
     /// Suggested-but-nonexistent edges, best first: `{node, score,
-    /// common_neighbors, structural, semantic}` each. `common_neighbors`
-    /// are shared 1-hop node ULIDs — the evidence for the suggestion.
+    /// similarity, common_neighbors, structural, semantic}` each.
+    /// `similarity` is the raw cosine when the suggestion came through the
+    /// semantic leg (`null` = found structurally); `common_neighbors`
+    /// entries are `{id, label, name}` shared 1-hop nodes — the evidence.
     suggestions: Vec<Value>,
 }
 
@@ -1532,7 +1561,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Predict missing links: rank the k nodes this node should probably be connected to but isn't — structurally close (many converging paths) and/or semantically similar (embedding cosine), with shared-neighbor evidence. Suggestions only: nothing is created — review them and call link for the ones you agree with, choosing the edge type yourself. Empty when the node is unknown in the read scopes."
+        description = "Predict missing links: rank the k nodes this node should probably be connected to but isn't — structurally close (many converging paths) and/or semantically similar (embedding cosine), with shared-neighbor evidence. Each suggestion carries `similarity` (raw cosine when found semantically; null when structural-only) and `common_neighbors` as {id, label, name} objects. Optional min_similarity floors the semantic signal (model-dependent; omit by default). Suggestions only: nothing is created — review them and call link for the ones you agree with, choosing the edge type yourself. Empty when the node is unknown in the read scopes."
     )]
     fn suggest_links(
         &self,
@@ -1541,13 +1570,14 @@ impl TopoServer {
         let node = parse_node_id(&p.node_id)?;
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         let query = topodb::SuggestLinksQuery {
-            scopes: scope_set,
+            scopes: scope_set.clone(),
             node,
             k: p.k as usize,
             // Always the active model's namespace: if the embedder is off
             // or the node has no vector, the engine degrades to
             // structure-only — same "visible subset" rule as recall.
             model: Some(self.embedder.model_name()),
+            min_semantic_similarity: p.min_similarity,
             as_of: None,
         };
         let hits = self.db.suggest_links(&query).map_err(classify_topo_error)?;
@@ -1555,11 +1585,26 @@ impl TopoServer {
             .iter()
             .map(|s| {
                 let node = convert::node_to_json(&s.node)?;
+                // Evidence rendered server-side (host convention — the
+                // engine returns ids only): scoped lookups, so an id the
+                // scope set cannot see is skipped, never leaked.
+                let common_neighbors: Vec<serde_json::Value> = s
+                    .common_neighbors
+                    .iter()
+                    .filter_map(|nid| self.db.node(&scope_set, *nid))
+                    .map(|n| {
+                        serde_json::json!({
+                            "id": n.id.to_string(),
+                            "label": n.label.as_str(),
+                            "name": display_name(&n),
+                        })
+                    })
+                    .collect();
                 Ok(serde_json::json!({
                     "node": node,
                     "score": s.score,
-                    "common_neighbors":
-                        s.common_neighbors.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "similarity": s.similarity,
+                    "common_neighbors": common_neighbors,
                     "structural": s.structural,
                     "semantic": s.semantic,
                 }))
