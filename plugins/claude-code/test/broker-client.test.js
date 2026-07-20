@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import { connectForProject } from "../broker-client.js";
+import { rmWithGrace } from "./fsgrace.js";
 import { socketPathFor } from "../ipc.js";
 import { serverArgs } from "../server-args.js";
 
@@ -50,13 +51,12 @@ test("hook client connects, handshakes, and round-trips tool calls", async () =>
     }
   } finally {
     shim.kill();
-    // The broker outlives the shim until its idle window elapses, and it
-    // holds topodb-mcp.exe inside dataDir — Windows cannot unlink a running
-    // executable (EPERM). retryDelay backs off linearly, so these knobs
-    // wait out the idle exit on Windows and cost nothing elsewhere (the
-    // first attempt succeeds on platforms that allow the unlink).
-    rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
-    rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    // The broker outlives the shim until its idle window elapses and holds
+    // topodb-mcp.exe (and its log) inside dataDir — Windows cannot delete
+    // those until the processes die. rmWithGrace retries with real sleeps
+    // and, if the dir still cannot go, names every surviving entry.
+    await rmWithGrace(dataDir);
+    await rmWithGrace(projectDir);
   }
 });
 

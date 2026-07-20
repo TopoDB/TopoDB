@@ -23,7 +23,27 @@ export function appendRetrieval(dataDir, sessionId, record, contents) {
   // (partially-written) file — renameSync is atomic on the same filesystem.
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(state));
-  renameSync(tmp, file);
+  // On Windows, renaming onto a target another process is concurrently
+  // replacing (or reading) fails EPERM/EACCES — observed with concurrent
+  // PostToolUse hooks. Bounded linear backoff, synchronous because every
+  // hook calls this synchronously (Atomics.wait sleep, the launch.js
+  // install-lock precedent). Last rename still wins; a rename that lands
+  // is still atomic, so readers never see a torn file.
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, file);
+      return;
+    } catch (err) {
+      if ((err.code !== "EPERM" && err.code !== "EACCES") || attempt >= 20) {
+        try {
+          unlinkSync(tmp); // don't strand the temp file behind a throw
+        } catch {}
+        throw err;
+      }
+      Atomics.wait(sleeper, 0, 0, 5 + attempt * 5);
+    }
+  }
 }
 
 export function readState(dataDir, sessionId) {

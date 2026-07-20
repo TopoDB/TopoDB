@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { rmWithGrace } from "./fsgrace.js";
 import { execFileSync, spawn } from "node:child_process";
 import { readState, stateFilePath } from "../recorder.js";
 
@@ -111,13 +112,12 @@ test("session-end flushes an episode through a real broker and deletes state", a
   } finally {
     client?.close();
     shim.kill();
-    // The broker outlives the shim until its idle window elapses, and it
-    // holds topodb-mcp.exe inside dataDir — Windows cannot unlink a running
-    // executable (EPERM). retryDelay backs off linearly, so these knobs
-    // wait out the idle exit on Windows and cost nothing elsewhere (the
-    // first attempt succeeds on platforms that allow the unlink).
-    rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
-    rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    // The broker outlives the shim until its idle window elapses and holds
+    // topodb-mcp.exe (and its log) inside dataDir — Windows cannot delete
+    // those until the processes die. rmWithGrace retries with real sleeps
+    // and, if the dir still cannot go, names every surviving entry.
+    await rmWithGrace(dataDir);
+    await rmWithGrace(projectDir);
   }
 });
 
