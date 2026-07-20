@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.9 — 2026-07-20
 
 #### Added
 
@@ -273,6 +273,10 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.6 — 2026-07-20
+
+- Dependency pin only: `topodb` 0.0.9. No functional change.
+
 ### 0.0.5 — 2026-07-18
 
 #### Added
@@ -344,7 +348,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
-### Unreleased
+### 0.0.11 — 2026-07-20
 
 #### Added
 
@@ -654,6 +658,10 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 ---
 
 ## `topodb-cli`
+
+### 0.0.6 — 2026-07-20
+
+- Dependency pins only: `topodb` 0.0.9, `topodb-json` 0.0.6. No functional change.
 
 ### 0.0.5 — 2026-07-18
 
