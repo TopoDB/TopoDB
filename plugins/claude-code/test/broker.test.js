@@ -16,7 +16,17 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
@@ -717,8 +727,14 @@ test("never runs a stale binary resolved from outside its own data dir", async (
   // The plugin must not depend on a NEW shim to catch this: the installs that
   // have the bug are, by definition, the ones running an older shim. Ownership
   // is checkable here -- a binary we own lives under our own data dir.
-  const root = mkdtempSync(path.join(tmpdir(), "topodb-t8-root-"));
-  const proj = mkdtempSync(path.join(tmpdir(), "topodb-t8-proj-"));
+  // `realpathSync` matters here, it is not tidying: on macOS `tmpdir()` is
+  // `/var/folders/...`, a symlink to `/private/var/folders/...`. Node's
+  // `require.resolve` returns the REAL path, so the fixture-sanity assertion
+  // below would compare `/private/var/...` against `/var/...` and fail —
+  // reporting "fixture is inert" when the fixture is fine. Resolving the temp
+  // roots once means every path derived from them is already canonical.
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "topodb-t8-root-")));
+  const proj = realpathSync(mkdtempSync(path.join(tmpdir(), "topodb-t8-proj-")));
   const sessions = [];
   try {
     // dataDir is nested one level down, so `root/node_modules` is an ANCESTOR of
