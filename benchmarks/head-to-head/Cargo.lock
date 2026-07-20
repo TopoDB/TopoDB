@@ -383,6 +383,7 @@ dependencies = [
  "criterion",
  "minigraf",
  "rand 0.8.7",
+ "redb",
  "serde",
  "serde_json",
  "sysinfo",
