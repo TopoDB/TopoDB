@@ -945,6 +945,49 @@ struct ConsolidateResult {
     transferred_edges: Vec<TransferredEdge>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindOrphanMemoriesParams {
+    /// Cap on the number of orphans returned (oldest first). Default 100.
+    #[serde(default = "default_orphan_limit")]
+    #[schemars(range(min = 1, max = 1000))]
+    limit: u32,
+    /// Scope to scan: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Scan across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs.
+    /// Takes precedence over `scope`; must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+fn default_orphan_limit() -> u32 {
+    100
+}
+
+/// A memory connected to nothing — a live Memory with no open outgoing edges.
+#[derive(Debug, Serialize, JsonSchema)]
+struct OrphanMemory {
+    /// The orphan memory's ULID.
+    id: String,
+    /// Its content, so the caller can decide whether to link or drop it without
+    /// a follow-up read.
+    content: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct FindOrphanMemoriesResult {
+    /// Memories linked to nothing, oldest first, at most `limit`. Empty when
+    /// every stored memory is connected.
+    orphans: Vec<OrphanMemory>,
+    /// How many live (non-superseded) memories were examined.
+    scanned: usize,
+    /// `true` when more orphans exist than `limit` returned. A hint to raise
+    /// `limit` or narrow scopes, not an error.
+    truncated: bool,
+}
+
 fn default_search_k() -> usize {
     10
 }
@@ -1954,6 +1997,63 @@ impl TopoServer {
             kept: keep.to_string(),
             dropped: drop.to_string(),
             transferred_edges: transferred,
+        }))
+    }
+
+    #[tool(
+        description = "Maintenance scan: find memories that are stored but connected to NOTHING — a live memory with no open outgoing edges, so it joined no entity and is reachable only by text/vector search, never by traversal. Usually a bare create_memory that was never linked, or a memory whose only link was later closed. Read-only and advisory: link the orphan to its entities (link/remember) or drop it. Superseded memories are excluded — their edges close on retirement, so they are retired, not orphaned. Oldest first, at most `limit`; `truncated=true` means more orphans exist than were returned."
+    )]
+    fn find_orphan_memories(
+        &self,
+        Parameters(p): Parameters<FindOrphanMemoriesParams>,
+    ) -> Result<Json<FindOrphanMemoriesResult>, ErrorData> {
+        if !(1..=1000).contains(&p.limit) {
+            return Err(ErrorData::invalid_params(
+                format!("limit must be between 1 and 1000, got {}", p.limit),
+                None,
+            ));
+        }
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+
+        let mut orphans: Vec<OrphanMemory> = Vec::new();
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        // nodes_by_label yields oldest-first (ascending id), so orphans come out
+        // oldest-first without a sort. Each memory needs one indexed out-edge
+        // lookup — O(n), not O(n^2), so no scan cap is needed; only the returned
+        // list is bounded.
+        for n in self.db.nodes_by_label(&scope_set, MEMORY_LABEL) {
+            // Retired memories have closed edges by design — not orphans.
+            if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+                continue;
+            }
+            scanned += 1;
+            let open = self
+                .db
+                .edges_from(&scope_set, n.id, None, None, true)
+                .map_err(classify_topo_error)?;
+            if !open.is_empty() {
+                continue;
+            }
+            if orphans.len() >= p.limit as usize {
+                // Keep counting `scanned` for an honest total, but stop growing
+                // the list and flag the truncation.
+                truncated = true;
+                continue;
+            }
+            let content = match n.props.get(MEMORY_CONTENT_PROP) {
+                Some(PropValue::Str(c)) => c.clone(),
+                _ => String::new(),
+            };
+            orphans.push(OrphanMemory {
+                id: n.id.to_string(),
+                content,
+            });
+        }
+        Ok(Json(FindOrphanMemoriesResult {
+            orphans,
+            scanned,
+            truncated,
         }))
     }
 
