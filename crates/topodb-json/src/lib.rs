@@ -34,6 +34,11 @@ pub const MEMORY_CONTENT_PROP: &str = "content";
 /// re-stored fact to the existing node instead of minting a duplicate. Set by
 /// the write front ends (`remember`/`create_memory`), never by a caller.
 pub const MEMORY_CONTENT_HASH_PROP: &str = "content_hash";
+/// Millisecond timestamp at which a memory was superseded by a newer fact.
+/// Set by `remember`'s `supersedes`; recall drops a memory whose value here is
+/// `<=` the query's `now` (so an `as_of` before it still sees the old fact).
+/// The node is not deleted — supersession dates a fact, keeping its history.
+pub const MEMORY_SUPERSEDED_AT_PROP: &str = "superseded_at";
 pub const ALIAS_LABEL: &str = "Alias";
 pub const ALIAS_NAME_PROP: &str = "name";
 pub const ALIAS_EDGE_TYPE: &str = "alias_of";

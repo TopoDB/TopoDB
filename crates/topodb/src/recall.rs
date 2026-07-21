@@ -73,6 +73,7 @@ mod tests {
 use crate::error::TopoError;
 use crate::fts::SearchOptions;
 use crate::ids::ScopeSet;
+use crate::props::PropValue;
 use crate::state::NodeRecord;
 use crate::Db;
 
@@ -118,6 +119,14 @@ pub struct RecallQuery {
     /// it is almost certainly a caller bug; omit the field to search
     /// unfiltered instead.
     pub labels: Option<Vec<String>>,
+    /// Tombstone filter: when `Some(prop)`, a fused candidate is dropped if it
+    /// carries that integer prop with a value `<=` the query's effective `now`
+    /// (`options.now_ms`, else wall clock). Used to exclude memories a caller
+    /// has marked superseded, while an `as_of`/`now_ms` set BEFORE the mark
+    /// still sees them — the marker is a timestamp, not a delete. `None` =
+    /// no tombstone filtering (today's behavior). Generic on purpose: the
+    /// engine never names the prop.
+    pub tombstone_prop: Option<String>,
     /// Text leg's RRF weight. Defaults to `WEIGHT_TEXT`.
     pub text_weight: f32,
     /// Vector leg's RRF weight. Defaults to `WEIGHT_VECTOR`.
@@ -160,6 +169,7 @@ impl RecallQuery {
             graph_boost: true,
             options: SearchOptions::default(),
             labels: None,
+            tombstone_prop: None,
             text_weight: WEIGHT_TEXT,
             vector_weight: WEIGHT_VECTOR,
             graph_weight: WEIGHT_GRAPH,
@@ -332,6 +342,22 @@ impl Db {
         // filtering rarely starves k — and legitimately may).
         if let Some(labels) = &q.labels {
             out.retain(|(n, _)| labels.iter().any(|l| n.label == l.as_str()));
+        }
+        // Tombstone filter: drop candidates the caller marked superseded as of
+        // this query's "now". The marker is a timestamp, so an as_of/now_ms set
+        // BEFORE the mark keeps the node (its tombstone is in that query's
+        // future) — supersession dates a fact, it doesn't erase its history.
+        if let Some(prop) = &q.tombstone_prop {
+            let now = q.options.now_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            });
+            out.retain(|(n, _)| match n.props.get(prop) {
+                Some(PropValue::Int(ts)) => *ts > now,
+                _ => true,
+            });
         }
         apply_adjustments(&mut out, &q.options, q.access_weight, &|id| {
             self.access_count_unbumped(id)

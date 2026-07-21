@@ -799,3 +799,48 @@ fn scoring_reads_do_not_bump_counters() {
     );
     let _ = before;
 }
+
+#[test]
+fn tombstone_prop_excludes_a_memory_only_as_of_the_mark() {
+    // A memory retired (superseded) at timestamp T: recall drops it for a
+    // query whose "now" is at/after T, but an as_of BEFORE T still sees it —
+    // supersession dates a fact, it does not erase its history.
+    let (_dir, db, a_id, b_id) = corpus_with_two_equal_memories("shared term");
+    let t: i64 = 1_000_000_000_000;
+    let mut props = std::collections::BTreeMap::new();
+    props.insert("superseded_at".to_string(), Some(PropValue::Int(t)));
+    db.submit(vec![Op::SetNodeProps { id: a_id, props }])
+        .unwrap();
+
+    let query = |now: i64| RecallQuery {
+        tombstone_prop: Some("superseded_at".to_string()),
+        options: SearchOptions {
+            now_ms: Some(now),
+            ..SearchOptions::default()
+        },
+        ..RecallQuery::new(scopes(), "shared term", 10)
+    };
+
+    let after: Vec<NodeId> = db
+        .recall(&query(t + 1))
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(
+        !after.contains(&a_id),
+        "superseded memory must be excluded as of now"
+    );
+    assert!(after.contains(&b_id), "the live memory stays");
+
+    let before: Vec<NodeId> = db
+        .recall(&query(t - 1))
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert!(
+        before.contains(&a_id),
+        "an as_of before the supersession still sees the old fact (history preserved)"
+    );
+}
