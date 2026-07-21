@@ -789,8 +789,17 @@ fn default_max_hops() -> u8 {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TraverseParams {
-    /// ULID of the node to start the traversal from.
-    seed_id: String,
+    /// ULID of the node to start the traversal from. Provide this OR
+    /// `seed_ids`; if both are given, `seed_ids` wins.
+    #[serde(default)]
+    seed_id: Option<String>,
+    /// Start the traversal from SEVERAL nodes at once — e.g. every hit from a
+    /// `search_memories` call — to explore the graph around all of them in a
+    /// single traverse instead of one call per anchor. Must not be empty when
+    /// present. Takes precedence over `seed_id`.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    seed_ids: Option<Vec<String>>,
     /// Hop budget (1-4). Out-of-range values are rejected, not clamped — the
     /// bound is advertised so a client never sends one.
     #[serde(default = "default_max_hops")]
@@ -820,7 +829,7 @@ struct TraverseParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct TraverseResult {
-    /// `{"nodes": [...], "edges": [...]}` reached from the seed.
+    /// `{"nodes": [...], "edges": [...]}` reached from the seed(s).
     subgraph: Value,
 }
 
@@ -1519,7 +1528,23 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<Json<TraverseResult>, ErrorData> {
-        let seed = parse_node_id(&p.seed_id)?;
+        // `seed_ids` (non-empty) wins over `seed_id`; at least one is required.
+        let seed_strs: Vec<String> = match p.seed_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => match p.seed_id {
+                Some(one) => vec![one],
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        "traverse requires `seed_id` or a non-empty `seed_ids`".to_string(),
+                        None,
+                    ))
+                }
+            },
+        };
+        let mut seeds = Vec::with_capacity(seed_strs.len());
+        for s in &seed_strs {
+            seeds.push(parse_node_id(s)?);
+        }
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
         // Each requested type name probes BOTH its raw and normalized forms:
         // `link` normalizes on write, but edges written before normalization
@@ -1539,7 +1564,7 @@ impl TopoServer {
         });
         let query = TraversalQuery {
             scopes: scope_set,
-            seeds: vec![seed],
+            seeds,
             max_hops: p.max_hops,
             edge_types,
             direction: p.direction.into(),
