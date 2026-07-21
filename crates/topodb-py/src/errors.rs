@@ -15,14 +15,25 @@ fn raise_arity1<'a>(py: Python<'a>, name: &str, arg: impl IntoPyObject<'a>) -> P
     }
 }
 
-fn raise_arity2<'a>(py: Python<'a>, name: &str, arg1: impl IntoPyObject<'a>, arg2: impl IntoPyObject<'a>) -> PyErr {
+fn raise_arity2<'a>(
+    py: Python<'a>,
+    name: &str,
+    arg1: impl IntoPyObject<'a>,
+    arg2: impl IntoPyObject<'a>,
+) -> PyErr {
     match cls(py, name).call1((arg1, arg2)) {
         Ok(v) => PyErr::from_value(v),
         Err(e) => e,
     }
 }
 
-fn raise_arity3<'a>(py: Python<'a>, name: &str, arg1: impl IntoPyObject<'a>, arg2: impl IntoPyObject<'a>, arg3: impl IntoPyObject<'a>) -> PyErr {
+fn raise_arity3<'a>(
+    py: Python<'a>,
+    name: &str,
+    arg1: impl IntoPyObject<'a>,
+    arg2: impl IntoPyObject<'a>,
+    arg3: impl IntoPyObject<'a>,
+) -> PyErr {
     match cls(py, name).call1((arg1, arg2, arg3)) {
         Ok(v) => PyErr::from_value(v),
         Err(e) => e,

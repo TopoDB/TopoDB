@@ -18,7 +18,7 @@ pub fn parse_node_id(s: &str) -> napi::Result<NodeId> {
 }
 
 pub fn node_to_value(n: &NodeRecord) -> napi::Result<serde_json::Value> {
-    topodb_json::node_to_json(n).map_err(|e| crate::errors::rejected(e))
+    topodb_json::node_to_json(n).map_err(crate::errors::rejected)
 }
 
 pub fn nodes_to_value(ns: Vec<NodeRecord>) -> napi::Result<serde_json::Value> {
@@ -34,7 +34,7 @@ pub fn edges_to_value(es: Vec<EdgeRecord>) -> napi::Result<serde_json::Value> {
 }
 
 pub fn subgraph_to_value(sg: &Subgraph) -> napi::Result<serde_json::Value> {
-    topodb_json::subgraph_to_json(sg).map_err(|e| crate::errors::rejected(e))
+    topodb_json::subgraph_to_json(sg).map_err(crate::errors::rejected)
 }
 
 pub fn json_to_prop_value(j: &serde_json::Value) -> napi::Result<PropValue> {
@@ -46,14 +46,16 @@ pub fn parse_direction(s: &str) -> napi::Result<Direction> {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
         "both" => Ok(Direction::Both),
-        other => Err(crate::errors::rejected(format!("invalid direction {other:?}"))),
+        other => Err(crate::errors::rejected(format!(
+            "invalid direction {other:?}"
+        ))),
     }
 }
 
 pub fn scored_to_value(scored: Vec<(NodeRecord, f32)>) -> napi::Result<serde_json::Value> {
     let mut rows = Vec::with_capacity(scored.len());
     for (nr, score) in scored {
-        let node = topodb_json::node_to_json(&nr).map_err(|e| crate::errors::rejected(e))?;
+        let node = topodb_json::node_to_json(&nr).map_err(crate::errors::rejected)?;
         rows.push(serde_json::json!({
             "node": node,
             "score": score,

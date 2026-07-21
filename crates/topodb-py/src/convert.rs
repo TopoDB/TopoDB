@@ -26,25 +26,38 @@ pub fn parse_scopes(py: Python<'_>, scopes: Vec<String>) -> PyResult<ScopeSet> {
 }
 
 pub fn parse_node_id(py: Python<'_>, s: &str) -> PyResult<NodeId> {
-    NodeId::from_str(s).map_err(|e| crate::errors::rejected(py, format!("invalid node id {s:?}: {e}")))
+    NodeId::from_str(s)
+        .map_err(|e| crate::errors::rejected(py, format!("invalid node id {s:?}: {e}")))
 }
 
 pub fn node_to_py(py: Python<'_>, n: &NodeRecord) -> PyResult<PyObject> {
-    json_to_py(py, &topodb_json::node_to_json(n).map_err(|e| crate::errors::rejected(py, e))?)
+    json_to_py(
+        py,
+        &topodb_json::node_to_json(n).map_err(|e| crate::errors::rejected(py, e))?,
+    )
 }
 
 pub fn nodes_to_py(py: Python<'_>, ns: Vec<NodeRecord>) -> PyResult<PyObject> {
     let vals: Result<Vec<_>, String> = ns.iter().map(topodb_json::node_to_json).collect();
-    json_to_py(py, &serde_json::Value::Array(vals.map_err(|e| crate::errors::rejected(py, e))?))
+    json_to_py(
+        py,
+        &serde_json::Value::Array(vals.map_err(|e| crate::errors::rejected(py, e))?),
+    )
 }
 
 pub fn edges_to_py(py: Python<'_>, es: Vec<EdgeRecord>) -> PyResult<PyObject> {
     let vals: Result<Vec<_>, String> = es.iter().map(topodb_json::edge_to_json).collect();
-    json_to_py(py, &serde_json::Value::Array(vals.map_err(|e| crate::errors::rejected(py, e))?))
+    json_to_py(
+        py,
+        &serde_json::Value::Array(vals.map_err(|e| crate::errors::rejected(py, e))?),
+    )
 }
 
 pub fn subgraph_to_py(py: Python<'_>, sg: &Subgraph) -> PyResult<PyObject> {
-    json_to_py(py, &topodb_json::subgraph_to_json(sg).map_err(|e| crate::errors::rejected(py, e))?)
+    json_to_py(
+        py,
+        &topodb_json::subgraph_to_json(sg).map_err(|e| crate::errors::rejected(py, e))?,
+    )
 }
 
 pub fn py_to_prop_value(v: &Bound<'_, PyAny>) -> PyResult<PropValue> {
@@ -57,13 +70,17 @@ pub fn parse_direction(py: Python<'_>, s: &str) -> PyResult<Direction> {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
         "both" => Ok(Direction::Both),
-        other => Err(crate::errors::rejected(py, format!("invalid direction {other:?}"))),
+        other => Err(crate::errors::rejected(
+            py,
+            format!("invalid direction {other:?}"),
+        )),
     }
 }
 
 pub fn parse_index_spec(py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<IndexSpec> {
     let j = py_to_json(spec)?;
-    serde_json::from_value(j).map_err(|e| crate::errors::rejected(py, format!("invalid index spec: {e}")))
+    serde_json::from_value(j)
+        .map_err(|e| crate::errors::rejected(py, format!("invalid index spec: {e}")))
 }
 
 pub fn scored_to_py(py: Python<'_>, hits: Vec<(NodeRecord, f32)>) -> PyResult<PyObject> {

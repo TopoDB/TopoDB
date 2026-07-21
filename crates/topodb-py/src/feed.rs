@@ -16,7 +16,9 @@ pub struct Subscription {
 
 impl Subscription {
     pub fn new(rx: Receiver<ChangeEvent>) -> Self {
-        Self { rx: Mutex::new(Some(rx)) }
+        Self {
+            rx: Mutex::new(Some(rx)),
+        }
     }
 }
 

@@ -60,7 +60,11 @@ pub struct TopoDb {
 
 impl TopoDb {
     fn db(&self) -> Result<Db> {
-        self.inner.lock().unwrap().clone().ok_or_else(errors::closed)
+        self.inner
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(errors::closed)
     }
 }
 
@@ -78,7 +82,9 @@ impl TopoDb {
     #[napi(factory)]
     pub async fn open(path: String) -> Result<TopoDb> {
         let db = blocking(move || Db::open(&path)).await?;
-        Ok(TopoDb { inner: Arc::new(Mutex::new(Some(db))) })
+        Ok(TopoDb {
+            inner: Arc::new(Mutex::new(Some(db))),
+        })
     }
 
     #[napi(factory, js_name = "openWith")]
@@ -86,7 +92,9 @@ impl TopoDb {
         let spec = serde_json::from_value::<topodb::IndexSpec>(index_spec)
             .map_err(|e| errors::rejected(format!("invalid index spec: {e}")))?;
         let db = blocking(move || Db::open_with(&path, spec)).await?;
-        Ok(TopoDb { inner: Arc::new(Mutex::new(Some(db))) })
+        Ok(TopoDb {
+            inner: Arc::new(Mutex::new(Some(db))),
+        })
     }
 
     #[napi]
@@ -108,8 +116,7 @@ impl TopoDb {
     ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let scope = convert::parse_scope(default_scope.as_deref())?;
-        let (ops, ids) =
-            topodb_json::resolve_batch(&commands, scope).map_err(errors::rejected)?;
+        let (ops, ids) = topodb_json::resolve_batch(&commands, scope).map_err(errors::rejected)?;
         let applied = blocking(move || match now_ms {
             Some(t) => db.submit_at(ops, t),
             None => db.submit(ops),
@@ -132,7 +139,11 @@ impl TopoDb {
     }
 
     #[napi(js_name = "nodesByLabel")]
-    pub async fn nodes_by_label(&self, scopes: Vec<String>, label: String) -> Result<serde_json::Value> {
+    pub async fn nodes_by_label(
+        &self,
+        scopes: Vec<String>,
+        label: String,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let nodes = blocking(move || Ok(db.nodes_by_label(&set, &label))).await?;
@@ -140,15 +151,27 @@ impl TopoDb {
     }
 
     #[napi(js_name = "nodesByLabelNewest")]
-    pub async fn nodes_by_label_newest(&self, scopes: Vec<String>, label: String, k: u32) -> Result<serde_json::Value> {
+    pub async fn nodes_by_label_newest(
+        &self,
+        scopes: Vec<String>,
+        label: String,
+        k: u32,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
-        let nodes = blocking(move || Ok(db.nodes_by_label_newest(&set, &label, k as usize))).await?;
+        let nodes =
+            blocking(move || Ok(db.nodes_by_label_newest(&set, &label, k as usize))).await?;
         convert::nodes_to_value(nodes)
     }
 
     #[napi(js_name = "nodesByProp")]
-    pub async fn nodes_by_prop(&self, scopes: Vec<String>, label: String, prop: String, value: serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn nodes_by_prop(
+        &self,
+        scopes: Vec<String>,
+        label: String,
+        prop: String,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let pv = convert::json_to_prop_value(&value)?;
@@ -157,7 +180,13 @@ impl TopoDb {
     }
 
     #[napi(js_name = "nodesByPropNormalized")]
-    pub async fn nodes_by_prop_normalized(&self, scopes: Vec<String>, label: String, prop: String, value: serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn nodes_by_prop_normalized(
+        &self,
+        scopes: Vec<String>,
+        label: String,
+        prop: String,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let pv = convert::json_to_prop_value(&value)?;
@@ -166,7 +195,13 @@ impl TopoDb {
     }
 
     #[napi(js_name = "nodesByFloatRange")]
-    pub async fn nodes_by_float_range(&self, scopes: Vec<String>, prop: String, min: f64, max: f64) -> Result<serde_json::Value> {
+    pub async fn nodes_by_float_range(
+        &self,
+        scopes: Vec<String>,
+        prop: String,
+        min: f64,
+        max: f64,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let nodes = blocking(move || Ok(db.nodes_by_float_range(&set, &prop, min, max))).await?;
@@ -174,14 +209,24 @@ impl TopoDb {
     }
 
     #[napi(js_name = "edgesFrom")]
-    pub async fn edges_from(&self, scopes: Vec<String>, from: String, opts: Option<EdgesFromOpts>) -> Result<serde_json::Value> {
+    pub async fn edges_from(
+        &self,
+        scopes: Vec<String>,
+        from: String,
+        opts: Option<EdgesFromOpts>,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let from_id = convert::parse_node_id(&from)?;
-        let to_id = opts.as_ref().and_then(|o| o.to.as_ref()).map(|s| convert::parse_node_id(s)).transpose()?;
+        let to_id = opts
+            .as_ref()
+            .and_then(|o| o.to.as_ref())
+            .map(|s| convert::parse_node_id(s))
+            .transpose()?;
         let ty = opts.as_ref().and_then(|o| o.ty.clone());
         let open_only = opts.as_ref().and_then(|o| o.open_only).unwrap_or(false);
-        let edges = blocking(move || db.edges_from(&set, from_id, to_id, ty.as_deref(), open_only)).await?;
+        let edges =
+            blocking(move || db.edges_from(&set, from_id, to_id, ty.as_deref(), open_only)).await?;
         convert::edges_to_value(edges)
     }
 
@@ -204,13 +249,26 @@ impl TopoDb {
     }
 
     #[napi(js_name = "traverse")]
-    pub async fn traverse(&self, scopes: Vec<String>, seeds: Vec<String>, max_hops: u8, opts: Option<TraverseOpts>) -> Result<serde_json::Value> {
+    pub async fn traverse(
+        &self,
+        scopes: Vec<String>,
+        seeds: Vec<String>,
+        max_hops: u8,
+        opts: Option<TraverseOpts>,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let seed_ids: Result<Vec<_>> = seeds.iter().map(|s| convert::parse_node_id(s)).collect();
         let seed_ids = seed_ids?;
-        let edge_types = opts.as_ref().and_then(|o| o.edge_types.as_ref()).map(|ts| ts.iter().map(|t| t.into()).collect());
-        let direction_str = opts.as_ref().and_then(|o| o.direction.as_ref()).map(|d| d.as_str()).unwrap_or("both");
+        let edge_types = opts
+            .as_ref()
+            .and_then(|o| o.edge_types.as_ref())
+            .map(|ts| ts.iter().map(|t| t.into()).collect());
+        let direction_str = opts
+            .as_ref()
+            .and_then(|o| o.direction.as_ref())
+            .map(|d| d.as_str())
+            .unwrap_or("both");
         let direction = convert::parse_direction(direction_str)?;
         let as_of = opts.as_ref().and_then(|o| o.as_of);
         let q = topodb::TraversalQuery {
@@ -226,11 +284,20 @@ impl TopoDb {
     }
 
     #[napi(js_name = "searchText")]
-    pub async fn search_text(&self, scopes: Vec<String>, query: String, k: u32, opts: Option<SearchTextOpts>) -> Result<serde_json::Value> {
+    pub async fn search_text(
+        &self,
+        scopes: Vec<String>,
+        query: String,
+        k: u32,
+        opts: Option<SearchTextOpts>,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let recency_weight = opts.as_ref().and_then(|o| o.recency_weight).unwrap_or(0.0) as f32;
-        let recency_half_life_ms = opts.as_ref().and_then(|o| o.recency_half_life_ms).unwrap_or(0);
+        let recency_half_life_ms = opts
+            .as_ref()
+            .and_then(|o| o.recency_half_life_ms)
+            .unwrap_or(0);
         let now_ms = opts.as_ref().and_then(|o| o.now_ms);
         let options = topodb::SearchOptions {
             recency_weight,
@@ -238,18 +305,25 @@ impl TopoDb {
             now_ms,
             ..Default::default()
         };
-        let hits = blocking(move || db.search_text_with(&set, &query, k as usize, &options)).await?;
+        let hits =
+            blocking(move || db.search_text_with(&set, &query, k as usize, &options)).await?;
         convert::scored_to_value(hits)
     }
 
     #[napi(js_name = "searchVector")]
-    pub async fn search_vector(&self, scopes: Vec<String>, model: String, vector: Vec<f64>, k: u32, candidates: Option<Vec<String>>) -> Result<serde_json::Value> {
+    pub async fn search_vector(
+        &self,
+        scopes: Vec<String>,
+        model: String,
+        vector: Vec<f64>,
+        k: u32,
+        candidates: Option<Vec<String>>,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let vector_f32: Vec<f32> = vector.into_iter().map(|v| v as f32).collect();
-        let candidates_ids: Option<Result<Vec<_>>> = candidates.map(|cs| {
-            cs.iter().map(|s| convert::parse_node_id(s)).collect()
-        });
+        let candidates_ids: Option<Result<Vec<_>>> =
+            candidates.map(|cs| cs.iter().map(|s| convert::parse_node_id(s)).collect());
         let candidates_ids = candidates_ids.transpose()?;
         let q = topodb::VectorQuery {
             scopes: set,
@@ -263,7 +337,13 @@ impl TopoDb {
     }
 
     #[napi(js_name = "recall")]
-    pub async fn recall(&self, scopes: Vec<String>, query: String, k: u32, opts: Option<RecallOpts>) -> Result<serde_json::Value> {
+    pub async fn recall(
+        &self,
+        scopes: Vec<String>,
+        query: String,
+        k: u32,
+        opts: Option<RecallOpts>,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let mut q = topodb::RecallQuery::new(set, query, k as usize);
@@ -290,11 +370,20 @@ impl TopoDb {
     }
 
     #[napi(js_name = "suggestLinks")]
-    pub async fn suggest_links(&self, scopes: Vec<String>, node: String, k: u32, opts: Option<SuggestLinksOpts>) -> Result<serde_json::Value> {
+    pub async fn suggest_links(
+        &self,
+        scopes: Vec<String>,
+        node: String,
+        k: u32,
+        opts: Option<SuggestLinksOpts>,
+    ) -> Result<serde_json::Value> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let nid = convert::parse_node_id(&node)?;
-        let min_sim = opts.as_ref().and_then(|o| o.min_semantic_similarity).map(|v| v as f32);
+        let min_sim = opts
+            .as_ref()
+            .and_then(|o| o.min_semantic_similarity)
+            .map(|v| v as f32);
         let q = topodb::SuggestLinksQuery {
             scopes: set,
             node: nid,
@@ -306,7 +395,7 @@ impl TopoDb {
         let out = blocking(move || db.suggest_links(&q)).await?;
         let mut rows = Vec::with_capacity(out.len());
         for s in &out {
-            let node = topodb_json::node_to_json(&s.node).map_err(|e| Error::from_reason(e))?;
+            let node = topodb_json::node_to_json(&s.node).map_err(Error::from_reason)?;
             rows.push(serde_json::json!({
                 "node": node,
                 "score": s.score,
@@ -332,7 +421,7 @@ impl TopoDb {
         let evs = blocking(move || db.ops_since(seq as u64)).await?;
         let rows: Result<Vec<_>, _> = evs
             .iter()
-            .map(|ev| feed::event_to_json(ev).map_err(|e| errors::rejected(e)))
+            .map(|ev| feed::event_to_json(ev).map_err(errors::rejected))
             .collect();
         rows
     }
@@ -357,7 +446,7 @@ impl TopoDb {
     pub async fn index_spec(&self) -> Result<serde_json::Value> {
         let db = self.db()?;
         let spec = blocking(move || Ok(db.index_spec())).await?;
-        Ok(serde_json::to_value(spec).map_err(|e| errors::rejected(e.to_string()))?)
+        serde_json::to_value(spec).map_err(|e| errors::rejected(e.to_string()))
     }
 
     /// Get storage report with table statistics.
@@ -382,7 +471,11 @@ impl TopoDb {
     /// Get access statistics for a node. Returns null if node doesn't exist.
     /// Returns {accessCount, lastAccessedAt} where accessCount is 0 for never-accessed existing nodes.
     #[napi(js_name = "accessStats")]
-    pub async fn access_stats(&self, scopes: Vec<String>, id: String) -> Result<Option<serde_json::Value>> {
+    pub async fn access_stats(
+        &self,
+        scopes: Vec<String>,
+        id: String,
+    ) -> Result<Option<serde_json::Value>> {
         let db = self.db()?;
         let set = convert::parse_scopes(&scopes)?;
         let nid = convert::parse_node_id(&id)?;
@@ -406,7 +499,9 @@ impl TopoDb {
     #[napi(factory, js_name = "openStored")]
     pub async fn open_stored(path: String) -> Result<TopoDb> {
         let db = blocking(move || Db::open_stored(&path)).await?;
-        Ok(TopoDb { inner: Arc::new(Mutex::new(Some(db))) })
+        Ok(TopoDb {
+            inner: Arc::new(Mutex::new(Some(db))),
+        })
     }
 
     /// Open database with options (index spec and optional cache size).
@@ -418,9 +513,13 @@ impl TopoDb {
     ) -> Result<TopoDb> {
         let spec = serde_json::from_value::<topodb::IndexSpec>(index_spec)
             .map_err(|e| errors::rejected(format!("invalid index spec: {e}")))?;
-        let opts = DbOptions { cache_size_bytes: cache_size_bytes.map(|s| s as usize) };
+        let opts = DbOptions {
+            cache_size_bytes: cache_size_bytes.map(|s| s as usize),
+        };
         let db = blocking(move || Db::open_with_options(&path, spec, opts)).await?;
-        Ok(TopoDb { inner: Arc::new(Mutex::new(Some(db))) })
+        Ok(TopoDb {
+            inner: Arc::new(Mutex::new(Some(db))),
+        })
     }
 
     /// Unstable debug surface — shape may change without notice.
@@ -428,11 +527,10 @@ impl TopoDb {
     pub async fn debug_dump_nodes(&self) -> Result<Vec<serde_json::Value>> {
         let db = self.db()?;
         let nodes = blocking(move || Ok(db.debug_dump_nodes())).await?;
-        convert::nodes_to_value(nodes)
-            .map(|v| match v {
-                serde_json::Value::Array(arr) => arr,
-                _ => vec![],
-            })
+        convert::nodes_to_value(nodes).map(|v| match v {
+            serde_json::Value::Array(arr) => arr,
+            _ => vec![],
+        })
     }
 
     /// Unstable debug surface — shape may change without notice.
@@ -440,10 +538,9 @@ impl TopoDb {
     pub async fn debug_dump_edges(&self) -> Result<Vec<serde_json::Value>> {
         let db = self.db()?;
         let edges = blocking(move || Ok(db.debug_dump_edges())).await?;
-        convert::edges_to_value(edges)
-            .map(|v| match v {
-                serde_json::Value::Array(arr) => arr,
-                _ => vec![],
-            })
+        convert::edges_to_value(edges).map(|v| match v {
+            serde_json::Value::Array(arr) => arr,
+            _ => vec![],
+        })
     }
 }

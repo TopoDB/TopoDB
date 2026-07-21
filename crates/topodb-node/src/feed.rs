@@ -16,7 +16,9 @@ pub struct Subscription {
 
 impl Subscription {
     pub fn new(rx: Receiver<ChangeEvent>) -> Self {
-        Self { rx: Mutex::new(Some(rx)) }
+        Self {
+            rx: Mutex::new(Some(rx)),
+        }
     }
 }
 
@@ -33,22 +35,23 @@ impl Subscription {
             .clone()
             .ok_or_else(crate::errors::closed)?;
 
-        let got = tokio::task::spawn_blocking(move || -> std::result::Result<Option<ChangeEvent>, ()> {
-            match timeout_ms {
-                Some(ms) => match rx.recv_timeout(Duration::from_millis(ms as u64)) {
-                    Ok(ev) => Ok(Some(ev)),
-                    Err(RecvTimeoutError::Timeout) => Ok(None),
-                    Err(RecvTimeoutError::Disconnected) => Ok(None), // Clean end on disconnect
-                },
-                None => rx.recv().map(Some).or_else(|_| Ok(None)), // Clean end on disconnect
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(format!("[STORAGE] join error: {e}")))?;
+        let got =
+            tokio::task::spawn_blocking(move || -> std::result::Result<Option<ChangeEvent>, ()> {
+                match timeout_ms {
+                    Some(ms) => match rx.recv_timeout(Duration::from_millis(ms as u64)) {
+                        Ok(ev) => Ok(Some(ev)),
+                        Err(RecvTimeoutError::Timeout) => Ok(None),
+                        Err(RecvTimeoutError::Disconnected) => Ok(None), // Clean end on disconnect
+                    },
+                    None => rx.recv().map(Some).or(Ok(None)), // Clean end on disconnect
+                }
+            })
+            .await
+            .map_err(|e| Error::from_reason(format!("[STORAGE] join error: {e}")))?;
 
         match got {
             Ok(Some(ev)) => {
-                let j = event_to_json(&ev).map_err(|e| crate::errors::rejected(e))?;
+                let j = event_to_json(&ev).map_err(crate::errors::rejected)?;
                 Ok(Some(j))
             }
             Ok(None) => Ok(None),

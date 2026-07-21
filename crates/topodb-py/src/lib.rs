@@ -30,7 +30,9 @@ impl TopoDB {
         let db = py
             .allow_threads(|| Db::open(&path))
             .map_err(|e| errors::to_py(py, e))?;
-        Ok(Self { inner: Mutex::new(Some(db)) })
+        Ok(Self {
+            inner: Mutex::new(Some(db)),
+        })
     }
 
     #[staticmethod]
@@ -39,7 +41,9 @@ impl TopoDB {
         let db = py
             .allow_threads(|| Db::open_with(&path, spec))
             .map_err(|e| errors::to_py(py, e))?;
-        Ok(Self { inner: Mutex::new(Some(db)) })
+        Ok(Self {
+            inner: Mutex::new(Some(db)),
+        })
     }
 
     fn format_version(&self, py: Python<'_>) -> PyResult<u32> {
@@ -61,8 +65,8 @@ impl TopoDB {
         let db = self.db(py)?;
         let batch = convert::py_to_json(commands)?;
         let scope = convert::parse_scope(py, default_scope)?;
-        let (ops, ids) = topodb_json::resolve_batch(&batch, scope)
-            .map_err(|e| errors::rejected(py, e))?;
+        let (ops, ids) =
+            topodb_json::resolve_batch(&batch, scope).map_err(|e| errors::rejected(py, e))?;
         let applied = py
             .allow_threads(|| match now_ms {
                 Some(t) => db.submit_at(ops, t),
@@ -88,21 +92,39 @@ impl TopoDB {
             .transpose()
     }
 
-    fn nodes_by_label(&self, py: Python<'_>, scopes: Vec<String>, label: &str) -> PyResult<PyObject> {
+    fn nodes_by_label(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        label: &str,
+    ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let nodes = py.allow_threads(|| db.nodes_by_label(&set, label));
         convert::nodes_to_py(py, nodes)
     }
 
-    fn nodes_by_label_newest(&self, py: Python<'_>, scopes: Vec<String>, label: &str, k: usize) -> PyResult<PyObject> {
+    fn nodes_by_label_newest(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        label: &str,
+        k: usize,
+    ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let nodes = py.allow_threads(|| db.nodes_by_label_newest(&set, label, k));
         convert::nodes_to_py(py, nodes)
     }
 
-    fn nodes_by_prop(&self, py: Python<'_>, scopes: Vec<String>, label: &str, prop: &str, value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn nodes_by_prop(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        label: &str,
+        prop: &str,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let pv = convert::py_to_prop_value(value)?;
@@ -112,7 +134,14 @@ impl TopoDB {
         convert::nodes_to_py(py, nodes)
     }
 
-    fn nodes_by_prop_normalized(&self, py: Python<'_>, scopes: Vec<String>, label: &str, prop: &str, value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn nodes_by_prop_normalized(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        label: &str,
+        prop: &str,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let pv = convert::py_to_prop_value(value)?;
@@ -122,7 +151,14 @@ impl TopoDB {
         convert::nodes_to_py(py, nodes)
     }
 
-    fn nodes_by_float_range(&self, py: Python<'_>, scopes: Vec<String>, prop: &str, min: f64, max: f64) -> PyResult<PyObject> {
+    fn nodes_by_float_range(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        prop: &str,
+        min: f64,
+        max: f64,
+    ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let nodes = py.allow_threads(|| db.nodes_by_float_range(&set, prop, min, max));
@@ -130,7 +166,15 @@ impl TopoDB {
     }
 
     #[pyo3(signature = (scopes, from_, to=None, r#type=None, open_only=false))]
-    fn edges_from(&self, py: Python<'_>, scopes: Vec<String>, from_: &str, to: Option<&str>, r#type: Option<&str>, open_only: bool) -> PyResult<PyObject> {
+    fn edges_from(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        from_: &str,
+        to: Option<&str>,
+        r#type: Option<&str>,
+        open_only: bool,
+    ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let from_id = convert::parse_node_id(py, from_)?;
@@ -158,6 +202,7 @@ impl TopoDB {
     }
 
     #[pyo3(signature = (scopes, seeds, max_hops, edge_types=None, direction="both", as_of=None))]
+    #[allow(clippy::too_many_arguments)]
     fn traverse(
         &self,
         py: Python<'_>,
@@ -171,17 +216,23 @@ impl TopoDB {
         let db = self.db(py)?;
         let q = topodb::TraversalQuery {
             scopes: convert::parse_scopes(py, scopes)?,
-            seeds: seeds.iter().map(|s| convert::parse_node_id(py, s)).collect::<PyResult<_>>()?,
+            seeds: seeds
+                .iter()
+                .map(|s| convert::parse_node_id(py, s))
+                .collect::<PyResult<_>>()?,
             max_hops,
             edge_types: edge_types.map(|ts| ts.into_iter().map(Into::into).collect()),
             direction: convert::parse_direction(py, direction)?,
             as_of,
         };
-        let sg = py.allow_threads(|| db.traverse(&q)).map_err(|e| errors::to_py(py, e))?;
+        let sg = py
+            .allow_threads(|| db.traverse(&q))
+            .map_err(|e| errors::to_py(py, e))?;
         convert::subgraph_to_py(py, &sg)
     }
 
     #[pyo3(signature = (scopes, query, k, recency_weight=0.0, recency_half_life_ms=0, now_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn search_text(
         &self,
         py: Python<'_>,
@@ -223,14 +274,21 @@ impl TopoDB {
             vector,
             k,
             candidates: candidates
-                .map(|cs| cs.iter().map(|s| convert::parse_node_id(py, s)).collect::<PyResult<_>>())
+                .map(|cs| {
+                    cs.iter()
+                        .map(|s| convert::parse_node_id(py, s))
+                        .collect::<PyResult<_>>()
+                })
                 .transpose()?,
         };
-        let hits = py.allow_threads(|| db.search_vector(&q)).map_err(|e| errors::to_py(py, e))?;
+        let hits = py
+            .allow_threads(|| db.search_vector(&q))
+            .map_err(|e| errors::to_py(py, e))?;
         convert::scored_to_py(py, hits)
     }
 
     #[pyo3(signature = (scopes, query, k, vector=None, expansions=None, graph_boost=false, labels=None, now_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn recall(
         &self,
         py: Python<'_>,
@@ -250,11 +308,14 @@ impl TopoDB {
         q.graph_boost = graph_boost;
         q.labels = labels;
         q.options.now_ms = now_ms;
-        let hits = py.allow_threads(|| db.recall(&q)).map_err(|e| errors::to_py(py, e))?;
+        let hits = py
+            .allow_threads(|| db.recall(&q))
+            .map_err(|e| errors::to_py(py, e))?;
         convert::scored_to_py(py, hits)
     }
 
     #[pyo3(signature = (scopes, node, k, model=None, as_of=None, min_semantic_similarity=None))]
+    #[allow(clippy::too_many_arguments)]
     fn suggest_links(
         &self,
         py: Python<'_>,
@@ -274,7 +335,9 @@ impl TopoDB {
             as_of,
             min_semantic_similarity,
         };
-        let out = py.allow_threads(|| db.suggest_links(&q)).map_err(|e| errors::to_py(py, e))?;
+        let out = py
+            .allow_threads(|| db.suggest_links(&q))
+            .map_err(|e| errors::to_py(py, e))?;
         let mut rows = Vec::with_capacity(out.len());
         for s in &out {
             let node = topodb_json::node_to_json(&s.node).map_err(|e| errors::rejected(py, e))?;
@@ -295,19 +358,26 @@ impl TopoDB {
 
     fn ops_since(&self, py: Python<'_>, seq: u64) -> PyResult<PyObject> {
         let db = self.db(py)?;
-        let evs = py.allow_threads(|| db.ops_since(seq)).map_err(|e| errors::to_py(py, e))?;
+        let evs = py
+            .allow_threads(|| db.ops_since(seq))
+            .map_err(|e| errors::to_py(py, e))?;
         let rows: Result<Vec<_>, String> = evs.iter().map(feed::event_to_json).collect();
-        convert::json_to_py(py, &serde_json::Value::Array(rows.map_err(|e| errors::rejected(py, e))?))
+        convert::json_to_py(
+            py,
+            &serde_json::Value::Array(rows.map_err(|e| errors::rejected(py, e))?),
+        )
     }
 
     fn current_seq(&self, py: Python<'_>) -> PyResult<u64> {
         let db = self.db(py)?;
-        py.allow_threads(|| db.current_seq()).map_err(|e| errors::to_py(py, e))
+        py.allow_threads(|| db.current_seq())
+            .map_err(|e| errors::to_py(py, e))
     }
 
     fn compact_ops(&self, py: Python<'_>, keep_from: u64) -> PyResult<()> {
         let db = self.db(py)?;
-        py.allow_threads(|| db.compact_ops(keep_from)).map_err(|e| errors::to_py(py, e))
+        py.allow_threads(|| db.compact_ops(keep_from))
+            .map_err(|e| errors::to_py(py, e))
     }
 
     fn index_spec(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -337,7 +407,12 @@ impl TopoDB {
     }
 
     #[pyo3(signature = (scopes, id))]
-    fn access_stats(&self, py: Python<'_>, scopes: Vec<String>, id: &str) -> PyResult<Option<PyObject>> {
+    fn access_stats(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        id: &str,
+    ) -> PyResult<Option<PyObject>> {
         let db = self.db(py)?;
         let set = convert::parse_scopes(py, scopes)?;
         let nid = convert::parse_node_id(py, id)?;
@@ -368,7 +443,9 @@ impl TopoDB {
         let db = py
             .allow_threads(|| Db::open_stored(&path))
             .map_err(|e| errors::to_py(py, e))?;
-        Ok(Self { inner: Mutex::new(Some(db)) })
+        Ok(Self {
+            inner: Mutex::new(Some(db)),
+        })
     }
 
     #[staticmethod]
@@ -384,7 +461,9 @@ impl TopoDB {
         let db = py
             .allow_threads(|| Db::open_with_options(&path, spec, opts))
             .map_err(|e| errors::to_py(py, e))?;
-        Ok(Self { inner: Mutex::new(Some(db)) })
+        Ok(Self {
+            inner: Mutex::new(Some(db)),
+        })
     }
 
     /// Unstable debug surface — shape may change without notice.
