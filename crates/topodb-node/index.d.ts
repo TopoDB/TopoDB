@@ -1,21 +1,21 @@
+/** Wire shape from topodb-json `node_to_json`; shared with Python binding and CLI. */
 export interface NodeRecord {
   id: string
+  scope: string
   label: string
   props: unknown
-  createdAt: number
-  validFrom: number
-  validTo: number | null
 }
 
+/** Wire shape from topodb-json `edge_to_json`; shared with Python binding and CLI. */
 export interface EdgeRecord {
   id: string
+  scope: string
+  type: string
   from: string
   to: string
-  type: string
   props: unknown
-  createdAt: number
-  validFrom: number
-  validTo: number | null
+  valid_from: number
+  valid_to: number | null
 }
 
 export interface Subgraph {

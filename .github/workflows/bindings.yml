@@ -21,8 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: pip install maturin pytest
-      - run: maturin develop -m crates/topodb-py/Cargo.toml
+      - run: pip install pytest
+      - run: pip install ./crates/topodb-py
       - run: pytest crates/topodb-py/tests -v
 
   test-node:

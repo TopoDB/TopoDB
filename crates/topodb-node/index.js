@@ -307,4 +307,4 @@ class Subscription {
   }
 }
 
-module.exports = { TopoDB, ops: require('./ops.js') }
+module.exports = { TopoDB, Subscription, ops: require('./ops.js') }
