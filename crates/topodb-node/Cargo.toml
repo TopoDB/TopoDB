@@ -1,0 +1,20 @@
+[package]
+name = "topodb-node"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi8", "async", "serde-json"] }
+napi-derive = "2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+crossbeam-channel = "0.5"
+topodb = { path = "../topodb" }
+topodb-json = { path = "../topodb-json" }
+
+[build-dependencies]
+napi-build = "2"
