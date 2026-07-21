@@ -321,7 +321,10 @@ mod tests {
             seed_shared(&mut t).unwrap();
             assert!(shared_is_seeded(&t).unwrap());
             let rows = t.iter().unwrap().count();
-            assert_eq!(rows, 1, "seed_shared must not create a duplicate shared row");
+            assert_eq!(
+                rows, 1,
+                "seed_shared must not create a duplicate shared row"
+            );
             // The single seeded row resolves back to Scope::Shared.
             let r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
             assert_eq!(r.resolve(0).unwrap(), Scope::Shared);
