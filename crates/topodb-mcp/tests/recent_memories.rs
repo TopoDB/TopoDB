@@ -27,6 +27,12 @@ fn returns_newest_memories_first_capped_at_k() {
                 .unwrap()
                 .to_string(),
         );
+        // Newest-first ordering is by ULID, and `Ulid::new()` is NOT monotonic:
+        // ids minted in the same millisecond sort by their random component, not
+        // creation order. Space the creates past a millisecond boundary so the
+        // three land in distinct ms and the descending-id order is deterministic
+        // — otherwise this assertion flakes whenever two creates share a ms.
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     // Entities must NOT appear — Memory label only.
     server.call_tool_ok(
@@ -42,7 +48,7 @@ fn returns_newest_memories_first_capped_at_k() {
     );
     let mems = res["memories"].as_array().unwrap();
     assert_eq!(mems.len(), 2, "k caps the result: {res}");
-    // Newest first: the third and second created (ULIDs mint in order).
+    // Newest first: the third and second created (distinct-ms ids sort by time).
     assert_eq!(mems[0]["id"].as_str().unwrap(), ids[2]);
     assert_eq!(mems[1]["id"].as_str().unwrap(), ids[1]);
     assert!(mems.iter().all(|m| m["label"] == "Memory"));
