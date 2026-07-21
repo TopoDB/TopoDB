@@ -271,4 +271,74 @@ mod tests {
             .unwrap();
         assert_eq!(fresh_id, pre_batch_label_next);
     }
+
+    /// The four namespaces are independent: a string interned as one kind is
+    /// invisible to the others, each kind resolves its own ids, and re-intern
+    /// within a kind is idempotent. A collision here would let a label alias a
+    /// prop key (or an edge type a model name) — silent cross-namespace
+    /// corruption.
+    #[test]
+    fn namespaces_are_independent_and_resolve_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        let mut t = tx.open_table(DICT).unwrap();
+
+        let mut dicts = Dicts::default();
+        let all = [
+            DictKind::Label,
+            DictKind::EdgeType,
+            DictKind::PropKey,
+            DictKind::Model,
+        ];
+
+        // The SAME string interned under every kind resolves within each.
+        let mut j = InternJournal::default();
+        for k in all {
+            dicts.intern(&mut t, k, "shared", &mut j).unwrap();
+        }
+        for k in all {
+            let id = dicts.id_of(k, "shared").expect("interned under this kind");
+            assert_eq!(
+                dicts.resolve(k, id).unwrap(),
+                SmolStr::new("shared"),
+                "round-trip must hold within kind {k:?}"
+            );
+        }
+
+        // A string interned under one kind never leaks into another's
+        // namespace.
+        let mut j2 = InternJournal::default();
+        dicts
+            .intern(&mut t, DictKind::Label, "label_only", &mut j2)
+            .unwrap();
+        assert!(dicts.id_of(DictKind::Label, "label_only").is_some());
+        for k in [DictKind::EdgeType, DictKind::PropKey, DictKind::Model] {
+            assert_eq!(
+                dicts.id_of(k, "label_only"),
+                None,
+                "a Label-interned string must be invisible in the {k:?} namespace"
+            );
+        }
+
+        // Re-intern within a kind is idempotent — same id, no new entry.
+        let before = dicts.total_len();
+        let existing = dicts.id_of(DictKind::Label, "shared").unwrap();
+        let mut j3 = InternJournal::default();
+        let again = dicts
+            .intern(&mut t, DictKind::Label, "shared", &mut j3)
+            .unwrap();
+        assert_eq!(existing, again, "re-intern must return the existing id");
+        assert_eq!(
+            dicts.total_len(),
+            before,
+            "an idempotent re-intern must not grow any namespace"
+        );
+
+        // Resolving an id never allocated in a kind is an error, not a panic.
+        assert!(
+            dicts.resolve(DictKind::Label, 9_999).is_err(),
+            "unknown dict id must be a clean error"
+        );
+    }
 }
