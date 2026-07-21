@@ -42,6 +42,14 @@ class TopoDB {
     }
   }
 
+  async submit(commands, defaultScope, nowMs) {
+    try {
+      return await this._inner.submit(commands, defaultScope, nowMs)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
   close() {
     this._inner.close()
   }
@@ -51,4 +59,4 @@ class TopoDB {
   }
 }
 
-module.exports = { TopoDB }
+module.exports = { TopoDB, ops: require('./ops.js') }

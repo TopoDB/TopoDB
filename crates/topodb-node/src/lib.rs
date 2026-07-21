@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate napi_derive;
 
+mod convert;
 mod errors;
 
 use napi::bindgen_prelude::*;
@@ -43,5 +44,28 @@ impl TopoDb {
     #[napi]
     pub fn close(&self) {
         self.inner.lock().unwrap().take();
+    }
+
+    #[napi]
+    pub async fn submit(
+        &self,
+        commands: serde_json::Value,
+        default_scope: Option<String>,
+        now_ms: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let db = self.db()?;
+        let scope = convert::parse_scope(default_scope.as_deref())?;
+        let (ops, ids) =
+            topodb_json::resolve_batch(&commands, scope).map_err(errors::rejected)?;
+        let applied = blocking(move || match now_ms {
+            Some(t) => db.submit_at(ops, t),
+            None => db.submit(ops),
+        })
+        .await?;
+        Ok(serde_json::json!({
+            "firstSeq": applied.first_seq,
+            "lastSeq": applied.last_seq,
+            "ids": ids,
+        }))
     }
 }
