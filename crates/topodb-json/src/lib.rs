@@ -30,6 +30,10 @@ pub const ENTITY_LABEL: &str = "Entity";
 pub const ENTITY_NAME_PROP: &str = "name";
 pub const MEMORY_LABEL: &str = "Memory";
 pub const MEMORY_CONTENT_PROP: &str = "content";
+/// Equality-indexed hash of a memory's normalized content, used to dedup a
+/// re-stored fact to the existing node instead of minting a duplicate. Set by
+/// the write front ends (`remember`/`create_memory`), never by a caller.
+pub const MEMORY_CONTENT_HASH_PROP: &str = "content_hash";
 pub const ALIAS_LABEL: &str = "Alias";
 pub const ALIAS_NAME_PROP: &str = "name";
 pub const ALIAS_EDGE_TYPE: &str = "alias_of";
@@ -67,6 +71,12 @@ pub fn default_spec() -> IndexSpec {
             PropIndex {
                 label: SYNONYM_LABEL.into(),
                 prop: SYNONYM_TERM_PROP.into(),
+            },
+            // A memory's normalized-content hash, so a re-stored fact resolves
+            // to its existing node (content-verified) instead of duplicating.
+            PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_HASH_PROP.into(),
             },
         ],
         text: vec![
