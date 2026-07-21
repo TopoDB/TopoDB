@@ -139,6 +139,38 @@ class TopoDB {
     }
   }
 
+  async searchText(scopes, query, k, opts) {
+    try {
+      return await this._inner.searchText(scopes, query, k, opts)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async searchVector(scopes, model, vector, k, candidates) {
+    try {
+      return await this._inner.searchVector(scopes, model, vector, k, candidates)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async recall(scopes, query, k, opts) {
+    try {
+      return await this._inner.recall(scopes, query, k, opts)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async suggestLinks(scopes, node, k, opts) {
+    try {
+      return await this._inner.suggestLinks(scopes, node, k, opts)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
   close() {
     this._inner.close()
   }

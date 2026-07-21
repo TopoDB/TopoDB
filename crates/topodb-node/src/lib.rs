@@ -23,6 +23,35 @@ pub struct TraverseOpts {
     pub as_of: Option<i64>,
 }
 
+#[napi(object)]
+pub struct SearchTextOpts {
+    pub recency_weight: Option<f64>,
+    pub recency_half_life_ms: Option<i64>,
+    pub now_ms: Option<i64>,
+}
+
+#[napi(object)]
+pub struct RecallVector {
+    pub model: String,
+    pub vector: Vec<f64>,
+}
+
+#[napi(object)]
+pub struct RecallOpts {
+    pub vector: Option<RecallVector>,
+    pub expansions: Option<serde_json::Value>,
+    pub graph_boost: Option<bool>,
+    pub labels: Option<Vec<String>>,
+    pub now_ms: Option<i64>,
+}
+
+#[napi(object)]
+pub struct SuggestLinksOpts {
+    pub model: Option<String>,
+    pub as_of: Option<i64>,
+    pub min_semantic_similarity: Option<f64>,
+}
+
 #[napi(js_name = "TopoDB")]
 pub struct TopoDb {
     inner: Arc<Mutex<Option<Db>>>,
@@ -193,5 +222,98 @@ impl TopoDb {
         };
         let sg = blocking(move || db.traverse(&q)).await?;
         convert::subgraph_to_value(&sg)
+    }
+
+    #[napi(js_name = "searchText")]
+    pub async fn search_text(&self, scopes: Vec<String>, query: String, k: u32, opts: Option<SearchTextOpts>) -> Result<serde_json::Value> {
+        let db = self.db()?;
+        let set = convert::parse_scopes(&scopes)?;
+        let recency_weight = opts.as_ref().and_then(|o| o.recency_weight).unwrap_or(0.0) as f32;
+        let recency_half_life_ms = opts.as_ref().and_then(|o| o.recency_half_life_ms).unwrap_or(0);
+        let now_ms = opts.as_ref().and_then(|o| o.now_ms);
+        let options = topodb::SearchOptions {
+            recency_weight,
+            recency_half_life_ms,
+            now_ms,
+            ..Default::default()
+        };
+        let hits = blocking(move || db.search_text_with(&set, &query, k as usize, &options)).await?;
+        convert::scored_to_value(hits)
+    }
+
+    #[napi(js_name = "searchVector")]
+    pub async fn search_vector(&self, scopes: Vec<String>, model: String, vector: Vec<f64>, k: u32, candidates: Option<Vec<String>>) -> Result<serde_json::Value> {
+        let db = self.db()?;
+        let set = convert::parse_scopes(&scopes)?;
+        let vector_f32: Vec<f32> = vector.into_iter().map(|v| v as f32).collect();
+        let candidates_ids: Option<Result<Vec<_>>> = candidates.map(|cs| {
+            cs.iter().map(|s| convert::parse_node_id(s)).collect()
+        });
+        let candidates_ids = candidates_ids.transpose()?;
+        let q = topodb::VectorQuery {
+            scopes: set,
+            model,
+            vector: vector_f32,
+            k: k as usize,
+            candidates: candidates_ids,
+        };
+        let hits = blocking(move || db.search_vector(&q)).await?;
+        convert::scored_to_value(hits)
+    }
+
+    #[napi(js_name = "recall")]
+    pub async fn recall(&self, scopes: Vec<String>, query: String, k: u32, opts: Option<RecallOpts>) -> Result<serde_json::Value> {
+        let db = self.db()?;
+        let set = convert::parse_scopes(&scopes)?;
+        let mut q = topodb::RecallQuery::new(set, query, k as usize);
+
+        // Always set graph_boost explicitly with false default (match Python behavior)
+        q.graph_boost = opts.as_ref().and_then(|o| o.graph_boost).unwrap_or(false);
+
+        if let Some(opts) = opts {
+            if let Some(vec) = opts.vector {
+                let vector_f32: Vec<f32> = vec.vector.into_iter().map(|v| v as f32).collect();
+                q.vector = Some((vec.model, vector_f32));
+            }
+            if let Some(exp_val) = opts.expansions {
+                // Parse expansions from JSON: [[term, [alt1, alt2, ...]], ...]
+                q.expansions = serde_json::from_value::<Vec<(String, Vec<String>)>>(exp_val)
+                    .map_err(|e| errors::rejected(format!("invalid expansions: {e}")))?;
+            }
+            q.labels = opts.labels;
+            q.options.now_ms = opts.now_ms;
+        }
+
+        let hits = blocking(move || db.recall(&q)).await?;
+        convert::scored_to_value(hits)
+    }
+
+    #[napi(js_name = "suggestLinks")]
+    pub async fn suggest_links(&self, scopes: Vec<String>, node: String, k: u32, opts: Option<SuggestLinksOpts>) -> Result<serde_json::Value> {
+        let db = self.db()?;
+        let set = convert::parse_scopes(&scopes)?;
+        let nid = convert::parse_node_id(&node)?;
+        let min_sim = opts.as_ref().and_then(|o| o.min_semantic_similarity).map(|v| v as f32);
+        let q = topodb::SuggestLinksQuery {
+            scopes: set,
+            node: nid,
+            k: k as usize,
+            model: opts.as_ref().and_then(|o| o.model.clone()),
+            as_of: opts.as_ref().and_then(|o| o.as_of),
+            min_semantic_similarity: min_sim,
+        };
+        let out = blocking(move || db.suggest_links(&q)).await?;
+        let mut rows = Vec::with_capacity(out.len());
+        for s in &out {
+            let node = topodb_json::node_to_json(&s.node).map_err(|e| Error::from_reason(e))?;
+            rows.push(serde_json::json!({
+                "node": node,
+                "score": s.score,
+                "commonNeighbors": s.common_neighbors.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                "structural": s.structural,
+                "semantic": s.semantic,
+            }));
+        }
+        Ok(serde_json::Value::Array(rows))
     }
 }

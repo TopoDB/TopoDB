@@ -23,6 +23,19 @@ export interface Subgraph {
   edges: EdgeRecord[]
 }
 
+export interface ScoredNode {
+  node: NodeRecord
+  score: number
+}
+
+export interface SuggestedLink {
+  node: NodeRecord
+  score: number
+  commonNeighbors: string[]
+  structural: number
+  semantic: number
+}
+
 export class TopoDB {
   static open(path: string): Promise<TopoDB>
   static openWith(path: string, indexSpec: unknown): Promise<TopoDB>
@@ -42,6 +55,10 @@ export class TopoDB {
   allEdgesBetween(from: string, to: string): Promise<EdgeRecord[]>
   openEdgesBetween(from: string, to: string): Promise<string[]>
   traverse(scopes: string[], seeds: string[], maxHops: number, opts?: { edgeTypes?: string[]; direction?: 'out' | 'in' | 'both'; asOf?: number }): Promise<Subgraph>
+  searchText(scopes: string[], query: string, k: number, opts?: { recencyWeight?: number; recencyHalfLifeMs?: number; nowMs?: number }): Promise<ScoredNode[]>
+  searchVector(scopes: string[], model: string, vector: number[], k: number, candidates?: string[]): Promise<ScoredNode[]>
+  recall(scopes: string[], query: string, k: number, opts?: { vector?: { model: string; vector: number[] }; expansions?: Array<[string, string[]]>; graphBoost?: boolean; labels?: string[]; nowMs?: number }): Promise<ScoredNode[]>
+  suggestLinks(scopes: string[], node: string, k: number, opts?: { model?: string; asOf?: number; minSemanticSimilarity?: number }): Promise<SuggestedLink[]>
   close(): void
   [Symbol.dispose](): void
 }

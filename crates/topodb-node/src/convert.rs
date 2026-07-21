@@ -49,3 +49,15 @@ pub fn parse_direction(s: &str) -> napi::Result<Direction> {
         other => Err(crate::errors::rejected(format!("invalid direction {other:?}"))),
     }
 }
+
+pub fn scored_to_value(scored: Vec<(NodeRecord, f32)>) -> napi::Result<serde_json::Value> {
+    let mut rows = Vec::with_capacity(scored.len());
+    for (nr, score) in scored {
+        let node = topodb_json::node_to_json(&nr).map_err(|e| crate::errors::rejected(e))?;
+        rows.push(serde_json::json!({
+            "node": node,
+            "score": score,
+        }));
+    }
+    Ok(serde_json::Value::Array(rows))
+}
