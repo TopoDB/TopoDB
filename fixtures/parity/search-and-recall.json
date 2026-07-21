@@ -1,0 +1,20 @@
+{
+  "now_ms": 1700000000000,
+  "index_spec": {"equality": [], "text": [{"label": "Memory", "prop": "content"}]},
+  "batch": [
+    {"op": "create_memory", "content": "ada wrote the first program"},
+    {"op": "create_memory", "content": "the analytical engine computes"}
+  ],
+  "checks": [
+    {
+      "call": "search_text",
+      "args": {"scopes": ["shared"], "query": "first program", "k": 5},
+      "expect_ids": ["#0"]
+    },
+    {
+      "call": "search_text",
+      "args": {"scopes": ["shared"], "query": "analytical engine", "k": 5},
+      "expect_ids": ["#1"]
+    }
+  ]
+}

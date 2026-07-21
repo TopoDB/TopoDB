@@ -1,0 +1,37 @@
+{
+  "now_ms": 1700000000000,
+  "index_spec": {"equality": [], "text": []},
+  "batch": [
+    {"op": "create_entity", "name": "ada"},
+    {"op": "create_memory", "content": "ada wrote the first program"},
+    {"op": "link", "from": "#1", "to": "#0", "type": "ABOUT"}
+  ],
+  "checks": [
+    {
+      "call": "node",
+      "args": {"scopes": ["shared"], "id": "#0"},
+      "expect_label": "Entity"
+    },
+    {
+      "call": "node",
+      "args": {"scopes": ["shared"], "id": "#1"},
+      "expect_label": "Memory"
+    },
+    {
+      "call": "nodes_by_label",
+      "args": {"scopes": ["shared"], "label": "Entity"},
+      "expect_ids": ["#0"]
+    },
+    {
+      "call": "nodes_by_label",
+      "args": {"scopes": ["shared"], "label": "Memory"},
+      "expect_ids": ["#1"]
+    },
+    {
+      "call": "traverse",
+      "args": {"scopes": ["shared"], "seeds": ["#1"], "max_hops": 2},
+      "expect_node_ids": ["#0", "#1"],
+      "expect_edge_count": 1
+    }
+  ]
+}

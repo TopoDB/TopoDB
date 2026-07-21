@@ -1,0 +1,27 @@
+{
+  "now_ms": 1700000000000,
+  "now_ms2": 1700000000010,
+  "index_spec": {"equality": [], "text": []},
+  "batch": [
+    {"op": "create_entity", "name": "ada"},
+    {"op": "create_entity", "name": "babbage"},
+    {"op": "link", "from": "#0", "to": "#1", "type": "COLLABORATES_WITH"}
+  ],
+  "batch2": [
+    {"op": "close_edge", "id": "#2"}
+  ],
+  "checks": [
+    {
+      "call": "traverse",
+      "args": {"scopes": ["shared"], "seeds": ["#0"], "max_hops": 2, "as_of": 1700000000005},
+      "expect_node_ids": ["#0", "#1"],
+      "expect_edge_count": 1
+    },
+    {
+      "call": "traverse",
+      "args": {"scopes": ["shared"], "seeds": ["#0"], "max_hops": 2, "as_of": 1700000000015},
+      "expect_node_ids": ["#0"],
+      "expect_edge_count": 0
+    }
+  ]
+}

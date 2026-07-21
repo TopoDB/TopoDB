@@ -1,0 +1,92 @@
+name: bindings
+on:
+  push:
+    branches: [main]
+    tags: ['bindings-v*']
+    paths: ['crates/topodb-py/**', 'crates/topodb-node/**', 'crates/topodb/**',
+            'crates/topodb-json/**', 'fixtures/**', '.github/workflows/bindings.yml']
+  pull_request:
+    paths: ['crates/topodb-py/**', 'crates/topodb-node/**', 'crates/topodb/**',
+            'crates/topodb-json/**', 'fixtures/**', '.github/workflows/bindings.yml']
+
+jobs:
+  test-python:
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, macos-latest, windows-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install pytest
+      - run: pip install ./crates/topodb-py
+      - run: pytest crates/topodb-py/tests -v
+
+  test-node:
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, macos-latest, windows-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm install
+        working-directory: crates/topodb-node
+      - run: npx napi build --platform --js native.js --dts native.d.ts
+        working-directory: crates/topodb-node
+      - run: node --test
+        working-directory: crates/topodb-node
+
+  parity-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/parity_cli.py
+
+  wheels:
+    if: startsWith(github.ref, 'refs/tags/bindings-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-latest, target: aarch64 }
+          - { os: macos-latest, target: universal2-apple-darwin }
+          - { os: windows-latest, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/topodb-py
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with: { name: 'wheels-${{ matrix.os }}-${{ matrix.target }}', path: crates/topodb-py/dist }
+
+  napi-prebuilds:
+    if: startsWith(github.ref, 'refs/tags/bindings-v')
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, macos-latest, windows-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm install
+        working-directory: crates/topodb-node
+      - run: npx napi build --platform --release --js native.js --dts native.d.ts
+        working-directory: crates/topodb-node
+      - uses: actions/upload-artifact@v4
+        with: { name: 'napi-${{ matrix.os }}', path: 'crates/topodb-node/*.node' }
