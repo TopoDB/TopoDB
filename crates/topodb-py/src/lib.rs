@@ -31,6 +31,15 @@ impl TopoDB {
         Ok(Self { inner: Mutex::new(Some(db)) })
     }
 
+    #[staticmethod]
+    fn open_with(py: Python<'_>, path: String, index_spec: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let spec = convert::parse_index_spec(py, index_spec)?;
+        let db = py
+            .allow_threads(|| Db::open_with(&path, spec))
+            .map_err(|e| errors::to_py(py, e))?;
+        Ok(Self { inner: Mutex::new(Some(db)) })
+    }
+
     fn format_version(&self, py: Python<'_>) -> PyResult<u32> {
         Ok(self.db(py)?.format_version())
     }
@@ -66,6 +75,108 @@ impl TopoDB {
                 "ids": ids,
             }),
         )
+    }
+
+    fn node(&self, py: Python<'_>, scopes: Vec<String>, id: &str) -> PyResult<Option<PyObject>> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let nid = convert::parse_node_id(py, id)?;
+        py.allow_threads(|| db.node(&set, nid))
+            .map(|n| convert::node_to_py(py, &n))
+            .transpose()
+    }
+
+    fn nodes_by_label(&self, py: Python<'_>, scopes: Vec<String>, label: &str) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let nodes = py.allow_threads(|| db.nodes_by_label(&set, label));
+        convert::nodes_to_py(py, nodes)
+    }
+
+    fn nodes_by_label_newest(&self, py: Python<'_>, scopes: Vec<String>, label: &str, k: usize) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let nodes = py.allow_threads(|| db.nodes_by_label_newest(&set, label, k));
+        convert::nodes_to_py(py, nodes)
+    }
+
+    fn nodes_by_prop(&self, py: Python<'_>, scopes: Vec<String>, label: &str, prop: &str, value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let pv = convert::py_to_prop_value(value)?;
+        let nodes = py
+            .allow_threads(|| db.nodes_by_prop(&set, label, prop, &pv))
+            .map_err(|e| errors::to_py(py, e))?;
+        convert::nodes_to_py(py, nodes)
+    }
+
+    fn nodes_by_prop_normalized(&self, py: Python<'_>, scopes: Vec<String>, label: &str, prop: &str, value: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let pv = convert::py_to_prop_value(value)?;
+        let nodes = py
+            .allow_threads(|| db.nodes_by_prop_normalized(&set, label, prop, &pv))
+            .map_err(|e| errors::to_py(py, e))?;
+        convert::nodes_to_py(py, nodes)
+    }
+
+    fn nodes_by_float_range(&self, py: Python<'_>, scopes: Vec<String>, prop: &str, min: f64, max: f64) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let nodes = py.allow_threads(|| db.nodes_by_float_range(&set, prop, min, max));
+        convert::nodes_to_py(py, nodes)
+    }
+
+    #[pyo3(signature = (scopes, from_, to=None, r#type=None, open_only=false))]
+    fn edges_from(&self, py: Python<'_>, scopes: Vec<String>, from_: &str, to: Option<&str>, r#type: Option<&str>, open_only: bool) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let from_id = convert::parse_node_id(py, from_)?;
+        let to_id = to.map(|s| convert::parse_node_id(py, s)).transpose()?;
+        let edges = py
+            .allow_threads(|| db.edges_from(&set, from_id, to_id, r#type, open_only))
+            .map_err(|e| errors::to_py(py, e))?;
+        convert::edges_to_py(py, edges)
+    }
+
+    fn all_edges_between(&self, py: Python<'_>, from_: &str, to: &str) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let from_id = convert::parse_node_id(py, from_)?;
+        let to_id = convert::parse_node_id(py, to)?;
+        let edges = py.allow_threads(|| db.all_edges_between(from_id, to_id));
+        convert::edges_to_py(py, edges)
+    }
+
+    fn open_edges_between(&self, py: Python<'_>, from_: &str, to: &str) -> PyResult<Vec<String>> {
+        let db = self.db(py)?;
+        let from_id = convert::parse_node_id(py, from_)?;
+        let to_id = convert::parse_node_id(py, to)?;
+        let edge_ids = py.allow_threads(|| db.open_edges_between(from_id, to_id));
+        Ok(edge_ids.iter().map(|e| e.to_string()).collect())
+    }
+
+    #[pyo3(signature = (scopes, seeds, max_hops, edge_types=None, direction="both", as_of=None))]
+    fn traverse(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        seeds: Vec<String>,
+        max_hops: u8,
+        edge_types: Option<Vec<String>>,
+        direction: &str,
+        as_of: Option<i64>,
+    ) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let q = topodb::TraversalQuery {
+            scopes: convert::parse_scopes(py, scopes)?,
+            seeds: seeds.iter().map(|s| convert::parse_node_id(py, s)).collect::<PyResult<_>>()?,
+            max_hops,
+            edge_types: edge_types.map(|ts| ts.into_iter().map(Into::into).collect()),
+            direction: convert::parse_direction(py, direction)?,
+            as_of,
+        };
+        let sg = py.allow_threads(|| db.traverse(&q)).map_err(|e| errors::to_py(py, e))?;
+        convert::subgraph_to_py(py, &sg)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
