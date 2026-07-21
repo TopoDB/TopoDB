@@ -1,10 +1,11 @@
 mod convert;
+mod debug;
 mod errors;
 mod feed;
 
 use pyo3::prelude::*;
 use std::sync::Mutex;
-use topodb::Db;
+use topodb::{Db, DbOptions};
 
 #[pyclass]
 pub struct TopoDB {
@@ -307,6 +308,95 @@ impl TopoDB {
     fn compact_ops(&self, py: Python<'_>, keep_from: u64) -> PyResult<()> {
         let db = self.db(py)?;
         py.allow_threads(|| db.compact_ops(keep_from)).map_err(|e| errors::to_py(py, e))
+    }
+
+    fn index_spec(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let spec = py.allow_threads(|| db.index_spec());
+        let spec_value = serde_json::to_value(spec).map_err(|e| errors::rejected(py, e))?;
+        convert::json_to_py(py, &spec_value)
+    }
+
+    fn storage_report(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let report = py
+            .allow_threads(|| db.storage_report())
+            .map_err(|e| errors::to_py(py, e))?;
+        let rows: Vec<_> = report
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "table": r.table,
+                    "rows": r.rows,
+                    "key_bytes": r.key_bytes,
+                    "value_bytes": r.value_bytes,
+                })
+            })
+            .collect();
+        convert::json_to_py(py, &serde_json::Value::Array(rows))
+    }
+
+    #[pyo3(signature = (scopes, id))]
+    fn access_stats(&self, py: Python<'_>, scopes: Vec<String>, id: &str) -> PyResult<Option<PyObject>> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let nid = convert::parse_node_id(py, id)?;
+        let stats = py
+            .allow_threads(|| db.access_stats(&set, nid))
+            .map_err(|e| errors::to_py(py, e))?;
+        stats
+            .map(|s| {
+                convert::json_to_py(
+                    py,
+                    &serde_json::json!({
+                        "access_count": s.access_count,
+                        "last_accessed_at": s.last_accessed_at,
+                    }),
+                )
+            })
+            .transpose()
+    }
+
+    fn rebuild_state_from_ops(&self, py: Python<'_>) -> PyResult<()> {
+        let db = self.db(py)?;
+        py.allow_threads(|| db.rebuild_state_from_ops())
+            .map_err(|e| errors::to_py(py, e))
+    }
+
+    #[staticmethod]
+    fn open_stored(py: Python<'_>, path: String) -> PyResult<Self> {
+        let db = py
+            .allow_threads(|| Db::open_stored(&path))
+            .map_err(|e| errors::to_py(py, e))?;
+        Ok(Self { inner: Mutex::new(Some(db)) })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (path, index_spec, cache_size_bytes=None))]
+    fn open_with_options(
+        py: Python<'_>,
+        path: String,
+        index_spec: &Bound<'_, PyAny>,
+        cache_size_bytes: Option<usize>,
+    ) -> PyResult<Self> {
+        let spec = convert::parse_index_spec(py, index_spec)?;
+        let opts = DbOptions { cache_size_bytes };
+        let db = py
+            .allow_threads(|| Db::open_with_options(&path, spec, opts))
+            .map_err(|e| errors::to_py(py, e))?;
+        Ok(Self { inner: Mutex::new(Some(db)) })
+    }
+
+    /// Unstable debug surface — shape may change without notice.
+    fn debug_dump_nodes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        debug::dump_nodes(py, &db)
+    }
+
+    /// Unstable debug surface — shape may change without notice.
+    fn debug_dump_edges(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        debug::dump_edges(py, &db)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
