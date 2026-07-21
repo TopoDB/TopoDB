@@ -461,7 +461,59 @@ impl TopoServer {
         }
         Ok((ops, marked))
     }
+
+    /// Existing memories in `write_scope` semantically close to the just-embedded
+    /// content (cosine `>=` [`NEAR_DUP_THRESHOLD`]), most-similar first, at most
+    /// [`NEAR_DUP_K`]. Advisory only — the caller judges whether a hit is truly
+    /// the same fact. Empty when `embedding` is `None` (embedder not Ready): no
+    /// semantic signal, so no guessing. Superseded memories are skipped (already
+    /// retired), as are non-Memory nodes. Called BEFORE the new memory is
+    /// written, so it never returns the node being created. A vector-search
+    /// error degrades to empty rather than failing the write — this is a hint.
+    fn near_duplicates(&self, write_scope: Scope, embedding: Option<&[f32]>) -> Vec<NearDuplicate> {
+        let Some(vector) = embedding else {
+            return Vec::new();
+        };
+        let query = VectorQuery {
+            scopes: convert::scopes_to_scope_set(&[write_scope]),
+            model: self.embedder.model_name(),
+            vector: vector.to_vec(),
+            k: NEAR_DUP_K,
+            candidates: None,
+        };
+        let Ok(hits) = self.db.search_vector(&query) else {
+            return Vec::new();
+        };
+        hits.into_iter()
+            .filter(|(n, score)| {
+                *score >= NEAR_DUP_THRESHOLD
+                    && n.label == MEMORY_LABEL
+                    && !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
+            })
+            .map(|(n, score)| NearDuplicate {
+                id: n.id.to_string(),
+                content: match n.props.get(MEMORY_CONTENT_PROP) {
+                    Some(PropValue::Str(c)) => c.clone(),
+                    _ => String::new(),
+                },
+                similarity: score,
+            })
+            .collect()
+    }
 }
+
+/// Cosine-similarity floor for surfacing a semantic near-duplicate.
+///
+/// Calibrated against the default model (bge-small-en-v1.5): the same fact in
+/// different words scores ~0.83, an unrelated fact well under 0.5, so 0.80
+/// catches near-duplicates while staying clear of the noise floor. Not set
+/// higher because the model compresses "same fact" to ~0.83, not 0.95+; and
+/// every hit is only advisory, so a borderline false positive costs the caller
+/// a glance, not data.
+const NEAR_DUP_THRESHOLD: f32 = 0.80;
+/// How many near-duplicates to surface at most — enough to notice a redundancy
+/// without burying the caller.
+const NEAR_DUP_K: usize = 3;
 
 /// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
 /// -fixable bad input) → `invalid_params`; every other variant → `internal_error`.
@@ -1132,6 +1184,10 @@ struct RememberResult {
     /// ULIDs actually marked superseded by this call (a subset of the
     /// requested `supersedes` — an already-superseded id is not re-marked).
     superseded: Vec<String>,
+    /// Existing memories semantically close to the one just stored (advisory —
+    /// nothing was merged). Non-empty only when embeddings are on. Empty on a
+    /// dedup hit. See `NearDuplicate`.
+    near_duplicates: Vec<NearDuplicate>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1215,6 +1271,24 @@ struct CreateResult {
     /// True if an identical memory already existed in the write scope and was
     /// returned instead of creating a duplicate.
     deduplicated: bool,
+    /// Existing memories semantically close to the one just stored (advisory —
+    /// nothing was merged). Non-empty only when embeddings are on; consider
+    /// whether a hit is actually the same fact and, if so, `supersedes` or
+    /// `remove_node` the redundant one. Empty on a dedup hit.
+    near_duplicates: Vec<NearDuplicate>,
+}
+
+/// A semantically-similar existing memory surfaced to the caller. Advisory:
+/// similarity is not identity — a high score can still be two different facts,
+/// so this is a signal for the caller to judge, never an automatic merge.
+#[derive(Debug, Serialize, JsonSchema)]
+struct NearDuplicate {
+    /// ULID of the similar existing memory.
+    id: String,
+    /// Its content, so the caller can tell "same fact" from "similar topic".
+    content: String,
+    /// Cosine similarity to the memory just stored (1.0 = identical direction).
+    similarity: f32,
 }
 
 /// Result of a find-or-create write (`create_entity`).
@@ -1946,10 +2020,14 @@ impl TopoServer {
         // call can never strand an unlinked memory the way the manual
         // create_memory -> create_entity -> link sequence can.
         let mut ops: Vec<Op> = Vec::new();
+        let mut near_duplicates = Vec::new();
         if !deduplicated {
             // New memory: create the node with its content + content_hash, and
-            // embed it. (Embed + hash before `p.content` moves into props.)
-            let memory_embed = self.embed_op(memory_id, &p.content);
+            // embed it. Embed ONCE and reuse the vector for both the semantic
+            // near-duplicate check (advisory) and the stored embedding. (Embed
+            // + hash before `p.content` moves into props.)
+            let embedding = self.embedder.embed(&p.content);
+            near_duplicates = self.near_duplicates(scope, embedding.as_deref());
             let hash = content_hash(&p.content);
             let mut memory_props = convert::merge_required_prop(
                 MEMORY_CONTENT_PROP,
@@ -1967,7 +2045,13 @@ impl TopoServer {
                 label: MEMORY_LABEL.into(),
                 props: memory_props,
             });
-            ops.extend(memory_embed);
+            if let Some(vector) = embedding {
+                ops.push(Op::SetEmbedding {
+                    id: memory_id,
+                    model: self.embedder.model_name(),
+                    vector,
+                });
+            }
         }
         // Id-level dedup: name-level dedup above only catches spelling
         // variants of the SAME string. Two DIFFERENT names can still
@@ -2029,6 +2113,7 @@ impl TopoServer {
             edge_ids,
             deduplicated,
             superseded,
+            near_duplicates,
         }))
     }
 
@@ -2045,11 +2130,15 @@ impl TopoServer {
             return Ok(Json(CreateResult {
                 id: existing.to_string(),
                 deduplicated: true,
+                near_duplicates: Vec::new(),
             }));
         }
         let id = NodeId::new();
-        // Embed + hash before `p.content` moves into the props map below.
-        let embed = self.embed_op(id, &p.content);
+        // Embed ONCE and reuse: the vector both searches for semantic near-
+        // duplicates (advisory) and is stored on the node. `None` when the
+        // embedder isn't Ready — no semantic signal then.
+        let embedding = self.embedder.embed(&p.content);
+        let near_duplicates = self.near_duplicates(scope, embedding.as_deref());
         let hash = content_hash(&p.content);
         let mut props = convert::merge_required_prop(
             MEMORY_CONTENT_PROP,
@@ -2067,11 +2156,18 @@ impl TopoServer {
             label: MEMORY_LABEL.into(),
             props,
         }];
-        ops.extend(embed);
+        if let Some(vector) = embedding {
+            ops.push(Op::SetEmbedding {
+                id,
+                model: self.embedder.model_name(),
+                vector,
+            });
+        }
         self.submit_write(ops)?;
         Ok(Json(CreateResult {
             id: id.to_string(),
             deduplicated: false,
+            near_duplicates,
         }))
     }
 
