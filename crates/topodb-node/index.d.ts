@@ -1,11 +1,47 @@
+export interface NodeRecord {
+  id: string
+  label: string
+  props: unknown
+  createdAt: number
+  validFrom: number
+  validTo: number | null
+}
+
+export interface EdgeRecord {
+  id: string
+  from: string
+  to: string
+  type: string
+  props: unknown
+  createdAt: number
+  validFrom: number
+  validTo: number | null
+}
+
+export interface Subgraph {
+  nodes: NodeRecord[]
+  edges: EdgeRecord[]
+}
+
 export class TopoDB {
   static open(path: string): Promise<TopoDB>
+  static openWith(path: string, indexSpec: unknown): Promise<TopoDB>
   formatVersion(): Promise<number>
   submit(commands: unknown, defaultScope?: string | null, nowMs?: number): Promise<{
     firstSeq: number
     lastSeq: number
     ids: (string | null)[]
   }>
+  node(scopes: string[], id: string): Promise<NodeRecord | null>
+  nodesByLabel(scopes: string[], label: string): Promise<NodeRecord[]>
+  nodesByLabelNewest(scopes: string[], label: string, k: number): Promise<NodeRecord[]>
+  nodesByProp(scopes: string[], label: string, prop: string, value: unknown): Promise<NodeRecord[]>
+  nodesByPropNormalized(scopes: string[], label: string, prop: string, value: unknown): Promise<NodeRecord[]>
+  nodesByFloatRange(scopes: string[], prop: string, min: number, max: number): Promise<NodeRecord[]>
+  edgesFrom(scopes: string[], from: string, opts?: { to?: string; type?: string; openOnly?: boolean }): Promise<EdgeRecord[]>
+  allEdgesBetween(from: string, to: string): Promise<EdgeRecord[]>
+  openEdgesBetween(from: string, to: string): Promise<string[]>
+  traverse(scopes: string[], seeds: string[], maxHops: number, opts?: { edgeTypes?: string[]; direction?: 'out' | 'in' | 'both'; asOf?: number }): Promise<Subgraph>
   close(): void
   [Symbol.dispose](): void
 }

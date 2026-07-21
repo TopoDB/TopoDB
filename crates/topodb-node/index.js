@@ -34,6 +34,15 @@ class TopoDB {
     }
   }
 
+  static async openWith(path, indexSpec) {
+    try {
+      const inner = await native.TopoDB.openWith(path, indexSpec)
+      return new TopoDB(inner)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
   async formatVersion() {
     try {
       return await this._inner.formatVersion()
@@ -45,6 +54,86 @@ class TopoDB {
   async submit(commands, defaultScope, nowMs) {
     try {
       return await this._inner.submit(commands, defaultScope, nowMs)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async node(scopes, id) {
+    try {
+      return await this._inner.node(scopes, id)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async nodesByLabel(scopes, label) {
+    try {
+      return await this._inner.nodesByLabel(scopes, label)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async nodesByLabelNewest(scopes, label, k) {
+    try {
+      return await this._inner.nodesByLabelNewest(scopes, label, k)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async nodesByProp(scopes, label, prop, value) {
+    try {
+      return await this._inner.nodesByProp(scopes, label, prop, value)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async nodesByPropNormalized(scopes, label, prop, value) {
+    try {
+      return await this._inner.nodesByPropNormalized(scopes, label, prop, value)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async nodesByFloatRange(scopes, prop, min, max) {
+    try {
+      return await this._inner.nodesByFloatRange(scopes, prop, min, max)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async edgesFrom(scopes, from, opts) {
+    try {
+      return await this._inner.edgesFrom(scopes, from, opts)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async allEdgesBetween(from, to) {
+    try {
+      return await this._inner.allEdgesBetween(from, to)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async openEdgesBetween(from, to) {
+    try {
+      return await this._inner.openEdgesBetween(from, to)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async traverse(scopes, seeds, maxHops, opts) {
+    try {
+      return await this._inner.traverse(scopes, seeds, maxHops, opts)
     } catch (e) {
       decorate(e)
     }
