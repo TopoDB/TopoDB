@@ -515,6 +515,33 @@ const NEAR_DUP_THRESHOLD: f32 = 0.80;
 /// without burying the caller.
 const NEAR_DUP_K: usize = 3;
 
+/// Ceiling on how many memories `find_duplicate_memories` compares in one scan.
+/// The comparison is O(n^2), so this bounds worst-case work; beyond it the scan
+/// reports `truncated: true` rather than doing unbounded work. 2000 memories is
+/// ~2M cosine ops over 384-dim vectors — well under a second — while covering
+/// any realistic single-project memory store.
+const DUP_SCAN_CAP: usize = 2000;
+
+/// Cosine similarity of two equal-length vectors, or `None` when the lengths
+/// differ or either vector has zero magnitude (no defined direction). Matches
+/// the engine's `search_vector` scoring so scan results are comparable to
+/// write-time `near_duplicates` scores.
+fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return None;
+    }
+    Some(dot / (na.sqrt() * nb.sqrt()))
+}
+
 /// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
 /// -fixable bad input) → `invalid_params`; every other variant → `internal_error`.
 /// Shared by the `submit_*` write helpers and the read tools that classify
@@ -820,6 +847,64 @@ struct RecentMemoriesResult {
     /// The newest `Memory` nodes in the scope set, most recent first
     /// (id/scope/label/props each).
     memories: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindDuplicateMemoriesParams {
+    /// Cosine floor for calling two memories duplicates (0.0–1.0). Defaults to
+    /// the same near-dup floor write-time detection uses (0.80): the default
+    /// model scores the same fact in different words ~0.83, unrelated facts well
+    /// under 0.5. Raise it for stricter matches, lower to cast a wider (noisier)
+    /// net.
+    #[serde(default = "default_dup_similarity")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    min_similarity: f32,
+    /// Cap on the number of pairs returned (most-similar first). Default 100.
+    #[serde(default = "default_dup_limit")]
+    #[schemars(range(min = 1, max = 1000))]
+    limit: u32,
+    /// Scope to scan: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Scan across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs.
+    /// Takes precedence over `scope`; must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+fn default_dup_similarity() -> f32 {
+    NEAR_DUP_THRESHOLD
+}
+
+fn default_dup_limit() -> u32 {
+    100
+}
+
+/// One unordered pair of near-duplicate memories found by `find_duplicate_memories`.
+#[derive(Debug, Serialize, JsonSchema)]
+struct DuplicatePair {
+    /// The two memories' ULIDs (ascending, so a pair is reported once).
+    ids: [String; 2],
+    /// Their contents, index-aligned with `ids`, so the caller can judge "same
+    /// fact" from "similar topic" without a follow-up read.
+    contents: [String; 2],
+    /// Cosine similarity between them (>= `min_similarity`; 1.0 = identical).
+    similarity: f32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct FindDuplicateMemoriesResult {
+    /// Near-duplicate pairs, most-similar first, at most `limit`. Empty when the
+    /// embedder is off/not-ready (no semantic signal) or nothing clears the floor.
+    pairs: Vec<DuplicatePair>,
+    /// How many embedded, non-superseded memories were actually compared.
+    scanned: usize,
+    /// `true` when the result is NOT exhaustive — either more memories existed
+    /// than the scan cap, or more pairs cleared the floor than `limit`. A hint to
+    /// narrow scopes or raise `limit`, not an error.
+    truncated: bool,
 }
 
 fn default_search_k() -> usize {
@@ -1641,6 +1726,96 @@ impl TopoServer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(RecentMemoriesResult { memories }))
+    }
+
+    #[tool(
+        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are semantically near-duplicates (cosine >= min_similarity, default 0.80), most-similar first. Read-only and advisory — nothing is merged; use the returned ids with `supersede`/`remember` to retire the redundant one. This catches duplicates that slipped in before write-time near-dup detection existed, or across scopes a single write didn't compare. Empty when the embedder is off/not-ready. Pairs is capped at `limit` and the whole scan at an internal cap; `truncated=true` means the result is not exhaustive (narrow scopes or raise `limit`)."
+    )]
+    fn find_duplicate_memories(
+        &self,
+        Parameters(p): Parameters<FindDuplicateMemoriesParams>,
+    ) -> Result<Json<FindDuplicateMemoriesResult>, ErrorData> {
+        if !(0.0..=1.0).contains(&p.min_similarity) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "min_similarity must be between 0.0 and 1.0, got {}",
+                    p.min_similarity
+                ),
+                None,
+            ));
+        }
+        if !(1..=1000).contains(&p.limit) {
+            return Err(ErrorData::invalid_params(
+                format!("limit must be between 1 and 1000, got {}", p.limit),
+                None,
+            ));
+        }
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let model = self.embedder.model_name();
+
+        // Candidates: Memory nodes carrying a same-model embedding that are NOT
+        // already retired. Superseded memories are excluded — they were retired
+        // on purpose, so re-flagging them as duplicates is noise. Embeddings-off
+        // stores have no vectors, so this is empty (no semantic signal).
+        let mut candidates: Vec<(String, String, Vec<f32>)> = self
+            .db
+            .nodes_by_label(&scope_set, MEMORY_LABEL)
+            .into_iter()
+            .filter(|n| !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP))
+            .filter_map(|n| {
+                let (m, v) = n.embedding?;
+                if m != model {
+                    return None;
+                }
+                let content = match n.props.get(MEMORY_CONTENT_PROP) {
+                    Some(PropValue::Str(c)) => c.clone(),
+                    _ => String::new(),
+                };
+                Some((n.id.to_string(), content, v))
+            })
+            .collect();
+
+        // Bound the O(n^2) comparison. Beyond the cap we compare a prefix and
+        // flag the result non-exhaustive rather than doing unbounded work — the
+        // candidates come from `nodes_by_label` in id (mint-time) order, so the
+        // prefix is the oldest memories, the ones most likely to have accreted
+        // duplicates.
+        let mut truncated = candidates.len() > DUP_SCAN_CAP;
+        candidates.truncate(DUP_SCAN_CAP);
+        let scanned = candidates.len();
+
+        // Complete pairwise cosine over the bounded set (not a k-capped index
+        // probe), so every pair above the floor is found, not just the top few
+        // per memory.
+        let mut pairs: Vec<DuplicatePair> = Vec::new();
+        for i in 0..candidates.len() {
+            for j in (i + 1)..candidates.len() {
+                if let Some(sim) = cosine(&candidates[i].2, &candidates[j].2) {
+                    if sim >= p.min_similarity {
+                        let (a, b) = (&candidates[i], &candidates[j]);
+                        // Canonical (ascending-id) order so a pair is reported once.
+                        let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                        pairs.push(DuplicatePair {
+                            ids: [lo.0.clone(), hi.0.clone()],
+                            contents: [lo.1.clone(), hi.1.clone()],
+                            similarity: sim,
+                        });
+                    }
+                }
+            }
+        }
+        // Most-similar first; NaN can't occur (finite vectors, non-zero norms
+        // filtered by `cosine`), so total_cmp is a safe total order.
+        pairs.sort_by(|x, y| y.similarity.total_cmp(&x.similarity));
+        if pairs.len() > p.limit as usize {
+            truncated = true;
+            pairs.truncate(p.limit as usize);
+        }
+        Ok(Json(FindDuplicateMemoriesResult {
+            pairs,
+            scanned,
+            truncated,
+        }))
     }
 
     #[tool(
