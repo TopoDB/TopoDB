@@ -65,3 +65,15 @@ pub fn parse_index_spec(py: Python<'_>, spec: &Bound<'_, PyAny>) -> PyResult<Ind
     let j = py_to_json(spec)?;
     serde_json::from_value(j).map_err(|e| crate::errors::rejected(py, format!("invalid index spec: {e}")))
 }
+
+pub fn scored_to_py(py: Python<'_>, hits: Vec<(NodeRecord, f32)>) -> PyResult<PyObject> {
+    let mut rows = Vec::with_capacity(hits.len());
+    for (n, score) in hits {
+        let node = topodb_json::node_to_json(&n).map_err(|e| crate::errors::rejected(py, e))?;
+        rows.push(serde_json::json!({
+            "node": node,
+            "score": score,
+        }));
+    }
+    json_to_py(py, &serde_json::Value::Array(rows))
+}

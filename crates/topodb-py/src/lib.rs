@@ -179,6 +179,114 @@ impl TopoDB {
         convert::subgraph_to_py(py, &sg)
     }
 
+    #[pyo3(signature = (scopes, query, k, recency_weight=0.0, recency_half_life_ms=0, now_ms=None))]
+    fn search_text(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        query: String,
+        k: usize,
+        recency_weight: f32,
+        recency_half_life_ms: i64,
+        now_ms: Option<i64>,
+    ) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let set = convert::parse_scopes(py, scopes)?;
+        let options = topodb::SearchOptions {
+            recency_weight,
+            recency_half_life_ms,
+            now_ms,
+            ..Default::default()
+        };
+        let hits = py
+            .allow_threads(|| db.search_text_with(&set, &query, k, &options))
+            .map_err(|e| errors::to_py(py, e))?;
+        convert::scored_to_py(py, hits)
+    }
+
+    #[pyo3(signature = (scopes, model, vector, k, candidates=None))]
+    fn search_vector(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        model: String,
+        vector: Vec<f32>,
+        k: usize,
+        candidates: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let q = topodb::VectorQuery {
+            scopes: convert::parse_scopes(py, scopes)?,
+            model,
+            vector,
+            k,
+            candidates: candidates
+                .map(|cs| cs.iter().map(|s| convert::parse_node_id(py, s)).collect::<PyResult<_>>())
+                .transpose()?,
+        };
+        let hits = py.allow_threads(|| db.search_vector(&q)).map_err(|e| errors::to_py(py, e))?;
+        convert::scored_to_py(py, hits)
+    }
+
+    #[pyo3(signature = (scopes, query, k, vector=None, expansions=None, graph_boost=false, labels=None, now_ms=None))]
+    fn recall(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        query: String,
+        k: usize,
+        vector: Option<(String, Vec<f32>)>,
+        expansions: Option<Vec<(String, Vec<String>)>>,
+        graph_boost: bool,
+        labels: Option<Vec<String>>,
+        now_ms: Option<i64>,
+    ) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let mut q = topodb::RecallQuery::new(convert::parse_scopes(py, scopes)?, query, k);
+        q.vector = vector;
+        q.expansions = expansions.unwrap_or_default();
+        q.graph_boost = graph_boost;
+        q.labels = labels;
+        q.options.now_ms = now_ms;
+        let hits = py.allow_threads(|| db.recall(&q)).map_err(|e| errors::to_py(py, e))?;
+        convert::scored_to_py(py, hits)
+    }
+
+    #[pyo3(signature = (scopes, node, k, model=None, as_of=None, min_semantic_similarity=None))]
+    fn suggest_links(
+        &self,
+        py: Python<'_>,
+        scopes: Vec<String>,
+        node: &str,
+        k: usize,
+        model: Option<String>,
+        as_of: Option<i64>,
+        min_semantic_similarity: Option<f32>,
+    ) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let q = topodb::SuggestLinksQuery {
+            scopes: convert::parse_scopes(py, scopes)?,
+            node: convert::parse_node_id(py, node)?,
+            k,
+            model,
+            as_of,
+            min_semantic_similarity,
+        };
+        let out = py.allow_threads(|| db.suggest_links(&q)).map_err(|e| errors::to_py(py, e))?;
+        let mut rows = Vec::with_capacity(out.len());
+        for s in &out {
+            let node = topodb_json::node_to_json(&s.node).map_err(|e| errors::rejected(py, e))?;
+            rows.push(serde_json::json!({
+                "node": node,
+                "score": s.score,
+                "common_neighbors": s.common_neighbors.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                "structural": s.structural,
+                "semantic": s.semantic,
+            }));
+        }
+        convert::json_to_py(py, &serde_json::Value::Array(rows))
+    }
+
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
