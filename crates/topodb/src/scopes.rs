@@ -157,4 +157,175 @@ mod tests {
         }
         tx.commit().unwrap();
     }
+
+    #[test]
+    fn intern_same_scope_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::create(d.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(SCOPES).unwrap();
+            seed_shared(&mut t).unwrap();
+            let mut r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
+            let mut journal = InternJournal::default();
+            let a = Scope::Id(ScopeId::from_u128(7));
+            let first = r.intern(&mut t, a, &mut journal).unwrap();
+            let next_after_first = r.next;
+            let second = r.intern(&mut t, a, &mut journal).unwrap();
+            assert_eq!(first, second, "same scope must return the same id");
+            assert_eq!(
+                r.next, next_after_first,
+                "re-interning an existing scope must not advance the next counter"
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn intern_distinct_scopes_yield_increasing_ids() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::create(d.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(SCOPES).unwrap();
+            seed_shared(&mut t).unwrap();
+            let mut r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
+            let mut journal = InternJournal::default();
+            let scopes = [
+                Scope::Shared,
+                Scope::Id(ScopeId::from_u128(10)),
+                Scope::Id(ScopeId::from_u128(20)),
+                Scope::Id(ScopeId::from_u128(30)),
+            ];
+            let mut ids = Vec::new();
+            for s in scopes {
+                ids.push(r.intern(&mut t, s, &mut journal).unwrap());
+            }
+            for pair in ids.windows(2) {
+                assert!(
+                    pair[1] > pair[0],
+                    "distinct scopes must yield strictly increasing ids, got {ids:?}"
+                );
+            }
+            // Distinct ids overall.
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), ids.len(), "ids must all be distinct: {ids:?}");
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn revert_rolls_back_and_reuses_freed_id() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::create(d.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(SCOPES).unwrap();
+            seed_shared(&mut t).unwrap();
+            let mut r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
+            // Seed the shared row in its own journal so it survives the revert.
+            let mut seed_journal = InternJournal::default();
+            r.intern(&mut t, Scope::Shared, &mut seed_journal).unwrap();
+            let next_before = r.next;
+
+            // Intern two distinct scopes in a fresh journal — these get reverted.
+            let mut journal = InternJournal::default();
+            let a = Scope::Id(ScopeId::from_u128(100));
+            let b = Scope::Id(ScopeId::from_u128(200));
+            let id_a = r.intern(&mut t, a, &mut journal).unwrap();
+            let id_b = r.intern(&mut t, b, &mut journal).unwrap();
+            assert!(r.next > next_before);
+
+            r.revert(&journal);
+
+            // Reverted ids gone from both directions of the maps.
+            assert!(!r.by_id.contains_key(&id_a));
+            assert!(!r.by_id.contains_key(&id_b));
+            assert!(!r.by_scope.contains_key(&a));
+            assert!(!r.by_scope.contains_key(&b));
+            // Counter restored to where it was before the reverted interns.
+            assert_eq!(r.next, next_before, "revert must restore the next counter");
+
+            // A fresh scope reuses the lowest freed id.
+            let mut journal2 = InternJournal::default();
+            let c = Scope::Id(ScopeId::from_u128(300));
+            let id_c = r.intern(&mut t, c, &mut journal2).unwrap();
+            assert_eq!(id_c, id_a, "a new scope must reuse the freed id");
+            assert_eq!(r.resolve(id_c).unwrap(), c);
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn resolve_returns_scope_and_errors_on_unknown_id() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::create(d.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(SCOPES).unwrap();
+            seed_shared(&mut t).unwrap();
+            let mut r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
+            let mut journal = InternJournal::default();
+            let a = Scope::Id(ScopeId::from_u128(42));
+            let id = r.intern(&mut t, a, &mut journal).unwrap();
+            assert_eq!(r.resolve(id).unwrap(), a);
+            assert!(
+                r.resolve(9999).is_err(),
+                "resolving a never-interned id must return Err, not panic"
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn id_of_none_then_some_after_intern() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::create(d.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(SCOPES).unwrap();
+            seed_shared(&mut t).unwrap();
+            let mut r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
+            let a = Scope::Id(ScopeId::from_u128(55));
+            assert_eq!(r.id_of(a), None, "never-interned scope must have no id");
+            let mut journal = InternJournal::default();
+            let id = r.intern(&mut t, a, &mut journal).unwrap();
+            assert_eq!(
+                r.id_of(a),
+                Some(id),
+                "after interning, id_of must return the interned id"
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn seed_shared_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::create(d.path().join("x.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(SCOPES).unwrap();
+            assert!(
+                !shared_is_seeded(&t).unwrap(),
+                "shared must not be seeded before seed_shared"
+            );
+            seed_shared(&mut t).unwrap();
+            assert!(
+                shared_is_seeded(&t).unwrap(),
+                "shared must be seeded after seed_shared"
+            );
+            // Second call must be safe and must not double-seed.
+            seed_shared(&mut t).unwrap();
+            assert!(shared_is_seeded(&t).unwrap());
+            let rows = t.iter().unwrap().count();
+            assert_eq!(rows, 1, "seed_shared must not create a duplicate shared row");
+            // The single seeded row resolves back to Scope::Shared.
+            let r = ScopeRegistry::load_table_for_rebuild(&t).unwrap();
+            assert_eq!(r.resolve(0).unwrap(), Scope::Shared);
+        }
+        tx.commit().unwrap();
+    }
 }
