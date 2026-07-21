@@ -397,6 +397,70 @@ impl TopoServer {
             .min_by_key(|n| n.id)
             .map(|n| n.id))
     }
+
+    /// Ops that mark the given memory ids superseded and disconnect them from
+    /// the graph, plus the ids actually marked. Each id must be a Memory in the
+    /// write scope. Marking sets `superseded_at` (recall then drops it as of
+    /// now, preserving `as_of`-past visibility) and closes its open out-edges
+    /// (so open traversal skips it). An already-superseded id is a no-op, not
+    /// re-stamped. Ops are meant to ride in the same atomic batch as the new
+    /// memory, so the replacement and the retirement commit together.
+    fn supersede_ops(
+        &self,
+        write_scope: Scope,
+        ids: &[String],
+    ) -> Result<(Vec<Op>, Vec<String>), ErrorData> {
+        let mut ops = Vec::new();
+        let mut marked = Vec::new();
+        if ids.is_empty() {
+            return Ok((ops, marked));
+        }
+        let now = now_ms();
+        let scope_set = convert::scopes_to_scope_set(&[write_scope]);
+        let mut seen = std::collections::BTreeSet::new();
+        for raw in ids {
+            let id = parse_node_id(raw)?;
+            if !seen.insert(id) {
+                continue;
+            }
+            let node = self.db.node(&scope_set, id).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("supersedes id {raw} is not a node in the write scope"),
+                    None,
+                )
+            })?;
+            if node.label != MEMORY_LABEL {
+                return Err(ErrorData::invalid_params(
+                    format!("supersedes id {raw} is a {}, not a Memory", node.label),
+                    None,
+                ));
+            }
+            // Idempotent: an already-superseded memory is left as-is.
+            if node.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+                continue;
+            }
+            // SetNodeProps takes `Option<PropValue>` per key (None removes).
+            let mut props: std::collections::BTreeMap<String, Option<PropValue>> =
+                std::collections::BTreeMap::new();
+            props.insert(
+                convert::MEMORY_SUPERSEDED_AT_PROP.into(),
+                Some(PropValue::Int(now)),
+            );
+            ops.push(Op::SetNodeProps { id, props });
+            for e in self
+                .db
+                .edges_from(&scope_set, id, None, None, true)
+                .map_err(classify_topo_error)?
+            {
+                ops.push(Op::CloseEdge {
+                    id: e.id,
+                    valid_to: None,
+                });
+            }
+            marked.push(id.to_string());
+        }
+        Ok((ops, marked))
+    }
 }
 
 /// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
@@ -427,6 +491,14 @@ fn entity_dedup_key(name: &str) -> String {
 /// Deliberately NOT lowercased — casing can carry meaning in a stored fact.
 fn normalize_content(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for stamping a supersession.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Stable FNV-1a 64-bit hash of normalized content, hex-encoded. This value is
@@ -1021,6 +1093,15 @@ struct RememberParams {
     /// is invisible to other projects.
     #[serde(default)]
     scope: Option<String>,
+    /// Memory ULIDs this new fact REPLACES. Each is marked superseded (dated,
+    /// not deleted) and unlinked from its entities, so it stops surfacing in
+    /// search_memories/traverse while remaining visible to an `as_of` read
+    /// before now. Use when a fact changes ("uses JWT" → "uses PASETO"): store
+    /// the new memory and pass the old one's id here. The ids must be memories
+    /// in this write scope. Empty/omitted supersedes nothing.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    supersedes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1048,6 +1129,9 @@ struct RememberResult {
     /// True if this exact content already existed: the existing memory was
     /// reused and only entities not already linked to it were newly linked.
     deduplicated: bool,
+    /// ULIDs actually marked superseded by this call (a subset of the
+    /// requested `supersedes` — an already-superseded id is not re-marked).
+    superseded: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1555,6 +1639,9 @@ impl TopoServer {
             graph_boost: p.graph_boost,
             options,
             labels: Some(p.labels.clone()),
+            // Drop memories retired by `remember`'s supersedes; an `as_of`
+            // before the retirement still sees them (the mark is a timestamp).
+            tombstone_prop: Some(convert::MEMORY_SUPERSEDED_AT_PROP.to_string()),
             text_weight: p.text_weight,
             vector_weight: p.vector_weight,
             graph_weight: p.graph_weight,
@@ -1797,6 +1884,10 @@ impl TopoServer {
         let existing = self.existing_memory(scope, &p.content)?;
         let deduplicated = existing.is_some();
         let memory_id = existing.unwrap_or_else(NodeId::new);
+        // Plan supersession up front (all reads/validation before any write),
+        // so a bad `supersedes` id leaves the database untouched.
+        let (supersede_ops, superseded) =
+            self.supersede_ops(scope, p.supersedes.as_deref().unwrap_or(&[]))?;
 
         // Resolve every entity BEFORE the batch: existing entities
         // contribute only their id (no per-entity props here, so unlike
@@ -1924,7 +2015,11 @@ impl TopoServer {
                 created: r.created,
             });
         }
-        // A pure no-op (dedup hit, every entity already linked) writes nothing.
+        // Retire superseded memories in the SAME batch, so the new fact and
+        // the old one's retirement commit atomically.
+        ops.extend(supersede_ops);
+        // A pure no-op (dedup hit, every entity already linked, nothing to
+        // supersede) writes nothing.
         if !ops.is_empty() {
             self.submit_write(ops)?;
         }
@@ -1933,6 +2028,7 @@ impl TopoServer {
             entities: entities_out,
             edge_ids,
             deduplicated,
+            superseded,
         }))
     }
 
