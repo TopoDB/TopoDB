@@ -152,9 +152,11 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
 /// mid-batch blocks until the writer's commit+fsync finishes; post-F9b the
 /// guard is dropped before `tx.commit()`, so reads race past the
 /// commit/fsync in low single-digit milliseconds.
-#[test]
-fn reads_complete_while_a_large_batch_commits() {
-    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// One writer-batch / concurrent-reader race. Returns the batch's measured
+/// duration, every read's latency, and the final Bulk count (which must be
+/// 4,000 — the batch fully committed). A fresh db per call keeps attempts
+/// independent when the caller retries.
+fn read_during_commit_attempt() -> (Duration, Vec<Duration>, usize) {
     let dir = tempfile::tempdir().unwrap();
     let spec = IndexSpec {
         equality: vec![],
@@ -234,28 +236,65 @@ fn reads_complete_while_a_large_batch_commits() {
 
     let batch_duration = writer.join().unwrap();
     let timings = reader.join().unwrap();
+    let bulk_len = db.nodes_by_label(&scopes, "Bulk").len();
+    (batch_duration, timings, bulk_len)
+}
 
-    assert!(
-        !timings.is_empty(),
-        "reader never got a chance to run concurrently with the writer \
-         (batch finished before any read fired) — grow the batch or shrink \
-         per-read overhead so the two threads actually overlap"
-    );
+#[test]
+fn reads_complete_while_a_large_batch_commits() {
+    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let threshold = std::cmp::max(batch_duration / 4, Duration::from_millis(250));
-    for (i, d) in timings.iter().enumerate() {
+    // Retry to separate a real regression from a transient scheduler stall.
+    //
+    // The assertion is unchanged: every read must finish under
+    // `max(batch_duration / 4, 250ms)`; a read actually serialized behind the
+    // commit takes ~the full batch and blows past it. The problem is that on a
+    // loaded box a *healthy* read can also spike that high — not because it
+    // blocked, but because the reader thread was descheduled mid-call. Wall
+    // time cannot tell those two apart: both look like one ~batch-long read,
+    // and the descheduled one is often the larger.
+    //
+    // What separates them is reproducibility. A dropped commit guard blocks
+    // reads on EVERY attempt; a scheduler stall is a random one-off. So run
+    // the race up to `ATTEMPTS` times and pass on the first clean sweep;
+    // only fail if a read breaches the threshold every single time. This
+    // keeps the guard's full strength — a genuine regression still fails all
+    // attempts — while shrugging off isolated stalls. (Sustained, total CPU
+    // saturation can still stall every attempt; no wall-time test can measure
+    // read-blocking under that, and it is not a realistic CI condition.)
+    const ATTEMPTS: usize = 5;
+    let mut worst: Option<String> = None;
+
+    for attempt in 1..=ATTEMPTS {
+        let (batch_duration, timings, bulk_len) = read_during_commit_attempt();
+
+        // The batch must fully commit regardless of the timing outcome.
+        assert_eq!(bulk_len, 4_000, "batch did not fully commit");
         assert!(
-            *d < threshold,
-            "read #{i} took {d:?}, exceeding threshold {threshold:?} \
-             (batch_duration={batch_duration:?}); reads must never block \
-             behind an in-flight batch's commit/fsync"
+            !timings.is_empty(),
+            "reader never got a chance to run concurrently with the writer \
+             (batch finished before any read fired) — grow the batch or shrink \
+             per-read overhead so the two threads actually overlap"
         );
+
+        let threshold = std::cmp::max(batch_duration / 4, Duration::from_millis(250));
+        match timings.iter().enumerate().find(|(_, d)| **d >= threshold) {
+            None => return, // a clean sweep: no read blocked. Done.
+            Some((i, d)) => {
+                worst = Some(format!(
+                    "attempt {attempt}/{ATTEMPTS}: read #{i} took {d:?}, exceeding \
+                     threshold {threshold:?} (batch_duration={batch_duration:?})"
+                ));
+            }
+        }
     }
 
-    // No correctness regression: the batch itself succeeded and a final
-    // read sees all 4,000 new nodes.
-    let bulk = db.nodes_by_label(&scopes, "Bulk");
-    assert_eq!(bulk.len(), 4_000);
+    panic!(
+        "a read exceeded the non-blocking threshold on all {ATTEMPTS} attempts — \
+         reads are serialized behind the in-flight batch's commit/fsync, not a \
+         one-off scheduler stall. Last: {}",
+        worst.unwrap()
+    );
 }
 
 /// F9c regression net: this test's shape (many independently-valid
