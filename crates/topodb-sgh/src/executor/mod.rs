@@ -285,6 +285,20 @@ impl<'r> Executor<'r> {
 
             match rung {
                 Rung::Retry => {
+                    // A bare retry re-runs the identical prompt, so a model
+                    // that replied with prose (failing a schema node's output
+                    // check) tends to reply with the same prose again — an
+                    // idempotent re-run against a finished workspace could
+                    // block forever this way. Feed the failure back and, for a
+                    // schema node, demand JSON. This spends no extra model call
+                    // (the retry is already budgeted and bounded); it only
+                    // changes what the next attempt is told. The downstream
+                    // command node still verifies the claim, so coaxing a
+                    // parseable reply cannot mask unfinished work.
+                    if node.kind == NodeKind::Agent {
+                        let base = original.prompt.as_deref().unwrap_or_default();
+                        node.prompt = Some(retry_prompt(base, &error, original.output.is_some()));
+                    }
                     let t = self.tick();
                     self.store.set_state(id, NodeState::Recovering, t)?;
                 }
@@ -345,6 +359,30 @@ impl<'r> Executor<'r> {
         }
         Ok(r)
     }
+}
+
+/// Build the prompt for a retried agent node: the original task, then the
+/// previous failure and a directive to fix it. For a schema-bearing node the
+/// directive demands JSON-only — the common reason a schema node's retry keeps
+/// failing is that the model narrated prose again instead of emitting the
+/// required JSON. Always rebuilt from the original prompt (not the last
+/// retry's), so corrections do not accumulate across retries.
+fn retry_prompt(base: &str, error: &str, expects_json: bool) -> String {
+    let mut p = String::from(base);
+    p.push_str("\n\n## Correction — your previous attempt was rejected\n\n");
+    p.push_str("Reason: ");
+    p.push_str(error);
+    p.push('\n');
+    if expects_json {
+        p.push_str(
+            "Reply with ONLY the JSON object matching the required schema — no prose, \
+             no explanation, no code fences. Even if the work is already complete and \
+             you change nothing, still output JSON reflecting the current state.",
+        );
+    } else {
+        p.push_str("Correct the issue above and complete the task.");
+    }
+    p
 }
 
 /// A node returning output that does not match its declared schema has

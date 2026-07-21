@@ -405,3 +405,70 @@ fn a_node_blocked_after_the_full_retry_repair_ladder_still_reports_its_reason() 
         "a node blocked via the repair rung must still carry its reason"
     );
 }
+
+#[test]
+fn a_retry_of_a_schema_node_feeds_back_the_error_and_demands_json() {
+    // A schema-bearing agent node whose first reply is prose (fails output
+    // validation) and whose second reply is valid JSON. With retries:1 the
+    // node must recover, and — the point of the fix — the retry's prompt must
+    // carry the previous failure and a demand for JSON, so a real model
+    // changes its output instead of narrating the same prose again. Without
+    // that, an idempotent re-run against a done workspace blocks forever on
+    // prose.
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: 'do the thing', output: {schema: {type: object}}, budget: {retries: 1, repairs: 0}}\n\
+         - {id: c, kind: command, run: 'true', needs: [a], budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new().script(
+        "a",
+        vec![
+            NodeOutcome::Succeeded {
+                output: "The work is already done, nothing to change.".into(),
+            },
+            NodeOutcome::Succeeded {
+                output: "{}".into(),
+            },
+        ],
+    );
+    let commands = topodb_sgh::runner::command::MockCommandRunner::new();
+
+    let mut ex = Executor::new(store, v, &runner).with_command_runner(&commands);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(
+        report.succeeded,
+        vec!["a".to_string(), "c".to_string()],
+        "a prose-first schema node must recover on retry"
+    );
+
+    let prompts = runner.prompts();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "the node ran twice: first attempt + one retry"
+    );
+    assert_eq!(
+        prompts[0], "do the thing",
+        "the first attempt uses the node's prompt verbatim"
+    );
+    let retry = &prompts[1];
+    assert!(
+        retry.contains("do the thing"),
+        "the retry keeps the original task, got: {retry}"
+    );
+    assert!(
+        retry.to_lowercase().contains("json"),
+        "the retry must demand JSON so the model stops narrating, got: {retry}"
+    );
+    assert!(
+        retry.contains("not valid json") || retry.to_lowercase().contains("previous"),
+        "the retry must feed back what went wrong, got: {retry}"
+    );
+}

@@ -11,6 +11,7 @@ pub struct MockRunner {
     scripts: Mutex<HashMap<String, Vec<NodeOutcome>>>,
     cursors: Mutex<HashMap<String, usize>>,
     calls: Mutex<Vec<String>>,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl MockRunner {
@@ -35,11 +36,18 @@ impl MockRunner {
     pub fn call_count(&self) -> usize {
         self.calls.lock().unwrap().len()
     }
+
+    /// The full prompt each call received, in order. Lets a test see how the
+    /// executor changed the prompt across retries.
+    pub fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
 }
 
 impl AgentRunner for MockRunner {
     fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
         self.calls.lock().unwrap().push(req.node_id.clone());
+        self.prompts.lock().unwrap().push(req.prompt.clone());
 
         let scripts = self.scripts.lock().unwrap();
         let Some(outcomes) = scripts.get(&req.node_id) else {
