@@ -174,13 +174,26 @@ impl Server {
     /// handshake every MCP session needs before any other call, and returns
     /// the `initialize` response's `result` for the caller to assert on.
     pub fn initialize(&mut self, timeout: Duration) -> serde_json::Value {
+        self.initialize_with_version("2025-11-25", timeout)
+    }
+
+    /// Like [`initialize`], but sends a caller-chosen `protocolVersion`. Real
+    /// MCP clients pin different versions (Claude/Pi/Codex have shipped
+    /// `2024-11-05`, `2025-03-26`, and `2025-06-18` at various points), so a
+    /// test can drive the handshake with each to confirm the server negotiates
+    /// rather than hard-failing on anything but one string.
+    pub fn initialize_with_version(
+        &mut self,
+        version: &str,
+        timeout: Duration,
+    ) -> serde_json::Value {
         let id = self.next_id();
         self.send(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": version,
                 "capabilities": {},
                 "clientInfo": { "name": "topodb-mcp-tests", "version": "0" }
             }
