@@ -1,13 +1,49 @@
 //! Behavioral tests for Db::recall — the production hybrid fusion API.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use topodb::*;
 
-/// Bumps are async (batched ~100ms / 256-item flush threshold, see
-/// `crates/topodb/tests/counters.rs`). Sleep past a flush interval instead
-/// of polling a specific id/count — the access-boost tests need "whatever
-/// bumps are pending have landed," not a per-id deadline poll.
-fn settle_counters(_db: &Db) {
-    std::thread::sleep(Duration::from_millis(300));
+/// Wait for a node's access counter to finish landing.
+///
+/// Bumps are async: a read `try_send`s a bump, a bumper thread forwards it to
+/// the applier only on a ~100ms `recv_timeout` (or a 256-item batch), and the
+/// applier then writes it. A fixed sleep races that pipeline on a slow/loaded
+/// runner — it flaked `test (windows-latest)` because 300ms was not always
+/// enough for the applier write to land. Instead of guessing a duration, poll
+/// the watched counter until it stops moving: once its value has held steady
+/// for a sustained window — after enough total time for the bumper's timeout
+/// to have fired — every in-flight bump for it has been applied.
+///
+/// Adaptive, so a fast machine returns quickly and a slow one waits as long as
+/// the counter keeps changing (bounded by a safety cap). A pathologically
+/// starved bumper could still, in theory, not have fired its timeout by the
+/// floor — no wall-clock settle can be perfect against total CPU starvation —
+/// but this eliminates the realistic-CI flake a bare sleep left in.
+fn settle_counters(db: &Db, watch: NodeId) {
+    let read = || {
+        db.access_stats(&scopes(), watch)
+            .ok()
+            .flatten()
+            .map(|s| s.access_count)
+    };
+    let start = Instant::now();
+    let mut last = read();
+    let mut stable_since = Instant::now();
+    let deadline = start + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_millis(40));
+        let cur = read();
+        if cur != last {
+            last = cur;
+            stable_since = Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(300)
+            && start.elapsed() >= Duration::from_millis(300)
+        {
+            return; // held steady past the bumper's flush window: drained
+        }
+        if Instant::now() >= deadline {
+            return; // safety cap; never hang a test
+        }
+    }
 }
 
 fn spec() -> IndexSpec {
@@ -675,7 +711,7 @@ fn access_boost_lifts_a_frequently_read_node() {
     for _ in 0..8 {
         let _ = db.node(&scopes(), second);
     }
-    settle_counters(&db);
+    settle_counters(&db, second);
     let out = db
         .recall(&topodb::RecallQuery {
             access_weight: 1.0,
@@ -701,7 +737,7 @@ fn recency_and_access_factors_multiply() {
     for _ in 0..32 {
         let _ = db.node(&scopes(), old_id);
     }
-    settle_counters(&db);
+    settle_counters(&db, old_id);
     let mut base = topodb::RecallQuery::new(scopes(), "shared term", 10);
     base.options.recency_weight = 0.9;
     // Pin "now" to the fresh node's mint time: the old node's age is then
@@ -725,7 +761,7 @@ fn recency_and_access_factors_multiply() {
 #[test]
 fn scoring_reads_do_not_bump_counters() {
     let (_dir, db, a_id, _b) = corpus_with_two_equal_memories("shared term");
-    settle_counters(&db);
+    settle_counters(&db, a_id);
     let before = db
         .access_stats(&scopes(), a_id)
         .unwrap()
@@ -741,7 +777,7 @@ fn scoring_reads_do_not_bump_counters() {
             ..topodb::RecallQuery::new(scopes(), "shared term", 10)
         })
         .unwrap();
-    settle_counters(&db);
+    settle_counters(&db, a_id);
     let after_boosted = db
         .access_stats(&scopes(), a_id)
         .unwrap()
@@ -750,7 +786,7 @@ fn scoring_reads_do_not_bump_counters() {
     let _ = db
         .recall(&topodb::RecallQuery::new(scopes(), "shared term", 10))
         .unwrap();
-    settle_counters(&db);
+    settle_counters(&db, a_id);
     let after_plain = db
         .access_stats(&scopes(), a_id)
         .unwrap()
