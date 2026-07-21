@@ -3,10 +3,11 @@ extern crate napi_derive;
 
 mod convert;
 mod errors;
+mod feed;
 
 use napi::bindgen_prelude::*;
 use std::sync::{Arc, Mutex};
-use topodb::Db;
+use topodb::{Db, DbOptions};
 
 #[napi(object)]
 pub struct EdgesFromOpts {
@@ -315,5 +316,134 @@ impl TopoDb {
             }));
         }
         Ok(serde_json::Value::Array(rows))
+    }
+
+    /// Subscribe to change feed with given buffer capacity.
+    #[napi]
+    pub fn subscribe(&self, capacity: u32) -> Result<feed::Subscription> {
+        let db = self.db()?;
+        Ok(feed::Subscription::new(db.subscribe(capacity as usize)))
+    }
+
+    /// Get all operations since a given sequence number.
+    #[napi(js_name = "opsSince")]
+    pub async fn ops_since(&self, seq: i64) -> Result<Vec<serde_json::Value>> {
+        let db = self.db()?;
+        let evs = blocking(move || db.ops_since(seq as u64)).await?;
+        let rows: Result<Vec<_>, _> = evs
+            .iter()
+            .map(|ev| feed::event_to_json(ev).map_err(|e| errors::rejected(e)))
+            .collect();
+        rows
+    }
+
+    /// Get the current sequence number.
+    #[napi(js_name = "currentSeq")]
+    pub async fn current_seq(&self) -> Result<i64> {
+        let db = self.db()?;
+        let seq = blocking(move || db.current_seq()).await?;
+        Ok(seq as i64)
+    }
+
+    /// Compact operations, keeping from the given sequence.
+    #[napi(js_name = "compactOps")]
+    pub async fn compact_ops(&self, keep_from: i64) -> Result<()> {
+        let db = self.db()?;
+        blocking(move || db.compact_ops(keep_from as u64)).await
+    }
+
+    /// Get the index specification.
+    #[napi(js_name = "indexSpec")]
+    pub async fn index_spec(&self) -> Result<serde_json::Value> {
+        let db = self.db()?;
+        let spec = blocking(move || Ok(db.index_spec())).await?;
+        Ok(serde_json::to_value(spec).map_err(|e| errors::rejected(e.to_string()))?)
+    }
+
+    /// Get storage report with table statistics.
+    #[napi(js_name = "storageReport")]
+    pub async fn storage_report(&self) -> Result<Vec<serde_json::Value>> {
+        let db = self.db()?;
+        let report = blocking(move || db.storage_report()).await?;
+        let rows: Vec<_> = report
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "table": r.table,
+                    "rows": r.rows,
+                    "keyBytes": r.key_bytes,
+                    "valueBytes": r.value_bytes,
+                })
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Get access statistics for a node. Returns null if node doesn't exist.
+    /// Returns {accessCount, lastAccessedAt} where accessCount is 0 for never-accessed existing nodes.
+    #[napi(js_name = "accessStats")]
+    pub async fn access_stats(&self, scopes: Vec<String>, id: String) -> Result<Option<serde_json::Value>> {
+        let db = self.db()?;
+        let set = convert::parse_scopes(&scopes)?;
+        let nid = convert::parse_node_id(&id)?;
+        let stats = blocking(move || db.access_stats(&set, nid)).await?;
+        Ok(stats.map(|s| {
+            serde_json::json!({
+                "accessCount": s.access_count,
+                "lastAccessedAt": s.last_accessed_at,
+            })
+        }))
+    }
+
+    /// Rebuild state from operations (replay ops log).
+    #[napi(js_name = "rebuildStateFromOps")]
+    pub async fn rebuild_state_from_ops(&self) -> Result<()> {
+        let db = self.db()?;
+        blocking(move || db.rebuild_state_from_ops()).await
+    }
+
+    /// Open an existing database from storage.
+    #[napi(factory, js_name = "openStored")]
+    pub async fn open_stored(path: String) -> Result<TopoDb> {
+        let db = blocking(move || Db::open_stored(&path)).await?;
+        Ok(TopoDb { inner: Arc::new(Mutex::new(Some(db))) })
+    }
+
+    /// Open database with options (index spec and optional cache size).
+    #[napi(factory, js_name = "openWithOptions")]
+    pub async fn open_with_options(
+        path: String,
+        index_spec: serde_json::Value,
+        cache_size_bytes: Option<u32>,
+    ) -> Result<TopoDb> {
+        let spec = serde_json::from_value::<topodb::IndexSpec>(index_spec)
+            .map_err(|e| errors::rejected(format!("invalid index spec: {e}")))?;
+        let opts = DbOptions { cache_size_bytes: cache_size_bytes.map(|s| s as usize) };
+        let db = blocking(move || Db::open_with_options(&path, spec, opts)).await?;
+        Ok(TopoDb { inner: Arc::new(Mutex::new(Some(db))) })
+    }
+
+    /// Unstable debug surface — shape may change without notice.
+    #[napi(js_name = "debugDumpNodes")]
+    pub async fn debug_dump_nodes(&self) -> Result<Vec<serde_json::Value>> {
+        let db = self.db()?;
+        let nodes = blocking(move || Ok(db.debug_dump_nodes())).await?;
+        convert::nodes_to_value(nodes)
+            .map(|v| match v {
+                serde_json::Value::Array(arr) => arr,
+                _ => vec![],
+            })
+    }
+
+    /// Unstable debug surface — shape may change without notice.
+    #[napi(js_name = "debugDumpEdges")]
+    pub async fn debug_dump_edges(&self) -> Result<Vec<serde_json::Value>> {
+        let db = self.db()?;
+        let edges = blocking(move || Ok(db.debug_dump_edges())).await?;
+        convert::edges_to_value(edges)
+            .map(|v| match v {
+                serde_json::Value::Array(arr) => arr,
+                _ => vec![],
+            })
     }
 }

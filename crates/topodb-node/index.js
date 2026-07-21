@@ -171,12 +171,139 @@ class TopoDB {
     }
   }
 
+  subscribe(capacity) {
+    try {
+      const sub = this._inner.subscribe(capacity)
+      return new Subscription(sub)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async opsSince(seq) {
+    try {
+      return await this._inner.opsSince(seq)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async currentSeq() {
+    try {
+      return await this._inner.currentSeq()
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async compactOps(keepFrom) {
+    try {
+      return await this._inner.compactOps(keepFrom)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async indexSpec() {
+    try {
+      return await this._inner.indexSpec()
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async storageReport() {
+    try {
+      return await this._inner.storageReport()
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async accessStats(scopes, id) {
+    try {
+      return await this._inner.accessStats(scopes, id)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async rebuildStateFromOps() {
+    try {
+      return await this._inner.rebuildStateFromOps()
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  static async openStored(path) {
+    try {
+      const inner = await native.TopoDB.openStored(path)
+      return new TopoDB(inner)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  static async openWithOptions(path, indexSpec, cacheSizeBytes) {
+    try {
+      const inner = await native.TopoDB.openWithOptions(path, indexSpec, cacheSizeBytes)
+      return new TopoDB(inner)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async debugDumpNodes() {
+    try {
+      return await this._inner.debugDumpNodes()
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  async debugDumpEdges() {
+    try {
+      return await this._inner.debugDumpEdges()
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
   close() {
     this._inner.close()
   }
 
   [Symbol.dispose]() {
     this.close()
+  }
+}
+
+class Subscription {
+  constructor(inner) {
+    this._inner = inner
+  }
+
+  async next(timeoutMs) {
+    try {
+      return await this._inner.next(timeoutMs)
+    } catch (e) {
+      decorate(e)
+    }
+  }
+
+  close() {
+    this._inner.close()
+  }
+
+  [Symbol.asyncIterator]() {
+    return {
+      next: async () => {
+        const ev = await this.next()
+        return ev == null ? { value: undefined, done: true } : { value: ev, done: false }
+      },
+      return: async () => { this.close(); return { value: undefined, done: true } },
+    }
   }
 }
 

@@ -36,9 +36,36 @@ export interface SuggestedLink {
   semantic: number
 }
 
+export interface ChangeEvent {
+  seq: number
+  op: unknown
+}
+
+export interface AccessStats {
+  accessCount: number
+  lastAccessedAt: number | null
+}
+
+export interface StorageTableReport {
+  table: string
+  rows: number
+  keyBytes: number
+  valueBytes: number
+}
+
+export type ErrorCode = 'STORAGE' | 'ENCODING' | 'REJECTED' | 'COMPACTED' | 'CLOSED' | 'UNSUPPORTED_FORMAT'
+
+export class Subscription {
+  next(timeoutMs?: number): Promise<ChangeEvent | null>
+  close(): void
+  [Symbol.asyncIterator](): AsyncIterator<ChangeEvent>
+}
+
 export class TopoDB {
   static open(path: string): Promise<TopoDB>
   static openWith(path: string, indexSpec: unknown): Promise<TopoDB>
+  static openStored(path: string): Promise<TopoDB>
+  static openWithOptions(path: string, indexSpec: unknown, cacheSizeBytes?: number): Promise<TopoDB>
   formatVersion(): Promise<number>
   submit(commands: unknown, defaultScope?: string | null, nowMs?: number): Promise<{
     firstSeq: number
@@ -59,6 +86,16 @@ export class TopoDB {
   searchVector(scopes: string[], model: string, vector: number[], k: number, candidates?: string[]): Promise<ScoredNode[]>
   recall(scopes: string[], query: string, k: number, opts?: { vector?: { model: string; vector: number[] }; expansions?: Array<[string, string[]]>; graphBoost?: boolean; labels?: string[]; nowMs?: number }): Promise<ScoredNode[]>
   suggestLinks(scopes: string[], node: string, k: number, opts?: { model?: string; asOf?: number; minSemanticSimilarity?: number }): Promise<SuggestedLink[]>
+  subscribe(capacity: number): Subscription
+  opsSince(seq: number): Promise<ChangeEvent[]>
+  currentSeq(): Promise<number>
+  compactOps(keepFrom: number): Promise<void>
+  indexSpec(): Promise<unknown>
+  storageReport(): Promise<StorageTableReport[]>
+  accessStats(scopes: string[], id: string): Promise<AccessStats | null>
+  rebuildStateFromOps(): Promise<void>
+  debugDumpNodes(): Promise<unknown[]>
+  debugDumpEdges(): Promise<unknown[]>
   close(): void
   [Symbol.dispose](): void
 }
