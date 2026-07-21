@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "topodb"
+version = "0.0.1"
+requires-python = ">=3.9"
+description = "TopoDB — embedded, temporal, graph-native memory for AI agents"
+
+[tool.maturin]
+module-name = "topodb._native"
+python-source = "python"

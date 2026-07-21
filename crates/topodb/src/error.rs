@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum TopoError {
     #[error("storage error: {0}")]
     Storage(Box<redb::Error>),

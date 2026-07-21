@@ -6,6 +6,7 @@ members = [
     "crates/topodb-mcp",
     "crates/topodb-cli",
     "crates/topodb-sgh",
+    "crates/topodb-py",
 ]
 
 # The profile that 'dist' will build with
