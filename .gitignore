@@ -10,3 +10,6 @@ specs/
 /PLAN.md
 /BROKER-PLAN.md
 /IMPROVEMENTS.md
+
+# sgh plugin writes goal.txt/graph.yaml here when run from the repo root.
+.sgh/
