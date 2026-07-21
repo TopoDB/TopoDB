@@ -907,6 +907,44 @@ struct FindDuplicateMemoriesResult {
     truncated: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConsolidateMemoriesParams {
+    /// ULID of the memory that SURVIVES: it inherits `drop`'s unique
+    /// relationships and stays live.
+    keep: String,
+    /// ULID of the redundant memory to RETIRE: marked superseded and
+    /// disconnected. The caller chooses this after judging the two are the same
+    /// fact — near-dup similarity is topical, not proof of sameness.
+    drop: String,
+    /// Scope both memories live in: `"shared"` or a scope ULID. Defaults to the
+    /// server's configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// A relationship `keep` inherited from `drop` during consolidation.
+#[derive(Debug, Serialize, JsonSchema)]
+struct TransferredEdge {
+    /// ULID of the NEW edge created on `keep`.
+    edge_id: String,
+    /// The edge's target node — the relationship `keep` gained from `drop`.
+    to: String,
+    /// The edge's (normalized) type, e.g. "about".
+    edge_type: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ConsolidateResult {
+    /// The surviving memory's ULID (echoes `keep`).
+    kept: String,
+    /// The retired memory's ULID (echoes `drop`), now marked superseded.
+    dropped: String,
+    /// Relationships `drop` had that `keep` did not — recreated on `keep` so no
+    /// graph knowledge is lost. Empty when `keep` already had every link `drop`
+    /// did (the common true-duplicate case).
+    transferred_edges: Vec<TransferredEdge>,
+}
+
 fn default_search_k() -> usize {
     10
 }
@@ -1815,6 +1853,107 @@ impl TopoServer {
             pairs,
             scanned,
             truncated,
+        }))
+    }
+
+    #[tool(
+        description = "Consolidate a near-duplicate PAIR into one memory: keep one, retire the other. YOU pick which survives (keep) and which is retired (drop) after judging they are the same fact — never let the tool infer it, because near-dup similarity is topical, not factual (a contradicting correction about the same subsystem scores high too). keep inherits drop's unique relationships (so no graph knowledge is lost) and drop is superseded — marked and disconnected — atomically. Pair this with find_duplicate_memories: scan for pairs, judge them, consolidate the true duplicates. Errors unless both are live (non-superseded) Memory nodes in the write scope and keep != drop."
+    )]
+    fn consolidate_memories(
+        &self,
+        Parameters(p): Parameters<ConsolidateMemoriesParams>,
+    ) -> Result<Json<ConsolidateResult>, ErrorData> {
+        let keep = parse_node_id(&p.keep)?;
+        let drop = parse_node_id(&p.drop)?;
+        if keep == drop {
+            return Err(ErrorData::invalid_params(
+                "keep and drop must be different memories".to_string(),
+                None,
+            ));
+        }
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let write_set = convert::scope_to_scope_set(scope);
+
+        // Both must be live Memory nodes in the write scope. supersede_ops
+        // re-checks drop, but validate both up front for a clear error before
+        // building any ops — and to reject an already-superseded node rather than
+        // silently no-op it.
+        let require_live_memory = |id: NodeId, raw: &str, role: &str| -> Result<(), ErrorData> {
+            let node = self.db.node(&write_set, id).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("{role} id {raw} is not a node in the write scope"),
+                    None,
+                )
+            })?;
+            if node.label != MEMORY_LABEL {
+                return Err(ErrorData::invalid_params(
+                    format!("{role} id {raw} is a {}, not a Memory", node.label),
+                    None,
+                ));
+            }
+            if node.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+                return Err(ErrorData::invalid_params(
+                    format!("{role} id {raw} is already superseded"),
+                    None,
+                ));
+            }
+            Ok(())
+        };
+        require_live_memory(keep, &p.keep, "keep")?;
+        require_live_memory(drop, &p.drop, "drop")?;
+
+        // Relationships keep already has, keyed by (target, type), so inheritance
+        // never stacks a duplicate edge.
+        let mut have: std::collections::BTreeSet<(NodeId, String)> = self
+            .db
+            .edges_from(&write_set, keep, None, None, true)
+            .map_err(classify_topo_error)?
+            .into_iter()
+            .map(|e| (e.to, e.ty.to_string()))
+            .collect();
+
+        let mut ops: Vec<Op> = Vec::new();
+        let mut transferred: Vec<TransferredEdge> = Vec::new();
+        for e in self
+            .db
+            .edges_from(&write_set, drop, None, None, true)
+            .map_err(classify_topo_error)?
+        {
+            // Never point keep at itself or at the node being retired.
+            if e.to == keep || e.to == drop {
+                continue;
+            }
+            // insert() returns true only when keep lacked this (target, type).
+            if have.insert((e.to, e.ty.to_string())) {
+                let id = EdgeId::new();
+                transferred.push(TransferredEdge {
+                    edge_id: id.to_string(),
+                    to: e.to.to_string(),
+                    edge_type: e.ty.to_string(),
+                });
+                ops.push(Op::CreateEdge {
+                    id,
+                    scope,
+                    ty: e.ty,
+                    from: keep,
+                    to: e.to,
+                    props: e.props,
+                    valid_from: None,
+                });
+            }
+        }
+
+        // Retire drop in the SAME batch, so keep's inheritance and drop's
+        // retirement commit together — keep can never absorb the edges and then
+        // fail to retire the duplicate.
+        let (sup_ops, _marked) = self.supersede_ops(scope, std::slice::from_ref(&p.drop))?;
+        ops.extend(sup_ops);
+        self.submit_write(ops)?;
+
+        Ok(Json(ConsolidateResult {
+            kept: keep.to_string(),
+            dropped: drop.to_string(),
+            transferred_edges: transferred,
         }))
     }
 
