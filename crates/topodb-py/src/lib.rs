@@ -1,5 +1,6 @@
 mod convert;
 mod errors;
+mod feed;
 
 use pyo3::prelude::*;
 use std::sync::Mutex;
@@ -287,6 +288,27 @@ impl TopoDB {
         convert::json_to_py(py, &serde_json::Value::Array(rows))
     }
 
+    fn subscribe(&self, py: Python<'_>, capacity: usize) -> PyResult<feed::Subscription> {
+        Ok(feed::Subscription::new(self.db(py)?.subscribe(capacity)))
+    }
+
+    fn ops_since(&self, py: Python<'_>, seq: u64) -> PyResult<PyObject> {
+        let db = self.db(py)?;
+        let evs = py.allow_threads(|| db.ops_since(seq)).map_err(|e| errors::to_py(py, e))?;
+        let rows: Result<Vec<_>, String> = evs.iter().map(feed::event_to_json).collect();
+        convert::json_to_py(py, &serde_json::Value::Array(rows.map_err(|e| errors::rejected(py, e))?))
+    }
+
+    fn current_seq(&self, py: Python<'_>) -> PyResult<u64> {
+        let db = self.db(py)?;
+        py.allow_threads(|| db.current_seq()).map_err(|e| errors::to_py(py, e))
+    }
+
+    fn compact_ops(&self, py: Python<'_>, keep_from: u64) -> PyResult<()> {
+        let db = self.db(py)?;
+        py.allow_threads(|| db.compact_ops(keep_from)).map_err(|e| errors::to_py(py, e))
+    }
+
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -301,5 +323,6 @@ impl TopoDB {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TopoDB>()?;
+    m.add_class::<feed::Subscription>()?;
     Ok(())
 }
