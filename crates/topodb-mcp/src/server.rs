@@ -365,6 +365,38 @@ impl TopoServer {
             Err(e) => Err(classify_topo_error(e)),
         }
     }
+
+    /// The id of a Memory in `write_scope` whose normalized content equals
+    /// `content`, if one is already stored. Dedup is scoped to the write scope
+    /// only — the same fact in two projects is two memories. Looks up by the
+    /// equality-indexed `content_hash` then verifies exact normalized content
+    /// on each candidate, so a hash collision can never merge distinct facts.
+    /// Oldest id wins if (astronomically) more than one true match exists.
+    fn existing_memory(
+        &self,
+        write_scope: Scope,
+        content: &str,
+    ) -> Result<Option<NodeId>, ErrorData> {
+        let hash = content_hash(content);
+        let want = normalize_content(content);
+        let scope_set = convert::scopes_to_scope_set(&[write_scope]);
+        let candidates = self
+            .db
+            .nodes_by_prop(
+                &scope_set,
+                MEMORY_LABEL,
+                convert::MEMORY_CONTENT_HASH_PROP,
+                &PropValue::Str(hash),
+            )
+            .map_err(classify_topo_error)?;
+        Ok(candidates
+            .into_iter()
+            .filter(|n| {
+                matches!(n.props.get(MEMORY_CONTENT_PROP), Some(PropValue::Str(c)) if normalize_content(c) == want)
+            })
+            .min_by_key(|n| n.id)
+            .map(|n| n.id))
+    }
 }
 
 /// Maps an engine `TopoError` to the right `ErrorData`: `Rejected` (caller
@@ -389,6 +421,27 @@ fn entity_dedup_key(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Normalize memory content for dedup: trim and collapse internal whitespace.
+/// Deliberately NOT lowercased — casing can carry meaning in a stored fact.
+fn normalize_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Stable FNV-1a 64-bit hash of normalized content, hex-encoded. This value is
+/// PERSISTED (equality-indexed as `content_hash`), so the algorithm must never
+/// change or old rows stop matching. A hash collision is harmless: the dedup
+/// path always verifies exact normalized content against each candidate, so
+/// the hash is only a fast bucket key, never the decision.
+fn content_hash(content: &str) -> String {
+    let normalized = normalize_content(content);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in normalized.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Schema stand-in for a props map. The tool bodies keep taking a raw
@@ -974,13 +1027,18 @@ struct RememberedEntity {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct RememberResult {
-    /// ULID of the newly created memory node.
+    /// ULID of the memory node — newly created, or the existing memory if this
+    /// exact content was already stored in the write scope.
     memory_id: String,
     /// One row per distinct entity, in input order.
     entities: Vec<RememberedEntity>,
-    /// ULIDs of the created memory→entity edges, index-aligned with
-    /// `entities`.
+    /// ULIDs of the memory→entity edges, index-aligned with `entities`. On a
+    /// dedup hit, an entity already linked to the existing memory reports its
+    /// existing edge id (no duplicate edge is created).
     edge_ids: Vec<String>,
+    /// True if this exact content already existed: the existing memory was
+    /// reused and only entities not already linked to it were newly linked.
+    deduplicated: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1058,8 +1116,12 @@ struct AddSynonymResult {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct CreateResult {
-    /// ULID of the newly created node.
+    /// ULID of the node — the newly created one, or the existing memory if
+    /// this exact content was already stored in the write scope.
     id: String,
+    /// True if an identical memory already existed in the write scope and was
+    /// returned instead of creating a duplicate.
+    deduplicated: bool,
 }
 
 /// Result of a find-or-create write (`create_entity`).
@@ -1703,17 +1765,13 @@ impl TopoServer {
                 None,
             ));
         }
-        let memory_id = NodeId::new();
-        // Embed before `p.content` moves into the props map below (same
-        // ordering create_memory uses).
-        let memory_embed = self.embed_op(memory_id, &p.content);
-        let memory_props = convert::merge_required_prop(
-            MEMORY_CONTENT_PROP,
-            PropValue::Str(p.content),
-            p.props.as_ref(),
-        )
-        .map_err(|e| ErrorData::invalid_params(e, None))?;
         let scope = self.resolve_scope(p.scope.as_deref())?;
+        // Dedup: if this exact content already lives in the write scope, reuse
+        // that memory node (below) and only ADD links for entities not already
+        // on it, rather than minting a duplicate memory.
+        let existing = self.existing_memory(scope, &p.content)?;
+        let deduplicated = existing.is_some();
+        let memory_id = existing.unwrap_or_else(NodeId::new);
 
         // Resolve every entity BEFORE the batch: existing entities
         // contribute only their id (no per-entity props here, so unlike
@@ -1771,45 +1829,85 @@ impl TopoServer {
         // ONE batch: memory + new entities + links commit atomically — this
         // call can never strand an unlinked memory the way the manual
         // create_memory -> create_entity -> link sequence can.
-        let mut ops: Vec<Op> = vec![Op::CreateNode {
-            id: memory_id,
-            scope,
-            label: MEMORY_LABEL.into(),
-            props: memory_props,
-        }];
-        ops.extend(memory_embed);
+        let mut ops: Vec<Op> = Vec::new();
+        if !deduplicated {
+            // New memory: create the node with its content + content_hash, and
+            // embed it. (Embed + hash before `p.content` moves into props.)
+            let memory_embed = self.embed_op(memory_id, &p.content);
+            let hash = content_hash(&p.content);
+            let mut memory_props = convert::merge_required_prop(
+                MEMORY_CONTENT_PROP,
+                PropValue::Str(p.content),
+                p.props.as_ref(),
+            )
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+            memory_props.insert(
+                convert::MEMORY_CONTENT_HASH_PROP.into(),
+                PropValue::Str(hash),
+            );
+            ops.push(Op::CreateNode {
+                id: memory_id,
+                scope,
+                label: MEMORY_LABEL.into(),
+                props: memory_props,
+            });
+            ops.extend(memory_embed);
+        }
         // Id-level dedup: name-level dedup above only catches spelling
         // variants of the SAME string. Two DIFFERENT names can still
         // resolve to the SAME node (e.g. a canonical name and its alias),
         // so collapse again on the resolved NodeId, first occurrence wins.
         let mut seen_ids = std::collections::BTreeSet::new();
         resolved.retain(|r| seen_ids.insert(r.id));
+        // On a dedup hit, an entity already linked to the existing memory keeps
+        // its edge — don't mint a second one. Empty for a fresh memory.
+        let already_linked: std::collections::HashMap<NodeId, EdgeId> = if deduplicated {
+            let scope_set = convert::scopes_to_scope_set(&[scope]);
+            self.db
+                .edges_from(&scope_set, memory_id, None, Some(ty.as_str()), true)
+                .map_err(classify_topo_error)?
+                .into_iter()
+                .map(|e| (e.to, e.id))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         let mut entities_out = Vec::with_capacity(resolved.len());
         let mut edge_ids = Vec::with_capacity(resolved.len());
         for r in resolved {
             ops.extend(r.ops);
-            let edge_id = EdgeId::new();
-            ops.push(Op::CreateEdge {
-                id: edge_id,
-                scope,
-                ty: ty.clone().into(),
-                from: memory_id,
-                to: r.id,
-                props: Props::new(),
-                valid_from: None,
-            });
-            edge_ids.push(edge_id.to_string());
+            let edge_id_str = match already_linked.get(&r.id) {
+                Some(existing_edge) => existing_edge.to_string(),
+                None => {
+                    let edge_id = EdgeId::new();
+                    ops.push(Op::CreateEdge {
+                        id: edge_id,
+                        scope,
+                        ty: ty.clone().into(),
+                        from: memory_id,
+                        to: r.id,
+                        props: Props::new(),
+                        valid_from: None,
+                    });
+                    edge_id.to_string()
+                }
+            };
+            edge_ids.push(edge_id_str);
             entities_out.push(RememberedEntity {
                 name: r.name,
                 id: r.id.to_string(),
                 created: r.created,
             });
         }
-        self.submit_write(ops)?;
+        // A pure no-op (dedup hit, every entity already linked) writes nothing.
+        if !ops.is_empty() {
+            self.submit_write(ops)?;
+        }
         Ok(Json(RememberResult {
             memory_id: memory_id.to_string(),
             entities: entities_out,
             edge_ids,
+            deduplicated,
         }))
     }
 
@@ -1820,16 +1918,28 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<CreateMemoryParams>,
     ) -> Result<Json<CreateResult>, ErrorData> {
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        // Dedup: re-storing an identical fact returns the existing node.
+        if let Some(existing) = self.existing_memory(scope, &p.content)? {
+            return Ok(Json(CreateResult {
+                id: existing.to_string(),
+                deduplicated: true,
+            }));
+        }
         let id = NodeId::new();
-        // Embed before `p.content` moves into the props map below.
+        // Embed + hash before `p.content` moves into the props map below.
         let embed = self.embed_op(id, &p.content);
-        let props = convert::merge_required_prop(
+        let hash = content_hash(&p.content);
+        let mut props = convert::merge_required_prop(
             MEMORY_CONTENT_PROP,
             PropValue::Str(p.content),
             p.props.as_ref(),
         )
         .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let scope = self.resolve_scope(p.scope.as_deref())?;
+        props.insert(
+            convert::MEMORY_CONTENT_HASH_PROP.into(),
+            PropValue::Str(hash),
+        );
         let mut ops = vec![Op::CreateNode {
             id,
             scope,
@@ -1838,7 +1948,10 @@ impl TopoServer {
         }];
         ops.extend(embed);
         self.submit_write(ops)?;
-        Ok(Json(CreateResult { id: id.to_string() }))
+        Ok(Json(CreateResult {
+            id: id.to_string(),
+            deduplicated: false,
+        }))
     }
 
     #[tool(
