@@ -2,10 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { projectScopeId } from "../scope-id.js";
+import { rmWithGraceSync } from "./fsgrace.js";
 
 const require = createRequire(import.meta.url);
 
@@ -97,10 +98,10 @@ test("the ULID this plugin derives is the ULID the Rust server reports back", as
       child.kill();
     }
   } finally {
-    // On Windows, child.kill() is TerminateProcess, which is asynchronous —
-    // the OS can still be releasing redb's handle on memory.redb when this
-    // rmSync runs, racing an EBUSY/EPERM. maxRetries + retryDelay give the
-    // handle time to actually let go instead of flaking the cleanup.
-    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    // On Windows, child.kill() is TerminateProcess, which is asynchronous — the
+    // OS can still be releasing redb's handle on memory.redb when teardown runs,
+    // racing an ENOTEMPTY/EBUSY/EPERM. The shared grace helper retries with a
+    // generous budget (30×1000ms) and names what is still held if it gives up.
+    rmWithGraceSync(dir);
   }
 });

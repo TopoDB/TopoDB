@@ -33,6 +33,7 @@ import net from "node:net";
 import path from "node:path";
 import { lineReader, socketPathFor, helloFrame } from "../ipc.js";
 import { projectScopeId } from "../scope-id.js";
+import { rmWithGraceSync } from "./fsgrace.js";
 import { SERVER_VERSION } from "../server-args.js";
 
 const require = createRequire(import.meta.url);
@@ -81,10 +82,14 @@ function platformPkgDir(dataDir) {
 }
 
 function rmDir(dir) {
-  // Windows kill() is asynchronous (TerminateProcess); the OS can still be
-  // releasing a file handle on memory.redb when this runs, racing an
-  // EBUSY/EPERM. maxRetries + retryDelay give the handle time to let go.
-  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  // Windows kill() is asynchronous (TerminateProcess) and won't remove a
+  // directory while the just-killed broker (or its topodb-mcp child) still
+  // holds a handle on memory.redb / broker.log — rmdir then throws ENOTEMPTY
+  // (or EBUSY/EPERM), failing the test in teardown, not on any assertion. This
+  // file's own retry budget (10×100ms ≈ 5.5s) was too short and flaked; use the
+  // shared grace helper (30×1000ms, and it names what is still held if it ever
+  // does give up). Sync variant because these teardowns run in sync `finally`s.
+  rmWithGraceSync(dir);
 }
 
 function sleep(ms) {
