@@ -547,14 +547,34 @@ fn dup_band(similarity: f32) -> &'static str {
     }
 }
 
-/// Words that retract or flip the token(s) that follow them — negations and
-/// replacement/comparison cues. The signal that separates a *contradiction* (one
-/// fact superseding another) from a *duplicate*: sentence embeddings score
-/// "X is A" and "X is now B, not A" as MORE similar than a genuine restatement,
-/// so cosine alone can never tell them apart — but the negation cue can.
-const DUP_NEG_CUES: &[&str] = &[
-    "not", "never", "longer", "instead", "without", "replaced", "replaces", "removed", "remove",
-    "dropped", "drops", "stopped", "rather", "no", "over", "versus", "vs",
+/// Words that retract or flip a token — the signal that separates a
+/// *contradiction* (one fact superseding another) from a *duplicate*: sentence
+/// embeddings score "X is A" and "X is now B, not A" as MORE similar than a
+/// genuine restatement, so cosine alone can never tell them apart, but the cue
+/// can. Split by which way they govern:
+/// - PRE cues govern the tokens AFTER them ("not redb", "no longer windows").
+const DUP_FWD_CUES: &[&str] = &[
+    "not", "never", "no", "longer", "instead", "without", "rather", "over", "versus", "vs",
+    "replaced", "replaces", "removed", "remove",
+];
+/// - POST cues govern the token immediately BEFORE them ("windows dropped",
+///   "redb backend removed"). Without these, a post-nominal negation reads as an
+///   assertion, so "windows dropped" and "no longer windows" — which AGREE —
+///   would be mislabeled a contradiction.
+const DUP_BWD_CUES: &[&str] = &[
+    "dropped",
+    "drops",
+    "removed",
+    "remove",
+    "gone",
+    "deprecated",
+    "retired",
+    "stopped",
+    "killed",
+    "disabled",
+    "discontinued",
+    "replaced",
+    "replaces",
 ];
 
 /// Function words (and a few high-frequency verbs) dropped before comparing
@@ -562,11 +582,16 @@ const DUP_NEG_CUES: &[&str] = &[
 const DUP_STOP: &[&str] = &[
     "a", "an", "the", "of", "to", "in", "on", "for", "its", "it", "is", "are", "as", "by", "with",
     "and", "or", "now", "only", "both", "this", "that", "using", "use", "uses", "chose", "runs",
-    "run", "their", "them", "people", "up",
+    "run", "was", "were", "be", "been", "their", "them", "people", "up",
 ];
 
-/// How many tokens after a negation cue are treated as governed by it.
-const DUP_NEG_WINDOW: usize = 4;
+/// How many tokens after a PRE cue are treated as governed by it (POST cues take
+/// just the one content token before them, to avoid over-negating).
+const DUP_FWD_WINDOW: usize = 4;
+
+fn dup_is_cue(w: &str) -> bool {
+    DUP_FWD_CUES.contains(&w) || DUP_BWD_CUES.contains(&w)
+}
 
 fn dup_singularize(t: &str) -> &str {
     if t.len() > 3 && t.ends_with('s') {
@@ -577,8 +602,10 @@ fn dup_singularize(t: &str) -> &str {
 }
 
 /// Tokenize `s` (lowercased alphanumeric runs) into (asserted, negated) content
-/// sets: `negated` = content tokens within [`DUP_NEG_WINDOW`] after a negation
-/// cue; `asserted` = every other content token. Stopwords and cues are dropped.
+/// sets: `negated` = content tokens governed by a cue (PRE cues take the tokens
+/// after them within [`DUP_FWD_WINDOW`]; POST cues take the nearest content token
+/// before them); `asserted` = every other content token. Stopwords and cues are
+/// dropped.
 fn dup_analyze(s: &str) -> (HashSet<String>, HashSet<String>) {
     let toks: Vec<String> = s
         .to_lowercase()
@@ -586,22 +613,31 @@ fn dup_analyze(s: &str) -> (HashSet<String>, HashSet<String>) {
         .filter(|w| !w.is_empty())
         .map(String::from)
         .collect();
-    let is_cue = |w: &str| DUP_NEG_CUES.contains(&w);
     let is_stop = |w: &str| DUP_STOP.contains(&w);
     let mut negated = HashSet::new();
     for (i, t) in toks.iter().enumerate() {
-        if is_cue(t) {
-            let end = (i + 1 + DUP_NEG_WINDOW).min(toks.len());
+        if DUP_FWD_CUES.contains(&t.as_str()) {
+            let end = (i + 1 + DUP_FWD_WINDOW).min(toks.len());
             for w in &toks[i + 1..end] {
-                if !is_stop(w) && !is_cue(w) {
+                if !is_stop(w) && !dup_is_cue(w) {
                     negated.insert(dup_singularize(w).to_string());
                 }
+            }
+        }
+        if DUP_BWD_CUES.contains(&t.as_str()) {
+            // Nearest content token before the cue: "windows dropped" -> windows.
+            for w in toks[..i].iter().rev() {
+                if is_stop(w) || dup_is_cue(w) {
+                    continue;
+                }
+                negated.insert(dup_singularize(w).to_string());
+                break;
             }
         }
     }
     let content: HashSet<String> = toks
         .iter()
-        .filter(|w| !is_stop(w) && !is_cue(w))
+        .filter(|w| !is_stop(w) && !dup_is_cue(w))
         .map(|w| dup_singularize(w).to_string())
         .collect();
     let asserted = content.difference(&negated).cloned().collect();
@@ -3592,6 +3628,10 @@ mod dup_classify_tests {
              "The CI pipeline executes formatting, linting, and the test suite on both ubuntu and windows runners"),
             ("the auth service issues JWT tokens to sign in users",
              "auth uses JSON Web Tokens to authenticate and log people in"),
+            // Post-nominal negation that AGREES with a pre-nominal one — both say
+            // Windows is gone — must read as a duplicate, not a contradiction.
+            ("CI runs only on ubuntu (windows dropped)",
+             "CI no longer runs on windows, only ubuntu"),
         ];
         let contradict = [
             (
@@ -3605,6 +3645,11 @@ mod dup_classify_tests {
             (
                 "CI runs on ubuntu and windows",
                 "CI no longer runs on windows, only ubuntu",
+            ),
+            // Post-nominal negation ("... was removed") must fire too.
+            (
+                "the redb backend is used for storage",
+                "the redb backend was removed",
             ),
         ];
         for (a, b) in same {
