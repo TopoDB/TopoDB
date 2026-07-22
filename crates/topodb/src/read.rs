@@ -97,6 +97,19 @@ impl Db {
         hits
     }
 
+    /// Same population and order as [`nodes_by_label`] but does NOT bump the
+    /// access counters. For maintenance scans that sweep the whole label to
+    /// inspect it rather than to recall it — a stale-memory scan reads
+    /// `last_accessed_at` and would erase that very signal by bumping it, and
+    /// dedup/orphan scans should not inflate the access-boost of everything they
+    /// examine. A read for housekeeping is not a recall.
+    #[must_use]
+    pub fn nodes_by_label_unbumped(&self, scopes: &ScopeSet, label: &str) -> Vec<NodeRecord> {
+        self.storage()
+            .load_nodes_by_label(scopes, label)
+            .unwrap_or_default()
+    }
+
     /// Newest-first, `k`-bounded label scan: the `recent_memories` shape,
     /// served near-`O(k)` via reverse-bounded `LABEL_INDEX` scans per
     /// `(label, scope)` pair, merged across scopes by `node_id` descending

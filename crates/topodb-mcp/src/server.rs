@@ -522,6 +522,10 @@ const NEAR_DUP_K: usize = 3;
 /// any realistic single-project memory store.
 const DUP_SCAN_CAP: usize = 2000;
 
+/// Milliseconds per day — the unit `find_stale_memories` converts `older_than_days`
+/// and computed ages through.
+const MS_PER_DAY: f64 = 86_400_000.0;
+
 /// Cosine similarity of two equal-length vectors, or `None` when the lengths
 /// differ or either vector has zero magnitude (no defined direction). Matches
 /// the engine's `search_vector` scoring so scan results are comparable to
@@ -985,6 +989,66 @@ struct FindOrphanMemoriesResult {
     scanned: usize,
     /// `true` when more orphans exist than `limit` returned. A hint to raise
     /// `limit` or narrow scopes, not an error.
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindStaleMemoriesParams {
+    /// Minimum age in days of a memory's LAST activity — the later of its
+    /// creation and its most recent recall — for it to count as stale. Default
+    /// 30. A memory created or recalled more recently than this is fresh and
+    /// excluded, so a brand-new memory is never stale.
+    #[serde(default = "default_stale_days")]
+    older_than_days: f64,
+    /// Cap on the number of stale memories returned (stalest first). Default 100.
+    #[serde(default = "default_stale_limit")]
+    #[schemars(range(min = 1, max = 1000))]
+    limit: u32,
+    /// Scope to scan: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Scan across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs.
+    /// Takes precedence over `scope`; must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+fn default_stale_days() -> f64 {
+    30.0
+}
+
+fn default_stale_limit() -> u32 {
+    100
+}
+
+/// A memory that has gone cold — no activity within the requested window.
+#[derive(Debug, Serialize, JsonSchema)]
+struct StaleMemory {
+    /// The stale memory's ULID.
+    id: String,
+    /// Its content, so the caller can decide to refresh, re-link, or drop it.
+    content: String,
+    /// Times this memory has been returned by a scoped read. 0 = never recalled.
+    access_count: u64,
+    /// Wall-clock ms of the most recent recall; omitted (null) when never
+    /// recalled — staleness is then measured from creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_accessed_at: Option<i64>,
+    /// Days since the memory's last activity (creation or recall).
+    age_days: f64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct FindStaleMemoriesResult {
+    /// Cold memories, stalest first, at most `limit`. Empty when everything is
+    /// fresher than `older_than_days`.
+    stale: Vec<StaleMemory>,
+    /// How many live (non-superseded) memories were examined.
+    scanned: usize,
+    /// `true` when more stale memories exist than `limit` returned. A hint to
+    /// raise `limit` or narrow scopes, not an error.
     truncated: bool,
 }
 
@@ -1840,7 +1904,7 @@ impl TopoServer {
         // stores have no vectors, so this is empty (no semantic signal).
         let mut candidates: Vec<(String, String, Vec<f32>)> = self
             .db
-            .nodes_by_label(&scope_set, MEMORY_LABEL)
+            .nodes_by_label_unbumped(&scope_set, MEMORY_LABEL)
             .into_iter()
             .filter(|n| !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP))
             .filter_map(|n| {
@@ -2022,7 +2086,7 @@ impl TopoServer {
         // oldest-first without a sort. Each memory needs one indexed out-edge
         // lookup — O(n), not O(n^2), so no scan cap is needed; only the returned
         // list is bounded.
-        for n in self.db.nodes_by_label(&scope_set, MEMORY_LABEL) {
+        for n in self.db.nodes_by_label_unbumped(&scope_set, MEMORY_LABEL) {
             // Retired memories have closed edges by design — not orphans.
             if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
                 continue;
@@ -2052,6 +2116,87 @@ impl TopoServer {
         }
         Ok(Json(FindOrphanMemoriesResult {
             orphans,
+            scanned,
+            truncated,
+        }))
+    }
+
+    #[tool(
+        description = "Maintenance scan: find memories that have gone COLD — not created or recalled within older_than_days (default 30), stalest first. 'Activity' is the later of a memory's creation and its most recent recall (last_accessed_at), so a brand-new memory is never stale and a frequently-recalled one stays fresh; a fact stored long ago and never looked at since is what surfaces. Read-only and advisory: review, then refresh (re-link), keep, or drop. The scan itself does NOT count as a recall — it inspects the recency signal without bumping it. Superseded memories are excluded. Each row carries access_count, last_accessed_at (null if never recalled), and age_days. Stalest first, at most `limit`; truncated=true means more exist."
+    )]
+    fn find_stale_memories(
+        &self,
+        Parameters(p): Parameters<FindStaleMemoriesParams>,
+    ) -> Result<Json<FindStaleMemoriesResult>, ErrorData> {
+        if !(1..=1000).contains(&p.limit) {
+            return Err(ErrorData::invalid_params(
+                format!("limit must be between 1 and 1000, got {}", p.limit),
+                None,
+            ));
+        }
+        if !p.older_than_days.is_finite() || p.older_than_days < 0.0 {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "older_than_days must be a finite number >= 0.0, got {}",
+                    p.older_than_days
+                ),
+                None,
+            ));
+        }
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let now = now_ms();
+        let threshold_ms = (p.older_than_days * MS_PER_DAY) as i64;
+
+        // (effective_last_activity_ms, row) so we can sort stalest-first after.
+        let mut candidates: Vec<(i64, StaleMemory)> = Vec::new();
+        let mut scanned = 0usize;
+        // Unbumped: this is housekeeping, not a recall. Bumping would reset the
+        // very last_accessed_at we read, making the whole store look fresh on the
+        // next scan.
+        for n in self.db.nodes_by_label_unbumped(&scope_set, MEMORY_LABEL) {
+            if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+                continue;
+            }
+            scanned += 1;
+            let stats = self
+                .db
+                .access_stats(&scope_set, n.id)
+                .map_err(classify_topo_error)?
+                .unwrap_or_default();
+            // Activity = later of creation (ULID mint) and last recall. A memory
+            // never recalled (last_accessed_at == 0) falls back to its mint time.
+            let effective = (n.id.timestamp_ms() as i64).max(stats.last_accessed_at);
+            let age_ms = now - effective;
+            if age_ms < threshold_ms {
+                continue;
+            }
+            let content = match n.props.get(MEMORY_CONTENT_PROP) {
+                Some(PropValue::Str(c)) => c.clone(),
+                _ => String::new(),
+            };
+            candidates.push((
+                effective,
+                StaleMemory {
+                    id: n.id.to_string(),
+                    content,
+                    access_count: stats.access_count,
+                    last_accessed_at: (stats.last_accessed_at != 0)
+                        .then_some(stats.last_accessed_at),
+                    age_days: age_ms as f64 / MS_PER_DAY,
+                },
+            ));
+        }
+        // Stalest first = oldest activity first (ascending effective timestamp).
+        // Stable sort keeps id (mint) order among equal-activity memories.
+        candidates.sort_by_key(|(effective, _)| *effective);
+        let truncated = candidates.len() > p.limit as usize;
+        let stale = candidates
+            .into_iter()
+            .take(p.limit as usize)
+            .map(|(_, m)| m)
+            .collect();
+        Ok(Json(FindStaleMemoriesResult {
+            stale,
             scanned,
             truncated,
         }))

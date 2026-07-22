@@ -44,6 +44,39 @@ fn reads_bump_counters_asynchronously() {
 }
 
 #[test]
+fn nodes_by_label_unbumped_reads_without_bumping() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let untouched = NodeId::new();
+    let fence = NodeId::new();
+    for id in [untouched, fence] {
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
+    }
+
+    // The unbumped scan returns the whole label population...
+    let hits = db.nodes_by_label_unbumped(&scopes, "M");
+    assert_eq!(hits.len(), 2, "sees both nodes");
+
+    // ...but must not have bumped anything. Fence: bump `fence` AFTER the scan;
+    // once its (later) bump lands, any scan-induced bump would have landed too.
+    let _ = db.node(&scopes, fence);
+    wait_for_count(&db, &scopes, fence, 1);
+    assert_eq!(
+        db.access_stats(&scopes, untouched).unwrap(),
+        Some(AccessStats::default()),
+        "an unbumped scan must leave the access counters untouched"
+    );
+}
+
+#[test]
 fn counters_are_outside_log_feed_and_replay() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
