@@ -25,8 +25,6 @@ contradiction-aware near-duplicate detection, and orphan / stale / health
 maintenance scans), plus a Claude Code plugin that injects recall and a
 hygiene nudge at session start. See [what's built](#whats-built).
 
-First consumer: Atlas (agentic OS desktop app).
-
 ## Principles
 
 1. Narrow and deep — one workload done excellently
