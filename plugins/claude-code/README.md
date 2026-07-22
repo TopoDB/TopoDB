@@ -36,7 +36,15 @@ rather than ever blocking a session:
   context — ranked by access within the recent window, capped well under
   2k tokens. No broker running yet (the very first session of a project)
   means no injection; it appears from the next session on. Requires server
-  version 0.0.11+, which is what the plugin pins, so this is live.
+  version 0.0.11+, which is what the plugin pins, so this is live. When the
+  store has accumulated cruft, the injection also carries a one-line
+  **memory-health nudge** (`🧹 Memory hygiene: N duplicate pairs, N
+  orphans, N stale …`) from a `memory_health` scan run concurrently with
+  the recall — so an agent notices redundancy/orphans/cold memories at
+  session start and can review with `memory_health` / the `find_*` scans,
+  then `consolidate`/`link`/`supersede`. Stale uses a 90-day window to
+  stay meaningful; the nudge is advisory and, like everything here, fails
+  silently to nothing.
 - **Episode capture:** the plugin records which memories each
   `search_memories`/`traverse`/`recent_memories` call returned and, at
   session end, writes an `Episode` node with `RetrievalEvent`s marking

@@ -12,7 +12,7 @@ import path from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { spawn, execFileSync } from "node:child_process";
-import { renderInjection } from "../hooks/session-start.js";
+import { renderInjection, renderHealth } from "../hooks/session-start.js";
 import { connectForProject } from "../broker-client.js";
 import { serverArgs } from "../server-args.js";
 import { socketPathFor } from "../ipc.js";
@@ -38,6 +38,31 @@ test("renderInjection: caps, formats, and returns null when empty", () => {
     id: `01${i}`, content: "x".repeat(300), entities: [], ageMs: 1000, accessCount: 0,
   }));
   assert.ok(renderInjection(many).length <= 6200);
+});
+
+test("renderHealth: null when tidy, concise nudge for non-zero categories", () => {
+  assert.equal(renderHealth(null), null);
+  assert.equal(
+    renderHealth({ needs_attention: false, duplicate_pairs: 0, orphan_count: 0, stale_count: 0 }),
+    null,
+  );
+  const line = renderHealth({
+    needs_attention: true, duplicate_pairs: 3, orphan_count: 1, stale_count: 0, truncated: false,
+  });
+  assert.match(line, /3 duplicate pairs/);
+  assert.match(line, /1 orphan\b/); // singular, no trailing "s"
+  assert.doesNotMatch(line, /stale/); // zero categories are omitted
+  assert.match(line, /memory_health/);
+});
+
+test("renderInjection: threads a health line in before the footer", () => {
+  const mems = [{ id: "01A", content: "x", entities: [], ageMs: 0, accessCount: 0 }];
+  const nudge = "🧹 hygiene nudge";
+  const out = renderInjection(mems, nudge);
+  assert.match(out, /🧹 hygiene nudge/);
+  assert.ok(out.indexOf(nudge) < out.indexOf("Deeper recall"), "nudge sits above the footer");
+  // Absent when not provided (existing behavior unchanged).
+  assert.doesNotMatch(renderInjection(mems), /🧹/);
 });
 
 // --- integration fixture plumbing ---------------------------------------
@@ -138,6 +163,55 @@ test(
       assert.match(ctx, /HNSW behind a flag/);
       assert.match(ctx, /redb over sled/);
       assert.match(ctx, /TopoDB/);
+    } finally {
+      if (broker) broker.kill();
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "session-start hook surfaces a memory-health nudge when there is cruft",
+  { skip: !existsSync(LOCAL_SERVER) && "build topodb-mcp first: cargo build -p topodb-mcp" },
+  async () => {
+    const dataDir = mkLocalServerDataDir("topodb-ssh-");
+    const projectDir = mkdtempSync(path.join(tmpdir(), "topodb-sshp-"));
+    const args = serverArgs({ projectDir, dataDir });
+    const dbPath = args[args.indexOf("--db") + 1];
+    const sock = socketPathFor(dbPath);
+    let broker = null;
+    try {
+      broker = spawn(process.execPath, [BROKER_JS, ...args], {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, TOPODB_BROKER_IDLE_MS: "5000", TOPODB_MCP_LOCAL_BIN: LOCAL_SERVER },
+      });
+      let brokerErr = "";
+      broker.stderr.on("data", (d) => (brokerErr += d));
+      await connectSocketWithRetry(sock);
+
+      // Seed two ORPHAN memories (create_memory, never linked to an entity) —
+      // memory_health should flag them at session start.
+      const seeder = await connectForProject({ projectDir, dataDir });
+      assert.ok(seeder, `failed to connect; stderr: ${brokerErr}`);
+      await seeder.call("create_memory", { content: "an unlinked floating fact" });
+      await seeder.call("create_memory", { content: "another dangling note" });
+      seeder.close();
+
+      const stdinPayload = JSON.stringify({
+        session_id: "s1", cwd: projectDir, hook_event_name: "SessionStart", source: "startup",
+      });
+      const out = execFileSync(process.execPath, [path.join(HERE, "..", "hooks", "session-start.js")], {
+        input: stdinPayload,
+        env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: projectDir },
+        timeout: 10000,
+      }).toString();
+
+      assert.notEqual(out, "", `hook printed nothing; broker stderr: ${brokerErr}`);
+      const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
+      assert.match(ctx, /Memory hygiene/, `expected a hygiene nudge; got: ${ctx}`);
+      assert.match(ctx, /2 orphans/);
+      assert.match(ctx, /memory_health/);
     } finally {
       if (broker) broker.kill();
       rmSync(dataDir, { recursive: true, force: true });
