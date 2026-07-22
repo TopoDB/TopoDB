@@ -98,11 +98,12 @@ and scoped recall as a library call.
 | Access stats (recall-driven counters) | engine | ✅ |
 | Change feed (`subscribe` / `ops_since`) + op-log compaction | engine | ✅ |
 | Versioned on-disk format ([FORMAT.md](FORMAT.md)) | engine | ✅ |
-| MCP server (20 tools) | `topodb-mcp` | ✅ |
+| MCP server (27 tools) | `topodb-mcp` | ✅ |
 | CLI (all 17 engine operations) | `topodb-cli` | ✅ v1 |
 | One-command Pi install | `@topodb/pi` | ✅ |
 | Vector search exposed over MCP / CLI | layers | ✅ |
 | Hybrid recall (BM25 + vector + graph, RRF-fused, recency-weighted) | engine + `topodb-mcp` | ✅ |
+| Memory hygiene (write-time dedup + supersession, banded/contradiction-aware near-dup, orphan + stale scans, `consolidate_memories`, `memory_health`, `suggest_links`) | `topodb-mcp` | ✅ |
 | Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup/search | `topodb-mcp` | ✅ |
 | Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime) | `topodb-mcp` | ✅ |
 | `set-props` / `remove-node` / bulk submit over CLI | `topodb-cli` | ✅ |
@@ -143,13 +144,16 @@ single-process access only).
 
 ### topodb-mcp
 
-`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 20 MCP tools over
+`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 27 MCP tools over
 stdio JSON-RPC — `db_info` (now also reporting embeddings status); scoped reads (`get_node`,
-`find_by_prop`, `search_memories` — hybrid BM25 + vector + graph recall, RRF-fused —, `traverse`,
-`access_stats`, `search_vectors`); writes (`remember`, `create_memory`, `create_entity`, `add_alias`,
-`add_synonym`, `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`,
-`submit_batch`); and `get_changes`, the one unscoped read, which replays the op log across every
-scope and is therefore off unless you pass `--allow-unscoped-changes`. Reads filter by a *set* of
+`find_by_prop`, `search_memories` — hybrid BM25 + vector + graph recall, RRF-fused —,
+`recent_memories`, `traverse`, `suggest_links`, `access_stats`, `search_vectors`, `get_edges`);
+a memory-hygiene toolkit (`find_duplicate_memories` — banded, contradiction-aware —,
+`find_orphan_memories`, `find_stale_memories`, `memory_health`); writes (`remember`,
+`create_memory`, `consolidate_memories`, `create_entity`, `add_alias`, `add_synonym`, `link`,
+`set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`); and `get_changes`,
+the one unscoped read, which replays the op log across every scope and is therefore off unless you
+pass `--allow-unscoped-changes`. Reads filter by a *set* of
 scopes (`--read-scopes` at startup, or a per-call `scopes` array); a write is stamped with exactly
 *one* scope (`--scope`, or a per-call `scope`) — `link` included, so an edge can join nodes living
 in different scopes. Local embeddings (`--embeddings`, on by default) auto-fetch an ONNX Runtime on first run (system runtimes and `ORT_DYLIB_PATH` take precedence; `--no-ort-download` disables fetching) — Intel Macs have no official 1.24.2 artifact and keep the manual path (system runtime or `ORT_DYLIB_PATH`); without any runtime the server gracefully runs text+graph-only. Install with

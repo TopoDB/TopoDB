@@ -35,8 +35,9 @@ rather than ever blocking a session:
   begins with up to 8 recent memories for this project injected as
   context — ranked by access within the recent window, capped well under
   2k tokens. No broker running yet (the very first session of a project)
-  means no injection; it appears from the next session on. Requires server
-  version 0.0.11+, which is what the plugin pins, so this is live. When the
+  means no injection; it appears from the next session on. The recall
+  injection needs a 0.0.11+ server and the hygiene nudge below needs 0.0.12+;
+  the plugin pins 0.0.12, so both are live. When the
   store has accumulated cruft, the injection also carries a one-line
   **memory-health nudge** (`🧹 Memory hygiene: N duplicate pairs, N
   supersessions, N orphans, N stale …`) from a `memory_health` scan run
