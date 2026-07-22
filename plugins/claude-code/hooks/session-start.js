@@ -25,6 +25,7 @@ export function renderHealth(health) {
   const plur = (n, s) => `${n} ${s}${n === 1 ? "" : "s"}`;
   const parts = [];
   if (health.duplicate_pairs > 0) parts.push(plur(health.duplicate_pairs, "duplicate pair"));
+  if (health.supersession_pairs > 0) parts.push(plur(health.supersession_pairs, "supersession"));
   if (health.orphan_count > 0) parts.push(plur(health.orphan_count, "orphan"));
   if (health.stale_count > 0) parts.push(`${health.stale_count} stale`);
   if (!parts.length) return null;

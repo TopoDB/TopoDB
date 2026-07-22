@@ -47,9 +47,11 @@ test("renderHealth: null when tidy, concise nudge for non-zero categories", () =
     null,
   );
   const line = renderHealth({
-    needs_attention: true, duplicate_pairs: 3, orphan_count: 1, stale_count: 0, truncated: false,
+    needs_attention: true, duplicate_pairs: 3, supersession_pairs: 2, orphan_count: 1,
+    stale_count: 0, truncated: false,
   });
   assert.match(line, /3 duplicate pairs/);
+  assert.match(line, /2 supersessions/);
   assert.match(line, /1 orphan\b/); // singular, no trailing "s"
   assert.doesNotMatch(line, /stale/); // zero categories are omitted
   assert.match(line, /memory_health/);

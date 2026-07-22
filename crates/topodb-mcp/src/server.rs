@@ -11,6 +11,7 @@
 //! (writes) and maps engine `Err`s to `ErrorData` through `topodb_json`
 //! (imported here as `convert`) — never panics.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -470,7 +471,12 @@ impl TopoServer {
     /// retired), as are non-Memory nodes. Called BEFORE the new memory is
     /// written, so it never returns the node being created. A vector-search
     /// error degrades to empty rather than failing the write — this is a hint.
-    fn near_duplicates(&self, write_scope: Scope, embedding: Option<&[f32]>) -> Vec<NearDuplicate> {
+    fn near_duplicates(
+        &self,
+        write_scope: Scope,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> Vec<NearDuplicate> {
         let Some(vector) = embedding else {
             return Vec::new();
         };
@@ -486,17 +492,22 @@ impl TopoServer {
         };
         hits.into_iter()
             .filter(|(n, score)| {
-                *score >= NEAR_DUP_THRESHOLD
+                *score >= NEAR_DUP_REVIEW
                     && n.label == MEMORY_LABEL
                     && !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
             })
-            .map(|(n, score)| NearDuplicate {
-                id: n.id.to_string(),
-                content: match n.props.get(MEMORY_CONTENT_PROP) {
+            .map(|(n, score)| {
+                let existing = match n.props.get(MEMORY_CONTENT_PROP) {
                     Some(PropValue::Str(c)) => c.clone(),
                     _ => String::new(),
-                },
-                similarity: score,
+                };
+                NearDuplicate {
+                    id: n.id.to_string(),
+                    similarity: score,
+                    band: dup_band(score).to_string(),
+                    relation: dup_relation(content, &existing).to_string(),
+                    content: existing,
+                }
             })
             .collect()
     }
@@ -514,6 +525,109 @@ const NEAR_DUP_THRESHOLD: f32 = 0.80;
 /// How many near-duplicates to surface at most — enough to notice a redundancy
 /// without burying the caller.
 const NEAR_DUP_K: usize = 3;
+
+/// Cosine floor below `NEAR_DUP_THRESHOLD` at which a pair is still surfaced, but
+/// only as a weaker `"possible"` candidate. Measurement showed genuine reworded
+/// duplicates can sit as low as ~0.70 — and merely-related facts sit right there
+/// too (0.69), so there is NO floor that catches the former without the latter.
+/// Set just under that overlap (0.68) so borderline restatements are SURFACED
+/// for the caller (an LLM, a native entailment judge) to confirm, rather than
+/// silently dropped; the `"possible"` band is the warning that these need a look,
+/// not an automatic merge. Widening recall at the cost of precision is the right
+/// trade for an advisory tool where a human/agent makes the final call.
+const NEAR_DUP_REVIEW: f32 = 0.68;
+
+/// Confidence band for a near-dup similarity: `"likely"` at/above the strong
+/// floor ([`NEAR_DUP_THRESHOLD`]), `"possible"` in the review band below it.
+fn dup_band(similarity: f32) -> &'static str {
+    if similarity >= NEAR_DUP_THRESHOLD {
+        "likely"
+    } else {
+        "possible"
+    }
+}
+
+/// Words that retract or flip the token(s) that follow them — negations and
+/// replacement/comparison cues. The signal that separates a *contradiction* (one
+/// fact superseding another) from a *duplicate*: sentence embeddings score
+/// "X is A" and "X is now B, not A" as MORE similar than a genuine restatement,
+/// so cosine alone can never tell them apart — but the negation cue can.
+const DUP_NEG_CUES: &[&str] = &[
+    "not", "never", "longer", "instead", "without", "replaced", "replaces", "removed", "remove",
+    "dropped", "drops", "stopped", "rather", "no", "over", "versus", "vs",
+];
+
+/// Function words (and a few high-frequency verbs) dropped before comparing
+/// content tokens, so overlap reflects the salient nouns, not scaffolding.
+const DUP_STOP: &[&str] = &[
+    "a", "an", "the", "of", "to", "in", "on", "for", "its", "it", "is", "are", "as", "by", "with",
+    "and", "or", "now", "only", "both", "this", "that", "using", "use", "uses", "chose", "runs",
+    "run", "their", "them", "people", "up",
+];
+
+/// How many tokens after a negation cue are treated as governed by it.
+const DUP_NEG_WINDOW: usize = 4;
+
+fn dup_singularize(t: &str) -> &str {
+    if t.len() > 3 && t.ends_with('s') {
+        &t[..t.len() - 1]
+    } else {
+        t
+    }
+}
+
+/// Tokenize `s` (lowercased alphanumeric runs) into (asserted, negated) content
+/// sets: `negated` = content tokens within [`DUP_NEG_WINDOW`] after a negation
+/// cue; `asserted` = every other content token. Stopwords and cues are dropped.
+fn dup_analyze(s: &str) -> (HashSet<String>, HashSet<String>) {
+    let toks: Vec<String> = s
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect();
+    let is_cue = |w: &str| DUP_NEG_CUES.contains(&w);
+    let is_stop = |w: &str| DUP_STOP.contains(&w);
+    let mut negated = HashSet::new();
+    for (i, t) in toks.iter().enumerate() {
+        if is_cue(t) {
+            let end = (i + 1 + DUP_NEG_WINDOW).min(toks.len());
+            for w in &toks[i + 1..end] {
+                if !is_stop(w) && !is_cue(w) {
+                    negated.insert(dup_singularize(w).to_string());
+                }
+            }
+        }
+    }
+    let content: HashSet<String> = toks
+        .iter()
+        .filter(|w| !is_stop(w) && !is_cue(w))
+        .map(|w| dup_singularize(w).to_string())
+        .collect();
+    let asserted = content.difference(&negated).cloned().collect();
+    (asserted, negated)
+}
+
+/// True when the two contents read as a CONTRADICTION rather than a restatement:
+/// one asserts a salient token the other negates. Cheap and deterministic — the
+/// hint that a high-similarity pair is a supersession (retire the stale one), not
+/// a duplicate (merge them). Calibrated in the module tests against a labeled
+/// battery.
+fn is_supersession(a: &str, b: &str) -> bool {
+    let (a_assert, a_neg) = dup_analyze(a);
+    let (b_assert, b_neg) = dup_analyze(b);
+    a_neg.intersection(&b_assert).next().is_some() || b_neg.intersection(&a_assert).next().is_some()
+}
+
+/// `"supersession"` when the pair contradicts (see [`is_supersession`]), else
+/// `"duplicate"`.
+fn dup_relation(a: &str, b: &str) -> &'static str {
+    if is_supersession(a, b) {
+        "supersession"
+    } else {
+        "duplicate"
+    }
+}
 
 /// Ceiling on how many memories `find_duplicate_memories` compares in one scan.
 /// The comparison is O(n^2), so this bounds worst-case work; beyond it the scan
@@ -887,7 +1001,7 @@ struct FindDuplicateMemoriesParams {
 }
 
 fn default_dup_similarity() -> f32 {
-    NEAR_DUP_THRESHOLD
+    NEAR_DUP_REVIEW
 }
 
 fn default_dup_limit() -> u32 {
@@ -904,6 +1018,16 @@ struct DuplicatePair {
     contents: [String; 2],
     /// Cosine similarity between them (>= `min_similarity`; 1.0 = identical).
     similarity: f32,
+    /// Confidence band: `"likely"` (cosine >= 0.80) or `"possible"` (the widened
+    /// review band below it, where genuine restatements overlap merely-related
+    /// facts — judge before acting).
+    band: String,
+    /// `"duplicate"` (merge with `consolidate_memories`) or `"supersession"` —
+    /// the pair CONTRADICTS (one negates what the other asserts), so it is likely
+    /// a fact that replaced the other; retire the stale one with `supersede`
+    /// rather than merging. Cosine can't tell these apart (contradictions score
+    /// HIGHER than restatements); a negation-cue check does.
+    relation: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1086,9 +1210,15 @@ struct MemoryHealthResult {
     /// because near-duplicate detection needs embeddings — NOT because there are
     /// none.
     embeddings_enabled: bool,
-    /// Near-duplicate pairs found (cosine >= the 0.80 floor). 0 when embeddings
+    /// Near-duplicate pairs that look like the SAME fact (cosine >= 0.80,
+    /// non-contradicting) — merge with `consolidate_memories`. 0 when embeddings
     /// are off.
     duplicate_pairs: usize,
+    /// High-similarity pairs that CONTRADICT each other (one negates what the
+    /// other asserts) — likely a fact that replaced an older one; retire the
+    /// stale side with `supersede`, don't merge. Split out from `duplicate_pairs`
+    /// because cosine scores contradictions even higher than restatements.
+    supersession_pairs: usize,
     /// Memories linked to nothing (no open outgoing edges).
     orphan_count: usize,
     /// Memories with no activity (creation or recall) within `stale_older_than_days`.
@@ -1574,6 +1704,12 @@ struct NearDuplicate {
     content: String,
     /// Cosine similarity to the memory just stored (1.0 = identical direction).
     similarity: f32,
+    /// Confidence band: `"likely"` (cosine >= 0.80) or `"possible"` (review band).
+    band: String,
+    /// `"duplicate"` or `"supersession"` — if the existing memory CONTRADICTS the
+    /// one being stored (negates what it asserts), this is the fact being
+    /// replaced; `supersede` it rather than treating it as a duplicate.
+    relation: String,
 }
 
 /// Result of a find-or-create write (`create_entity`).
@@ -1929,7 +2065,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are semantically near-duplicates (cosine >= min_similarity, default 0.80), most-similar first. Read-only and advisory — nothing is merged; use the returned ids with `supersede`/`remember` to retire the redundant one. This catches duplicates that slipped in before write-time near-dup detection existed, or across scopes a single write didn't compare. Empty when the embedder is off/not-ready. Pairs is capped at `limit` and the whole scan at an internal cap; `truncated=true` means the result is not exhaustive (narrow scopes or raise `limit`)."
+        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are semantically near-duplicates (cosine >= min_similarity, default 0.70), most-similar first. Read-only and advisory. Each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80, a wider net where genuine restatements overlap merely-related facts, so judge the contents before acting) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates what the other asserts, so it's a fact that replaced the older one -> retire the stale side with `supersede`, don't merge). The relation matters because cosine scores contradictions HIGHER than restatements, so similarity alone can't tell them apart. Empty when the embedder is off/not-ready. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
     )]
     fn find_duplicate_memories(
         &self,
@@ -2013,8 +2149,10 @@ impl TopoServer {
                         let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
                         pairs.push(DuplicatePair {
                             ids: [lo.0.clone(), hi.0.clone()],
-                            contents: [lo.1.clone(), hi.1.clone()],
                             similarity: sim,
+                            band: dup_band(sim).to_string(),
+                            relation: dup_relation(&lo.1, &hi.1).to_string(),
+                            contents: [lo.1.clone(), hi.1.clone()],
                         });
                     }
                 }
@@ -2294,7 +2432,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs all three hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows per category. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember three separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act (consolidate/link/supersede/drop). duplicate_pairs is 0 when the embedder is off — check embeddings_enabled to tell 'none' from 'couldn't check'. Counts cap at an internal limit; truncated=true means they are lower bounds."
+        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. Near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). `duplicate_pairs`/`supersession_pairs` are 0 when the embedder is off — check `embeddings_enabled` to tell 'none' from 'couldn't check'. Counts cap at an internal limit; truncated=true means lower bounds."
     )]
     fn memory_health(
         &self,
@@ -2321,13 +2459,21 @@ impl TopoServer {
         // list cap bounds only the returned rows), so either gives the true total.
         let total_memories = stale.scanned;
         let embeddings_enabled = matches!(self.embedder.status(), EmbedderStatus::Ready);
-        let duplicate_pairs = dups.pairs.len();
+        // Split the near-dup pairs by relation: same-fact restatements are
+        // duplicates (merge), contradictions are supersessions (retire the stale
+        // side). Sample only the true duplicates.
+        let (mut sample_duplicates, supersessions): (Vec<DuplicatePair>, Vec<DuplicatePair>) = dups
+            .pairs
+            .into_iter()
+            .partition(|p| p.relation == "duplicate");
+        let duplicate_pairs = sample_duplicates.len();
+        let supersession_pairs = supersessions.len();
         let orphan_count = orphans.orphans.len();
         let stale_count = stale.stale.len();
-        let needs_attention = duplicate_pairs > 0 || orphan_count > 0 || stale_count > 0;
+        let needs_attention =
+            duplicate_pairs > 0 || supersession_pairs > 0 || orphan_count > 0 || stale_count > 0;
         let truncated = dups.truncated || orphans.truncated || stale.truncated;
 
-        let mut sample_duplicates = dups.pairs;
         sample_duplicates.truncate(HEALTH_SAMPLE);
         let mut sample_orphans = orphans.orphans;
         sample_orphans.truncate(HEALTH_SAMPLE);
@@ -2338,6 +2484,7 @@ impl TopoServer {
             total_memories,
             embeddings_enabled,
             duplicate_pairs,
+            supersession_pairs,
             orphan_count,
             stale_count,
             needs_attention,
@@ -2732,7 +2879,7 @@ impl TopoServer {
             // near-duplicate check (advisory) and the stored embedding. (Embed
             // + hash before `p.content` moves into props.)
             let embedding = self.embedder.embed(&p.content);
-            near_duplicates = self.near_duplicates(scope, embedding.as_deref());
+            near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
             let hash = content_hash(&p.content);
             let mut memory_props = convert::merge_required_prop(
                 MEMORY_CONTENT_PROP,
@@ -2843,7 +2990,7 @@ impl TopoServer {
         // duplicates (advisory) and is stored on the node. `None` when the
         // embedder isn't Ready — no semantic signal then.
         let embedding = self.embedder.embed(&p.content);
-        let near_duplicates = self.near_duplicates(scope, embedding.as_deref());
+        let near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
         let hash = content_hash(&p.content);
         let mut props = convert::merge_required_prop(
             MEMORY_CONTENT_PROP,
@@ -3423,5 +3570,71 @@ impl ServerHandler for TopoServer {
         let session = self.for_request(&context.meta)?;
         let tcc = ToolCallContext::new(&session, request, context);
         session.tool_router.call(tcc).await
+    }
+}
+
+#[cfg(test)]
+mod dup_classify_tests {
+    use super::{dup_band, dup_relation, is_supersession};
+
+    // Labeled battery from the calibration experiment (raw cosine can't separate
+    // these — the negation cue must). SAME/UNRELATED => "duplicate" relation,
+    // CONTRADICT => "supersession".
+    #[test]
+    fn supersession_detector_separates_contradictions_from_restatements() {
+        let same = [
+            ("The team chose redb as TopoDB's storage engine for its single-file ACID guarantees",
+             "TopoDB persists its data in the redb embedded key-value database"),
+            ("TopoDB uses redb as its storage backend", "The storage engine behind TopoDB is redb"),
+            ("Drew prefers Colima over Docker Desktop",
+             "Drew runs containers on Colima instead of Docker Desktop"),
+            ("CI runs fmt, clippy, and tests on ubuntu and windows",
+             "The CI pipeline executes formatting, linting, and the test suite on both ubuntu and windows runners"),
+            ("the auth service issues JWT tokens to sign in users",
+             "auth uses JSON Web Tokens to authenticate and log people in"),
+        ];
+        let contradict = [
+            (
+                "TopoDB stores its data in redb",
+                "TopoDB now stores its data in sled, not redb",
+            ),
+            (
+                "the auth service issues JWT tokens",
+                "the auth service now issues opaque session tokens, not JWTs",
+            ),
+            (
+                "CI runs on ubuntu and windows",
+                "CI no longer runs on windows, only ubuntu",
+            ),
+        ];
+        for (a, b) in same {
+            assert!(
+                !is_supersession(a, b),
+                "should read as a duplicate: {a:?} / {b:?}"
+            );
+            assert_eq!(dup_relation(a, b), "duplicate");
+        }
+        for (a, b) in contradict {
+            assert!(
+                is_supersession(a, b),
+                "should read as a supersession: {a:?} / {b:?}"
+            );
+            assert_eq!(dup_relation(a, b), "supersession");
+        }
+    }
+
+    #[test]
+    fn is_supersession_is_symmetric() {
+        let a = "TopoDB stores its data in redb";
+        let b = "TopoDB now stores its data in sled, not redb";
+        assert_eq!(is_supersession(a, b), is_supersession(b, a));
+    }
+
+    #[test]
+    fn band_splits_at_the_strong_floor() {
+        assert_eq!(dup_band(0.95), "likely");
+        assert_eq!(dup_band(0.80), "likely");
+        assert_eq!(dup_band(0.799), "possible");
+        assert_eq!(dup_band(0.70), "possible");
     }
 }

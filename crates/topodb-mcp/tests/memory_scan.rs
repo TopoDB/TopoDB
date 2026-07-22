@@ -176,3 +176,98 @@ fn scan_surfaces_a_pre_existing_near_duplicate_pair() {
         "one unordered pair, reported once: {res:#?}"
     );
 }
+
+/// Requires the real embedder. Bands + relation labels: a reworded duplicate is
+/// tagged `duplicate`, a contradicting pair (same subject, one negates the other)
+/// is tagged `supersession` — even though cosine scores the contradiction just as
+/// high. Run: cargo test -p topodb-mcp --test memory_scan -- --ignored
+#[ignore]
+#[test]
+fn scan_labels_band_and_distinguishes_supersession_from_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = topodb::ScopeId::new().to_string();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &[
+            "--scope",
+            scope.as_str(),
+            "--embeddings",
+            "bge-small-en-v1.5",
+        ],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let info = s.call_tool_ok("db_info", serde_json::json!({}), DEFAULT_TIMEOUT);
+        match info["embeddings"]["status"].as_str().unwrap() {
+            "ready" => break,
+            "failed" | "off" => panic!("embedder not usable: {info:#?}"),
+            _ => {
+                assert!(std::time::Instant::now() < deadline, "model never ready");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+
+    // A same-fact reworded pair (should be `duplicate`).
+    let d1 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "TopoDB uses redb as its storage backend" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d2 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "The storage engine behind TopoDB is redb" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A contradicting pair (should be `supersession`).
+    let c1 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the auth service issues JWT tokens" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let c2 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the auth service now issues opaque session tokens, not JWTs" }),
+        DEFAULT_TIMEOUT,
+    )["id"].as_str().unwrap().to_string();
+
+    let res = s.call_tool_ok(
+        "find_duplicate_memories",
+        serde_json::json!({}),
+        DEFAULT_TIMEOUT,
+    );
+    let pairs = res["pairs"].as_array().unwrap();
+    let find = |x: &str, y: &str| {
+        pairs.iter().find(|p| {
+            let ids: std::collections::HashSet<_> = p["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            ids == [x, y].into_iter().collect()
+        })
+    };
+    let dup = find(&d1, &d2).unwrap_or_else(|| panic!("redb duplicate pair missing: {res:#?}"));
+    assert_eq!(
+        dup["relation"], "duplicate",
+        "reworded same fact => duplicate: {dup}"
+    );
+    assert_eq!(dup["band"], "likely", "0.9+ => likely: {dup}");
+
+    let sup = find(&c1, &c2).unwrap_or_else(|| panic!("auth contradiction pair missing: {res:#?}"));
+    assert_eq!(
+        sup["relation"], "supersession",
+        "contradiction => supersession: {sup}"
+    );
+}

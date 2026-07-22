@@ -72,6 +72,9 @@ fn surfaces_counts_and_samples_when_there_is_work() {
     assert_eq!(res["total_memories"], 3, "three live memories: {res}");
     assert_eq!(res["orphan_count"], 2, "the two unlinked ones: {res}");
     assert_eq!(res["stale_count"], 3, "all live at threshold 0: {res}");
+    // Embeddings off => no near-dup signal at all, so both split counts are 0.
+    assert_eq!(res["duplicate_pairs"], 0, "{res}");
+    assert_eq!(res["supersession_pairs"], 0, "{res}");
     assert_eq!(res["needs_attention"], true, "{res}");
 
     // Samples are present and point at real ids.
@@ -160,5 +163,58 @@ fn reports_duplicate_pairs_when_embeddings_are_on() {
         !res["sample_duplicates"].as_array().unwrap().is_empty(),
         "and appear in the sample: {res}"
     );
+    assert_eq!(res["needs_attention"], true, "{res}");
+}
+
+/// Requires the real embedder. A contradicting pair must land in
+/// `supersession_pairs`, not `duplicate_pairs`.
+/// Run: cargo test -p topodb-mcp --test memory_health -- --ignored
+#[ignore]
+#[test]
+fn splits_supersessions_out_of_duplicate_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = topodb::ScopeId::new().to_string();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &[
+            "--scope",
+            scope.as_str(),
+            "--embeddings",
+            "bge-small-en-v1.5",
+        ],
+    );
+    s.initialize(T);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let info = s.call_tool_ok("db_info", json!({}), T);
+        match info["embeddings"]["status"].as_str().unwrap() {
+            "ready" => break,
+            "failed" | "off" => panic!("embedder not usable: {info:#?}"),
+            _ => {
+                assert!(std::time::Instant::now() < deadline, "model never ready");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+
+    // Contradicting facts about the same subject (cosine >= 0.80, but a negation).
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the auth service issues JWT tokens"}),
+        T,
+    );
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the auth service now issues opaque session tokens, not JWTs"}),
+        T,
+    );
+
+    let res = s.call_tool_ok("memory_health", json!({}), T);
+    assert_eq!(res["embeddings_enabled"], true, "{res}");
+    assert!(
+        res["supersession_pairs"].as_u64().unwrap() >= 1,
+        "the contradiction must count as a supersession: {res}"
+    );
+    assert_eq!(res["duplicate_pairs"], 0, "and NOT as a duplicate: {res}");
     assert_eq!(res["needs_attention"], true, "{res}");
 }
