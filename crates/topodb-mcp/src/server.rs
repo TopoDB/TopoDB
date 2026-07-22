@@ -526,6 +526,14 @@ const DUP_SCAN_CAP: usize = 2000;
 /// and computed ages through.
 const MS_PER_DAY: f64 = 86_400_000.0;
 
+/// How many of each category `memory_health` counts before flagging the total a
+/// lower bound (`truncated`). Matches the scans' max `limit`.
+const HEALTH_COUNT_LIMIT: usize = 1000;
+
+/// How many example rows per category `memory_health` returns — a glance, not
+/// the full lists (use the dedicated scan for those).
+const HEALTH_SAMPLE: usize = 3;
+
 /// Cosine similarity of two equal-length vectors, or `None` when the lengths
 /// differ or either vector has zero magnitude (no defined direction). Matches
 /// the engine's `search_vector` scoring so scan results are comparable to
@@ -1049,6 +1057,53 @@ struct FindStaleMemoriesResult {
     scanned: usize,
     /// `true` when more stale memories exist than `limit` returned. A hint to
     /// raise `limit` or narrow scopes, not an error.
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MemoryHealthParams {
+    /// Staleness threshold in days, passed through to the stale check (a memory
+    /// is stale when the later of its creation and last recall is older than
+    /// this). Default 30.
+    #[serde(default = "default_stale_days")]
+    stale_older_than_days: f64,
+    /// Scope to assess: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope when omitted.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Assess across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs.
+    /// Takes precedence over `scope`; must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct MemoryHealthResult {
+    /// Live (non-superseded) memories in the scope set.
+    total_memories: usize,
+    /// Whether the embedder is Ready. When `false`, `duplicate_pairs` is 0
+    /// because near-duplicate detection needs embeddings — NOT because there are
+    /// none.
+    embeddings_enabled: bool,
+    /// Near-duplicate pairs found (cosine >= the 0.80 floor). 0 when embeddings
+    /// are off.
+    duplicate_pairs: usize,
+    /// Memories linked to nothing (no open outgoing edges).
+    orphan_count: usize,
+    /// Memories with no activity (creation or recall) within `stale_older_than_days`.
+    stale_count: usize,
+    /// `true` if any category is non-zero — the one-glance "does my memory need
+    /// tidying?" signal.
+    needs_attention: bool,
+    /// Up to a few most-similar duplicate pairs, for orientation. Use
+    /// `find_duplicate_memories` for the full list.
+    sample_duplicates: Vec<DuplicatePair>,
+    /// Up to a few orphans, oldest first. Use `find_orphan_memories` for all.
+    sample_orphans: Vec<OrphanMemory>,
+    /// Up to a few stalest memories. Use `find_stale_memories` for all.
+    sample_stale: Vec<StaleMemory>,
+    /// `true` if any underlying scan hit its cap, so the counts are lower bounds.
     truncated: bool,
 }
 
@@ -1896,6 +1951,22 @@ impl TopoServer {
             ));
         }
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        Ok(Json(self.duplicate_scan(
+            &scope_set,
+            p.min_similarity,
+            p.limit as usize,
+        )))
+    }
+
+    /// Core of [`find_duplicate_memories`] — no param validation or scope
+    /// resolution (callers do those), so `memory_health` can reuse the exact
+    /// same detection instead of re-deriving it.
+    fn duplicate_scan(
+        &self,
+        scope_set: &ScopeSet,
+        min_similarity: f32,
+        limit: usize,
+    ) -> FindDuplicateMemoriesResult {
         let model = self.embedder.model_name();
 
         // Candidates: Memory nodes carrying a same-model embedding that are NOT
@@ -1904,7 +1975,7 @@ impl TopoServer {
         // stores have no vectors, so this is empty (no semantic signal).
         let mut candidates: Vec<(String, String, Vec<f32>)> = self
             .db
-            .nodes_by_label_unbumped(&scope_set, MEMORY_LABEL)
+            .nodes_by_label_unbumped(scope_set, MEMORY_LABEL)
             .into_iter()
             .filter(|n| !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP))
             .filter_map(|n| {
@@ -1936,7 +2007,7 @@ impl TopoServer {
         for i in 0..candidates.len() {
             for j in (i + 1)..candidates.len() {
                 if let Some(sim) = cosine(&candidates[i].2, &candidates[j].2) {
-                    if sim >= p.min_similarity {
+                    if sim >= min_similarity {
                         let (a, b) = (&candidates[i], &candidates[j]);
                         // Canonical (ascending-id) order so a pair is reported once.
                         let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
@@ -1952,15 +2023,15 @@ impl TopoServer {
         // Most-similar first; NaN can't occur (finite vectors, non-zero norms
         // filtered by `cosine`), so total_cmp is a safe total order.
         pairs.sort_by(|x, y| y.similarity.total_cmp(&x.similarity));
-        if pairs.len() > p.limit as usize {
+        if pairs.len() > limit {
             truncated = true;
-            pairs.truncate(p.limit as usize);
+            pairs.truncate(limit);
         }
-        Ok(Json(FindDuplicateMemoriesResult {
+        FindDuplicateMemoriesResult {
             pairs,
             scanned,
             truncated,
-        }))
+        }
     }
 
     #[tool(
@@ -2078,7 +2149,16 @@ impl TopoServer {
             ));
         }
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        Ok(Json(self.orphan_scan(&scope_set, p.limit as usize)?))
+    }
 
+    /// Core of [`find_orphan_memories`] — no validation/scope resolution, so
+    /// `memory_health` reuses the identical orphan definition.
+    fn orphan_scan(
+        &self,
+        scope_set: &ScopeSet,
+        limit: usize,
+    ) -> Result<FindOrphanMemoriesResult, ErrorData> {
         let mut orphans: Vec<OrphanMemory> = Vec::new();
         let mut scanned = 0usize;
         let mut truncated = false;
@@ -2086,7 +2166,7 @@ impl TopoServer {
         // oldest-first without a sort. Each memory needs one indexed out-edge
         // lookup — O(n), not O(n^2), so no scan cap is needed; only the returned
         // list is bounded.
-        for n in self.db.nodes_by_label_unbumped(&scope_set, MEMORY_LABEL) {
+        for n in self.db.nodes_by_label_unbumped(scope_set, MEMORY_LABEL) {
             // Retired memories have closed edges by design — not orphans.
             if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
                 continue;
@@ -2094,12 +2174,12 @@ impl TopoServer {
             scanned += 1;
             let open = self
                 .db
-                .edges_from(&scope_set, n.id, None, None, true)
+                .edges_from(scope_set, n.id, None, None, true)
                 .map_err(classify_topo_error)?;
             if !open.is_empty() {
                 continue;
             }
-            if orphans.len() >= p.limit as usize {
+            if orphans.len() >= limit {
                 // Keep counting `scanned` for an honest total, but stop growing
                 // the list and flag the truncation.
                 truncated = true;
@@ -2114,11 +2194,11 @@ impl TopoServer {
                 content,
             });
         }
-        Ok(Json(FindOrphanMemoriesResult {
+        Ok(FindOrphanMemoriesResult {
             orphans,
             scanned,
             truncated,
-        }))
+        })
     }
 
     #[tool(
@@ -2144,8 +2224,23 @@ impl TopoServer {
             ));
         }
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        Ok(Json(self.stale_scan(
+            &scope_set,
+            p.older_than_days,
+            p.limit as usize,
+        )?))
+    }
+
+    /// Core of [`find_stale_memories`] — no validation/scope resolution, so
+    /// `memory_health` reuses the identical staleness definition.
+    fn stale_scan(
+        &self,
+        scope_set: &ScopeSet,
+        older_than_days: f64,
+        limit: usize,
+    ) -> Result<FindStaleMemoriesResult, ErrorData> {
         let now = now_ms();
-        let threshold_ms = (p.older_than_days * MS_PER_DAY) as i64;
+        let threshold_ms = (older_than_days * MS_PER_DAY) as i64;
 
         // (effective_last_activity_ms, row) so we can sort stalest-first after.
         let mut candidates: Vec<(i64, StaleMemory)> = Vec::new();
@@ -2153,14 +2248,14 @@ impl TopoServer {
         // Unbumped: this is housekeeping, not a recall. Bumping would reset the
         // very last_accessed_at we read, making the whole store look fresh on the
         // next scan.
-        for n in self.db.nodes_by_label_unbumped(&scope_set, MEMORY_LABEL) {
+        for n in self.db.nodes_by_label_unbumped(scope_set, MEMORY_LABEL) {
             if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
                 continue;
             }
             scanned += 1;
             let stats = self
                 .db
-                .access_stats(&scope_set, n.id)
+                .access_stats(scope_set, n.id)
                 .map_err(classify_topo_error)?
                 .unwrap_or_default();
             // Activity = later of creation (ULID mint) and last recall. A memory
@@ -2189,15 +2284,66 @@ impl TopoServer {
         // Stalest first = oldest activity first (ascending effective timestamp).
         // Stable sort keeps id (mint) order among equal-activity memories.
         candidates.sort_by_key(|(effective, _)| *effective);
-        let truncated = candidates.len() > p.limit as usize;
-        let stale = candidates
-            .into_iter()
-            .take(p.limit as usize)
-            .map(|(_, m)| m)
-            .collect();
-        Ok(Json(FindStaleMemoriesResult {
+        let truncated = candidates.len() > limit;
+        let stale = candidates.into_iter().take(limit).map(|(_, m)| m).collect();
+        Ok(FindStaleMemoriesResult {
             stale,
             scanned,
+            truncated,
+        })
+    }
+
+    #[tool(
+        description = "Memory health check: one call that runs all three hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows per category. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember three separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act (consolidate/link/supersede/drop). duplicate_pairs is 0 when the embedder is off — check embeddings_enabled to tell 'none' from 'couldn't check'. Counts cap at an internal limit; truncated=true means they are lower bounds."
+    )]
+    fn memory_health(
+        &self,
+        Parameters(p): Parameters<MemoryHealthParams>,
+    ) -> Result<Json<MemoryHealthResult>, ErrorData> {
+        if !p.stale_older_than_days.is_finite() || p.stale_older_than_days < 0.0 {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "stale_older_than_days must be a finite number >= 0.0, got {}",
+                    p.stale_older_than_days
+                ),
+                None,
+            ));
+        }
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+
+        // Reuse the exact scan cores so the health summary can never disagree
+        // with the dedicated tools about what a duplicate/orphan/stale memory is.
+        let dups = self.duplicate_scan(&scope_set, NEAR_DUP_THRESHOLD, HEALTH_COUNT_LIMIT);
+        let orphans = self.orphan_scan(&scope_set, HEALTH_COUNT_LIMIT)?;
+        let stale = self.stale_scan(&scope_set, p.stale_older_than_days, HEALTH_COUNT_LIMIT)?;
+
+        // Both orphan and stale scans count EVERY live memory in `scanned` (the
+        // list cap bounds only the returned rows), so either gives the true total.
+        let total_memories = stale.scanned;
+        let embeddings_enabled = matches!(self.embedder.status(), EmbedderStatus::Ready);
+        let duplicate_pairs = dups.pairs.len();
+        let orphan_count = orphans.orphans.len();
+        let stale_count = stale.stale.len();
+        let needs_attention = duplicate_pairs > 0 || orphan_count > 0 || stale_count > 0;
+        let truncated = dups.truncated || orphans.truncated || stale.truncated;
+
+        let mut sample_duplicates = dups.pairs;
+        sample_duplicates.truncate(HEALTH_SAMPLE);
+        let mut sample_orphans = orphans.orphans;
+        sample_orphans.truncate(HEALTH_SAMPLE);
+        let mut sample_stale = stale.stale;
+        sample_stale.truncate(HEALTH_SAMPLE);
+
+        Ok(Json(MemoryHealthResult {
+            total_memories,
+            embeddings_enabled,
+            duplicate_pairs,
+            orphan_count,
+            stale_count,
+            needs_attention,
+            sample_duplicates,
+            sample_orphans,
+            sample_stale,
             truncated,
         }))
     }
