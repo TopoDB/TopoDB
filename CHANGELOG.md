@@ -14,6 +14,23 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### 0.0.10 — 2026-07-22
+
+#### Added
+
+- **`Db::nodes_by_label_unbumped`** — a label scan that returns the same population
+  and order as `nodes_by_label` but does NOT bump the access counters. For
+  maintenance sweeps that read the population to inspect it (e.g. staleness reads
+  `last_accessed_at`, and bumping it would erase the very signal) rather than to
+  recall it — a read for housekeeping is not a recall.
+- **`RecallQuery.tombstone_prop`** (`Option<String>`, default `None`) — a
+  post-fusion filter that drops any candidate whose named `Int` prop is `<=` the
+  effective now (`options.now_ms` when set, else wall clock). Powers supersession:
+  a memory marked `superseded_at` disappears from recall as of its supersession,
+  while an `as_of`-past query still sees it. **Breaking for struct-literal
+  construction** of `RecallQuery` (new field) — same caveat as the recall-tuning
+  fields; use `RecallQuery::new(..)` and set fields.
+
 ### 0.0.9 — 2026-07-20
 
 #### Added
@@ -273,6 +290,18 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.7 — 2026-07-22
+
+#### Added
+
+- **`MEMORY_CONTENT_HASH_PROP`** (`"content_hash"`) plus a `Memory`/`content_hash`
+  equality index in `default_spec()` — the dedup primitive that lets the write
+  front ends resolve a re-stored fact to the memory that already holds it, instead
+  of accumulating identical copies.
+- **`MEMORY_SUPERSEDED_AT_PROP`** (`"superseded_at"`) — the supersession tombstone
+  marker (a millisecond timestamp) that recall filters on via
+  `RecallQuery.tombstone_prop`.
+
 ### 0.0.6 — 2026-07-20
 
 - Dependency pin only: `topodb` 0.0.9. No functional change.
@@ -347,6 +376,53 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### 0.0.12 — 2026-07-22
+
+A full memory-hygiene layer for topodb-as-agent-memory: prevent redundancy on
+write, detect what has accreted, and act on it — all advisory (nothing
+auto-merges). Tool count 21 → 27.
+
+#### Added — hygiene
+
+- **Write-time dedup** — re-storing identical content via `remember`/`create_memory`
+  resolves to the existing memory (`deduplicated: true`) and only links entities it
+  did not already have, instead of stacking copies (content is FNV-hashed and
+  equality-indexed). (#16)
+- **Supersession** — `remember`'s `supersedes: [ids]` retires a memory when a fact
+  changes: marks `superseded_at`, closes its open out-edges, and recall drops it as
+  of now (still visible in `as_of`-past queries). (#17)
+- **Semantic near-duplicate detection**, banded and contradiction-aware — write-time
+  `near_duplicates` and the `find_duplicate_memories` scan surface semantically
+  close memories with a `band` (`likely` cosine ≥ 0.80 / `possible` 0.68–0.80, the
+  widened review net) and a `relation` (`duplicate` → merge / `supersession` → the
+  pair CONTRADICTS, retire the stale side). A deterministic negation-cue check
+  distinguishes contradictions from restatements — raw cosine can't, since it scores
+  contradictions even higher than reworded duplicates. (#18, #20, #27, #28)
+- **`consolidate_memories`** — merge a near-duplicate pair: keep one, inherit the
+  other's unique relationships, supersede it, atomically. (#22)
+- **`find_orphan_memories`** — live memories with no open outgoing edges (stored but
+  linked to nothing, reachable only by search). (#23)
+- **`find_stale_memories`** — memories cold beyond `older_than_days` (activity = the
+  later of creation and last recall), stalest first; the scan is non-bumping so it
+  never resets the recency signal it reads. (#24)
+- **`memory_health`** — one call that runs all three scans and returns a summary:
+  `duplicate_pairs` vs `supersession_pairs`, `orphan_count`, `stale_count`, a
+  `needs_attention` flag, and sample rows. The session-start orientation read. (#25)
+- **`traverse` multi-seed** — `seed_ids` starts a walk from several nodes at once
+  (e.g. every `search_memories` hit) in a single call. (#15)
+
+#### Changed
+
+- The maintenance scans (`find_duplicate`/`find_orphan`/`find_stale`,
+  `memory_health`) read via the engine's non-bumping label scan, so a housekeeping
+  sweep never inflates the access-boost or resets the recency of everything it
+  examines.
+
+#### Fixed
+
+- Deflaked `recent_memories` ordering: it sorts by ULID, and `Ulid::new()` is not
+  monotonic, so same-millisecond creates could sort out of order. (#19)
 
 ### 0.0.11 — 2026-07-20
 
@@ -654,10 +730,21 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   injection; capture works against 0.0.10. Ships fully with the 0.0.11 pin bump. At that pin bump,
   also remove SKILL.md's "presently disabled" phrasing and capture a real PostToolUse payload
   fixture (`TOPODB_HOOK_DEBUG=1`) to confirm the normalizer's branch against production shape.
+- **Session-start memory-health nudge.** The session-start hook also runs `memory_health`
+  concurrently with the recall injection and, when the store has accreted cruft, appends a
+  one-line advisory nudge (`🧹 Memory hygiene: N duplicate pairs, N supersessions, N orphans,
+  N stale …`). Concurrent, timeout-guarded, and swallowed on any error, so it never delays or
+  risks the memory injection; a server without `memory_health` yields no nudge. Requires the
+  0.0.12 pin. (#26)
 
 ---
 
 ## `topodb-cli`
+
+### 0.0.7 — 2026-07-22
+
+- Pin-only bump: rebuilt against `topodb` 0.0.10 / `topodb-json` 0.0.7. Minor
+  doc clarification in the engine-error → exit-code mapping.
 
 ### 0.0.6 — 2026-07-20
 
