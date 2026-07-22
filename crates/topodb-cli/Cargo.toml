@@ -1,6 +1,6 @@
 [package]
 name = "topodb-cli"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -15,8 +15,8 @@ name = "topodb"
 path = "src/main.rs"
 
 [dependencies]
-topodb = { path = "../topodb", version = "0.0.9" }
-topodb-json = { path = "../topodb-json", version = "0.0.6" }
+topodb = { path = "../topodb", version = "0.0.10" }
+topodb-json = { path = "../topodb-json", version = "0.0.7" }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 
