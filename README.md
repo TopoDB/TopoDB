@@ -16,12 +16,14 @@ pure Rust: a property graph with temporal facts (facts supersede, never
 overwrite), scope-aware recall, graph-scoped vector search, and a change feed
 for external consolidation — running in-process, no server.
 
-Status: **early development (0.0.x)** — the engine core **and the recall
-layer** are implemented: op-log write path, single-applier concurrency,
-scoped k-hop temporal traversal, BM25 full-text search, graph-scoped vector
-search, access stats, change feed, and replay-determinism property tests.
-API not yet stable — pin exact versions. See
-[implemented vs planned](#implemented-vs-planned).
+Status: **early development (0.0.x), API not yet stable — pin exact
+versions.** Shipping today: the engine (temporal property graph, scoped
+k-hop traversal, BM25 + graph-scoped vector search, change feed, a
+replay-deterministic op log), hybrid recall, and — over `topodb-mcp` — a
+full memory-hygiene layer (write-time dedup and supersession,
+contradiction-aware near-duplicate detection, and orphan / stale / health
+maintenance scans), plus a Claude Code plugin that injects recall and a
+hygiene nudge at session start. See [what's built](#whats-built).
 
 First consumer: Atlas (agentic OS desktop app).
 
@@ -84,35 +86,37 @@ To embed the engine directly in a Rust process, see the
 [`topodb` crate example](crates/topodb/README.md) — the same graph, ops,
 and scoped recall as a library call.
 
-## Implemented vs planned
+## What's built
 
-| Capability | Where | Status |
-|---|---|---|
-| Op-log write path — atomic batches, deterministic replay (property-tested) | engine | ✅ |
-| Single-applier concurrency; MVCC reads that never block each other or redb's storage commits (a long-running read can briefly delay the applier's next batch via registry guards) | engine | ✅ |
-| Scoped k-hop temporal traversal (`as_of` history reads) | engine | ✅ |
-| Temporal edges — facts supersede, never overwrite | engine | ✅ |
-| Equality property index | engine | ✅ |
-| BM25 full-text search (per-scope corpus) | engine | ✅ |
-| Graph-scoped vector search (cosine; embeddings host-computed, stored via `SetEmbedding`) | engine | ✅ |
-| Access stats (recall-driven counters) | engine | ✅ |
-| Change feed (`subscribe` / `ops_since`) + op-log compaction | engine | ✅ |
-| Versioned on-disk format ([FORMAT.md](FORMAT.md)) | engine | ✅ |
-| MCP server (27 tools) | `topodb-mcp` | ✅ |
-| CLI (all 17 engine operations) | `topodb-cli` | ✅ v1 |
-| One-command Pi install | `@topodb/pi` | ✅ |
-| Vector search exposed over MCP / CLI | layers | ✅ |
-| Hybrid recall (BM25 + vector + graph, RRF-fused, recency-weighted) | engine + `topodb-mcp` | ✅ |
-| Memory hygiene (write-time dedup + supersession, banded/contradiction-aware near-dup, orphan + stale scans, `consolidate_memories`, `memory_health`, `suggest_links`) | `topodb-mcp` | ✅ |
-| Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup/search | `topodb-mcp` | ✅ |
-| Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime) | `topodb-mcp` | ✅ |
-| `set-props` / `remove-node` / bulk submit over CLI | `topodb-cli` | ✅ |
-| Multi-scope reads (read across a scope *set*) | `topodb-mcp` | ✅ |
-| Multi-scope reads over CLI | `topodb-cli` | Planned |
-| API stabilization (0.1) | engine | Planned |
-| Reproducible benchmarks | repo | Planned |
-| LLM calls inside the engine | — | **Never** (principle 4) |
-| Server process as a prerequisite | — | **Never** (principle 5) |
+Everything in the three groups below ships today (0.0.x — pin exact versions).
+
+**Engine — `topodb`**
+
+- Op-log write path — atomic batches, deterministic replay (property-tested)
+- Single-applier concurrency; MVCC reads that never block each other or redb's storage commits (a long read can briefly delay the applier's next batch via registry guards)
+- Scoped k-hop temporal traversal with `as_of` history reads
+- Temporal edges — facts supersede, never overwrite
+- Equality property index; BM25 full-text search (per-scope corpus)
+- Graph-scoped vector search (cosine; embeddings host-computed, stored via `SetEmbedding`)
+- Access stats (recall-driven counters); change feed (`subscribe` / `ops_since`) + op-log compaction
+- Versioned on-disk format ([FORMAT.md](FORMAT.md))
+
+**Memory & recall over MCP — `topodb-mcp`** (27 tools; [full table](crates/topodb-mcp/README.md))
+
+- Hybrid recall — BM25 + vector + graph, RRF-fused, recency-weighted
+- Memory hygiene — write-time dedup + supersession, banded/contradiction-aware near-duplicate detection, `consolidate_memories`, orphan + stale scans, `memory_health`, `suggest_links`
+- Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup and search
+- Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime)
+- Multi-scope reads — read across a scope *set*
+
+**CLI & distribution — `topodb-cli`, `@topodb/pi`, plugin**
+
+- All 17 engine operations, JSON in/out, exit-code contract (incl. `set-props` / `remove-node` / bulk submit)
+- One-command Pi install (`@topodb/pi`); Claude Code plugin (managed server + session-start recall/hygiene injection)
+
+**Planned:** multi-scope reads over the CLI · API stabilization (0.1) · reproducible benchmarks
+
+**Never — by principle:** LLM calls inside the engine (principle 4) · a server process as a prerequisite (principle 5)
 
 ## Crates
 
@@ -144,21 +148,22 @@ single-process access only).
 
 ### topodb-mcp
 
-`topodb-mcp` is a standalone binary: point it at a `.redb` file and it serves 27 MCP tools over
-stdio JSON-RPC — `db_info` (now also reporting embeddings status); scoped reads (`get_node`,
-`find_by_prop`, `search_memories` — hybrid BM25 + vector + graph recall, RRF-fused —,
-`recent_memories`, `traverse`, `suggest_links`, `access_stats`, `search_vectors`, `get_edges`);
-a memory-hygiene toolkit (`find_duplicate_memories` — banded, contradiction-aware —,
-`find_orphan_memories`, `find_stale_memories`, `memory_health`); writes (`remember`,
-`create_memory`, `consolidate_memories`, `create_entity`, `add_alias`, `add_synonym`, `link`,
-`set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`); and `get_changes`,
-the one unscoped read, which replays the op log across every scope and is therefore off unless you
-pass `--allow-unscoped-changes`. Reads filter by a *set* of
-scopes (`--read-scopes` at startup, or a per-call `scopes` array); a write is stamped with exactly
-*one* scope (`--scope`, or a per-call `scope`) — `link` included, so an edge can join nodes living
-in different scopes. Local embeddings (`--embeddings`, on by default) auto-fetch an ONNX Runtime on first run (system runtimes and `ORT_DYLIB_PATH` take precedence; `--no-ort-download` disables fetching) — Intel Macs have no official 1.24.2 artifact and keep the manual path (system runtime or `ORT_DYLIB_PATH`); without any runtime the server gracefully runs text+graph-only. Install with
-`cargo install topodb-mcp` and wire it into Claude Code or Claude Desktop in a couple of lines.
-See [`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
-table, and client config examples.
+A standalone binary: point it at a `.redb` file and it serves **27 MCP tools** over stdio
+JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
 
-- **Pi (pi.dev):** one command via `pi install npm:@topodb/pi` — see [topodb-mcp README → Pi](crates/topodb-mcp/README.md#pi).
+- **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`
+- **Memory hygiene** — `find_duplicate_memories` (banded, contradiction-aware), `find_orphan_memories`, `find_stale_memories`, `memory_health`
+- **Write** — `remember`, `create_memory`, `consolidate_memories`, `create_entity`, `add_alias`, `add_synonym`, `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`
+- **Admin** — `db_info`; `get_changes` (the one unscoped read — replays the op log across every scope, so it's off unless you pass `--allow-unscoped-changes`)
+
+**Scoping.** Reads filter by a *set* of scopes (`--read-scopes`, or a per-call `scopes` array);
+a write is stamped with exactly *one* scope (`--scope`, or a per-call `scope`) — `link` included,
+so an edge can join nodes in different scopes.
+
+**Embeddings.** `--embeddings` is on by default and auto-fetches an ONNX Runtime on first run
+(system runtimes and `ORT_DYLIB_PATH` win; `--no-ort-download` disables it). Intel Macs have no
+official 1.24.2 artifact and use the manual path; with no runtime the server runs text+graph-only.
+
+Install with `cargo install topodb-mcp` (or on **Pi**: `pi install npm:@topodb/pi`). See
+[`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
+table, and client config.
