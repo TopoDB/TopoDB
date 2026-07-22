@@ -28,11 +28,11 @@ fn handshake_and_tools_list_exposes_all_tools() {
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
 
-    // db_info + 12 read tools + 12 write tools = 25 total.
+    // db_info + 13 read tools + 12 write tools = 26 total.
     assert_eq!(
         tools.len(),
-        25,
-        "expected exactly 25 tools, got: {tools:#?}"
+        26,
+        "expected exactly 26 tools, got: {tools:#?}"
     );
     for name in [
         "db_info",
