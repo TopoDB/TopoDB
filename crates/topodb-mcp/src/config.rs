@@ -187,6 +187,11 @@ impl Config {
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
+                "--help" | "-h" => {
+                    let usage = "usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|model>] [--model-dir <path>] [--no-ort-download]";
+                    println!("{usage}");
+                    std::process::exit(0);
+                }
                 "--db" => {
                     db_path = Some(it.next().ok_or("--db requires a <path> value")?.into());
                 }
