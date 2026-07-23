@@ -48,17 +48,15 @@ The fastest path is the CLI (installs a binary named `topodb`):
 ```bash
 cargo install topodb-cli
 
-# Create a database, an entity, and a memory — then link and search them.
-topodb --db agent.redb create-entity --name ada
-# → {"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}
-topodb --db agent.redb create-memory --content "ada wrote the first program"
-# → {"id":"01BX5ZZKBKACTAV9WEVGEMMVRZ"}
-topodb --db agent.redb link --from 01BX5ZZKBKACTAV9WEVGEMMVRZ --to 01ARZ3NDEKTSV4RRFFQ69G5FAV --type ABOUT
+# Store and link a fact in one call.
+topodb --db agent.redb remember --content "ada wrote the first program" --entity ada
+# → {"memory_id":"01…","deduplicated":false,"entities":[{"name":"ada","id":"01…","created":true}],…}
 topodb --db agent.redb search "first program"
-topodb --db agent.redb traverse 01BX5ZZKBKACTAV9WEVGEMMVRZ --max-hops 2
+topodb --db agent.redb traverse 01… --max-hops 2
 ```
 
-(Substitute the ids your own `create-*` calls print.)
+(The low-level `create-memory`, `create-entity`, and `link` commands are still available for
+fine-grained control.)
 
 To give a coding agent the same database as MCP tools:
 

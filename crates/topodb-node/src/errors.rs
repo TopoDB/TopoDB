@@ -8,6 +8,7 @@ fn code(e: &TopoError) -> &'static str {
         TopoError::Rejected(_) => "REJECTED",
         TopoError::Compacted { .. } => "COMPACTED",
         TopoError::Closed => "CLOSED",
+        TopoError::Busy => "BUSY",
         TopoError::UnsupportedFormat { .. } => "UNSUPPORTED_FORMAT",
     }
 }

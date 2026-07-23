@@ -14,6 +14,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Added
+
+- **`TopoError::Busy`**: lock contention on ANY open path (`open`, `open_with`, `open_stored`,
+  including the persisted-spec read) is a typed, retryable variant instead of an opaque storage
+  error. Enables graceful degradation and callers to implement retry loops (e.g. with
+  exponential backoff). A caller invoking `Db::open*` under concurrent contention now receives
+  `Busy` instead of storage-layer errors; the engine returns this variant immediately without
+  blocking, so the caller owns the retry policy.
+
 ### 0.0.10 — 2026-07-22
 
 #### Added
@@ -290,6 +301,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### Unreleased
+
+#### Added
+
+- **`compose` module** — the shared remember verb planning layer: `plan_remember` (exact-content
+  dedup, alias-aware find-or-create entities, idempotent links, supersession) plus the lookup
+  helpers (`find_existing_entity`, `existing_memory`, `content_hash`) and `RememberRequest::validate()`
+  moved from `topodb-mcp` so both the MCP server and the CLI can delegate composition logic to the
+  same place. Also `open_with_busy_retry` — a helper that wraps `Db::open_stored` with configurable
+  retry on `TopoError::Busy`.
+
 ### 0.0.7 — 2026-07-22
 
 #### Added
@@ -376,6 +398,15 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### Unreleased
+
+#### Changed
+
+- **Internal refactor**: `remember` and entity-lookup composition now delegates to the shared
+  `topodb-json::compose` module instead of maintaining separate logic in the MCP server. The
+  startup open path now retries on `TopoError::Busy` using the same `TOPODB_LOCK_WAIT_MS` env
+  var. No tool-surface change.
 
 ### 0.0.12 — 2026-07-22
 
@@ -740,6 +771,31 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 ---
 
 ## `topodb-cli`
+
+### Unreleased
+
+#### Added
+
+- **`remember` subcommand** — atomic store-and-link-entities in one call (`--content`, repeatable
+  `--entity` [required ≥1], `--edge-type` default `"about"`, repeatable `--supersedes`, `--props`,
+  `--scope`). Output: `{"memory_id","deduplicated","entities":[{"name","id","created"}],"edge_ids","superseded"}`.
+  Combines memory creation, entity find-or-create, and linking into a single engine batch, so stored
+  facts never strand unlinked.
+- **`--lock-wait-ms`** / **`TOPODB_LOCK_WAIT_MS` env var** (default 3000, `0` = fail fast) — global
+  flag for all subcommands; configures how long to retry on `TopoError::Busy` at startup. Lock
+  exhaustion reports `{"error":{"kind":"busy",...}}` and exits with code 3.
+
+#### Changed
+
+- **Breaking: `create-entity` is now find-or-create by default** — the name is matched case- and
+  whitespace-insensitively across read scopes + write scope + shared, and resolves aliases.
+  Existing entity is returned with `"created": false`; `--always-create` opts out (raw create,
+  old behavior). Both paths now report the `created` flag in their output. When `created: false`,
+  `--props` merges only NEW keys; a `name` key in props is always rejected.
+- **Breaking: `create-memory` now stamps `content_hash` and reports `deduplicated`** — identical
+  content (after whitespace normalization) resolves to the existing memory; `"deduplicated": true`
+  indicates a hit, `false` a new memory. Links are still created/reused per the entity find-or-create
+  behavior.
 
 ### 0.0.7 — 2026-07-22
 

@@ -25,6 +25,7 @@ topodb --db <path> [--scope <ulid|shared>] [--pretty] <command> [args...]
 |---|---|---|---|
 | `--db <path>` (env `TOPODB_DB`) | yes | — | Path to the redb database file. A missing file is created fresh (with the canonical default index spec — equality on `Entity/name`, text on `Memory/content`); an existing file is opened with **its own persisted index spec** via `Db::open_stored` — no `--spec` flag exists on this CLI, and none is ever needed. A missing *parent directory* is a db-open failure. |
 | `--scope <ulid\|shared>` | no | `shared` | The default scope every scoped command uses. `"shared"` (case-insensitive) resolves to the shared scope; any other value is parsed as a `ScopeId` ULID. An invalid value is rejected before the db is even opened. |
+| `--lock-wait-ms <ms>` (env `TOPODB_LOCK_WAIT_MS`) | no | `3000` | How long to retry on lock contention (`TopoError::Busy`) during database open. `0` disables retries and fails immediately. See **Exit-code contract** below for the exit code on lock exhaustion. |
 | `--pretty` | no | off | Pretty-print the JSON output instead of compact one-line JSON. |
 
 ## Commands
@@ -34,8 +35,9 @@ All 17 subcommands, in scaffold + write + read order:
 | Command | Key flags | Output |
 |---|---|---|
 | `info` | — | `{"path","format_version","current_seq","index_spec","default_scope"}` |
-| `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
-| `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
+| `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>", "deduplicated": bool, "content_hash": "<hash>"}` |
+| `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>`, `--always-create` | `{"id": "<ulid>", "created": bool}` |
+| `remember` | `--content <text>` (required), `--entity <name>` (required, repeatable), `--edge-type <ty>` (default `"about"`), `--supersedes <id>` (repeatable), `--props <json-object>`, `--scope <ulid\|shared>` | `{"memory_id": "<ulid>", "deduplicated": bool, "entities": [{"name": "<name>", "id": "<ulid>", "created": bool}], "edge_ids": ["<ulid>", ...], "superseded": ["<ulid>", ...]}` |
 | `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
 | `get <id>` | positional node id | `{"found": bool, "node"?: {...}}` |
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
@@ -53,9 +55,21 @@ All 17 subcommands, in scaffold + write + read order:
 
 Notes on individual commands:
 
-- **`create-memory`**/**`create-entity`**: `--props` is a JSON *object* string merged in
-  alongside the reserved key (`content` / `name`); a `--props` that tries to set the reserved
-  key itself is rejected (exit 2), it never silently overwrites.
+- **`create-memory`**: now stamped with a `content_hash` for dedup tracking. If identical content
+  (after whitespace normalization) was already stored, `"deduplicated": true` and the existing
+  memory id is returned; `--props` is ignored on a hit. `"deduplicated": false` indicates a new
+  memory. `--props` is a JSON *object* string merged in alongside `content`; a `--props` that
+  tries to set `content` itself is rejected (exit 2).
+- **`create-entity`**: now find-or-create by default — the name is matched case- and
+  whitespace-insensitively across read scopes, write scope, and `shared`, and resolves aliases.
+  An existing entity is returned with `"created": false`; `--always-create` restores the old
+  raw-create behavior. Both paths now report the `created` flag. When `created: false`, `--props`
+  merges only NEW keys; a `name` key in props is rejected either way (exit 2).
+- **`remember`**: atomic store-and-link — one call creates a memory (with dedup), find-or-creates
+  each named entity (same semantics as `create-entity`), and links them. Combines three operations
+  into a single engine batch so facts never strand unlinked. `--entity` is repeatable (must pass
+  ≥1). `--supersedes` is repeatable and marks the listed memory ids as superseded. `--edge-type`
+  defaults to `"about"` and describes the link from memory→entity.
 - **`link`**: `--valid-from` is Unix milliseconds; omit it to let the engine resolve "now".
 - **`find`**: `--value` is parsed as a JSON scalar first (`42` → `Int`, `true` → `Bool`, `"ada"`
   → `Str`); if it doesn't parse as JSON at all, the raw string is taken as `Str` — so
@@ -75,10 +89,11 @@ Notes on individual commands:
 | Code | Meaning |
 |---|---|
 | `0` | Success — **including** `get`/`stats` reporting `{"found": false}` for a missing or out-of-scope id. Not-found is a normal `Option` result, not an error. |
+| `3` | Lock exhaustion — database open timed out after `--lock-wait-ms` retries on `TopoError::Busy` (another process/client held the database lock for the entire retry window). Caller may increase `--lock-wait-ms` and retry. |
 | `2` | Rejected / bad input: a clap usage error (missing `--db`, unknown flag/subcommand), a malformed `--scope`/`--props`/`--value`, an unparseable node id, or an engine `TopoError::Rejected` (undeclared index, empty batch, malformed query, `Compacted` changes range). |
-| `1` | Internal / storage / db-open failure: anything the caller can't fix by changing their input — a missing parent directory for `--db`, a corrupt/incompatible file, or any non-`Rejected` `TopoError` variant. |
+| `1` | Internal / storage / db-open failure: anything the caller can't fix by changing their input — a missing parent directory for `--db`, a corrupt/incompatible file, or any non-`Rejected`/`Busy` `TopoError` variant. |
 
-On failure, stderr carries `{"error": {"kind": "rejected"|"internal", "message": "..."}}`; stdout
+On failure, stderr carries `{"error": {"kind": "busy"|"rejected"|"internal", "message": "..."}}`; stdout
 is left empty. clap's own usage errors print clap's own message (not this JSON shape) but still
 exit 2.
 
