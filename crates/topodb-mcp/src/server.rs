@@ -1289,11 +1289,14 @@ struct SearchMemoriesParams {
     access_weight: f32,
     /// Post-fusion multipliers for node labels (default: {"Entity": 0.5}).
     /// For each label, multiply its matching nodes' scores by the given factor
-    /// (0.0-10.0). Omitted defaults to {"Entity": 0.5} — entity hits are
+    /// (0.0-10.0). Omitted (null) defaults to {"Entity": 0.5} — entity hits are
     /// down-weighted so that question-shaped queries surface facts (memories)
-    /// first. Pass `{}` explicitly to restore old behavior (no down-weighting).
-    /// Factors must be finite JSON numbers in the range 0.0-10.0; invalid labels
-    /// or out-of-range values are rejected with invalid_params.
+    /// first. For looking up an entity by its exact name, prefer labels: ["Entity"]
+    /// (unaffected by the down-weight) over a plain search. Pass `{}` explicitly
+    /// to disable the down-weight (old behavior). Label matching is case-sensitive
+    /// ("Entity", not "entity"); unknown labels validate but no-op. Factors must be
+    /// finite JSON numbers in the range 0.0-10.0; invalid labels or out-of-range
+    /// values are rejected with invalid_params.
     #[serde(default)]
     label_weights: Option<serde_json::Map<String, Value>>,
 }
@@ -2455,7 +2458,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting. For looking up an entity by its exact name, prefer labels: [\"Entity\"] (unaffected by the down-weight) over a plain search."
     )]
     fn search_memories(
         &self,

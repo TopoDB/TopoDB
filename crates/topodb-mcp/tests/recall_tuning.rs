@@ -201,15 +201,15 @@ fn alias_query_surfaces_entity_via_graph_seed_not_alias() {
 #[test]
 fn entity_ranks_below_memory_by_default() {
     let (_dir, mut server) = fresh_server();
-    // A memory whose content shares a word with an entity's name.
+    // A linked memory about an entity with the same name: entity "login" linked
+    // from a memory mentioning "login". This covers the graph-leg contribution
+    // that the field failure tested.
     let _mem = server.call_tool_ok(
-        "create_memory",
-        serde_json::json!({ "content": "the login flow breaks on big cookies" }),
-        DEFAULT_TIMEOUT,
-    );
-    server.call_tool_ok(
-        "create_entity",
-        serde_json::json!({ "name": "login" }),
+        "remember",
+        serde_json::json!({
+            "content": "the login flow breaks on big cookies",
+            "entities": ["login"]
+        }),
         DEFAULT_TIMEOUT,
     );
 
@@ -322,7 +322,7 @@ fn label_weights_validation() {
     );
     expect_tool_error(&resp);
 
-    // Test 2: infinite weight (use 1e999 which might parse to inf, or 11.0 to exceed max)
+    // Test 2: out-of-range weight (11.0 > max 10.0)
     let resp = server.call_tool(
         "search_memories",
         serde_json::json!({ "query": "basalt", "k": 5, "label_weights": {"Entity": 11.0} }),
