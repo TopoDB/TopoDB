@@ -21,7 +21,9 @@ This installs a binary named **`topodb`** (not `topodb-cli`) to your Cargo bin d
 topodb [--db <path>] [--scope <ulid|shared>] [--pretty] [--lock-wait-ms <ms>] <command> [args...]
 ```
 
-Global flags are valid **before or after** the subcommand name.
+`--pretty` and `--lock-wait-ms` are valid **before or after** the subcommand
+name; `--db` and `--scope` must come before it (or use the `TOPODB_DB` env
+var for the former).
 
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
