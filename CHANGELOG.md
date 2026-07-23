@@ -421,6 +421,15 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Added
+
+- **`traverse` and `get_edges` — `as_of` params for temporal reads.** `traverse` accepts `as_of`
+  (Unix milliseconds) to walk the graph at a historical timestamp (closed edges reappear, later
+  edges vanish; omit for "now"). `get_edges` accepts `as_of` (mutually exclusive with
+  `open_only`) to list edges within the window `valid_from <= t < valid_to` (valid_to exclusive).
+  **Temporal dimension lives on edges; nodes are always current-state** — `get_node` readings
+  remain timeless, focused on node labels and properties as they exist now.
+
 #### Changed
 
 - **`search_memories` defaults to down-weighting Entity hits (`label_weights: {"Entity": 0.5}`)** —
@@ -815,6 +824,10 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`traverse --as-of <unix-ms>`** — temporal graph walk at a Unix millisecond timestamp. Closed
+  edges reappear, later edges vanish; omit to read "now". **Temporal dimension lives on edges;
+  nodes are always current-state** — `get`/`get-node` readings remain timeless, focused on node
+  labels and properties as they exist now.
 - **`remember` subcommand** — atomic store-and-link-entities in one call (`--content`, repeatable
   `--entity` [required ≥1], `--edge-type` default `"about"`, repeatable `--supersedes`, `--props`,
   `--scope`). Output: `{"memory_id","deduplicated","entities":[{"name","id","created"}],"edge_ids","superseded"}`.
