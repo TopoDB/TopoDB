@@ -2733,11 +2733,6 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<RememberParams>,
     ) -> Result<Json<RememberResult>, ErrorData> {
-        let scope = self.resolve_scope(p.scope.as_deref())?;
-        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
-        lookup_scopes.push(scope);
-        lookup_scopes.push(Scope::Shared);
-        let lookup = convert::scopes_to_scope_set(&lookup_scopes);
         let req = convert::RememberRequest {
             content: p.content.clone(),
             entities: p.entities.clone(),
@@ -2745,6 +2740,13 @@ impl TopoServer {
             supersedes: p.supersedes.clone().unwrap_or_default(),
             props: p.props.clone(),
         };
+        req.validate()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup_scopes.push(scope);
+        lookup_scopes.push(Scope::Shared);
+        let lookup = convert::scopes_to_scope_set(&lookup_scopes);
         let mut plan = convert::plan_remember(&self.db, scope, &lookup, now_ms(), &req).map_err(
             |e| match e {
                 convert::ComposeError::Invalid(m) => ErrorData::invalid_params(m, None),
