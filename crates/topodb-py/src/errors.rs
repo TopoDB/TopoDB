@@ -50,6 +50,7 @@ pub fn to_py(py: Python<'_>, e: TopoError) -> PyErr {
         TopoError::Rejected(_) => raise_arity1(py, "RejectedError", msg),
         TopoError::Compacted { oldest } => raise_arity2(py, "CompactedError", msg, oldest),
         TopoError::Closed => raise_arity1(py, "ClosedError", msg),
+        TopoError::Busy => raise_arity1(py, "BusyError", msg),
         TopoError::UnsupportedFormat { found, supported } => {
             raise_arity3(py, "UnsupportedFormatError", msg, found, supported)
         }
