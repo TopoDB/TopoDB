@@ -314,3 +314,39 @@ fn remember_lands_as_one_contiguous_op_batch() {
         "no unexpected op kinds: {kinds:?}"
     );
 }
+
+#[test]
+fn validation_errors_precede_scope_resolution() {
+    let (_dir, mut server) = fresh_server();
+
+    // A call with BOTH an invalid scope AND empty entities must return the
+    // entities error (input validation), not the scope error (scope resolution).
+    let resp = server.call_tool(
+        "remember",
+        serde_json::json!({
+            "content": "c",
+            "entities": [],
+            "scope": "not-a-ulid",
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    common::expect_tool_error(&resp);
+    // Error structure: either JSON-RPC `error` (protocol error) or `result.isError`.
+    let error_msg = if let Some(err) = resp.get("error") {
+        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+    } else if let Some(result) = resp.get("result") {
+        result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    assert!(
+        error_msg.contains("entities must contain at least one name"),
+        "expected entities error, got: {error_msg}, full response: {resp}"
+    );
+}

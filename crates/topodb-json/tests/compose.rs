@@ -233,3 +233,54 @@ fn content_hash_is_whitespace_stable_and_case_sensitive() {
     assert_eq!(content_hash("a  b"), content_hash(" a b "));
     assert_ne!(content_hash("a b"), content_hash("A b"));
 }
+
+#[test]
+fn validate_rejects_empty_entities() {
+    let r = RememberRequest {
+        content: "x".into(),
+        entities: vec![],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+    };
+    let err = r.validate().unwrap_err();
+    assert!(err.contains("entities must contain"), "{err}");
+}
+
+#[test]
+fn validate_rejects_blank_entity_names() {
+    let r = RememberRequest {
+        content: "x".into(),
+        entities: vec!["  ".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+    };
+    let err = r.validate().unwrap_err();
+    assert!(err.contains("entity names must be non-empty"), "{err}");
+}
+
+#[test]
+fn validate_normalizes_default_edge_type() {
+    let r = RememberRequest {
+        content: "x".into(),
+        entities: vec!["one".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+    };
+    let ty = r.validate().unwrap();
+    assert_eq!(ty, "about");
+}
+
+#[test]
+fn validate_succeeds_with_valid_entity() {
+    let r = RememberRequest {
+        content: "x".into(),
+        entities: vec!["one".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+    };
+    assert_eq!(r.validate().unwrap(), "about");
+}

@@ -198,6 +198,30 @@ pub struct RememberRequest {
     pub props: Option<Value>,
 }
 
+impl RememberRequest {
+    /// Input-only validation (no db access): the edge type normalizes and
+    /// at least one non-blank entity name is present. `plan_remember` runs
+    /// this itself; front ends call it FIRST when they must report input
+    /// errors ahead of scope/db errors (the pre-refactor precedence).
+    /// Returns the normalized edge type.
+    pub fn validate(&self) -> Result<String, String> {
+        let ty = normalize_edge_type(
+            self.edge_type
+                .as_deref()
+                .unwrap_or(DEFAULT_REMEMBER_EDGE_TYPE),
+        )?;
+        if self.entities.is_empty() {
+            return Err(
+                "entities must contain at least one name — use create_memory for a deliberately unlinked note".into(),
+            );
+        }
+        if self.entities.iter().any(|n| n.trim().is_empty()) {
+            return Err("entity names must be non-empty".into());
+        }
+        Ok(ty)
+    }
+}
+
 pub struct PlannedEntity {
     pub name: String,
     pub id: NodeId,
@@ -226,22 +250,7 @@ pub fn plan_remember(
     now_ms: i64,
     req: &RememberRequest,
 ) -> Result<RememberPlan, ComposeError> {
-    let ty = normalize_edge_type(
-        req.edge_type
-            .as_deref()
-            .unwrap_or(DEFAULT_REMEMBER_EDGE_TYPE),
-    )
-    .map_err(ComposeError::Invalid)?;
-    if req.entities.is_empty() {
-        return Err(ComposeError::Invalid(
-            "entities must contain at least one name — use create_memory for a deliberately unlinked note".into(),
-        ));
-    }
-    if req.entities.iter().any(|n| n.trim().is_empty()) {
-        return Err(ComposeError::Invalid(
-            "entity names must be non-empty".into(),
-        ));
-    }
+    let ty = req.validate().map_err(ComposeError::Invalid)?;
     let existing = existing_memory(db, write_scope, &req.content)?;
     let deduplicated = existing.is_some();
     let memory_id = existing.unwrap_or_else(NodeId::new);
