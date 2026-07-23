@@ -222,7 +222,7 @@ fn edge_type_is_normalized() {
     let plan = plan_remember(&db, Scope::Shared, &lookup(), 1_000, &r).unwrap();
     let has_normalized = plan.ops.iter().any(|op| {
         matches!(
-            op, topodb::Op::CreateEdge { ty, .. } if ty.to_string() == "works_at"
+            op, topodb::Op::CreateEdge { ty, .. } if *ty == "works_at"
         )
     });
     assert!(has_normalized, "edge type must normalize to works_at");
