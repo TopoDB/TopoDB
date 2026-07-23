@@ -1,15 +1,23 @@
 //! JSON ↔ engine-type conversions shared by TopoDB's JSON-speaking front ends
 //! (currently `topodb-mcp`; `topodb-cli` is next).
 //!
-//! Every function here is pure (no I/O, no `Db` access) and returns `Result<_,
+//! Most functions here are pure (no I/O, no `Db` access) and return `Result<_,
 //! String>` — callers are responsible for mapping the `String` into their own
 //! error type (`topodb-mcp`'s `server.rs` maps it to an `rmcp::ErrorData`:
 //! `invalid_params` for bad input, `internal_error` otherwise). Nothing here
 //! ever panics: an unrepresentable value is always an `Err`, never an
-//! `unwrap`/`expect`.
+//! `unwrap`/`expect`. Exception: the `compose` module reads from a `Db` to
+//! plan writes, but never writes itself.
 
 mod batch;
 pub use batch::resolve_batch;
+
+mod compose;
+pub use compose::{
+    content_hash, entity_dedup_key, existing_memory, find_existing_entity, normalize_content,
+    plan_remember, resolve_entities_by_name, ComposeError, PlannedEntity, RememberPlan,
+    RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
+};
 
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
