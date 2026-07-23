@@ -762,6 +762,18 @@ fn validate_ms_timestamp(field: &str, v: i64) -> Result<(), ErrorData> {
     Ok(())
 }
 
+fn validate_as_of(v: Option<i64>) -> Result<(), ErrorData> {
+    if let Some(timestamp) = v {
+        if timestamp <= 0 {
+            return Err(ErrorData::invalid_params(
+                "as_of must be a positive Unix-millisecond timestamp".to_string(),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Host display-name convention for evidence rendering: the `name` prop
 /// (Entity/Alias), else the first 80 CHARACTERS of `content` (Memory,
 /// char-boundary safe, `…` when truncated), else null. The engine
@@ -1382,6 +1394,9 @@ struct TraverseParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
+    /// View the graph at a past Unix-millisecond instant. Omitted = now.
+    #[serde(default)]
+    as_of: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1765,6 +1780,9 @@ struct GetEdgesParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
+    /// Only edges live at this Unix-ms instant. Mutually exclusive with open_only — as_of means open-at-that-time.
+    #[serde(default)]
+    as_of: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2622,12 +2640,13 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Walk the graph outward from a seed node, following edges up to max_hops. Call this to gather the context AROUND something you already found — related entities, linked memories. Returns the subgraph (nodes + edges)."
+        description = "Walk the graph outward from a seed node, following edges up to max_hops. Call this to gather the context AROUND something you already found — related entities, linked memories. Optionally view the graph at a past timestamp via as_of; omit for now. Returns the subgraph (nodes + edges)."
     )]
     fn traverse(
         &self,
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<Json<TraverseResult>, ErrorData> {
+        validate_as_of(p.as_of)?;
         // `seed_ids` (non-empty) wins over `seed_id`; at least one is required.
         let seed_strs: Vec<String> = match p.seed_ids {
             Some(ids) if !ids.is_empty() => ids,
@@ -2668,7 +2687,7 @@ impl TopoServer {
             max_hops: p.max_hops,
             edge_types,
             direction: p.direction.into(),
-            as_of: None,
+            as_of: p.as_of,
         };
         // `traverse` opens a redb read transaction and walks on-disk chunked
         // adjacency (v3), so — like `search_text` — it can fail with
@@ -3243,36 +3262,53 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "List a node's outgoing edges, optionally filtered by target node and/or edge type; open edges only by default. This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
+        description = "List a node's outgoing edges, optionally filtered by target node and/or edge type; open edges only by default. Optionally view edges at a past timestamp via as_of (mutually exclusive with open_only — use as_of to see edges superseded at that point in time). This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
     )]
     fn get_edges(
         &self,
         Parameters(p): Parameters<GetEdgesParams>,
     ) -> Result<Json<GetEdgesResult>, ErrorData> {
+        // Check mutually exclusive parameters
+        if p.as_of.is_some() && p.open_only {
+            return Err(ErrorData::invalid_params(
+                "as_of and open_only are mutually exclusive".to_string(),
+                None,
+            ));
+        }
+        validate_as_of(p.as_of)?;
+
         let from = parse_node_id(&p.from_id)?;
         let to = match &p.to_id {
             Some(s) => Some(parse_node_id(s)?),
             None => None,
         };
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+
+        // When as_of is set, we need to get all edges (open_only=false) to see history
+        let open_only_to_use = if p.as_of.is_some() {
+            false
+        } else {
+            p.open_only
+        };
+
         let mut edges = match &p.edge_type {
             None => self
                 .db
-                .edges_from(&scope_set, from, to, None, p.open_only)
+                .edges_from(&scope_set, from, to, None, open_only_to_use)
                 .map_err(classify_topo_error)?,
             Some(raw) => {
                 let norm = convert::normalize_edge_type(raw)
                     .map_err(|e| ErrorData::invalid_params(e, None))?;
                 let mut es = self
                     .db
-                    .edges_from(&scope_set, from, to, Some(&norm), p.open_only)
+                    .edges_from(&scope_set, from, to, Some(&norm), open_only_to_use)
                     .map_err(classify_topo_error)?;
                 // Edges written before type normalization are stored under
                 // the raw form — probe it too so they stay findable.
                 if norm != *raw {
                     es.extend(
                         self.db
-                            .edges_from(&scope_set, from, to, Some(raw), p.open_only)
+                            .edges_from(&scope_set, from, to, Some(raw), open_only_to_use)
                             .map_err(classify_topo_error)?,
                     );
                 }
@@ -3281,6 +3317,14 @@ impl TopoServer {
         };
         edges.sort_by_key(|e| e.id);
         edges.dedup_by_key(|e| e.id);
+
+        // If as_of is set, filter edges to only those live at that timestamp
+        if let Some(timestamp) = p.as_of {
+            edges.retain(|e| {
+                e.valid_from <= timestamp && e.valid_to.is_none_or(|vt| vt > timestamp)
+            });
+        }
+
         let edges = edges
             .iter()
             .map(convert::edge_to_json)
