@@ -392,6 +392,11 @@ fn parse_props_arg(props: Option<&str>) -> Option<serde_json::Value> {
 fn create_memory(db: &Db, scope: Scope, content: String, props: Option<&str>, pretty: bool) -> ! {
     // Parse --props first so malformed JSON is rejected (exit 2) even on a dedup hit.
     let extra = parse_props_arg(props);
+    // Validate reserved keys BEFORE the dedup check (so reserved keys are always rejected).
+    let props = match topodb_json::memory_props(&content, extra.as_ref()) {
+        Ok(p) => p,
+        Err(e) => output::fail("rejected", &e, 2),
+    };
     // Dedup: re-storing an identical (whitespace-normalized) fact returns
     // the existing node — same contract as the MCP create_memory tool.
     match topodb_json::existing_memory(db, scope, &content) {
@@ -402,10 +407,6 @@ fn create_memory(db: &Db, scope: Scope, content: String, props: Option<&str>, pr
         Ok(None) => {}
         Err(e) => output::fail_engine(&e),
     }
-    let props = match topodb_json::memory_props(&content, extra.as_ref()) {
-        Ok(p) => p,
-        Err(e) => output::fail("rejected", &e, 2),
-    };
     let id = NodeId::new();
     let op = Op::CreateNode {
         id,

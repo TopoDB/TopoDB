@@ -1372,6 +1372,47 @@ fn create_memory_rejects_reserved_prop_keys() {
 }
 
 #[test]
+fn create_memory_rejects_reserved_keys_even_on_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // First: create memory without props
+    let out1 = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "create-memory",
+            "--content",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out1.status.code(), Some(0));
+
+    // Second: re-send the SAME content WITH reserved-key props → must be rejected, not deduplicated
+    for props in [r#"{"content_hash":"boom"}"#, r#"{"superseded_at":1}"#] {
+        let out = bin()
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "create-memory",
+                "--content",
+                "x",
+                "--props",
+                props,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "reserved key {props} must be rejected even on dedup"
+        );
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(err["error"]["kind"], "rejected");
+    }
+}
+
+#[test]
 fn re_remember_of_superseded_content_is_a_fresh_memory() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
@@ -1417,6 +1458,35 @@ fn re_remember_of_superseded_content_is_a_fresh_memory() {
         "retired content must not dedup"
     );
     assert_ne!(again["memory_id"].as_str().unwrap(), old_id);
+}
+
+#[test]
+fn remember_rejects_reserved_prop_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    for props in [r#"{"content_hash":"boom"}"#, r#"{"superseded_at":1}"#] {
+        let out = bin()
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "remember",
+                "--content",
+                "a fact",
+                "--entity",
+                "e",
+                "--props",
+                props,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "props {props} must be rejected");
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(err["error"]["kind"], "rejected");
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("maintained by the engine write path"));
+    }
 }
 
 #[test]
