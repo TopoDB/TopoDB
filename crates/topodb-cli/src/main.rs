@@ -152,6 +152,7 @@ fn main() {
             max_hops,
             direction,
             edge_type,
+            as_of,
         } => traverse(
             &db,
             default_scope,
@@ -159,6 +160,7 @@ fn main() {
             max_hops,
             direction.into(),
             edge_type,
+            as_of,
             cli.pretty,
         ),
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
@@ -283,12 +285,23 @@ fn traverse(
     max_hops: u8,
     direction: Direction,
     edge_type: Vec<String>,
+    as_of: Option<i64>,
     pretty: bool,
 ) -> ! {
     let seed = match NodeId::from_str(seed) {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid seed id {seed:?}: {e}"), 2),
     };
+    // Validate as_of: must be positive if provided.
+    if let Some(ts) = as_of {
+        if ts <= 0 {
+            output::fail(
+                "rejected",
+                "as-of must be a positive Unix-millisecond timestamp",
+                2,
+            );
+        }
+    }
     let scopes = topodb_json::scope_to_scope_set(scope);
     // Empty --edge-type (none given) -> None, follow every edge type; the
     // engine treats `Some(vec![])` as "match nothing", which would silently
@@ -305,7 +318,7 @@ fn traverse(
         max_hops,
         edge_types,
         direction,
-        as_of: None,
+        as_of,
     };
     let sg = match db.traverse(&query) {
         Ok(sg) => sg,
