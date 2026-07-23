@@ -20,12 +20,13 @@ pub fn open_with_busy_retry(
     loop {
         match open() {
             Err(TopoError::Busy) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                if elapsed >= budget_ms {
+                let elapsed = start.elapsed();
+                let elapsed_ms = elapsed.as_millis() as u64;
+                if elapsed_ms >= budget_ms {
                     return Err(TopoError::Busy);
                 }
-                let jitter = u64::from(start.elapsed().subsec_nanos()) % (delay_ms / 4 + 1);
-                let remaining = budget_ms - elapsed;
+                let jitter = u64::from(elapsed.subsec_nanos()) % (delay_ms / 4 + 1);
+                let remaining = budget_ms - elapsed_ms;
                 std::thread::sleep(Duration::from_millis((delay_ms + jitter).min(remaining)));
                 delay_ms = (delay_ms * 2).min(500);
             }

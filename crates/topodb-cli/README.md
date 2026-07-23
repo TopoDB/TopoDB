@@ -61,7 +61,7 @@ Notes on individual commands:
   memory. The response is `{"id":…,"deduplicated":…}`. `--props` is a JSON *object* string merged in alongside `content`; a `--props` that
   tries to set `content` itself is rejected (exit 2).
 - **`create-entity`**: now find-or-create by default — the name is matched case- and
-  whitespace-insensitively across read scopes, write scope, and `shared`, and resolves aliases.
+  whitespace-insensitively across write scope and `shared`, and resolves aliases.
   An existing entity is returned with `"created": false`; `--always-create` restores the old
   raw-create behavior. Both paths now report the `created` flag. When `created: false`, `--props`
   merges only NEW keys; a `name` key in props is rejected either way (exit 2).
@@ -154,7 +154,7 @@ Fresh database, `info`:
 
 ```console
 $ topodb --db demo.redb info
-{"current_seq":0,"default_scope":"shared","format_version":1,"index_spec":{"equality":[{"label":"Entity","prop":"name"}],"text":[{"label":"Memory","prop":"content"}]},"path":"demo.redb"}
+{"current_seq":0,"default_scope":"shared","format_version":6,"index_spec":{"equality":[{"label":"Entity","prop":"name"},{"label":"Alias","prop":"name"},{"label":"Synonym","prop":"term"},{"label":"Memory","prop":"content_hash"}],"text":[{"label":"Memory","prop":"content"},{"label":"Entity","prop":"name"},{"label":"Alias","prop":"name"}]},"path":"demo.redb"}
 ```
 
 Create an entity and a memory, then search for it:
@@ -167,7 +167,7 @@ $ topodb --db demo.redb create-memory --content "ada wrote the first program"
 {"deduplicated":false,"id":"01KX2NZY4VH5QQC16VHXHJSKFE"}
 
 $ topodb --db demo.redb search "first program"
-[{"node":{"id":"01KX2NZY4VH5QQC16VHXHJSKFE","label":"Memory","props":{"content":"ada wrote the first program"},"scope":"shared"},"score":0.5753642320632935}]
+[{"node":{"id":"01KY6TA0DC8YYBKMW9XJASEQ07","label":"Memory","props":{"content":"ada wrote the first program","content_hash":"ba78ad81d00f6917"},"scope":"shared"},"score":0.5753642320632935}]
 ```
 
 `get` on an id that doesn't exist — still exit 0:

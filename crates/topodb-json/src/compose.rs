@@ -35,7 +35,11 @@ impl From<TopoError> for ComposeError {
 // --- moved verbatim from topodb-mcp/src/server.rs (self.db -> db) ---
 // Keep the original doc comments from server.rs on each of these when moving.
 
-/// Case/whitespace-insensitive key for in-call entity-name dedup.
+/// lowercased — mirroring the engine's prop-index normalization
+/// (`prop_index::normalize_str`, which is pub(crate) and thus can't be
+/// called from here). Drift between the two only weakens IN-CALL dedup
+/// (["Drew", "drew"] in one call); cross-call dedup always goes through the
+/// engine's own normalized index via find_existing_entity.
 pub fn entity_dedup_key(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
@@ -62,8 +66,20 @@ pub fn content_hash(content: &str) -> String {
     format!("{h:016x}")
 }
 
-/// Entities matching `name` in `scopes`: normalized-name equality hits plus
-/// canonical entities reached through a same-named Alias. Sorted by id.
+/// (Entity, name) matches followed through alias_of. Deduped by id,
+/// oldest first.
+///
+/// Returns the raw `TopoError` (not `ErrorData`) rather than swallowing
+/// it: the two existing call sites disagree on what an undeclared
+/// (Entity, name) index should mean. `find_by_prop` must still surface it
+/// as a caller error — that is the exact contract tests pin down (an
+/// undeclared-index probe on a custom spec must error, not silently return
+/// empty, or a clobbered spec reopen would go undetected). `create_entity`
+/// instead treats it as "can't dedup on this spec" and degrades to
+/// create-always. Only the (Alias, name) probe's `Rejected` is
+/// unconditionally swallowed here — a spec that predates the Alias index
+/// (or a custom spec that never declared it) simply has no aliases to
+/// resolve, which is never a caller error.
 pub fn resolve_entities_by_name(
     db: &Db,
     scopes: &ScopeSet,
@@ -92,8 +108,9 @@ pub fn resolve_entities_by_name(
 
 /// `lookup` is the caller's collision surface (MCP: default read scopes +
 /// write scope + shared; CLI: write scope + shared). `Ok(None)` means
-/// "create it", covering both no-match and a custom spec without the
-/// (Entity, name) equality index (engine `Rejected` degrades to create).
+/// "create it" — covering both no-visible-match and a custom spec without
+/// the (Entity, name) equality index (`Rejected`), which degrades to
+/// create-always rather than failing the write.
 pub fn find_existing_entity(
     db: &Db,
     lookup: &ScopeSet,
