@@ -286,3 +286,132 @@ fn find_duplicate_memories_exact_boundary_at_0_6() {
         "pair similarity should be approximately 0.6: {result:#?}"
     );
 }
+
+#[test]
+fn duplicate_scan_dispatches_on_embedder_status_not_stored_vectors() {
+    // TDD item 1: duplicate_scan must dispatch on embedder.status(), not on
+    // whether stored embeddings exist. With a Failed embedder, the text path is
+    // taken even if set_embedding adds vectors.
+    let dir = tempfile::tempdir().unwrap();
+    let scope = topodb::ScopeId::new().to_string();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &[
+            "--scope",
+            scope.as_str(),
+            "--embeddings",
+            "not-a-real-model",
+        ],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // Create two overlapping memories
+    let mem1 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({"content": "the login flow breaks when the session cookie exceeds four kilobytes"}),
+        DEFAULT_TIMEOUT,
+    );
+    let mem1_id = mem1["id"].as_str().unwrap();
+
+    let mem2 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({"content": "the login flow breaks when the session cookie exceeds the size limit"}),
+        DEFAULT_TIMEOUT,
+    );
+    let mem2_id = mem2["id"].as_str().unwrap();
+
+    // Check the model name from db_info to use in set_embedding
+    let db_info = s.call_tool_ok("db_info", serde_json::json!({}), DEFAULT_TIMEOUT);
+    let model_name = db_info["embeddings"]["model"].as_str().unwrap();
+
+    // Set an embedding on mem1 with the failed model name
+    let small_vector = vec![0.1, 0.2, 0.3, 0.4];
+    s.call_tool_ok(
+        "set_embedding",
+        serde_json::json!({
+            "id": mem1_id,
+            "model": model_name,
+            "vector": small_vector
+        }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // find_duplicate_memories must still use text mode because embedder.status() is Failed
+    let result = s.call_tool_ok(
+        "find_duplicate_memories",
+        serde_json::json!({}),
+        DEFAULT_TIMEOUT,
+    );
+
+    assert_eq!(
+        result["method"], "text",
+        "dispatch must use text mode when embedder status is Failed, regardless of stored embeddings: {result}"
+    );
+    assert!(
+        !result["pairs"].as_array().unwrap().is_empty(),
+        "text mode should find the overlapping pair: {result}"
+    );
+
+    // The pair should use text-mode similarity (token-Jaccard)
+    let pair = &result["pairs"][0];
+    let ids = [
+        pair["ids"][0].as_str().unwrap(),
+        pair["ids"][1].as_str().unwrap(),
+    ];
+    assert!(
+        ids.contains(&mem1_id) && ids.contains(&mem2_id),
+        "pair should include both memories: {pair}"
+    );
+}
+
+#[test]
+fn text_mode_ignores_min_similarity_threshold() {
+    // Item 6: min_similarity is ignored in text mode. A pair at the exact
+    // 0.6 Jaccard boundary is returned even with min_similarity: 0.99.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Server::spawn(&dir.path().join("t.redb"), &["--scope", A]);
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // Create the exact 0.6 Jaccard boundary pair
+    let mem1_id = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({"content": "the login breaks when the cookie exceeds size"}),
+        DEFAULT_TIMEOUT,
+    );
+    let mem1_id = mem1_id["id"].as_str().unwrap();
+
+    let mem2_id = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({"content": "the login breaks when the cookie exceeds four"}),
+        DEFAULT_TIMEOUT,
+    );
+    let mem2_id = mem2_id["id"].as_str().unwrap();
+
+    // Call find_duplicate_memories with min_similarity: 0.99 (very high).
+    // In text mode, this should be ignored; the 0.6-Jaccard pair should still
+    // be returned.
+    let result = s.call_tool_ok(
+        "find_duplicate_memories",
+        serde_json::json!({"min_similarity": 0.99}),
+        DEFAULT_TIMEOUT,
+    );
+
+    assert_eq!(
+        result["method"], "text",
+        "should use text mode since embeddings are off: {result}"
+    );
+    assert!(
+        !result["pairs"].as_array().unwrap().is_empty(),
+        "text mode should return the 0.6-Jaccard pair despite min_similarity: 0.99: {result}"
+    );
+
+    let pair = &result["pairs"][0];
+    let ids = [
+        pair["ids"][0].as_str().unwrap(),
+        pair["ids"][1].as_str().unwrap(),
+    ];
+    assert!(
+        ids.contains(&mem1_id) && ids.contains(&mem2_id),
+        "pair should include both memories: {pair}"
+    );
+}
