@@ -1236,3 +1236,30 @@ fn create_entity_rejects_name_key_in_props_on_both_paths() {
         "miss path error kind must be rejected"
     );
 }
+
+#[test]
+fn create_memory_stamps_hash_and_dedups() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let a: serde_json::Value =
+        serde_json::from_slice(&run(&["create-memory", "--content", "the sky is blue"]).stdout)
+            .unwrap();
+    assert_eq!(a["deduplicated"], false);
+    let id = a["id"].as_str().unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", id]).stdout).unwrap();
+    assert!(
+        got["node"]["props"]["content_hash"].is_string(),
+        "hash stamped"
+    );
+    // Whitespace-normalized duplicate resolves to the same node.
+    let b: serde_json::Value =
+        serde_json::from_slice(&run(&["create-memory", "--content", "the  sky is blue "]).stdout)
+            .unwrap();
+    assert_eq!(b["deduplicated"], true);
+    assert_eq!(b["id"].as_str().unwrap(), id);
+}

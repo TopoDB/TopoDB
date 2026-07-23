@@ -379,13 +379,30 @@ fn parse_props_arg(props: Option<&str>) -> Option<serde_json::Value> {
 }
 
 fn create_memory(db: &Db, scope: Scope, content: String, props: Option<&str>, pretty: bool) -> ! {
+    // Dedup: re-storing an identical (whitespace-normalized) fact returns
+    // the existing node — same contract as the MCP create_memory tool.
+    match topodb_json::existing_memory(db, scope, &content) {
+        Ok(Some(id)) => output::ok(
+            &serde_json::json!({ "id": id.to_string(), "deduplicated": true }),
+            pretty,
+        ),
+        Ok(None) => {}
+        Err(e) => output::fail_engine(&e),
+    }
     let extra = parse_props_arg(props);
+    let hash = topodb_json::content_hash(&content);
     let props = match topodb_json::merge_required_prop(
         topodb_json::MEMORY_CONTENT_PROP,
         PropValue::Str(content),
         extra.as_ref(),
     ) {
-        Ok(p) => p,
+        Ok(mut p) => {
+            p.insert(
+                topodb_json::MEMORY_CONTENT_HASH_PROP.into(),
+                PropValue::Str(hash),
+            );
+            p
+        }
         Err(e) => output::fail("rejected", &e, 2),
     };
     let id = NodeId::new();
@@ -398,7 +415,10 @@ fn create_memory(db: &Db, scope: Scope, content: String, props: Option<&str>, pr
     if let Err(e) = db.submit(vec![op]) {
         output::fail_engine(&e);
     }
-    output::ok(&serde_json::json!({ "id": id.to_string() }), pretty);
+    output::ok(
+        &serde_json::json!({ "id": id.to_string(), "deduplicated": false }),
+        pretty,
+    );
 }
 
 fn create_entity(
