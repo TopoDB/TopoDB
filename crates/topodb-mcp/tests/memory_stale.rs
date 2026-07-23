@@ -62,6 +62,11 @@ fn stalest_first_and_a_recall_freshens() {
     let _b = mem(&mut s, "bravo fact");
     let c = mem(&mut s, "charlie fact");
 
+    // ms-granularity timestamps: force the recall into a later millisecond than
+    // charlie's mint, or stalest-first ties and the order is tiebreak-dependent
+    // (flaked on fast CI runners).
+    std::thread::sleep(Duration::from_millis(5));
+
     // Recall bravo -> its last_accessed_at jumps to now, the freshest of the three.
     let b = _b;
     s.call_tool_ok("get_node", json!({ "id": b }), T);
