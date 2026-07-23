@@ -1799,7 +1799,9 @@ struct NearDuplicate {
     id: String,
     /// Its content, so the caller can tell "same fact" from "similar topic".
     content: String,
-    /// Cosine similarity to the memory just stored (1.0 = identical direction).
+    /// Similarity to the memory just stored: cosine in vector mode (1.0 =
+    /// identical direction), token-Jaccard in text mode (see `method`) — the
+    /// two scales are NOT comparable.
     similarity: f32,
     /// Confidence band: `"likely"` (cosine >= 0.80) or `"possible"` (review band).
     band: String,
@@ -2173,7 +2175,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Relation splitting requires vector embeddings. Text mode (embeddings off): detects token-Jaccard similarity (>= 0.6 by default); cannot distinguish duplicates from supersessions, so all pairs are reported as `duplicate`. The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
+        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Text mode (embedder not Ready, including deliberate off): exhaustive pairwise token-Jaccard over the scope (>= 0.6, fixed); the same lexical negation-cue relation check runs, so pairs still split into `duplicate` vs `supersession` (heuristic — lower confidence than the vector split; bands reuse the cosine cutoffs applied to Jaccard, treat as rough). The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
     )]
     fn find_duplicate_memories(
         &self,
@@ -2616,7 +2618,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When embeddings are off, text-based detection (token-Jaccard) runs instead; all pairs count as `duplicate_pairs` and `supersession_pairs` is 0 (relation splitting requires vectors). Check `embeddings_enabled` to distinguish 'none found' from 'couldn't check with vectors'. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
+        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When the embedder is not Ready (including deliberate off), text-based detection (token-Jaccard) runs instead, and the duplicate/supersession split still applies via the lexical negation-cue check (heuristic — lower confidence than vectors). Check `embeddings_enabled` to tell which detection grade produced the counts. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
     )]
     fn memory_health(
         &self,
