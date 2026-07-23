@@ -402,19 +402,8 @@ fn create_memory(db: &Db, scope: Scope, content: String, props: Option<&str>, pr
         Ok(None) => {}
         Err(e) => output::fail_engine(&e),
     }
-    let hash = topodb_json::content_hash(&content);
-    let props = match topodb_json::merge_required_prop(
-        topodb_json::MEMORY_CONTENT_PROP,
-        PropValue::Str(content),
-        extra.as_ref(),
-    ) {
-        Ok(mut p) => {
-            p.insert(
-                topodb_json::MEMORY_CONTENT_HASH_PROP.into(),
-                PropValue::Str(hash),
-            );
-            p
-        }
+    let props = match topodb_json::memory_props(&content, extra.as_ref()) {
+        Ok(p) => p,
         Err(e) => output::fail("rejected", &e, 2),
     };
     let id = NodeId::new();

@@ -1343,3 +1343,121 @@ fn create_memory_stamps_hash_and_dedups() {
     assert_eq!(b["deduplicated"], true);
     assert_eq!(b["id"].as_str().unwrap(), id);
 }
+
+#[test]
+fn create_memory_rejects_reserved_prop_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    for props in [r#"{"content_hash":"x"}"#, r#"{"superseded_at":1}"#] {
+        let out = bin()
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "create-memory",
+                "--content",
+                "a fact",
+                "--props",
+                props,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "props {props} must be rejected");
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert_eq!(err["error"]["kind"], "rejected");
+        assert!(err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("maintained by the engine write path"));
+    }
+}
+
+#[test]
+fn re_remember_of_superseded_content_is_a_fresh_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let old: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "vega uses postgres",
+            "--entity",
+            "vega",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let old_id = old["memory_id"].as_str().unwrap().to_string();
+    run(&[
+        "remember",
+        "--content",
+        "vega uses sqlite",
+        "--entity",
+        "vega",
+        "--supersedes",
+        &old_id,
+    ]);
+    let again: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "vega uses postgres",
+            "--entity",
+            "vega",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        again["deduplicated"], false,
+        "retired content must not dedup"
+    );
+    assert_ne!(again["memory_id"].as_str().unwrap(), old_id);
+}
+
+#[test]
+fn remember_edge_type_and_props_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let out: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "omar owns worker",
+            "--entity",
+            "omar",
+            "--edge-type",
+            "Works On",
+            "--props",
+            r#"{"source":"standup"}"#,
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let memory_id = out["memory_id"].as_str().unwrap();
+    // Props landed on the memory node.
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", memory_id]).stdout).unwrap();
+    assert_eq!(got["node"]["props"]["source"], "standup");
+    // Edge type normalized to works_on.
+    let tv: serde_json::Value =
+        serde_json::from_slice(&run(&["traverse", memory_id, "--max-hops", "1"]).stdout).unwrap();
+    let types: Vec<&str> = tv["subgraph"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(
+        types.contains(&"works_on"),
+        "normalized edge type, got {types:?}"
+    );
+}
