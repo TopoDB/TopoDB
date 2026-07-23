@@ -78,7 +78,11 @@ Notes on individual commands:
   db's index spec.
 - **`traverse`**: omitting `--edge-type` entirely follows every edge type; passing it (once or
   repeated) restricts the walk to exactly those types. `--as-of <unix-ms>` performs a temporal read
-  at the given Unix millisecond timestamp (closed edges reappear, later edges vanish); omit to read "now".
+  at the given Unix millisecond timestamp (closed edges reappear, later edges vanish); a future as_of
+  behaves like "now". Omit to read "now".
+  
+  Example: `topodb --db agent.redb traverse <id> --as-of 1700000000000` reads the graph as it was at
+  the given instant, showing edges that were open then (including edges since closed) and hiding edges created after.
 - **`changes`**: the one unscoped command — see [Scoping](#scoping) — and `Compacted` (the
   requested `--since` is below the retained floor) is a rejected/exit-2 condition, not an
   internal error; the caller re-anchors from `info`'s `current_seq` rather than trusting a
