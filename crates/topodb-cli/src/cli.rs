@@ -174,7 +174,8 @@ pub enum Command {
         edge_type: Vec<String>,
         /// View the graph as it was at this Unix-millisecond instant: only
         /// edges live at that time are followed (closed edges whose
-        /// validity covered it reappear; later edges vanish). Omitted = now.
+        /// validity covered it reappear; later edges vanish). A future
+        /// as_of behaves like "now". Omitted = now.
         #[arg(long)]
         as_of: Option<i64>,
     },

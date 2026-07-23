@@ -1765,10 +1765,12 @@ struct GetEdgesParams {
     /// edges stored under the raw un-normalized form are matched too).
     #[serde(default)]
     edge_type: Option<String>,
-    /// Only currently-open edges (no `valid_to`). Defaults to true — the
-    /// common case is finding the open edge that a changed fact should close.
-    #[serde(default = "default_true")]
-    open_only: bool,
+    /// Only currently-open edges (no `valid_to`). Defaults to true when `as_of`
+    /// is absent — the common case is finding the open edge that a changed fact
+    /// should close. OMIT this field entirely when passing `as_of` (mutually
+    /// exclusive; `as_of` already means "open at that instant").
+    #[serde(default)]
+    open_only: Option<bool>,
     /// Scope to read in: `"shared"` or a scope ULID. Defaults to the
     /// server's configured default scope when omitted.
     #[serde(default)]
@@ -1780,7 +1782,10 @@ struct GetEdgesParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
-    /// Only edges live at this Unix-ms instant. Mutually exclusive with open_only — as_of means open-at-that-time.
+    /// Only edges live at this Unix-ms instant (a past Unix-millisecond
+    /// timestamp). Mutually exclusive with `open_only` — omit `open_only` when
+    /// passing `as_of`. A future `as_of` behaves like "now". Filters edges to
+    /// those with `valid_from <= t < valid_to` (open edges have no `valid_to`).
     #[serde(default)]
     as_of: Option<i64>,
 }
@@ -3262,20 +3267,24 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "List a node's outgoing edges, optionally filtered by target node and/or edge type; open edges only by default. Optionally view edges at a past timestamp via as_of (mutually exclusive with open_only — use as_of to see edges superseded at that point in time). This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
+        description = "List a node's outgoing edges, optionally filtered by target node and/or edge type; open edges only by default. Optionally view edges at a past timestamp via as_of (omit open_only when passing as_of; as_of already means \"open at that instant\") — use as_of to see edges superseded at that point in time. A future as_of behaves like \"now\". This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
     )]
     fn get_edges(
         &self,
         Parameters(p): Parameters<GetEdgesParams>,
     ) -> Result<Json<GetEdgesResult>, ErrorData> {
-        // Check mutually exclusive parameters
-        if p.as_of.is_some() && p.open_only {
+        // Validate as_of timestamp FIRST (so as_of: 0 gets the timestamp error,
+        // not the exclusivity one).
+        validate_as_of(p.as_of)?;
+
+        // Check mutually exclusive parameters: as_of and open_only cannot both
+        // be specified. When as_of is present, omit open_only entirely.
+        if p.as_of.is_some() && p.open_only.is_some() {
             return Err(ErrorData::invalid_params(
-                "as_of and open_only are mutually exclusive — as_of already means \"open at that instant\"".to_string(),
+                "as_of and open_only are mutually exclusive — omit open_only when passing as_of (as_of already means \"open at that instant\")".to_string(),
                 None,
             ));
         }
-        validate_as_of(p.as_of)?;
 
         let from = parse_node_id(&p.from_id)?;
         let to = match &p.to_id {
@@ -3284,11 +3293,13 @@ impl TopoServer {
         };
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
 
-        // When as_of is set, we need to get all edges (open_only=false) to see history
+        // Determine whether to fetch only open edges: when as_of is present,
+        // always fetch with open_only=false to see the full history, then filter
+        // below. When as_of is absent, use the provided open_only or default to true.
         let open_only_to_use = if p.as_of.is_some() {
             false
         } else {
-            p.open_only
+            p.open_only.unwrap_or(true)
         };
 
         let mut edges = match &p.edge_type {
@@ -3319,6 +3330,7 @@ impl TopoServer {
         edges.dedup_by_key(|e| e.id);
 
         // If as_of is set, filter edges to only those live at that timestamp
+        // (inclusive lower bound, exclusive upper bound: valid_from <= t < valid_to).
         if let Some(timestamp) = p.as_of {
             edges.retain(|e| {
                 e.valid_from <= timestamp && e.valid_to.is_none_or(|vt| vt > timestamp)

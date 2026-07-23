@@ -738,14 +738,21 @@ fn get_edges_with_as_of_parameter() {
         .as_i64()
         .expect("closed edge should have valid_to");
 
+    // Capture the E1 edge's valid_from for boundary testing
+    let e1_valid_from = all_edges
+        .iter()
+        .find(|e| e["id"].as_str() == Some(edge1_id.as_str()))
+        .and_then(|e| e["valid_from"].as_i64())
+        .expect("E1 edge should have valid_from");
+
     // Test 1: get_edges(from=M) with as_of=mid returns EXACTLY the E1 edge
+    // DOCUMENTED CONTRACT: omit open_only when passing as_of
     let mid_edges_resp = server.call_tool_ok(
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
             "edge_type": "links",
-            "as_of": mid,
-            "open_only": false
+            "as_of": mid
         }),
         DEFAULT_TIMEOUT,
     );
@@ -788,13 +795,13 @@ fn get_edges_with_as_of_parameter() {
     );
 
     // Test 3: with as_of AFTER the close and after E2's link returns only E2's edge
+    // DOCUMENTED CONTRACT: omit open_only when passing as_of
     let future_edges_resp = server.call_tool_ok(
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
             "edge_type": "links",
-            "as_of": future_time,
-            "open_only": false
+            "as_of": future_time
         }),
         DEFAULT_TIMEOUT,
     );
@@ -820,13 +827,13 @@ fn get_edges_with_as_of_parameter() {
     );
 
     // Test 4: EXCLUSIVE boundary — as_of == edge's valid_to must NOT include the edge
+    // DOCUMENTED CONTRACT: omit open_only when passing as_of
     let boundary_edges_resp = server.call_tool_ok(
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
             "edge_type": "links",
-            "as_of": closed_valid_to,
-            "open_only": false
+            "as_of": closed_valid_to
         }),
         DEFAULT_TIMEOUT,
     );
@@ -841,8 +848,45 @@ fn get_edges_with_as_of_parameter() {
         "get_edges with as_of == valid_to must NOT include the closed edge (exclusive boundary)"
     );
 
-    // Test: as_of + open_only should error (mutually exclusive)
-    let mutually_exclusive = server.call_tool(
+    // Test 5: INCLUSIVE boundary — as_of == edge's valid_from MUST include the edge
+    let inclusive_boundary_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": memory_id,
+            "edge_type": "links",
+            "as_of": e1_valid_from
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let inclusive_boundary_edges = inclusive_boundary_resp["edges"]
+        .as_array()
+        .expect("edges array");
+    assert!(
+        inclusive_boundary_edges
+            .iter()
+            .any(|e| e["id"].as_str() == Some(edge1_id.as_str())),
+        "get_edges with as_of == valid_from must INCLUDE the edge (inclusive lower boundary)"
+    );
+
+    // Helper to extract error message from either JSON-RPC protocol error or tool result error
+    fn extract_error_msg(resp: &serde_json::Value) -> String {
+        resp.get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or(
+                resp.get("result")
+                    .and_then(|r| r.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(""),
+            )
+            .to_string()
+    }
+
+    // Test 6: as_of + open_only=true should error with "omit open_only" message
+    let mutually_exclusive_true = server.call_tool(
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
@@ -851,9 +895,34 @@ fn get_edges_with_as_of_parameter() {
         }),
         DEFAULT_TIMEOUT,
     );
-    expect_tool_error(&mutually_exclusive);
+    expect_tool_error(&mutually_exclusive_true);
+    let error_msg = extract_error_msg(&mutually_exclusive_true);
+    assert!(
+        error_msg.contains("omit open_only"),
+        "as_of + open_only=true error must mention 'omit open_only': {}",
+        error_msg
+    );
 
-    // Test: invalid as_of (non-positive) should error
+    // Test 7: as_of + open_only=false should error with "omit open_only" message
+    let mutually_exclusive_false = server.call_tool(
+        "get_edges",
+        serde_json::json!({
+            "from_id": memory_id,
+            "as_of": mid,
+            "open_only": false
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&mutually_exclusive_false);
+    let error_msg = extract_error_msg(&mutually_exclusive_false);
+    assert!(
+        error_msg.contains("omit open_only"),
+        "as_of + open_only=false error must mention 'omit open_only': {}",
+        error_msg
+    );
+
+    // Test 8: invalid as_of (negative) should error with "positive Unix-millisecond" message
+    // (validate_as_of must run first, before exclusivity check)
     let invalid_as_of = server.call_tool(
         "get_edges",
         serde_json::json!({
@@ -863,7 +932,14 @@ fn get_edges_with_as_of_parameter() {
         DEFAULT_TIMEOUT,
     );
     expect_tool_error(&invalid_as_of);
+    let error_msg = extract_error_msg(&invalid_as_of);
+    assert!(
+        error_msg.contains("positive Unix-millisecond"),
+        "as_of < 0 error must contain 'positive Unix-millisecond': {}",
+        error_msg
+    );
 
+    // Test 9: invalid as_of (zero) should error with "positive Unix-millisecond" message
     let invalid_as_of_zero = server.call_tool(
         "get_edges",
         serde_json::json!({
@@ -873,4 +949,10 @@ fn get_edges_with_as_of_parameter() {
         DEFAULT_TIMEOUT,
     );
     expect_tool_error(&invalid_as_of_zero);
+    let error_msg = extract_error_msg(&invalid_as_of_zero);
+    assert!(
+        error_msg.contains("positive Unix-millisecond"),
+        "as_of == 0 error must contain 'positive Unix-millisecond': {}",
+        error_msg
+    );
 }
