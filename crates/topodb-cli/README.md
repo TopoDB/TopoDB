@@ -83,6 +83,7 @@ Notes on individual commands:
   internal error; the caller re-anchors from `info`'s `current_seq` rather than trusting a
   truncated tail.
 - **`compact`**: drops every op-log entry with `seq < --keep-from`.
+- **`submit [input]`**: submit a JSON array of batch commands atomically. Each command has an `op` field (the command type) and type-specific fields. `#N` in an id field is 0-indexed: `#0` refers to the first command's produced id, `#1` to the second command's produced id, etc. Reads from `input` file path, or stdin if `-` or omitted. This matches `submit_batch` in `topodb-mcp`.
 
 ## Exit-code contract
 

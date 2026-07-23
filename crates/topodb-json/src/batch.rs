@@ -2,7 +2,8 @@
 //! keyed by `"op"`, whose value equals the corresponding MCP tool name) that
 //! both `topodb-cli submit` and `topodb-mcp submit_batch` consume. Turns the
 //! array into a `Vec<Op>` for one atomic `Db::submit`, resolving `#N`
-//! back-references to ULIDs produced by earlier commands in the same batch.
+//! back-references (0-indexed: `#0` is the first command) to ULIDs produced by
+//! earlier commands in the same batch.
 //!
 //! Supported ops: `create_memory`, `create_entity`, `create_node` (an
 //! arbitrary-label node, for host-level schemas like episode recording),
@@ -71,8 +72,9 @@ fn scope_of(
 }
 
 /// Resolves an id-bearing field to a ULID string: a literal ULID passes through
-/// verbatim; `#N` resolves to command N's produced id, requiring N < idx
-/// (backward-only) and a matching id kind (node vs edge).
+/// verbatim; `#N` (0-indexed: `#0` is the first command) resolves to command N's
+/// produced id, requiring N < idx (backward-only) and a matching id kind (node vs
+/// edge).
 fn resolve_ref(
     raw: &str,
     expected: IdKind,
