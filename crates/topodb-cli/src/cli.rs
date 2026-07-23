@@ -85,6 +85,35 @@ pub enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
+    /// Store a fact and link it to its entities in ONE atomic write:
+    /// exact-content dedup (whitespace-normalized), find-or-create for each
+    /// `--entity` name (alias-aware, oldest node wins), one edge per entity
+    /// (`--edge-type`, default "about", vocabulary-normalized), and optional
+    /// retirement of replaced memories via `--supersedes`. The composed,
+    /// fragmentation-proof alternative to create-memory + create-entity +
+    /// link. Prints memory_id, per-entity {name,id,created}, edge_ids,
+    /// deduplicated, superseded.
+    Remember {
+        /// The fact to store (full-text-searchable body).
+        #[arg(long)]
+        content: String,
+        /// Entity name to link the memory to; repeatable, at least one.
+        #[arg(long = "entity", required = true)]
+        entity: Vec<String>,
+        /// Edge type for the memory->entity links (default: "about").
+        #[arg(long)]
+        edge_type: Option<String>,
+        /// Memory id this fact replaces; repeatable. Marks it superseded
+        /// (recall drops it from "now" onward; history keeps it).
+        #[arg(long = "supersedes")]
+        supersedes: Vec<String>,
+        /// Additional metadata as a JSON object string.
+        #[arg(long)]
+        props: Option<String>,
+        /// Scope override for THIS command: a ScopeId ULID, or "shared".
+        #[arg(long)]
+        scope: Option<String>,
+    },
     /// Fetch one node by id. `{"found":false}` (exit 0) if it doesn't exist
     /// or is out of the default scope — the two are indistinguishable by
     /// design.
