@@ -17,12 +17,17 @@ pub struct Cli {
     #[arg(long, default_value = "shared")]
     pub scope: String,
     /// Pretty-print JSON output.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub pretty: bool,
     /// Milliseconds to wait (retrying with backoff) when another process
     /// holds the database file, before failing with kind "busy" / exit 3.
     /// 0 = fail immediately.
-    #[arg(long, env = "TOPODB_LOCK_WAIT_MS", default_value_t = 3000)]
+    #[arg(
+        long,
+        global = true,
+        env = "TOPODB_LOCK_WAIT_MS",
+        default_value_t = 3000
+    )]
     pub lock_wait_ms: u64,
     #[command(subcommand)]
     pub cmd: Command,

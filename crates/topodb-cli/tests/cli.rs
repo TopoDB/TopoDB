@@ -1592,3 +1592,61 @@ fn traverse_as_of_shows_the_past_topology() {
     let bad = run(&["traverse", &m, "--as-of", "0"]);
     assert_eq!(bad.status.code(), Some(2));
 }
+
+// --- Task 1: Global args placement + mcp --help ---
+
+/// Global flags like `--pretty` must work AFTER the subcommand, not just before.
+#[test]
+fn pretty_flag_works_after_subcommand_with_create_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["create-entity", "--name", "ada", "--pretty"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Pretty-printed JSON should be multi-line (has newlines).
+    assert!(
+        stdout.contains('\n'),
+        "pretty output should be multi-line, got: {stdout}"
+    );
+}
+
+/// Global flags like `--pretty` must work AFTER the subcommand with search.
+#[test]
+fn pretty_flag_works_after_subcommand_with_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // Create a memory first so there's something to search.
+    let _ = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["create-memory", "--content", "test memory content"])
+        .output()
+        .unwrap();
+    // Now search with --pretty after the subcommand.
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["search", "test", "--pretty"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Pretty-printed JSON should be multi-line.
+    assert!(
+        stdout.contains('\n'),
+        "pretty output should be multi-line, got: {stdout}"
+    );
+}
