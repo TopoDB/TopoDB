@@ -418,6 +418,7 @@ impl TopoServer {
     /// when the embedder is not Ready. Performs BM25 text search to fetch
     /// candidates, filters by token-Jaccard floor, and returns ranked results.
     /// Excludes `exclude` node (if provided), non-Memory labels, and superseded nodes.
+    /// Uses the non-bumping text search path — a maintenance read is not a recall.
     fn text_near_duplicates(
         &self,
         write_scope: Scope,
@@ -426,27 +427,12 @@ impl TopoServer {
     ) -> Vec<NearDuplicate> {
         let scope_set = convert::scopes_to_scope_set(&[write_scope]);
         // Fetch BM25 candidates with a small buffer over NEAR_DUP_K to account for filtering.
-        let query = RecallQuery {
-            vector: None,
-            expansions: Vec::new(),
-            graph_boost: false,
-            options: SearchOptions {
-                recency_weight: 0.0,
-                recency_half_life_ms: 0,
-                now_ms: None,
-                fuzzy_fallback: false,
-            },
-            labels: Some(vec![MEMORY_LABEL.to_string()]),
-            tombstone_prop: Some(convert::MEMORY_SUPERSEDED_AT_PROP.to_string()),
-            text_weight: 1.0,
-            vector_weight: 0.0,
-            graph_weight: 0.0,
-            access_weight: 0.0,
-            label_weights: vec![],
-            ..RecallQuery::new(scope_set, content.to_string(), NEAR_DUP_K + 5)
-        };
-
-        let Ok(hits) = self.db.recall(&query) else {
+        // Use search_text_unbumped to avoid corrupting the staleness signal that hygiene
+        // reads depend on (see nodes_by_label_unbumped rationale in fts.rs).
+        let Ok(hits) = self
+            .db
+            .search_text_unbumped(&scope_set, content, NEAR_DUP_K + 5)
+        else {
             return Vec::new();
         };
 

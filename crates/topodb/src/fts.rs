@@ -1064,6 +1064,36 @@ impl Db {
         options: &SearchOptions,
         expansions: &[(String, Vec<String>)],
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_text_expanded_internal(scopes, query, k, options, expansions, true)
+    }
+
+    /// [`Db::search_text_expanded`] without bumping access counters. For
+    /// maintenance scans that read text candidates for advisory purposes
+    /// (near-duplicate detection, hygiene inspection) rather than to recall
+    /// them — a hygiene scan reads `last_accessed_at` and would erase that very
+    /// signal by bumping it. A read for housekeeping is not a recall.
+    pub fn search_text_unbumped(
+        &self,
+        scopes: &ScopeSet,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_text_expanded_internal(scopes, query, k, &SearchOptions::default(), &[], false)
+    }
+
+    /// Internal implementation of text search with a `bump` flag to control
+    /// whether access counters are bumped. Both `search_text_expanded` and
+    /// `search_text_unbumped` use this; the flag preserves the semantic
+    /// boundary between advisory reads (maintenance scans) and recall reads.
+    fn search_text_expanded_internal(
+        &self,
+        scopes: &ScopeSet,
+        query: &str,
+        k: usize,
+        options: &SearchOptions,
+        expansions: &[(String, Vec<String>)],
+        bump: bool,
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if k == 0 {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
         }
@@ -1264,7 +1294,9 @@ impl Db {
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
         out.truncate(k);
-        self.bump(out.iter().map(|(n, _)| n.id));
+        if bump {
+            self.bump(out.iter().map(|(n, _)| n.id));
+        }
         Ok(out)
     }
 }
