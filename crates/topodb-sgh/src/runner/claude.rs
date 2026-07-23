@@ -7,8 +7,9 @@ use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 /// This is a rail to catch obviously problematic prefixes — not a security boundary.
 /// Rejects:
 /// - Empty or whitespace-only strings
-/// - Base commands (first whitespace-separated token, basename after `/`) in {sh, bash, zsh, env}
-/// - Any of the characters `;`, `|`, `&`, `<`, `>`, `` ` ``, `$`
+/// - Every whitespace-separated token's basename (after `/`) if it matches
+///   a shell command (case-insensitive) in {sh, bash, zsh, dash, ksh, fish, env}
+/// - Any of the characters `;`, `|`, `&`, `<`, `>`, `` ` ``, `$`, `,`, `(`, `)`, `:`
 ///
 /// Error message names the prefix and explains why it was rejected.
 pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
@@ -19,29 +20,32 @@ pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
         return Err("bash grant prefix is empty or whitespace-only".to_string());
     }
 
-    // Extract the base command (first whitespace-separated token, basename after `/`)
-    let base_cmd = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .next_back()
-        .unwrap_or("");
-
-    // Reject shell commands and env
-    if matches!(base_cmd, "sh" | "bash" | "zsh" | "env") {
-        return Err(format!(
-            "bash grant prefix '{}' is a shell or generic launcher ({}), not a binary",
-            prefix, base_cmd
-        ));
-    }
-
-    // Reject dangerous characters
-    for ch in &[';', '|', '&', '<', '>', '`', '$'] {
+    // Reject rule-injection and metacharacters
+    for ch in &[';', '|', '&', '<', '>', '`', '$', ',', '(', ')', ':'] {
         if trimmed.contains(*ch) {
             return Err(format!(
                 "bash grant prefix '{}' contains forbidden character '{}'",
                 prefix, ch
+            ));
+        }
+    }
+
+    // Shell set: case-insensitive match (bash is the most common, but zsh, sh,
+    // dash, ksh, and fish are also shells; env is a generic launcher).
+    let forbidden_shells = ["sh", "bash", "zsh", "dash", "ksh", "fish", "env"];
+
+    // Check every whitespace-separated token's basename
+    for token in trimmed.split_whitespace() {
+        let base_cmd = token
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if forbidden_shells.contains(&base_cmd.as_str()) {
+            return Err(format!(
+                "bash grant prefix '{}' contains a shell or generic launcher ({}), not a binary",
+                prefix, base_cmd
             ));
         }
     }
@@ -54,6 +58,11 @@ pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
 /// Returns a vector of arguments suitable for `std::process::Command`.
 /// Includes the prompt, allowedTools (with optional bash grants), output format,
 /// and model if specified.
+///
+/// Structured output (--output-format json) is what makes a denied tool visible at all:
+/// in plain-text mode a blocked tool call is indistinguishable from a completed one,
+/// since both exit 0 with prose on stdout. This ensures that when a node's Write is
+/// denied, we can detect it in the JSON response's permission_denials field.
 pub fn build_argv(prompt: String, model: Option<String>, bash_grants: &[String]) -> Vec<String> {
     let mut argv = vec!["claude".to_string(), "-p".to_string(), prompt];
 
@@ -290,10 +299,6 @@ impl AgentRunner for ClaudeCodeRunner {
         let argv = build_argv(build_prompt(req), self.model.clone(), &self.bash_grants);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
-
-        // Structured output is what makes a denied tool visible at all: in
-        // plain-text mode a blocked Write is indistinguishable from a
-        // completed one, since both exit 0 with prose on stdout.
 
         let out = cmd.output()?;
 

@@ -77,12 +77,14 @@ will be asked to do.
 Agent prompts remain ungated and run under your existing permission settings.
 The `--agent-bash` flag, available for direct CLI use, widens what an agent
 node can execute by granting it `Bash(<prefix>:*)` permissions additively on
-top of Read, Write, and Edit — narrowing a shell's reach to commands matching
-a prefix (e.g. `--agent-bash 'topodb'` grants access to `topodb:*` binaries,
-never to `/bin/sh` or `npm`). Grant the narrowest binary scoped to your task.
-The gate echoes every grant so you can see what permissions an agent receives
-before it runs. **The plugin itself never passes `--agent-bash`** — it runs
-agents under the permissions you configure globally in Claude Code settings.
+top of Read, Write, and Edit (e.g. `--agent-bash 'topodb'` grants access to
+shell commands matching the prefix `topodb:*`). The rail rejects only shells
+and launchers (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, `env`), not binary
+restrictions — `npm` would pass through. As guidance, grant the narrowest
+binary scoped to your task. The gate echoes every grant so you can see what
+permissions an agent receives before it runs. **The plugin itself never passes
+`--agent-bash`** — it runs agents under the permissions you configure globally
+in Claude Code settings.
 
 `--yes-including-revisions` is not used anywhere in this plugin, and `--replan`
 is off unless you ask for it by name. Both exist because a replan lets a model

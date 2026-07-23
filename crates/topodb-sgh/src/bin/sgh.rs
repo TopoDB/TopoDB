@@ -104,15 +104,11 @@ fn command_preview(v: &Validated) -> Vec<String> {
         .collect()
 }
 
-/// Agent bash grant prefixes converted to display format for the approval gate.
+/// Agent bash grant prefixes for display at the approval gate.
 ///
-/// Each grant becomes a line describing what shell commands agent nodes may run.
-/// Empty input yields empty output.
+/// Empty input yields empty output. Formatting is applied at the call site.
 fn grants_preview(grants: &[String]) -> Vec<String> {
-    grants
-        .iter()
-        .map(|g| format!("agent nodes may run: {} *", g))
-        .collect()
+    grants.to_vec()
 }
 
 /// Agent nodes with no declared `output.schema`.
@@ -302,6 +298,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // of `yes` doesn't have to know about the other flag).
             let yes = yes || yes_including_revisions;
 
+            // Canonicalize bash grants: trim each one, then validate. Pass trimmed
+            // grants to the runner so build_argv interpolates canonicalized values.
+            let agent_bash: Vec<String> = agent_bash
+                .into_iter()
+                .map(|g| g.trim().to_string())
+                .collect();
+
             // Validate bash grants before anything runs.
             for grant in &agent_bash {
                 if let Err(e) = topodb_sgh::runner::claude::validate_bash_grant(grant) {
@@ -351,8 +354,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let grants = grants_preview(&agent_bash);
                 if !grants.is_empty() {
-                    for line in &grants {
-                        println!("{line}");
+                    println!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
+                    for grant in &grants {
+                        println!("  {grant}:*");
                     }
                 }
 
@@ -369,8 +373,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if !grants.is_empty() {
                     // With --yes or --yes-including-revisions and non-empty grants,
                     // echo the same lines to stderr before execution (no prompt, no silence).
-                    for line in &grants {
-                        eprintln!("{line}");
+                    eprintln!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
+                    for grant in &grants {
+                        eprintln!("  {grant}:*");
                     }
                 }
 
@@ -555,10 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn grants_preview_converts_grants_to_display_lines() {
+    fn grants_preview_returns_grants_unchanged() {
         let grants = vec!["topodb".to_string()];
         let lines = grants_preview(&grants);
-        assert_eq!(lines, vec!["agent nodes may run: topodb *"]);
+        assert_eq!(lines, vec!["topodb".to_string()]);
     }
 
     #[test]
@@ -572,13 +577,7 @@ mod tests {
     fn grants_preview_multiple_grants() {
         let grants = vec!["topodb".to_string(), "cargo".to_string()];
         let lines = grants_preview(&grants);
-        assert_eq!(
-            lines,
-            vec![
-                "agent nodes may run: topodb *".to_string(),
-                "agent nodes may run: cargo *".to_string(),
-            ]
-        );
+        assert_eq!(lines, vec!["topodb".to_string(), "cargo".to_string()]);
     }
 
     #[test]
