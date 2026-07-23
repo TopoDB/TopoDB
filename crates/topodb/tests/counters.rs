@@ -293,3 +293,76 @@ fn float_range_scan_does_not_bump() {
         Some(AccessStats::default())
     );
 }
+
+#[test]
+fn search_text_unbumped_leaves_access_counters_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let id = NodeId::new();
+
+    // Create a Memory node with searchable text.
+    let mut props = Props::new();
+    props.insert(
+        "content".into(),
+        PropValue::Str("rust database engine architecture".into()),
+    );
+    db.submit(vec![Op::CreateNode {
+        id,
+        scope: Scope::Id(s),
+        label: "Memory".into(),
+        props,
+    }])
+    .unwrap();
+
+    // Call search_text and verify access count rose.
+    let hits = db.search_text(&scopes, "database", 10).unwrap();
+    assert_eq!(hits.len(), 1, "search_text must find the node");
+    assert_eq!(hits[0].0.id, id);
+    let bumped_score = hits[0].1;
+
+    let bumped_stats = wait_for_count(&db, &scopes, id, 1);
+    assert!(
+        bumped_stats.access_count >= 1,
+        "search_text must bump access count"
+    );
+
+    // Record the count after the bumped call.
+    let count_after_bumped = bumped_stats.access_count;
+
+    // Call search_text_unbumped with the same query.
+    let unbumped_hits = db.search_text_unbumped(&scopes, "database", 10).unwrap();
+
+    // Verify the unbumped call returned the same nodes in the same order
+    // with the same scores (both use default BM25, only the bump differs).
+    assert_eq!(
+        unbumped_hits.len(),
+        1,
+        "search_text_unbumped must find the node"
+    );
+    assert_eq!(unbumped_hits[0].0.id, id);
+    assert_eq!(
+        unbumped_hits[0].1, bumped_score,
+        "unbumped must return the same score as bumped (same BM25, only bump differs)"
+    );
+
+    // Give async bumps time to land, then verify the count did NOT change.
+    std::thread::sleep(Duration::from_millis(300));
+    let final_stats = db.access_stats(&scopes, id).unwrap();
+    assert_eq!(
+        final_stats,
+        Some(AccessStats {
+            access_count: count_after_bumped,
+            last_accessed_at: bumped_stats.last_accessed_at,
+        }),
+        "search_text_unbumped must not bump access counters"
+    );
+}
