@@ -326,10 +326,10 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
-- **`edge_live_at(valid_from, valid_to, query_time)` shared predicate** — determines whether an edge
-  is "live" (open) at a given query time (`query_time` must satisfy `valid_from <= query_time < valid_to`).
-  Shared utility used by the CLI, MCP server, and batch DSL for temporal edge filtering. An edge with
-  no `valid_to` (open edge, `valid_to = None`) is live at any time >= `valid_from`.
+- **`edge_live_at(e: &EdgeRecord, t: i64)` shared predicate** — determines whether an edge
+  is "live" (open) at a given query time (returns `true` if `valid_from <= t < valid_to`).
+  Utility used by the CLI `get-edges` command and the MCP `get_edges` tool for temporal edge
+  filtering. An edge with no `valid_to` (open edge) is live at any time >= `valid_from`.
 - **`memory_props` constructor** — the shared new-Memory props builder used by both CLI and MCP
   servers. Rejects the system-maintained `content_hash` and `superseded_at` keys (caller-level
   validation, fails fast with an actionable error) so front ends can validate early without
@@ -877,8 +877,9 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 - **`--lock-wait-ms`** / **`TOPODB_LOCK_WAIT_MS` env var** (default 3000, `0` = fail fast) — global
   flag for all subcommands; configures how long to retry on `TopoError::Busy` at startup. Lock
   exhaustion reports `{"error":{"kind":"busy",...}}` and exits with code 3.
-- **Global flags now valid before or after the subcommand** — `--db`, `--scope`, `--lock-wait-ms`,
-  and `--pretty` are now accepted in any position relative to the subcommand name.
+- **`--pretty` and `--lock-wait-ms` now valid before or after the subcommand** — these two flags are
+  now accepted in any position relative to the subcommand name. `--db` and `--scope` continue to
+  require placement before the subcommand (or use `TOPODB_DB` env var for `--db`).
 
 #### Changed
 

@@ -358,6 +358,18 @@ fn get_edges(
     as_of: Option<i64>,
     pretty: bool,
 ) -> ! {
+    // Validate as_of timestamp first (so as_of: 0 gets the timestamp error,
+    // not the exclusivity one), matching the MCP handler error order.
+    if let Some(timestamp) = as_of {
+        if timestamp <= 0 {
+            output::fail(
+                "rejected",
+                "as-of must be a positive Unix-millisecond timestamp",
+                2,
+            );
+        }
+    }
+
     let from_id = match NodeId::from_str(from) {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid from id {from:?}: {e}"), 2),
@@ -370,18 +382,6 @@ fn get_edges(
         }),
         None => None,
     };
-
-    // Validate as_of timestamp FIRST (so as_of: 0 gets the timestamp error,
-    // not the exclusivity one).
-    if let Some(timestamp) = as_of {
-        if timestamp <= 0 {
-            output::fail(
-                "rejected",
-                "as-of must be a positive Unix-millisecond timestamp",
-                2,
-            );
-        }
-    }
 
     // Check mutually exclusive parameters: as_of and open_only cannot both
     // be specified. When as_of is present, omit open_only entirely.
@@ -439,12 +439,14 @@ fn get_edges(
         edges.retain(|e| topodb_json::edge_live_at(e, timestamp));
     }
 
-    let edges = edges
+    let edges: Vec<serde_json::Value> = match edges
         .iter()
         .map(topodb_json::edge_to_json)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| output::fail("internal", &e, 1))
-        .unwrap_or_else(|_| unreachable!());
+    {
+        Ok(edges) => edges,
+        Err(e) => output::fail("internal", &e, 1),
+    };
 
     output::ok(&serde_json::json!({ "edges": edges }), pretty);
 }
