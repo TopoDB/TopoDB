@@ -73,9 +73,19 @@ fn main() {
         Command::CreateMemory { content, props, .. } => {
             create_memory(&db, write_scope, content, props.as_deref(), cli.pretty)
         }
-        Command::CreateEntity { name, props, .. } => {
-            create_entity(&db, write_scope, name, props.as_deref(), cli.pretty)
-        }
+        Command::CreateEntity {
+            name,
+            props,
+            always_create,
+            ..
+        } => create_entity(
+            &db,
+            write_scope,
+            name,
+            props.as_deref(),
+            always_create,
+            cli.pretty,
+        ),
         Command::Link {
             from,
             to,
@@ -391,8 +401,50 @@ fn create_memory(db: &Db, scope: Scope, content: String, props: Option<&str>, pr
     output::ok(&serde_json::json!({ "id": id.to_string() }), pretty);
 }
 
-fn create_entity(db: &Db, scope: Scope, name: String, props: Option<&str>, pretty: bool) -> ! {
+fn create_entity(
+    db: &Db,
+    scope: Scope,
+    name: String,
+    props: Option<&str>,
+    always_create: bool,
+    pretty: bool,
+) -> ! {
     let extra = parse_props_arg(props);
+    if !always_create {
+        // Same collision surface as `remember`: write scope + shared.
+        let lookup = topodb_json::scopes_to_scope_set(&[scope, Scope::Shared]);
+        let existing = match topodb_json::find_existing_entity(db, &lookup, &name) {
+            Ok(hit) => hit,
+            Err(e) => output::fail_engine(&e),
+        };
+        if let Some(node) = existing {
+            // Merge only NEW metadata keys; never overwrite, never touch name.
+            let incoming = match &extra {
+                Some(v) => match topodb_json::json_to_props(v) {
+                    Ok(p) => p,
+                    Err(e) => output::fail("rejected", &e, 2),
+                },
+                None => topodb::Props::new(),
+            };
+            let new_keys: std::collections::BTreeMap<String, Option<PropValue>> = incoming
+                .into_iter()
+                .filter(|(k, _)| k != topodb_json::ENTITY_NAME_PROP && !node.props.contains_key(k))
+                .map(|(k, v)| (k, Some(v)))
+                .collect();
+            if !new_keys.is_empty() {
+                if let Err(e) = db.submit(vec![Op::SetNodeProps {
+                    id: node.id,
+                    props: new_keys,
+                }]) {
+                    output::fail_engine(&e);
+                }
+            }
+            output::ok(
+                &serde_json::json!({ "id": node.id.to_string(), "created": false }),
+                pretty,
+            );
+        }
+    }
     let props = match topodb_json::merge_required_prop(
         topodb_json::ENTITY_NAME_PROP,
         PropValue::Str(name),
@@ -411,7 +463,10 @@ fn create_entity(db: &Db, scope: Scope, name: String, props: Option<&str>, prett
     if let Err(e) = db.submit(vec![op]) {
         output::fail_engine(&e);
     }
-    output::ok(&serde_json::json!({ "id": id.to_string() }), pretty);
+    output::ok(
+        &serde_json::json!({ "id": id.to_string(), "created": true }),
+        pretty,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
