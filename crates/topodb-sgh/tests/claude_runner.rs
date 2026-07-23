@@ -211,7 +211,7 @@ fn interpret_result_leaves_prose_alone_when_no_json_is_expected() {
 
 #[test]
 fn build_argv_with_no_grants_includes_base_allowed_tools() {
-    let argv = build_argv(None, vec![]);
+    let argv = build_argv("Test prompt".to_string(), None, &[]);
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -221,7 +221,7 @@ fn build_argv_with_no_grants_includes_base_allowed_tools() {
 
 #[test]
 fn build_argv_with_single_grant_appends_bash_grant() {
-    let argv = build_argv(None, vec!["topodb".to_string()]);
+    let argv = build_argv("Test prompt".to_string(), None, &["topodb".to_string()]);
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -231,7 +231,11 @@ fn build_argv_with_single_grant_appends_bash_grant() {
 
 #[test]
 fn build_argv_with_multiple_grants_appends_all_in_order() {
-    let argv = build_argv(None, vec!["topodb".to_string(), "cargo".to_string()]);
+    let argv = build_argv(
+        "Test prompt".to_string(),
+        None,
+        &["topodb".to_string(), "cargo".to_string()],
+    );
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -244,7 +248,11 @@ fn build_argv_with_multiple_grants_appends_all_in_order() {
 
 #[test]
 fn build_argv_with_model_includes_model_flag() {
-    let argv = build_argv(Some("claude-opus".to_string()), vec![]);
+    let argv = build_argv(
+        "Test prompt".to_string(),
+        Some("claude-opus".to_string()),
+        &[],
+    );
     let has_model = argv
         .iter()
         .position(|arg| arg == "--model")
@@ -258,7 +266,7 @@ fn build_argv_with_model_includes_model_flag() {
 
 #[test]
 fn build_argv_includes_base_flags() {
-    let argv = build_argv(None, vec![]);
+    let argv = build_argv("Test prompt".to_string(), None, &[]);
     assert!(
         argv.iter().any(|arg| arg == "-p"),
         "argv should include -p flag"
@@ -275,6 +283,46 @@ fn build_argv_includes_base_flags() {
         argv[idx + 1],
         "json",
         "argv should have json as output-format value"
+    );
+}
+
+#[test]
+fn build_argv_full_order_empty_grants_with_model() {
+    let argv = build_argv(
+        "Do the thing".to_string(),
+        Some("claude-opus".to_string()),
+        &[],
+    );
+    assert_eq!(
+        argv,
+        vec![
+            "claude",
+            "-p",
+            "Do the thing",
+            "--allowedTools",
+            "Read,Write,Edit",
+            "--output-format",
+            "json",
+            "--model",
+            "claude-opus",
+        ]
+    );
+}
+
+#[test]
+fn build_argv_full_order_one_grant_no_model() {
+    let argv = build_argv("Fix the code".to_string(), None, &["topodb".to_string()]);
+    assert_eq!(
+        argv,
+        vec![
+            "claude",
+            "-p",
+            "Fix the code",
+            "--allowedTools",
+            "Read,Write,Edit,Bash(topodb:*)",
+            "--output-format",
+            "json",
+        ]
     );
 }
 
