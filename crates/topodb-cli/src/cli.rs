@@ -268,10 +268,10 @@ pub enum Command {
     /// Submit a batch of high-level commands (a JSON array) atomically. Each
     /// command's `op` matches an MCP tool name, but field names are the batch
     /// DSL's own (not always identical to the tool's param names); `#N` in an
-    /// id field refers to the id produced by the Nth (earlier) command. Reads
-    /// from the given file, or from stdin when the path is `-` or omitted.
-    /// Prints `{"ids":[...]}` (null for commands that produce no id).
-    /// All-or-nothing.
+    /// id field refers to the id produced by the Nth earlier command (0-indexed:
+    /// `#0` is the first command). Reads from the given file, or from stdin when
+    /// the path is `-` or omitted. Prints `{"ids":[...]}` (null for commands
+    /// that produce no id). All-or-nothing.
     ///
     /// Per-op fields: create_memory { content, scope?, props? };
     /// create_entity { name, scope?, props? };
