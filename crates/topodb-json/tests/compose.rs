@@ -284,3 +284,124 @@ fn validate_succeeds_with_valid_entity() {
     };
     assert_eq!(r.validate().unwrap(), "about");
 }
+
+#[test]
+fn superseded_content_does_not_dedup_and_mints_a_fresh_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let old = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        1_000,
+        &req("db is postgres", &["vega"]),
+    )
+    .unwrap();
+    db.submit(old.ops).unwrap();
+    let mut sup = req("db is sqlite", &["vega"]);
+    sup.supersedes = vec![old.memory_id.to_string()];
+    db.submit(
+        plan_remember(&db, Scope::Shared, &lookup(), 2_000, &sup)
+            .unwrap()
+            .ops,
+    )
+    .unwrap();
+    // Re-remember the retired content: must NOT dedup to the tombstone.
+    let again = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        3_000,
+        &req("db is postgres", &["vega"]),
+    )
+    .unwrap();
+    assert!(!again.deduplicated, "superseded content must not dedup");
+    assert_ne!(
+        again.memory_id, old.memory_id,
+        "fresh live memory, not the tombstone"
+    );
+    db.submit(again.ops).unwrap();
+    // Tombstone untouched; new node has no stamp.
+    let tomb = db.node(&lookup(), old.memory_id).unwrap();
+    assert_eq!(tomb.props[MEMORY_SUPERSEDED_AT_PROP], PropValue::Int(2_000));
+    let fresh = db.node(&lookup(), again.memory_id).unwrap();
+    assert!(!fresh.props.contains_key(MEMORY_SUPERSEDED_AT_PROP));
+}
+
+#[test]
+fn alias_name_resolves_to_canonical_entity() {
+    use topodb_json::{ALIAS_EDGE_TYPE, ALIAS_LABEL, ALIAS_NAME_PROP};
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let seeded = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        1_000,
+        &req("vega exists", &["vega"]),
+    )
+    .unwrap();
+    let canonical = seeded.entities[0].id;
+    db.submit(seeded.ops).unwrap();
+    // Seed an Alias node + alias_of edge via raw ops.
+    let alias_id = topodb::NodeId::new();
+    let mut props = topodb::Props::new();
+    props.insert(
+        ALIAS_NAME_PROP.into(),
+        PropValue::Str("the vega project".into()),
+    );
+    db.submit(vec![
+        topodb::Op::CreateNode {
+            id: alias_id,
+            scope: Scope::Shared,
+            label: ALIAS_LABEL.into(),
+            props,
+        },
+        topodb::Op::CreateEdge {
+            id: topodb::EdgeId::new(),
+            scope: Scope::Shared,
+            ty: ALIAS_EDGE_TYPE.into(),
+            from: alias_id,
+            to: canonical,
+            props: topodb::Props::new(),
+            valid_from: None,
+        },
+    ])
+    .unwrap();
+    // Remember via the ALIAS name: must resolve to the canonical entity.
+    let plan = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        2_000,
+        &req("a fact", &["the vega project"]),
+    )
+    .unwrap();
+    assert!(
+        !plan.entities[0].created,
+        "alias must resolve, not mint a duplicate"
+    );
+    assert_eq!(plan.entities[0].id, canonical);
+    assert_eq!(plan.edge_ids.len(), 1);
+}
+
+#[test]
+fn memory_props_rejects_reserved_keys_and_stamps_hash() {
+    use topodb_json::memory_props;
+    for key in ["content_hash", "superseded_at"] {
+        let extra = serde_json::json!({ key: "boom" });
+        let err = memory_props("a fact", Some(&extra)).unwrap_err();
+        assert!(err.contains(key), "error must name the reserved key: {err}");
+        assert!(err.contains("maintained by the engine write path"), "{err}");
+    }
+    // `content` collision still rejected via merge_required_prop.
+    assert!(memory_props("a fact", Some(&serde_json::json!({"content": "x"}))).is_err());
+    // Happy path: content + stamped hash + extra key.
+    let props = memory_props("a fact", Some(&serde_json::json!({"source": "chat"}))).unwrap();
+    assert_eq!(props["content"], PropValue::Str("a fact".into()));
+    assert_eq!(
+        props["content_hash"],
+        PropValue::Str(content_hash("a fact"))
+    );
+    assert_eq!(props["source"], PropValue::Str("chat".into()));
+}

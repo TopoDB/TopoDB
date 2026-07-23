@@ -67,6 +67,34 @@ pub fn content_hash(content: &str) -> String {
     format!("{h:016x}")
 }
 
+/// Builds a new Memory node's props: caller `extra` is validated (the
+/// system-maintained keys below are rejected, and `content` collides via
+/// merge_required_prop), then the whitespace-normalized content hash is
+/// stamped. The ONE constructor for every front end's new-memory write
+/// (plan_remember, MCP create_memory, CLI create-memory) — so the reserved
+/// set cannot drift between surfaces.
+pub fn memory_props(content: &str, extra: Option<&Value>) -> Result<Props, String> {
+    if let Some(Value::Object(map)) = extra {
+        for reserved in [MEMORY_CONTENT_HASH_PROP, MEMORY_SUPERSEDED_AT_PROP] {
+            if map.contains_key(reserved) {
+                return Err(format!(
+                    "props must not include {reserved:?}: it is maintained by the engine write path"
+                ));
+            }
+        }
+    }
+    let mut props = merge_required_prop(
+        MEMORY_CONTENT_PROP,
+        PropValue::Str(content.to_string()),
+        extra,
+    )?;
+    props.insert(
+        MEMORY_CONTENT_HASH_PROP.into(),
+        PropValue::Str(content_hash(content)),
+    );
+    Ok(props)
+}
+
 /// Canonical entities for `name`: direct (Entity, name) matches plus
 /// (Alias, name) matches followed through alias_of. Deduped by id,
 /// oldest first.
@@ -127,7 +155,9 @@ pub fn find_existing_entity(
 
 /// The id of a Memory in `write_scope` whose normalized content equals
 /// `content`. Hash-bucket lookup, then exact normalized-content verify on
-/// every candidate; oldest id wins.
+/// every candidate; oldest id wins. Superseded memories (those with a
+/// `superseded_at` timestamp) are excluded — re-learning a retired fact is
+/// a NEW fact, and the tombstone's `as_of` history stays intact.
 pub fn existing_memory(
     db: &Db,
     write_scope: Scope,
@@ -145,7 +175,8 @@ pub fn existing_memory(
     Ok(candidates
         .into_iter()
         .filter(|n| {
-            matches!(n.props.get(MEMORY_CONTENT_PROP), Some(PropValue::Str(c)) if normalize_content(c) == want)
+            !n.props.contains_key(MEMORY_SUPERSEDED_AT_PROP)
+                && matches!(n.props.get(MEMORY_CONTENT_PROP), Some(PropValue::Str(c)) if normalize_content(c) == want)
         })
         .min_by_key(|n| n.id)
         .map(|n| n.id))
@@ -318,14 +349,8 @@ pub fn plan_remember(
     let mut ops: Vec<Op> = Vec::new();
     let mut new_memory = None;
     if !deduplicated {
-        let hash = content_hash(&req.content);
-        let mut props = merge_required_prop(
-            MEMORY_CONTENT_PROP,
-            PropValue::Str(req.content.clone()),
-            req.props.as_ref(),
-        )
-        .map_err(ComposeError::Invalid)?;
-        props.insert(MEMORY_CONTENT_HASH_PROP.into(), PropValue::Str(hash));
+        let props =
+            memory_props(&req.content, req.props.as_ref()).map_err(ComposeError::Invalid)?;
         ops.push(Op::CreateNode {
             id: memory_id,
             scope: write_scope,
