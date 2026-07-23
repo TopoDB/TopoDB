@@ -362,6 +362,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 print_unconstrained(&current);
 
+                // The gate preview above (commands + grants) prints on stdout
+                // whether or not a prompt follows, so a --yes run is never
+                // silent about the widened surface — no separate stderr echo.
                 if needs_prompt(is_revision, yes, yes_including_revisions) {
                     println!("\nProceed? [y/N]");
                     let mut line = String::new();
@@ -369,13 +372,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !line.trim().eq_ignore_ascii_case("y") {
                         println!("aborted");
                         return Ok(());
-                    }
-                } else if !grants.is_empty() {
-                    // With --yes or --yes-including-revisions and non-empty grants,
-                    // echo the same lines to stderr before execution (no prompt, no silence).
-                    eprintln!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
-                    for grant in &grants {
-                        eprintln!("  {grant}:*");
                     }
                 }
 
