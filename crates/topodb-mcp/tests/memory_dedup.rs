@@ -218,3 +218,71 @@ fn find_duplicate_memories_text_fallback_with_embeddings_off() {
         "should find the overlapping pair: {result:#?}"
     );
 }
+
+#[test]
+fn find_duplicate_memories_exact_boundary_at_0_6() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &["--scope", A, "--embeddings", "off"],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // Seed two memories with token Jaccard exactly 0.6:
+    // "alpha beta gamma delta" → {alpha, beta, gamma, delta}
+    // "alpha beta gamma epsilon" → {alpha, beta, gamma, epsilon}
+    // Intersection: {alpha, beta, gamma} = 3
+    // Union: {alpha, beta, gamma, delta, epsilon} = 5
+    // Jaccard = 3/5 = 0.6
+    let exact_boundary1 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "alpha beta gamma delta" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let exact_boundary2 = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "alpha beta gamma epsilon" }),
+        DEFAULT_TIMEOUT,
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Call find_duplicate_memories with min_similarity 0.6 (should include the boundary pair).
+    let result = s.call_tool_ok(
+        "find_duplicate_memories",
+        serde_json::json!({ "min_similarity": 0.6 }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Check that we found the pair with exactly 0.6 similarity.
+    let pairs = result["pairs"].as_array().unwrap();
+    assert!(
+        !pairs.is_empty(),
+        "should find at least 1 pair at exactly 0.6 boundary: {result:#?}"
+    );
+
+    let pair = &pairs[0];
+    let ids = pair["ids"].as_array().unwrap();
+    let pair_ids_set = (
+        ids[0].as_str().unwrap().to_string(),
+        ids[1].as_str().unwrap().to_string(),
+    );
+    let expected_pair = if exact_boundary1 <= exact_boundary2 {
+        (exact_boundary1.clone(), exact_boundary2.clone())
+    } else {
+        (exact_boundary2.clone(), exact_boundary1.clone())
+    };
+
+    assert_eq!(
+        pair_ids_set, expected_pair,
+        "should find the exact 0.6 boundary pair: {result:#?}"
+    );
+    assert!(
+        (pair["similarity"].as_f64().unwrap() - 0.6).abs() < 0.001,
+        "pair similarity should be approximately 0.6: {result:#?}"
+    );
+}

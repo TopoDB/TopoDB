@@ -573,25 +573,33 @@ const NEAR_DUP_REVIEW: f32 = 0.68;
 /// meaningful overlap without false positives on tangentially-related content.
 const TEXT_NEAR_DUP_JACCARD: f64 = 0.6;
 
-/// Jaccard similarity of two strings' token sets (lowercase, whitespace-split).
-/// Returns 1.0 if both strings are empty.
-fn token_jaccard(a: &str, b: &str) -> f64 {
-    use std::collections::BTreeSet;
-    let tokens_a: BTreeSet<String> = a.split_whitespace().map(|t| t.to_lowercase()).collect();
-    let tokens_b: BTreeSet<String> = b.split_whitespace().map(|t| t.to_lowercase()).collect();
-
-    if tokens_a.is_empty() && tokens_b.is_empty() {
+/// Jaccard similarity of two precomputed token sets.
+/// Returns 1.0 if both sets are empty.
+fn jaccard_of_sets(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> f64 {
+    if a.is_empty() && b.is_empty() {
         return 1.0;
     }
 
-    let intersection = tokens_a.intersection(&tokens_b).count() as f64;
-    let union = tokens_a.union(&tokens_b).count() as f64;
+    let intersection = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
 
     if union == 0.0 {
         1.0
     } else {
         intersection / union
     }
+}
+
+/// Jaccard similarity of two strings' token sets (lowercase, whitespace-split).
+/// Returns 1.0 if both strings are empty.
+fn token_jaccard(a: &str, b: &str) -> f64 {
+    use std::collections::BTreeSet;
+    let tokens_a: BTreeSet<String> = a.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let tokens_b: BTreeSet<String> = b.split_whitespace().map(|t| t.to_lowercase()).collect();
+    jaccard_of_sets(&tokens_a, &tokens_b)
 }
 
 /// Confidence band for a near-dup similarity: `"likely"` at/above the strong
@@ -1052,7 +1060,8 @@ struct FindDuplicateMemoriesParams {
     /// the same near-dup floor write-time detection uses (0.80): the default
     /// model scores the same fact in different words ~0.83, unrelated facts well
     /// under 0.5. Raise it for stricter matches, lower to cast a wider (noisier)
-    /// net.
+    /// net. Ignored in text mode; text mode always uses the fixed token-Jaccard
+    /// floor (0.6).
     #[serde(default = "default_dup_similarity")]
     #[schemars(range(min = 0.0, max = 1.0))]
     min_similarity: f32,
@@ -1080,7 +1089,7 @@ fn default_dup_limit() -> u32 {
 }
 
 /// One unordered pair of near-duplicate memories found by `find_duplicate_memories`.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 struct DuplicatePair {
     /// The two memories' ULIDs (ascending, so a pair is reported once).
     ids: [String; 2],
@@ -2301,35 +2310,36 @@ impl TopoServer {
         // Text detection uses TEXT_NEAR_DUP_JACCARD as its floor (0.6), not the
         // vector similarity threshold. This provides a consistent text-based signal
         // independent of vector tuning parameters.
-        let text_min_sim = TEXT_NEAR_DUP_JACCARD as f32;
+        // Precompute token sets to avoid repeated tokenization in the pairwise loop.
+        use std::collections::BTreeSet;
+        let token_sets: Vec<BTreeSet<String>> = text_candidates
+            .iter()
+            .map(|(_, content)| {
+                content
+                    .split_whitespace()
+                    .map(|t| t.to_lowercase())
+                    .collect()
+            })
+            .collect();
+
         let mut pairs: Vec<DuplicatePair> = Vec::new();
-        let mut seen_pairs: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
 
         for i in 0..text_candidates.len() {
             for j in (i + 1)..text_candidates.len() {
-                let jaccard = token_jaccard(&text_candidates[i].1, &text_candidates[j].1);
-                if jaccard >= text_min_sim as f64 {
+                let jaccard = jaccard_of_sets(&token_sets[i], &token_sets[j]);
+                if jaccard >= TEXT_NEAR_DUP_JACCARD {
                     let (a, b) = (&text_candidates[i], &text_candidates[j]);
                     // Canonical (ascending-id) order so a pair is reported once.
-                    let (lo_id, hi_id) = if a.0 <= b.0 {
-                        (a.0.clone(), b.0.clone())
-                    } else {
-                        (b.0.clone(), a.0.clone())
-                    };
-                    let pair_key = (lo_id.clone(), hi_id.clone());
-                    if seen_pairs.insert(pair_key) {
-                        let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
-                        // Text mode cannot distinguish duplicates from supersessions.
-                        // All pairs are reported as "duplicate"; the split requires vectors.
-                        pairs.push(DuplicatePair {
-                            ids: [lo.0.clone(), hi.0.clone()],
-                            similarity: jaccard as f32,
-                            band: dup_band(jaccard as f32).to_string(),
-                            relation: "duplicate".to_string(),
-                            contents: [lo.1.clone(), hi.1.clone()],
-                        });
-                    }
+                    let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                    // Text mode cannot distinguish duplicates from supersessions.
+                    // All pairs are reported as "duplicate"; the split requires vectors.
+                    pairs.push(DuplicatePair {
+                        ids: [lo.0.clone(), hi.0.clone()],
+                        similarity: jaccard as f32,
+                        band: dup_band(jaccard as f32).to_string(),
+                        relation: "duplicate".to_string(),
+                        contents: [lo.1.clone(), hi.1.clone()],
+                    });
                 }
             }
         }
@@ -2642,7 +2652,7 @@ impl TopoServer {
         let (mut sample_duplicates, supersessions): (Vec<DuplicatePair>, Vec<DuplicatePair>) =
             if dups.method == "text" {
                 // Text mode: all pairs are duplicates, none are supersessions.
-                (dups.pairs.clone(), Vec::new())
+                (dups.pairs.into_iter().collect(), Vec::new())
             } else {
                 // Vector mode: split by relation.
                 dups.pairs
