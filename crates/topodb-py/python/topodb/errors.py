@@ -4,6 +4,8 @@ class TopoDBError(Exception):
 class StorageError(TopoDBError): pass
 class EncodingError(TopoDBError): pass
 class RejectedError(TopoDBError): pass
+class BusyError(TopoDBError):
+    """Database file is held by another process. The operation may be retried."""
 
 class CompactedError(TopoDBError):
     def __init__(self, msg, oldest=None):
