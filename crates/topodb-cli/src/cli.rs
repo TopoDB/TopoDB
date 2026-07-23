@@ -172,6 +172,11 @@ pub enum Command {
         /// every type.
         #[arg(long = "edge-type")]
         edge_type: Vec<String>,
+        /// View the graph as it was at this Unix-millisecond instant: only
+        /// edges live at that time are followed (closed edges whose
+        /// validity covered it reappear; later edges vanish). Omitted = now.
+        #[arg(long)]
+        as_of: Option<i64>,
     },
     /// Read a node's access statistics (count, last-accessed timestamp).
     /// `{"found":false}` (exit 0) if the node doesn't exist or is out of the

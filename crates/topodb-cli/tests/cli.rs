@@ -1531,3 +1531,64 @@ fn remember_edge_type_and_props_land() {
         "normalized edge type, got {types:?}"
     );
 }
+
+#[test]
+fn traverse_as_of_shows_the_past_topology() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let j = |o: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    // Build: memory M -about-> entity old_home, edge later closed; then M -about-> new_home.
+    let m = j(&run(&["create-memory", "--content", "the service moved"]));
+    let old_home = j(&run(&["create-entity", "--name", "old-home"]));
+    let new_home = j(&run(&["create-entity", "--name", "new-home"]));
+    let (m, old_home, new_home) = (
+        m["id"].as_str().unwrap().to_string(),
+        old_home["id"].as_str().unwrap().to_string(),
+        new_home["id"].as_str().unwrap().to_string(),
+    );
+    let e1 = j(&run(&[
+        "link", "--from", &m, "--to", &old_home, "--type", "about",
+    ]));
+    // Capture a timestamp strictly between edge1's creation and its closure.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let mid = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    run(&["close-edge", e1["id"].as_str().unwrap()]);
+    run(&["link", "--from", &m, "--to", &new_home, "--type", "about"]);
+    let names = |v: &serde_json::Value| -> Vec<String> {
+        v["subgraph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["props"]["name"].as_str().map(String::from))
+            .collect()
+    };
+    // Now: new-home reachable, old-home not.
+    let now_view = j(&run(&["traverse", &m, "--max-hops", "1"]));
+    assert!(names(&now_view).contains(&"new-home".to_string()));
+    assert!(!names(&now_view).contains(&"old-home".to_string()));
+    // As of `mid`: old-home reachable, new-home not.
+    let past_view = j(&run(&["traverse", &m, "--max-hops", "1", "--as-of", &mid]));
+    assert!(
+        names(&past_view).contains(&"old-home".to_string()),
+        "closed edge must reappear at as_of"
+    );
+    assert!(
+        !names(&past_view).contains(&"new-home".to_string()),
+        "later edge must vanish at as_of"
+    );
+    // Validation: non-positive rejected.
+    let bad = run(&["traverse", &m, "--as-of", "0"]);
+    assert_eq!(bad.status.code(), Some(2));
+}
