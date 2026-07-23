@@ -197,3 +197,144 @@ fn alias_query_surfaces_entity_via_graph_seed_not_alias() {
         "the Alias plumbing node must not surface in default results: {res}"
     );
 }
+
+#[test]
+fn entity_ranks_below_memory_by_default() {
+    let (_dir, mut server) = fresh_server();
+    // A memory whose content shares a word with an entity's name.
+    let _mem = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the login flow breaks on big cookies" }),
+        DEFAULT_TIMEOUT,
+    );
+    server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "login" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Search for "login trouble" — matches the memory content directly and
+    // the entity name. With the default label_weights (Entity: 0.5), the
+    // Entity hit should rank BELOW the Memory hit.
+    let res = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "login trouble", "k": 10 }),
+        DEFAULT_TIMEOUT,
+    );
+    let hits = res["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "the search must find results: {res}");
+
+    let mut memory_idx = None;
+    let mut entity_idx = None;
+    for (i, hit) in hits.iter().enumerate() {
+        let label = hit["node"]["label"].as_str().unwrap();
+        if label == "Memory" && memory_idx.is_none() {
+            memory_idx = Some(i);
+        }
+        if label == "Entity" && entity_idx.is_none() {
+            entity_idx = Some(i);
+        }
+    }
+
+    assert!(memory_idx.is_some(), "the memory must be in results: {res}");
+    assert!(entity_idx.is_some(), "the entity must be in results: {res}");
+
+    let memory_idx = memory_idx.unwrap();
+    let entity_idx = entity_idx.unwrap();
+    assert!(
+        memory_idx < entity_idx,
+        "Memory at position {memory_idx} must rank ABOVE Entity at position {entity_idx} with default label_weights: {res}"
+    );
+}
+
+#[test]
+fn empty_label_weights_restores_old_order() {
+    let (_dir, mut server) = fresh_server();
+    server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the login flow breaks on big cookies" }),
+        DEFAULT_TIMEOUT,
+    );
+    server.call_tool_ok(
+        "create_entity",
+        serde_json::json!({ "name": "login" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Search with default label_weights (Entity: 0.5)
+    let res_default = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "login trouble", "k": 10 }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Search with explicit empty label_weights (no down-weighting)
+    let res_empty = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "login trouble", "k": 10, "label_weights": {} }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Find Entity hits in both results
+    let find_entity_score = |hits: &serde_json::Value| -> Option<f32> {
+        hits.as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["node"]["label"].as_str().unwrap() == "Entity")
+            .map(|h| h["score"].as_f64().unwrap() as f32)
+    };
+
+    let score_default = find_entity_score(&res_default["hits"]);
+    let score_empty = find_entity_score(&res_empty["hits"]);
+
+    assert!(
+        score_default.is_some() && score_empty.is_some(),
+        "Entity must appear in both searches: default={res_default}, empty={res_empty}"
+    );
+
+    let score_default = score_default.unwrap();
+    let score_empty = score_empty.unwrap();
+
+    // With Entity: 0.5, the score should be exactly half of the no-weight score
+    // (within float tolerance).
+    let ratio = score_default / score_empty;
+    let tolerance = 0.0001;
+    assert!(
+        (ratio - 0.5).abs() < tolerance,
+        "Entity score with default (0.5) should be ~0.5x the score with {{}}: {score_default} vs {score_empty}, ratio={ratio}"
+    );
+}
+
+#[test]
+fn label_weights_validation() {
+    let (_dir, mut server) = fresh_server();
+    server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "basalt columns form hexagons" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Test 1: negative weight should be rejected
+    let resp = server.call_tool(
+        "search_memories",
+        serde_json::json!({ "query": "basalt", "k": 5, "label_weights": {"Entity": -1.0} }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+
+    // Test 2: infinite weight (use 1e999 which might parse to inf, or 11.0 to exceed max)
+    let resp = server.call_tool(
+        "search_memories",
+        serde_json::json!({ "query": "basalt", "k": 5, "label_weights": {"Entity": 11.0} }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+
+    // Test 3: empty label name
+    let resp = server.call_tool(
+        "search_memories",
+        serde_json::json!({ "query": "basalt", "k": 5, "label_weights": {"": 0.5} }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}

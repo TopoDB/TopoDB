@@ -1287,6 +1287,15 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(range(min = 0.0, max = 1.0))]
     access_weight: f32,
+    /// Post-fusion multipliers for node labels (default: {"Entity": 0.5}).
+    /// For each label, multiply its matching nodes' scores by the given factor
+    /// (0.0-10.0). Omitted defaults to {"Entity": 0.5} — entity hits are
+    /// down-weighted so that question-shaped queries surface facts (memories)
+    /// first. Pass `{}` explicitly to restore old behavior (no down-weighting).
+    /// Factors must be finite JSON numbers in the range 0.0-10.0; invalid labels
+    /// or out-of-range values are rejected with invalid_params.
+    #[serde(default)]
+    label_weights: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2446,7 +2455,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting."
     )]
     fn search_memories(
         &self,
@@ -2504,6 +2513,68 @@ impl TopoServer {
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
         };
+
+        // Process label_weights: convert from JSON map to Vec<(String, f32)>.
+        // Omitted => {"Entity": 0.5}; explicit {} => empty (old behavior);
+        // values must be finite JSON numbers in 0.0-10.0 range.
+        let label_weights = match p.label_weights {
+            None => {
+                // Default: Entity down-weighted to 0.5
+                vec![(ENTITY_LABEL.to_string(), 0.5)]
+            }
+            Some(map) if map.is_empty() => {
+                // Explicit empty map => old behavior (no down-weighting)
+                vec![]
+            }
+            Some(map) => {
+                // Validate and convert each entry
+                let mut weights = Vec::new();
+                for (label, value) in map {
+                    // Reject empty label names
+                    if label.is_empty() {
+                        return Err(ErrorData::invalid_params(
+                            "label_weights: label name cannot be empty".to_string(),
+                            None,
+                        ));
+                    }
+
+                    // Extract and validate the numeric value
+                    let f = match value.as_f64() {
+                        Some(num) if !num.is_finite() => {
+                            return Err(ErrorData::invalid_params(
+                                format!(
+                                    "label_weights[{:?}]: value must be a finite number, got {}",
+                                    label, num
+                                ),
+                                None,
+                            ));
+                        }
+                        Some(num) if !(0.0..=10.0).contains(&num) => {
+                            return Err(ErrorData::invalid_params(
+                                format!(
+                                    "label_weights[{:?}]: value must be in range 0.0-10.0, got {}",
+                                    label, num
+                                ),
+                                None,
+                            ));
+                        }
+                        Some(num) => num as f32,
+                        None => {
+                            return Err(ErrorData::invalid_params(
+                                format!(
+                                    "label_weights[{:?}]: value must be a JSON number, got {}",
+                                    label, value
+                                ),
+                                None,
+                            ));
+                        }
+                    };
+                    weights.push((label, f));
+                }
+                weights
+            }
+        };
+
         let query = RecallQuery {
             // None when the embedder isn't Ready (or errors on this text) —
             // recall then degrades to text/graph legs only.
@@ -2522,6 +2593,7 @@ impl TopoServer {
             vector_weight: p.vector_weight,
             graph_weight: p.graph_weight,
             access_weight: p.access_weight,
+            label_weights,
             ..RecallQuery::new(scope_set, p.query.clone(), p.k)
         };
         // `recall` opens redb read transactions, so unlike the pure snapshot
