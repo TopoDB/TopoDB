@@ -350,3 +350,226 @@ fn validation_errors_precede_scope_resolution() {
         "expected entities error, got: {error_msg}, full response: {resp}"
     );
 }
+
+#[test]
+fn remember_rejects_reserved_props_keys() {
+    let (_dir, mut server) = fresh_server();
+
+    // remember with content_hash in props must be rejected.
+    let resp = server.call_tool(
+        "remember",
+        serde_json::json!({
+            "content": "fact A",
+            "entities": ["X"],
+            "props": { "content_hash": "x" }
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    common::expect_tool_error(&resp);
+    let error_msg = if let Some(err) = resp.get("error") {
+        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+    } else if let Some(result) = resp.get("result") {
+        result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    assert!(
+        error_msg.contains("content_hash")
+            && error_msg.contains("maintained by the engine write path"),
+        "expected content_hash rejection, got: {error_msg}"
+    );
+
+    // remember with superseded_at in props must also be rejected.
+    let resp = server.call_tool(
+        "remember",
+        serde_json::json!({
+            "content": "fact B",
+            "entities": ["X"],
+            "props": { "superseded_at": 12345 }
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    common::expect_tool_error(&resp);
+    let error_msg = if let Some(err) = resp.get("error") {
+        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+    } else if let Some(result) = resp.get("result") {
+        result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    assert!(
+        error_msg.contains("superseded_at")
+            && error_msg.contains("maintained by the engine write path"),
+        "expected superseded_at rejection, got: {error_msg}"
+    );
+
+    // create_memory with content_hash in props must be rejected.
+    let resp = server.call_tool(
+        "create_memory",
+        serde_json::json!({
+            "content": "fact C",
+            "props": { "content_hash": "x" }
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    common::expect_tool_error(&resp);
+    let error_msg = if let Some(err) = resp.get("error") {
+        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+    } else if let Some(result) = resp.get("result") {
+        result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    assert!(
+        error_msg.contains("content_hash")
+            && error_msg.contains("maintained by the engine write path"),
+        "expected content_hash rejection in create_memory, got: {error_msg}"
+    );
+
+    // create_memory with superseded_at in props must also be rejected.
+    let resp = server.call_tool(
+        "create_memory",
+        serde_json::json!({
+            "content": "fact D",
+            "props": { "superseded_at": 12345 }
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    common::expect_tool_error(&resp);
+    let error_msg = if let Some(err) = resp.get("error") {
+        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+    } else if let Some(result) = resp.get("result") {
+        result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    assert!(
+        error_msg.contains("superseded_at")
+            && error_msg.contains("maintained by the engine write path"),
+        "expected superseded_at rejection in create_memory, got: {error_msg}"
+    );
+}
+
+#[test]
+fn re_remember_of_superseded_content_mints_fresh_memory() {
+    let (_dir, mut server) = fresh_server();
+
+    // Store fact A.
+    let res_a = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "fact A content",
+            "entities": ["Entity1"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_a = res_a["memory_id"].as_str().unwrap().to_string();
+
+    // Store fact B, superseding fact A.
+    let res_b = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "fact B content",
+            "entities": ["Entity1"],
+            "supersedes": [memory_a.clone()]
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_b = res_b["memory_id"].as_str().unwrap().to_string();
+
+    // Re-remember fact A's content: should NOT dedup to the superseded node,
+    // but instead return a fresh memory with deduplicated: false.
+    let res_re_a = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "fact A content",
+            "entities": ["Entity1"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_re_a = res_re_a["memory_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        res_re_a["deduplicated"], false,
+        "re-remember of superseded content must not dedup"
+    );
+    assert_ne!(
+        memory_re_a, memory_a,
+        "re-remember must return a fresh memory_id, not the superseded one"
+    );
+    assert_ne!(
+        memory_re_a, memory_b,
+        "re-remember must not return the other memory either"
+    );
+}
+
+#[test]
+fn create_memory_with_superseded_content_mints_fresh_memory() {
+    let (_dir, mut server) = fresh_server();
+
+    // Store fact A via remember.
+    let res_a = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "fact A content",
+            "entities": ["Entity1"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_a = res_a["memory_id"].as_str().unwrap().to_string();
+
+    // Store fact B via remember, superseding fact A.
+    server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "fact B content",
+            "entities": ["Entity1"],
+            "supersedes": [memory_a.clone()]
+        }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // create_memory with fact A's content: should NOT dedup to the superseded
+    // node, but instead return a fresh memory with deduplicated: false.
+    let res_create_a = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({
+            "content": "fact A content",
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let memory_create_a = res_create_a["id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        res_create_a["deduplicated"], false,
+        "create_memory with superseded content must not dedup"
+    );
+    assert_ne!(
+        memory_create_a, memory_a,
+        "create_memory must return a fresh memory_id, not the superseded one"
+    );
+}
