@@ -282,6 +282,9 @@ pub struct RememberPlan {
     /// ONE atomic batch; possibly empty (pure no-op). The caller submits.
     pub ops: Vec<Op>,
     pub memory_id: NodeId,
+    /// True iff content was found in an existing node in the write scope.
+    /// Note: if that node is in `superseded`, deduplicated is still false —
+    /// superseding a node you would otherwise dedup to means "replace it".
     pub deduplicated: bool,
     /// The content, iff a new Memory node is planned (callers with an
     /// embedder append `SetEmbedding` ops keyed on this).
@@ -301,9 +304,30 @@ pub fn plan_remember(
     req: &RememberRequest,
 ) -> Result<RememberPlan, ComposeError> {
     let ty = req.validate().map_err(ComposeError::Invalid)?;
+
+    // Validate reserved keys BEFORE the dedup check (so reserved keys are always rejected).
+    let memory_props_result =
+        memory_props(&req.content, req.props.as_ref()).map_err(ComposeError::Invalid)?;
+
+    // Parse the supersedes list early to detect self-supersede.
+    // If the dedup hit is in the supersedes list, treat it as a fresh node creation.
+    // Error strings match plan_supersede's parse errors exactly.
+    let mut supersedes_ids = BTreeSet::new();
+    for raw in &req.supersedes {
+        let id: NodeId = raw
+            .parse()
+            .map_err(|e| ComposeError::Invalid(format!("invalid node id {raw:?}: {e}")))?;
+        supersedes_ids.insert(id);
+    }
+
     let existing = existing_memory(db, write_scope, &req.content)?;
-    let deduplicated = existing.is_some();
-    let memory_id = existing.unwrap_or_else(NodeId::new);
+    // If we found a dedup match but it's in the supersedes list, treat as NOT deduplicated.
+    let deduplicated = existing.is_some() && !supersedes_ids.contains(&existing.unwrap());
+    let memory_id = if deduplicated {
+        existing.unwrap()
+    } else {
+        NodeId::new()
+    };
     let (supersede_ops, superseded) = plan_supersede(db, write_scope, &req.supersedes, now_ms)?;
 
     struct Resolved {
@@ -349,13 +373,11 @@ pub fn plan_remember(
     let mut ops: Vec<Op> = Vec::new();
     let mut new_memory = None;
     if !deduplicated {
-        let props =
-            memory_props(&req.content, req.props.as_ref()).map_err(ComposeError::Invalid)?;
         ops.push(Op::CreateNode {
             id: memory_id,
             scope: write_scope,
             label: MEMORY_LABEL.into(),
-            props,
+            props: memory_props_result,
         });
         new_memory = Some(req.content.clone());
     }

@@ -2801,6 +2801,9 @@ impl TopoServer {
         Parameters(p): Parameters<CreateMemoryParams>,
     ) -> Result<Json<CreateResult>, ErrorData> {
         let scope = self.resolve_scope(p.scope.as_deref())?;
+        // Validate reserved keys BEFORE the dedup check (so reserved keys are always rejected).
+        let props = convert::memory_props(&p.content, p.props.as_ref())
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
         // Dedup: re-storing an identical fact returns the existing node.
         if let Some(existing) = self.existing_memory(scope, &p.content)? {
             return Ok(Json(CreateResult {
@@ -2815,8 +2818,6 @@ impl TopoServer {
         // embedder isn't Ready — no semantic signal then.
         let embedding = self.embedder.embed(&p.content);
         let near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
-        let props = convert::memory_props(&p.content, p.props.as_ref())
-            .map_err(|e| ErrorData::invalid_params(e, None))?;
         let mut ops = vec![Op::CreateNode {
             id,
             scope,

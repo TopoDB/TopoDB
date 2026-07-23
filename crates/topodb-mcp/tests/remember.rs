@@ -265,6 +265,24 @@ fn op_kind(op: &serde_json::Value) -> String {
     op.as_object().unwrap().keys().next().unwrap().clone()
 }
 
+/// Extract error message from tool response. Handles both direct error objects
+/// and error messages wrapped in tool result content blocks.
+fn extract_error_message(resp: &serde_json::Value) -> &str {
+    if let Some(err) = resp.get("error") {
+        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+    } else if let Some(result) = resp.get("result") {
+        result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    }
+}
+
 #[test]
 fn remember_lands_as_one_contiguous_op_batch() {
     let dir = tempfile::tempdir().unwrap();
@@ -332,19 +350,7 @@ fn validation_errors_precede_scope_resolution() {
     );
     common::expect_tool_error(&resp);
     // Error structure: either JSON-RPC `error` (protocol error) or `result.isError`.
-    let error_msg = if let Some(err) = resp.get("error") {
-        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
-    } else if let Some(result) = resp.get("result") {
-        result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|first| first.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-    } else {
-        ""
-    };
+    let error_msg = extract_error_message(&resp);
     assert!(
         error_msg.contains("entities must contain at least one name"),
         "expected entities error, got: {error_msg}, full response: {resp}"
@@ -366,19 +372,7 @@ fn remember_rejects_reserved_props_keys() {
         DEFAULT_TIMEOUT,
     );
     common::expect_tool_error(&resp);
-    let error_msg = if let Some(err) = resp.get("error") {
-        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
-    } else if let Some(result) = resp.get("result") {
-        result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|first| first.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-    } else {
-        ""
-    };
+    let error_msg = extract_error_message(&resp);
     assert!(
         error_msg.contains("content_hash")
             && error_msg.contains("maintained by the engine write path"),
@@ -396,19 +390,7 @@ fn remember_rejects_reserved_props_keys() {
         DEFAULT_TIMEOUT,
     );
     common::expect_tool_error(&resp);
-    let error_msg = if let Some(err) = resp.get("error") {
-        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
-    } else if let Some(result) = resp.get("result") {
-        result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|first| first.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-    } else {
-        ""
-    };
+    let error_msg = extract_error_message(&resp);
     assert!(
         error_msg.contains("superseded_at")
             && error_msg.contains("maintained by the engine write path"),
@@ -425,19 +407,7 @@ fn remember_rejects_reserved_props_keys() {
         DEFAULT_TIMEOUT,
     );
     common::expect_tool_error(&resp);
-    let error_msg = if let Some(err) = resp.get("error") {
-        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
-    } else if let Some(result) = resp.get("result") {
-        result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|first| first.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-    } else {
-        ""
-    };
+    let error_msg = extract_error_message(&resp);
     assert!(
         error_msg.contains("content_hash")
             && error_msg.contains("maintained by the engine write path"),
@@ -454,24 +424,88 @@ fn remember_rejects_reserved_props_keys() {
         DEFAULT_TIMEOUT,
     );
     common::expect_tool_error(&resp);
-    let error_msg = if let Some(err) = resp.get("error") {
-        err.get("message").and_then(|m| m.as_str()).unwrap_or("")
-    } else if let Some(result) = resp.get("result") {
-        result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|first| first.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-    } else {
-        ""
-    };
+    let error_msg = extract_error_message(&resp);
     assert!(
         error_msg.contains("superseded_at")
             && error_msg.contains("maintained by the engine write path"),
         "expected superseded_at rejection in create_memory, got: {error_msg}"
     );
+}
+
+#[test]
+fn create_memory_rejects_reserved_keys_even_on_dedup() {
+    let (_dir, mut server) = fresh_server();
+
+    // First: create memory without props
+    let res1 = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({
+            "content": "x",
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(!res1["deduplicated"].as_bool().unwrap());
+
+    // Second: re-send the SAME content WITH reserved-key props → must be rejected, not deduplicated
+    for (content, reserved_key, reserved_val) in [
+        ("x", "content_hash", serde_json::json!("boom")),
+        ("x", "superseded_at", serde_json::json!(1)),
+    ] {
+        let resp = server.call_tool(
+            "create_memory",
+            serde_json::json!({
+                "content": content,
+                "props": { reserved_key: reserved_val }
+            }),
+            DEFAULT_TIMEOUT,
+        );
+        common::expect_tool_error(&resp);
+        let error_msg = extract_error_message(&resp);
+        assert!(
+            error_msg.contains(reserved_key)
+                && error_msg.contains("maintained by the engine write path"),
+            "expected {reserved_key} rejection even on dedup, got: {error_msg}"
+        );
+    }
+}
+
+#[test]
+fn remember_rejects_reserved_keys_even_on_dedup() {
+    let (_dir, mut server) = fresh_server();
+
+    // First: remember content with entity
+    let res1 = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "y",
+            "entities": ["E"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(!res1["deduplicated"].as_bool().unwrap());
+
+    // Second: re-send the SAME content WITH reserved-key props → must be rejected, not deduplicated
+    for (content, reserved_key, reserved_val) in [
+        ("y", "content_hash", serde_json::json!("boom")),
+        ("y", "superseded_at", serde_json::json!(1)),
+    ] {
+        let resp = server.call_tool(
+            "remember",
+            serde_json::json!({
+                "content": content,
+                "entities": ["E"],
+                "props": { reserved_key: reserved_val }
+            }),
+            DEFAULT_TIMEOUT,
+        );
+        common::expect_tool_error(&resp);
+        let error_msg = extract_error_message(&resp);
+        assert!(
+            error_msg.contains(reserved_key)
+                && error_msg.contains("maintained by the engine write path"),
+            "expected {reserved_key} rejection even on dedup, got: {error_msg}"
+        );
+    }
 }
 
 #[test]

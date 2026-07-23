@@ -248,6 +248,73 @@ fn validate_rejects_empty_entities() {
 }
 
 #[test]
+fn self_supersede_mints_fresh_not_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    // First: remember X with entity "vega"
+    let first = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        1_000,
+        &req("the fact", &["vega"]),
+    )
+    .unwrap();
+    assert!(!first.deduplicated);
+    let old_id = first.memory_id;
+    db.submit(first.ops).unwrap();
+
+    // Second: remember the SAME content with supersedes=[old id] and entity "mira"
+    let mut second_req = req("the fact", &["mira"]);
+    second_req.supersedes = vec![old_id.to_string()];
+    let second = plan_remember(&db, Scope::Shared, &lookup(), 2_000, &second_req).unwrap();
+
+    // Must NOT deduplicate (fresh node, not reuse old)
+    assert!(
+        !second.deduplicated,
+        "remembering X with supersedes=[id of live X] must mint fresh, not dedup"
+    );
+    // Fresh memory_id must differ from the old one
+    assert_ne!(
+        second.memory_id, old_id,
+        "self-supersede must create a new memory node"
+    );
+    // Must mark the old one as superseded
+    assert_eq!(
+        second.superseded,
+        vec![old_id.to_string()],
+        "old id must be in superseded list"
+    );
+
+    // Submit and verify: old node has superseded_at, fresh node exists
+    db.submit(second.ops).unwrap();
+    let old_node = db.node(&lookup(), old_id).unwrap();
+    assert_eq!(
+        old_node.props[MEMORY_SUPERSEDED_AT_PROP],
+        PropValue::Int(2_000),
+        "old node must have superseded_at timestamp"
+    );
+    // Check old node has no open out-edges (all should be closed)
+    let old_edges = db.edges_from(&lookup(), old_id, None, None, true).unwrap();
+    assert!(
+        old_edges.is_empty(),
+        "old node should have no open out-edges after supersede"
+    );
+
+    let fresh_node = db.node(&lookup(), second.memory_id).unwrap();
+    assert_eq!(
+        fresh_node.props["content"],
+        PropValue::Str("the fact".into()),
+        "fresh node must have the content"
+    );
+    // Verify the fresh node has an edge to mira
+    let fresh_edges = db
+        .edges_from(&lookup(), second.memory_id, None, Some("about"), true)
+        .unwrap();
+    assert_eq!(fresh_edges.len(), 1, "fresh node must have edge to mira");
+}
+
+#[test]
 fn validate_rejects_blank_entity_names() {
     let r = RememberRequest {
         content: "x".into(),
