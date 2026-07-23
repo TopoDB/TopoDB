@@ -1192,3 +1192,47 @@ fn create_entity_merges_only_new_props_on_hit() {
     );
     assert_eq!(got["node"]["props"]["team"], "worker", "new key merged");
 }
+
+#[test]
+fn create_entity_rejects_name_key_in_props_on_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+
+    // Create entity "zed" first.
+    run(&["create-entity", "--name", "zed"]);
+
+    // Hit path: existing entity "zed" with --props containing name key.
+    let out = run(&[
+        "create-entity",
+        "--name",
+        "zed",
+        "--props",
+        r#"{"name":"evil"}"#,
+    ]);
+    assert_eq!(out.status.code(), Some(2), "hit path must reject name key");
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(
+        err["error"]["kind"], "rejected",
+        "hit path error kind must be rejected"
+    );
+
+    // Miss path: brand-new entity "zed2" with --props containing name key.
+    let out = run(&[
+        "create-entity",
+        "--name",
+        "zed2",
+        "--props",
+        r#"{"name":"evil"}"#,
+    ]);
+    assert_eq!(out.status.code(), Some(2), "miss path must reject name key");
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(
+        err["error"]["kind"], "rejected",
+        "miss path error kind must be rejected"
+    );
+}

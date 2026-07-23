@@ -419,12 +419,13 @@ fn create_entity(
         };
         if let Some(node) = existing {
             // Merge only NEW metadata keys; never overwrite, never touch name.
-            let incoming = match &extra {
-                Some(v) => match topodb_json::json_to_props(v) {
-                    Ok(p) => p,
-                    Err(e) => output::fail("rejected", &e, 2),
-                },
-                None => topodb::Props::new(),
+            let incoming = match topodb_json::merge_required_prop(
+                topodb_json::ENTITY_NAME_PROP,
+                PropValue::Str(name.clone()),
+                extra.as_ref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => output::fail("rejected", &e, 2),
             };
             let new_keys: std::collections::BTreeMap<String, Option<PropValue>> = incoming
                 .into_iter()
