@@ -57,6 +57,11 @@ enum Cmd {
         /// written. Implies `--yes`.
         #[arg(long)]
         yes_including_revisions: bool,
+        /// Grant agent nodes permission to run shell commands starting with this
+        /// prefix (repeatable). Additive on top of Read/Write/Edit. Echoed at the
+        /// approval gate. Grant the narrowest binary (e.g. 'topodb'), never a shell.
+        #[arg(long = "agent-bash")]
+        agent_bash: Vec<String>,
         /// Seconds a single command node may run before it is killed.
         #[arg(long, default_value_t = 120)]
         command_timeout: u64,
@@ -96,6 +101,17 @@ fn command_preview(v: &Validated) -> Vec<String> {
         .iter()
         .filter(|n| n.kind == NodeKind::Command)
         .map(|n| format!("{}: {}", n.id, n.run.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// Agent bash grant prefixes converted to display format for the approval gate.
+///
+/// Each grant becomes a line describing what shell commands agent nodes may run.
+/// Empty input yields empty output.
+fn grants_preview(grants: &[String]) -> Vec<String> {
+    grants
+        .iter()
+        .map(|g| format!("agent nodes may run: {} *", g))
         .collect()
 }
 
@@ -275,6 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             yes,
             yes_including_revisions,
+            agent_bash,
             command_timeout,
             replan,
             max_replans,
@@ -284,6 +301,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // but keeping the invariant explicit here means a future reader
             // of `yes` doesn't have to know about the other flag).
             let yes = yes || yes_including_revisions;
+
+            // Validate bash grants before anything runs.
+            for grant in &agent_bash {
+                if let Err(e) = topodb_sgh::runner::claude::validate_bash_grant(grant) {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+
             let src = std::fs::read_to_string(&graph)?;
             let g = Graph::from_yaml(&src)?;
             let v = match validate(&g) {
@@ -299,7 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db = Db::open(&cli.db)?;
             let command_runner =
                 ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
-            let runner = ClaudeCodeRunner::new(model.clone(), vec![]);
+            let runner = ClaudeCodeRunner::new(model.clone(), agent_bash.clone());
 
             let mut current = v;
             let mut replans_used = 0u32;
@@ -323,6 +349,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                let grants = grants_preview(&agent_bash);
+                if !grants.is_empty() {
+                    for line in &grants {
+                        println!("{line}");
+                    }
+                }
+
                 print_unconstrained(&current);
 
                 if needs_prompt(is_revision, yes, yes_including_revisions) {
@@ -332,6 +365,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !line.trim().eq_ignore_ascii_case("y") {
                         println!("aborted");
                         return Ok(());
+                    }
+                } else if !grants.is_empty() {
+                    // With --yes or --yes-including-revisions and non-empty grants,
+                    // echo the same lines to stderr before execution (no prompt, no silence).
+                    for line in &grants {
+                        eprintln!("{line}");
                     }
                 }
 
@@ -513,6 +552,33 @@ mod tests {
 
     fn validated(yaml: &str) -> topodb_sgh::schema::validate::Validated {
         validate(&Graph::from_yaml(yaml).expect("parses")).expect("valid")
+    }
+
+    #[test]
+    fn grants_preview_converts_grants_to_display_lines() {
+        let grants = vec!["topodb".to_string()];
+        let lines = grants_preview(&grants);
+        assert_eq!(lines, vec!["agent nodes may run: topodb *"]);
+    }
+
+    #[test]
+    fn grants_preview_empty_grants_returns_empty() {
+        let grants: Vec<String> = vec![];
+        let lines = grants_preview(&grants);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn grants_preview_multiple_grants() {
+        let grants = vec!["topodb".to_string(), "cargo".to_string()];
+        let lines = grants_preview(&grants);
+        assert_eq!(
+            lines,
+            vec![
+                "agent nodes may run: topodb *".to_string(),
+                "agent nodes may run: cargo *".to_string(),
+            ]
+        );
     }
 
     #[test]
