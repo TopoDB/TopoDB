@@ -25,6 +25,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
   Entity hits relative to Memory for question-shaped queries. **Breaking for struct-literal
   construction** (new field) — use `RecallQuery::new(scopes, query, k)` with struct-update
   syntax so future additions don't break call sites.
+- **`Db::search_text_unbumped`** — BM25 text search with the same population, order, and
+  scores as `search_text`, but WITHOUT bumping access counters. For maintenance and advisory
+  reads (hygiene scans, near-duplicate checks) that must not spend the recency signal they
+  exist to protect — the same rationale as `nodes_by_label_unbumped`. One shared
+  implementation with the bumping variant.
 - **`TopoError::Busy`**: lock contention on ANY open path (`open`, `open_with`, `open_stored`,
   including the persisted-spec read) is a typed, retryable variant instead of an opaque storage
   error. Enables graceful degradation and callers to implement retry loops (e.g. with
