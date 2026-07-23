@@ -42,6 +42,11 @@ use std::str::FromStr;
 
 use topodb::{IndexSpec, Scope, ScopeId};
 
+/// The one canonical usage line, shared by `--help` and the unknown-argument
+/// error so the two can never drift. `<off|auto|model>` matches the README
+/// (an explicit `auto` spells out the default model).
+const USAGE: &str = "usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|auto|model>] [--model-dir <path>] [--no-ort-download]";
+
 /// Label/prop name constants, single-sourced in `topodb-json` (shared with
 /// `topodb-cli`'s `create-entity`/`create-memory`) and re-exported here so
 /// existing `topodb-mcp` call sites (`use crate::config::{ENTITY_LABEL, ...}`)
@@ -188,8 +193,11 @@ impl Config {
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--help" | "-h" => {
-                    let usage = "usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|model>] [--model-dir <path>] [--no-ort-download]";
-                    println!("{usage}");
+                    println!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--version" | "-V" => {
+                    println!("topodb-mcp {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
                 }
                 "--db" => {
@@ -231,10 +239,7 @@ impl Config {
                     no_ort_download = true;
                 }
                 other => {
-                    return Err(format!(
-                        "unknown argument {other:?}; usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|model>] [--model-dir <path>] [--no-ort-download]"
-                    )
-                    .into());
+                    return Err(format!("unknown argument {other:?}; {USAGE}").into());
                 }
             }
         }
