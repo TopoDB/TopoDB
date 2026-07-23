@@ -18,8 +18,10 @@ This installs a binary named **`topodb`** (not `topodb-cli`) to your Cargo bin d
 ## Global flags
 
 ```
-topodb --db <path> [--scope <ulid|shared>] [--pretty] <command> [args...]
+topodb [--db <path>] [--scope <ulid|shared>] [--pretty] [--lock-wait-ms <ms>] <command> [args...]
 ```
+
+Global flags are valid **before or after** the subcommand name.
 
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
@@ -43,6 +45,7 @@ All 17 subcommands, in scaffold + write + read order:
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
 | `search <query>` | positional query, `--k <n>` (default 10) | `[ {"node":..., "score": f}, ... ]` |
 | `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
+| `get-edges <from>` | positional source node id, `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `[ {"id","from","to","type","valid_from","valid_to"}, ... ]` |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
@@ -83,6 +86,18 @@ Notes on individual commands:
   
   Example: `topodb --db agent.redb traverse <id> --as-of 1700000000000` reads the graph as it was at
   the given instant, showing edges that were open then (including edges since closed) and hiding edges created after.
+- **`get-edges`**: list a node's outgoing edges, optionally filtered by target node (`--to`) and/or
+  edge type (`--edge-type`). `--open-only true` (default) shows only open edges; `--open-only false`
+  shows the full history (open + closed). `--as-of <unix-ms>` performs a temporal read within the window
+  `valid_from <= t < valid_to` (valid_to exclusive; a future `as_of` behaves like "now"), and is
+  mutually exclusive with `--open-only` (since `as_of` already means "edges open at that instant").
+  Use this to find the edge id to pass to `close-edge` when a fact stops being true, or to check
+  what a node is already linked to.
+  
+  Example — list all edges ever created from an entity, including closed ones:
+  ```console
+  $ topodb --db agent.redb get-edges <entity-id> --open-only false
+  ```
 - **`changes`**: the one unscoped command — see [Scoping](#scoping) — and `Compacted` (the
   requested `--since` is below the retained floor) is a rejected/exit-2 condition, not an
   internal error; the caller re-anchors from `info`'s `current_seq` rather than trusting a

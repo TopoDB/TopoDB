@@ -38,7 +38,7 @@ topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...
 | `--model-dir <path>` | no | `~/.cache/topodb/models` (falls back to `./.topodb-models` if `$HOME` is unset) | Directory the embedding model's weights are downloaded into and loaded from. Shared across servers/projects when left at its default, so the one-time download only happens once per machine. |
 | `--no-ort-download` | no | off | Disables the automatic ONNX Runtime download; embeddings reach `ready` only if a system runtime or `ORT_DYLIB_PATH` is available, exactly as before. |
 
-Arg parsing is hand-rolled (eight flags); there is no `--help` flag yet.
+The `--help`/`-h` and `--version`/`-V` flags print to stdout and exit 0.
 
 ## Tools
 

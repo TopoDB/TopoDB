@@ -326,6 +326,10 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`edge_live_at(valid_from, valid_to, query_time)` shared predicate** — determines whether an edge
+  is "live" (open) at a given query time (`query_time` must satisfy `valid_from <= query_time < valid_to`).
+  Shared utility used by the CLI, MCP server, and batch DSL for temporal edge filtering. An edge with
+  no `valid_to` (open edge, `valid_to = None`) is live at any time >= `valid_from`.
 - **`memory_props` constructor** — the shared new-Memory props builder used by both CLI and MCP
   servers. Rejects the system-maintained `content_hash` and `superseded_at` keys (caller-level
   validation, fails fast with an actionable error) so front ends can validate early without
@@ -471,6 +475,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
   and `band` (omitted only in text mode). `memory_health` gains `degraded`/`degraded_reason` fields and forces
   `needs_attention: true` when the embedder is Failed or Downloading (text mode is degraded hygiene).
   Deliberately off (`--embeddings off`) is not degraded — scans are empty by design, not by failure.
+
+#### Fixed
+
+- **`--help`/`-h` and `--version`/`-V` flags now print to stdout and exit 0** — previously these flags
+  were not available. They now match conventional behavior for CLI tools.
 
 ### 0.0.12 — 2026-07-22
 
@@ -850,6 +859,12 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`get-edges <from> [--to] [--edge-type] [--open-only <true|false>] [--as-of <unix-ms>]`** — list
+  a node's outgoing edges, optionally filtered by target node and/or edge type. `--open-only true`
+  (default) shows only open edges; `--open-only false` shows the full history (open + closed).
+  `--as-of <unix-ms>` performs a temporal read within the window `valid_from <= t < valid_to`
+  (valid_to exclusive) and is mutually exclusive with `--open-only`. Use this to find the edge id
+  to pass to `close-edge` when a fact stops being true, or to check what a node is already linked to.
 - **`traverse --as-of <unix-ms>`** — temporal graph walk at a Unix millisecond timestamp. Closed
   edges reappear, later edges vanish; a future `as_of` behaves like "now"; omit to read "now".
   **Temporal dimension lives on edges; nodes are always current-state** — `get` readings remain
@@ -862,6 +877,8 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 - **`--lock-wait-ms`** / **`TOPODB_LOCK_WAIT_MS` env var** (default 3000, `0` = fail fast) — global
   flag for all subcommands; configures how long to retry on `TopoError::Busy` at startup. Lock
   exhaustion reports `{"error":{"kind":"busy",...}}` and exits with code 3.
+- **Global flags now valid before or after the subcommand** — `--db`, `--scope`, `--lock-wait-ms`,
+  and `--pretty` are now accepted in any position relative to the subcommand name.
 
 #### Changed
 
