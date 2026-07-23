@@ -304,34 +304,7 @@ impl TopoServer {
         scopes: &ScopeSet,
         name: &str,
     ) -> Result<Vec<topodb::NodeRecord>, TopoError> {
-        let value = PropValue::Str(name.to_string());
-        let mut out =
-            self.db
-                .nodes_by_prop_normalized(scopes, ENTITY_LABEL, ENTITY_NAME_PROP, &value)?;
-        let aliases =
-            match self
-                .db
-                .nodes_by_prop_normalized(scopes, ALIAS_LABEL, ALIAS_NAME_PROP, &value)
-            {
-                Ok(hits) => hits,
-                Err(TopoError::Rejected(_)) => Vec::new(),
-                Err(e) => return Err(e),
-            };
-        for alias in aliases {
-            for edge in self
-                .db
-                .edges_from(scopes, alias.id, None, Some(ALIAS_EDGE_TYPE), true)?
-            {
-                if let Some(canonical) = self.db.node(scopes, edge.to) {
-                    if canonical.label == ENTITY_LABEL {
-                        out.push(canonical);
-                    }
-                }
-            }
-        }
-        out.sort_by_key(|n| n.id);
-        out.dedup_by_key(|n| n.id);
-        Ok(out)
+        convert::resolve_entities_by_name(&self.db, scopes, name)
     }
 
     /// Find-or-create lookup shared by `create_entity` and `remember`.
@@ -359,12 +332,8 @@ impl TopoServer {
         let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
         lookup_scopes.push(write_scope);
         lookup_scopes.push(Scope::Shared);
-        let lookup_set = convert::scopes_to_scope_set(&lookup_scopes);
-        match self.resolve_entities_by_name(&lookup_set, name) {
-            Ok(hits) => Ok(hits.into_iter().min_by_key(|n| n.id)),
-            Err(TopoError::Rejected(_)) => Ok(None),
-            Err(e) => Err(classify_topo_error(e)),
-        }
+        let lookup = convert::scopes_to_scope_set(&lookup_scopes);
+        convert::find_existing_entity(&self.db, &lookup, name).map_err(classify_topo_error)
     }
 
     /// The id of a Memory in `write_scope` whose normalized content equals
@@ -378,25 +347,7 @@ impl TopoServer {
         write_scope: Scope,
         content: &str,
     ) -> Result<Option<NodeId>, ErrorData> {
-        let hash = content_hash(content);
-        let want = normalize_content(content);
-        let scope_set = convert::scopes_to_scope_set(&[write_scope]);
-        let candidates = self
-            .db
-            .nodes_by_prop(
-                &scope_set,
-                MEMORY_LABEL,
-                convert::MEMORY_CONTENT_HASH_PROP,
-                &PropValue::Str(hash),
-            )
-            .map_err(classify_topo_error)?;
-        Ok(candidates
-            .into_iter()
-            .filter(|n| {
-                matches!(n.props.get(MEMORY_CONTENT_PROP), Some(PropValue::Str(c)) if normalize_content(c) == want)
-            })
-            .min_by_key(|n| n.id)
-            .map(|n| n.id))
+        convert::existing_memory(&self.db, write_scope, content).map_err(classify_topo_error)
     }
 
     /// Ops that mark the given memory ids superseded and disconnect them from
@@ -715,46 +666,12 @@ fn classify_topo_error(e: TopoError) -> ErrorData {
     }
 }
 
-/// In-call dedup key for `remember`'s entity names: whitespace-collapsed,
-/// lowercased — mirroring the engine's prop-index normalization
-/// (`prop_index::normalize_str`, which is pub(crate) and thus can't be
-/// called from here). Drift between the two only weakens IN-CALL dedup
-/// (["Drew", "drew"] in one call); cross-call dedup always goes through the
-/// engine's own normalized index via find_existing_entity.
-fn entity_dedup_key(name: &str) -> String {
-    name.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-/// Normalize memory content for dedup: trim and collapse internal whitespace.
-/// Deliberately NOT lowercased — casing can carry meaning in a stored fact.
-fn normalize_content(content: &str) -> String {
-    content.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Wall-clock milliseconds since the Unix epoch, for stamping a supersession.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Stable FNV-1a 64-bit hash of normalized content, hex-encoded. This value is
-/// PERSISTED (equality-indexed as `content_hash`), so the algorithm must never
-/// change or old rows stop matching. A hash collision is harmless: the dedup
-/// path always verifies exact normalized content against each candidate, so
-/// the hash is only a fast bucket key, never the decision.
-fn content_hash(content: &str) -> String {
-    let normalized = normalize_content(content);
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in normalized.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
 }
 
 /// Schema stand-in for a props map. The tool bodies keep taking a raw
@@ -1557,9 +1474,6 @@ struct GetChangesResult {
     /// Ops in ascending `seq` order, starting at `since_seq`.
     ops: Vec<ChangeEventJson>,
 }
-
-/// The default edge type `remember` links with when the call doesn't name one.
-const DEFAULT_REMEMBER_EDGE_TYPE: &str = "about";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2819,188 +2733,60 @@ impl TopoServer {
         &self,
         Parameters(p): Parameters<RememberParams>,
     ) -> Result<Json<RememberResult>, ErrorData> {
-        // Validate EVERYTHING before planning a single write: a rejected
-        // call must leave the database untouched. (`minItems: 1` is the
-        // advertised half of the non-empty rule; this is the runtime half,
-        // same dual enforcement as `scopes`.)
-        let ty = convert::normalize_edge_type(
-            p.edge_type.as_deref().unwrap_or(DEFAULT_REMEMBER_EDGE_TYPE),
-        )
-        .map_err(|e| ErrorData::invalid_params(e, None))?;
-        if p.entities.is_empty() {
-            return Err(ErrorData::invalid_params(
-                "entities must contain at least one name — use create_memory for a deliberately unlinked note".to_string(),
-                None,
-            ));
-        }
-        if p.entities.iter().any(|n| n.trim().is_empty()) {
-            return Err(ErrorData::invalid_params(
-                "entity names must be non-empty".to_string(),
-                None,
-            ));
-        }
         let scope = self.resolve_scope(p.scope.as_deref())?;
-        // Dedup: if this exact content already lives in the write scope, reuse
-        // that memory node (below) and only ADD links for entities not already
-        // on it, rather than minting a duplicate memory.
-        let existing = self.existing_memory(scope, &p.content)?;
-        let deduplicated = existing.is_some();
-        let memory_id = existing.unwrap_or_else(NodeId::new);
-        // Plan supersession up front (all reads/validation before any write),
-        // so a bad `supersedes` id leaves the database untouched.
-        let (supersede_ops, superseded) =
-            self.supersede_ops(scope, p.supersedes.as_deref().unwrap_or(&[]))?;
-
-        // Resolve every entity BEFORE the batch: existing entities
-        // contribute only their id (no per-entity props here, so unlike
-        // create_entity there is nothing to merge); new names get a planned
-        // CreateNode + best-effort embed. All reads precede the single
-        // submit below — failure anywhere in this loop writes nothing.
-        struct Resolved {
-            name: String,
-            id: NodeId,
-            created: bool,
-            ops: Vec<Op>,
-        }
-        let mut resolved: Vec<Resolved> = Vec::with_capacity(p.entities.len());
-        // In-call dedup: ["Drew Powell", " drew   powell "] is ONE entity and
-        // ONE edge; the first spelling is the one echoed back.
-        let mut seen = std::collections::BTreeSet::new();
-        let names: Vec<&String> = p
-            .entities
-            .iter()
-            .filter(|n| seen.insert(entity_dedup_key(n)))
-            .collect();
-        for name in names {
-            match self.find_existing_entity(scope, name)? {
-                Some(node) => resolved.push(Resolved {
-                    name: name.clone(),
-                    id: node.id,
-                    created: false,
-                    ops: Vec::new(),
-                }),
-                None => {
-                    let id = NodeId::new();
-                    let props = convert::merge_required_prop(
-                        ENTITY_NAME_PROP,
-                        PropValue::Str(name.clone()),
-                        None,
-                    )
-                    .map_err(|e| ErrorData::invalid_params(e, None))?;
-                    let mut ops = vec![Op::CreateNode {
-                        id,
-                        scope,
-                        label: ENTITY_LABEL.into(),
-                        props,
-                    }];
-                    ops.extend(self.embed_op(id, name));
-                    resolved.push(Resolved {
-                        name: name.clone(),
-                        id,
-                        created: true,
-                        ops,
-                    });
-                }
-            }
-        }
-
-        // ONE batch: memory + new entities + links commit atomically — this
-        // call can never strand an unlinked memory the way the manual
-        // create_memory -> create_entity -> link sequence can.
-        let mut ops: Vec<Op> = Vec::new();
+        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup_scopes.push(scope);
+        lookup_scopes.push(Scope::Shared);
+        let lookup = convert::scopes_to_scope_set(&lookup_scopes);
+        let req = convert::RememberRequest {
+            content: p.content.clone(),
+            entities: p.entities.clone(),
+            edge_type: p.edge_type.clone(),
+            supersedes: p.supersedes.clone().unwrap_or_default(),
+            props: p.props.clone(),
+        };
+        let mut plan = convert::plan_remember(&self.db, scope, &lookup, now_ms(), &req).map_err(
+            |e| match e {
+                convert::ComposeError::Invalid(m) => ErrorData::invalid_params(m, None),
+                convert::ComposeError::Engine(t) => classify_topo_error(t),
+            },
+        )?;
+        // Embedder leg (MCP-only): embed the new memory once — the vector
+        // serves both the advisory near-duplicate check and the stored
+        // embedding — and embed each newly created entity name. Appending
+        // after the plan's CreateNode ops keeps SetEmbedding after its node.
         let mut near_duplicates = Vec::new();
-        if !deduplicated {
-            // New memory: create the node with its content + content_hash, and
-            // embed it. Embed ONCE and reuse the vector for both the semantic
-            // near-duplicate check (advisory) and the stored embedding. (Embed
-            // + hash before `p.content` moves into props.)
-            let embedding = self.embedder.embed(&p.content);
-            near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
-            let hash = content_hash(&p.content);
-            let mut memory_props = convert::merge_required_prop(
-                MEMORY_CONTENT_PROP,
-                PropValue::Str(p.content),
-                p.props.as_ref(),
-            )
-            .map_err(|e| ErrorData::invalid_params(e, None))?;
-            memory_props.insert(
-                convert::MEMORY_CONTENT_HASH_PROP.into(),
-                PropValue::Str(hash),
-            );
-            ops.push(Op::CreateNode {
-                id: memory_id,
-                scope,
-                label: MEMORY_LABEL.into(),
-                props: memory_props,
-            });
+        if let Some(content) = plan.new_memory.as_deref() {
+            let embedding = self.embedder.embed(content);
+            near_duplicates = self.near_duplicates(scope, content, embedding.as_deref());
             if let Some(vector) = embedding {
-                ops.push(Op::SetEmbedding {
-                    id: memory_id,
+                plan.ops.push(Op::SetEmbedding {
+                    id: plan.memory_id,
                     model: self.embedder.model_name(),
                     vector,
                 });
             }
         }
-        // Id-level dedup: name-level dedup above only catches spelling
-        // variants of the SAME string. Two DIFFERENT names can still
-        // resolve to the SAME node (e.g. a canonical name and its alias),
-        // so collapse again on the resolved NodeId, first occurrence wins.
-        let mut seen_ids = std::collections::BTreeSet::new();
-        resolved.retain(|r| seen_ids.insert(r.id));
-        // On a dedup hit, an entity already linked to the existing memory keeps
-        // its edge — don't mint a second one. Empty for a fresh memory.
-        let already_linked: std::collections::HashMap<NodeId, EdgeId> = if deduplicated {
-            let scope_set = convert::scopes_to_scope_set(&[scope]);
-            self.db
-                .edges_from(&scope_set, memory_id, None, Some(ty.as_str()), true)
-                .map_err(classify_topo_error)?
-                .into_iter()
-                .map(|e| (e.to, e.id))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
-        let mut entities_out = Vec::with_capacity(resolved.len());
-        let mut edge_ids = Vec::with_capacity(resolved.len());
-        for r in resolved {
-            ops.extend(r.ops);
-            let edge_id_str = match already_linked.get(&r.id) {
-                Some(existing_edge) => existing_edge.to_string(),
-                None => {
-                    let edge_id = EdgeId::new();
-                    ops.push(Op::CreateEdge {
-                        id: edge_id,
-                        scope,
-                        ty: ty.clone().into(),
-                        from: memory_id,
-                        to: r.id,
-                        props: Props::new(),
-                        valid_from: None,
-                    });
-                    edge_id.to_string()
-                }
-            };
-            edge_ids.push(edge_id_str);
-            entities_out.push(RememberedEntity {
-                name: r.name,
-                id: r.id.to_string(),
-                created: r.created,
-            });
+        for (id, name) in &plan.new_entities {
+            plan.ops.extend(self.embed_op(*id, name));
         }
-        // Retire superseded memories in the SAME batch, so the new fact and
-        // the old one's retirement commit atomically.
-        ops.extend(supersede_ops);
-        // A pure no-op (dedup hit, every entity already linked, nothing to
-        // supersede) writes nothing.
-        if !ops.is_empty() {
-            self.submit_write(ops)?;
+        if !plan.ops.is_empty() {
+            self.submit_write(plan.ops)?;
         }
         Ok(Json(RememberResult {
-            memory_id: memory_id.to_string(),
-            entities: entities_out,
-            edge_ids,
-            deduplicated,
-            superseded,
+            memory_id: plan.memory_id.to_string(),
+            entities: plan
+                .entities
+                .into_iter()
+                .map(|e| RememberedEntity {
+                    name: e.name,
+                    id: e.id.to_string(),
+                    created: e.created,
+                })
+                .collect(),
+            edge_ids: plan.edge_ids,
+            deduplicated: plan.deduplicated,
+            superseded: plan.superseded,
             near_duplicates,
         }))
     }
@@ -3027,7 +2813,7 @@ impl TopoServer {
         // embedder isn't Ready — no semantic signal then.
         let embedding = self.embedder.embed(&p.content);
         let near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
-        let hash = content_hash(&p.content);
+        let hash = convert::content_hash(&p.content);
         let mut props = convert::merge_required_prop(
             MEMORY_CONTENT_PROP,
             PropValue::Str(p.content),
