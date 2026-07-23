@@ -2,6 +2,85 @@ use std::process::Command;
 
 use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
+/// Validate a bash grant prefix.
+///
+/// This is a rails to catch obviously problematic prefixes — not a security boundary.
+/// Rejects:
+/// - Empty or whitespace-only strings
+/// - Base commands (first whitespace-separated token, basename after `/`) in {sh, bash, zsh, env}
+/// - Any of the characters `;`, `|`, `&`, `<`, `>`, `` ` ``, `$`
+///
+/// Error message names the prefix and explains why it was rejected.
+pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
+    let trimmed = prefix.trim();
+
+    // Reject empty or whitespace-only
+    if trimmed.is_empty() {
+        return Err("bash grant prefix is empty or whitespace-only".to_string());
+    }
+
+    // Extract the base command (first whitespace-separated token, basename after `/`)
+    let base_cmd = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .next_back()
+        .unwrap_or("");
+
+    // Reject shell commands and env
+    if matches!(base_cmd, "sh" | "bash" | "zsh" | "env") {
+        return Err(format!(
+            "bash grant prefix '{}' is a shell or package manager ({}), not a binary",
+            prefix, base_cmd
+        ));
+    }
+
+    // Reject dangerous characters
+    for ch in &[';', '|', '&', '<', '>', '`', '$'] {
+        if trimmed.contains(*ch) {
+            return Err(format!(
+                "bash grant prefix '{}' contains forbidden character '{}'",
+                prefix, ch
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the command-line arguments for invoking `claude -p`.
+///
+/// Returns a vector of arguments suitable for `std::process::Command`.
+/// Includes the prompt, allowedTools (with optional bash grants), output format,
+/// and model if specified.
+pub fn build_argv(model: Option<String>, bash_grants: Vec<String>) -> Vec<String> {
+    let mut argv = vec![
+        "claude".to_string(),
+        "-p".to_string(),
+        "".to_string(), // Placeholder; the prompt is typically added by the caller
+    ];
+
+    // Build allowedTools value with optional bash grants
+    let mut allowed_tools = "Read,Write,Edit".to_string();
+    for grant in bash_grants {
+        allowed_tools.push_str(&format!(",Bash({}:*)", grant));
+    }
+
+    argv.push("--allowedTools".to_string());
+    argv.push(allowed_tools);
+
+    argv.push("--output-format".to_string());
+    argv.push("json".to_string());
+
+    if let Some(m) = model {
+        argv.push("--model".to_string());
+        argv.push(m);
+    }
+
+    argv
+}
+
 /// Assembles the prompt for a node. Kept separate from process spawning so it
 /// is unit-testable without invoking a model.
 pub fn build_prompt(req: &NodeRequest) -> String {
@@ -174,11 +253,12 @@ fn elide(s: &str) -> String {
 
 pub struct ClaudeCodeRunner {
     model: Option<String>,
+    bash_grants: Vec<String>,
 }
 
 impl ClaudeCodeRunner {
-    pub fn new(model: Option<String>) -> Self {
-        ClaudeCodeRunner { model }
+    pub fn new(model: Option<String>, bash_grants: Vec<String>) -> Self {
+        ClaudeCodeRunner { model, bash_grants }
     }
 }
 
@@ -204,7 +284,16 @@ impl AgentRunner for ClaudeCodeRunner {
         // ambient settings already permit, Bash included, and omitting a tool
         // here withholds nothing. Confining a node to a tool set would need a
         // mechanism this flag does not provide.
-        cmd.arg("--allowedTools").arg("Read,Write,Edit");
+        //
+        // Bash grants are additive on top of these ambient permissions: each
+        // `Bash(prefix:*)` widens what an UNGATED agent prompt can execute.
+        // The run-level gate echo (shown before approval) is the human control —
+        // grants here alone do not confine or restrict agent execution.
+        let mut allowed_tools = "Read,Write,Edit".to_string();
+        for grant in &self.bash_grants {
+            allowed_tools.push_str(&format!(",Bash({}:*)", grant));
+        }
+        cmd.arg("--allowedTools").arg(allowed_tools);
         // Structured output is what makes a denied tool visible at all: in
         // plain-text mode a blocked Write is indistinguishable from a
         // completed one, since both exit 0 with prose on stdout.

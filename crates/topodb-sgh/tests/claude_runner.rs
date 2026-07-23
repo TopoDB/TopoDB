@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use topodb_sgh::runner::claude::{build_prompt, extract_json, interpret_result};
+use topodb_sgh::runner::claude::{
+    build_argv, build_prompt, extract_json, interpret_result, validate_bash_grant,
+};
 use topodb_sgh::runner::{NodeOutcome, NodeRequest};
 
 #[test]
@@ -201,4 +203,191 @@ fn interpret_result_leaves_prose_alone_when_no_json_is_expected() {
             output: "A prose summary { with a brace } inside.".to_string()
         }
     );
+}
+
+// --- build_argv ----------------------------------------------------------
+//
+// Tests for argv construction with bash grants.
+
+#[test]
+fn build_argv_with_no_grants_includes_base_allowed_tools() {
+    let argv = build_argv(None, vec![]);
+    let idx = argv
+        .iter()
+        .position(|arg| arg == "--allowedTools")
+        .expect("--allowedTools not found");
+    assert_eq!(argv[idx + 1], "Read,Write,Edit");
+}
+
+#[test]
+fn build_argv_with_single_grant_appends_bash_grant() {
+    let argv = build_argv(None, vec!["topodb".to_string()]);
+    let idx = argv
+        .iter()
+        .position(|arg| arg == "--allowedTools")
+        .expect("--allowedTools not found");
+    assert_eq!(argv[idx + 1], "Read,Write,Edit,Bash(topodb:*)");
+}
+
+#[test]
+fn build_argv_with_multiple_grants_appends_all_in_order() {
+    let argv = build_argv(None, vec!["topodb".to_string(), "cargo".to_string()]);
+    let idx = argv
+        .iter()
+        .position(|arg| arg == "--allowedTools")
+        .expect("--allowedTools not found");
+    assert_eq!(
+        argv[idx + 1],
+        "Read,Write,Edit,Bash(topodb:*),Bash(cargo:*)"
+    );
+}
+
+#[test]
+fn build_argv_with_model_includes_model_flag() {
+    let argv = build_argv(Some("claude-opus".to_string()), vec![]);
+    let has_model = argv
+        .iter()
+        .position(|arg| arg == "--model")
+        .map(|idx| argv.get(idx + 1).map(|v| v.as_str()) == Some("claude-opus"))
+        .unwrap_or(false);
+    assert!(
+        has_model,
+        "argv should include --model flag with the given model"
+    );
+}
+
+#[test]
+fn build_argv_includes_base_flags() {
+    let argv = build_argv(None, vec![]);
+    assert!(
+        argv.iter().any(|arg| arg == "-p"),
+        "argv should include -p flag"
+    );
+    assert!(
+        argv.iter().any(|arg| arg == "--output-format"),
+        "argv should include --output-format flag"
+    );
+    let idx = argv
+        .iter()
+        .position(|arg| arg == "--output-format")
+        .expect("--output-format not found");
+    assert_eq!(
+        argv[idx + 1],
+        "json",
+        "argv should have json as output-format value"
+    );
+}
+
+// --- validate_bash_grant --------------------------------------------------
+//
+// Tests for bash grant validation.
+
+#[test]
+fn validate_bash_grant_accepts_simple_command() {
+    assert_eq!(validate_bash_grant("topodb"), Ok(()));
+}
+
+#[test]
+fn validate_bash_grant_rejects_empty_string() {
+    let result = validate_bash_grant("");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("empty"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_whitespace_only() {
+    let result = validate_bash_grant("   ");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("empty"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_bash_shell() {
+    let result = validate_bash_grant("bash");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("bash"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_sh_shell() {
+    let result = validate_bash_grant("sh");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("sh"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_zsh_shell() {
+    let result = validate_bash_grant("zsh");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("zsh"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_env_command() {
+    let result = validate_bash_grant("env");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("env"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_bash_with_path() {
+    let result = validate_bash_grant("/bin/bash");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("bash"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_semicolon() {
+    let result = validate_bash_grant("a;b");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("a;b"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_pipe() {
+    let result = validate_bash_grant("x | y");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("x | y"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_backtick() {
+    let result = validate_bash_grant("`bash`");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("`bash`"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_dollar_paren() {
+    let result = validate_bash_grant("$(x)");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("$(x)"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_ampersand() {
+    let result = validate_bash_grant("x & y");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("x & y"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_redirect_in() {
+    let result = validate_bash_grant("x < y");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("x < y"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_redirect_out() {
+    let result = validate_bash_grant("x > y");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("x > y"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_dollar_expansion() {
+    let result = validate_bash_grant("$var");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("$var"));
 }
