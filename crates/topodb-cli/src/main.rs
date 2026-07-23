@@ -45,26 +45,37 @@ fn main() {
         _ => default_scope,
     };
 
-    let db = if cli.db.exists() {
-        // Inherit the persisted spec, but silently upgrade a db still on an
-        // older STOCK default to the current one (`topodb_json::upgraded_spec`
-        // — e.g. adding the (Entity, name) text index); a customized spec is
-        // inherited verbatim. Mirrors topodb-mcp's open path exactly.
-        Db::open_stored(&cli.db).and_then(|db| {
-            let persisted = db.index_spec();
-            let upgraded = topodb_json::upgraded_spec(persisted.clone());
-            if upgraded != persisted {
-                drop(db);
-                Db::open_with(&cli.db, upgraded)
-            } else {
-                Ok(db)
-            }
-        })
-    } else {
-        Db::open_with(&cli.db, topodb_json::default_spec())
-    };
+    let db = topodb_json::open_with_busy_retry(cli.lock_wait_ms, || {
+        if cli.db.exists() {
+            // Inherit the persisted spec, but silently upgrade a db still on an
+            // older STOCK default to the current one (`topodb_json::upgraded_spec`
+            // — e.g. adding the (Entity, name) text index); a customized spec is
+            // inherited verbatim. Mirrors topodb-mcp's open path exactly.
+            Db::open_stored(&cli.db).and_then(|db| {
+                let persisted = db.index_spec();
+                let upgraded = topodb_json::upgraded_spec(persisted.clone());
+                if upgraded != persisted {
+                    drop(db);
+                    Db::open_with(&cli.db, upgraded)
+                } else {
+                    Ok(db)
+                }
+            })
+        } else {
+            Db::open_with(&cli.db, topodb_json::default_spec())
+        }
+    });
     let db = match db {
         Ok(db) => db,
+        Err(TopoError::Busy) => output::fail(
+            "busy",
+            &format!(
+                "another process holds {}; retried for {}ms (tune with --lock-wait-ms / TOPODB_LOCK_WAIT_MS)",
+                cli.db.display(),
+                cli.lock_wait_ms
+            ),
+            3,
+        ),
         Err(e) => output::fail_engine(&e),
     };
 
