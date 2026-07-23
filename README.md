@@ -148,7 +148,7 @@ A standalone binary: point it at a `.redb` file and it serves **27 MCP tools** o
 JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
 
 - **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`
-- **Memory hygiene** — `find_duplicate_memories` (banded, contradiction-aware), `find_orphan_memories`, `find_stale_memories`, `memory_health`
+- **Memory hygiene** — `find_duplicate_memories` (vector-mode: banded + contradiction-aware; text-mode fallback when embedder unavailable), `find_orphan_memories`, `find_stale_memories`, `memory_health`
 - **Write** — `remember`, `create_memory`, `consolidate_memories`, `create_entity`, `add_alias`, `add_synonym`, `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`
 - **Admin** — `db_info`; `get_changes` (the one unscoped read — replays the op log across every scope, so it's off unless you pass `--allow-unscoped-changes`)
 
