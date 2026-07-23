@@ -1128,3 +1128,67 @@ fn remember_requires_an_entity() {
         "clap missing-required is exit 2"
     );
 }
+
+// --- Task 5: create-entity is find-or-create by default ---
+
+#[test]
+fn create_entity_is_find_or_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let a: serde_json::Value =
+        serde_json::from_slice(&run(&["create-entity", "--name", "vega"]).stdout).unwrap();
+    assert_eq!(a["created"], true);
+    let b: serde_json::Value =
+        serde_json::from_slice(&run(&["create-entity", "--name", "vega"]).stdout).unwrap();
+    assert_eq!(b["created"], false);
+    assert_eq!(b["id"], a["id"], "same name resolves to the same node");
+    // --always-create opts back into a raw create.
+    let c: serde_json::Value = serde_json::from_slice(
+        &run(&["create-entity", "--name", "vega", "--always-create"]).stdout,
+    )
+    .unwrap();
+    assert_eq!(c["created"], true);
+    assert_ne!(c["id"], a["id"]);
+}
+
+#[test]
+fn create_entity_merges_only_new_props_on_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let a: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "create-entity",
+            "--name",
+            "omar",
+            "--props",
+            r#"{"role":"owner"}"#,
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let id = a["id"].as_str().unwrap();
+    // Existing key must NOT be overwritten; new key must land.
+    run(&[
+        "create-entity",
+        "--name",
+        "omar",
+        "--props",
+        r#"{"role":"intern","team":"worker"}"#,
+    ]);
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", id]).stdout).unwrap();
+    assert_eq!(
+        got["node"]["props"]["role"], "owner",
+        "existing value never overwritten"
+    );
+    assert_eq!(got["node"]["props"]["team"], "worker", "new key merged");
+}

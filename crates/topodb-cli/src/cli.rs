@@ -59,6 +59,12 @@ pub enum Command {
         /// scope take this — a write lands in exactly one scope.
         #[arg(long)]
         scope: Option<String>,
+        /// Opt OUT of find-or-create: always mint a new node, even when an
+        /// entity with this name already exists in the write scope (the
+        /// pre-0.0.13 behavior). Duplicate names fragment traversal — only
+        /// use this when two same-named entities are genuinely distinct.
+        #[arg(long)]
+        always_create: bool,
     },
     /// Create a typed, time-aware edge between two existing nodes. `--scope`
     /// stamps the EDGE's own scope (default: the global `--scope`) — a `shared`
