@@ -35,7 +35,7 @@ All 17 subcommands, in scaffold + write + read order:
 | Command | Key flags | Output |
 |---|---|---|
 | `info` | — | `{"path","format_version","current_seq","index_spec","default_scope"}` |
-| `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>", "deduplicated": bool, "content_hash": "<hash>"}` |
+| `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>", "deduplicated": bool}` |
 | `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>`, `--always-create` | `{"id": "<ulid>", "created": bool}` |
 | `remember` | `--content <text>` (required), `--entity <name>` (required, repeatable), `--edge-type <ty>` (default `"about"`), `--supersedes <id>` (repeatable), `--props <json-object>`, `--scope <ulid\|shared>` | `{"memory_id": "<ulid>", "deduplicated": bool, "entities": [{"name": "<name>", "id": "<ulid>", "created": bool}], "edge_ids": ["<ulid>", ...], "superseded": ["<ulid>", ...]}` |
 | `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
@@ -55,10 +55,10 @@ All 17 subcommands, in scaffold + write + read order:
 
 Notes on individual commands:
 
-- **`create-memory`**: now stamped with a `content_hash` for dedup tracking. If identical content
+- **`create-memory`**: stamped with a `content_hash` (stored as a node property for dedup tracking). If identical content
   (after whitespace normalization) was already stored, `"deduplicated": true` and the existing
   memory id is returned; `--props` is ignored on a hit. `"deduplicated": false` indicates a new
-  memory. `--props` is a JSON *object* string merged in alongside `content`; a `--props` that
+  memory. The response is `{"id":…,"deduplicated":…}`. `--props` is a JSON *object* string merged in alongside `content`; a `--props` that
   tries to set `content` itself is rejected (exit 2).
 - **`create-entity`**: now find-or-create by default — the name is matched case- and
   whitespace-insensitively across read scopes, write scope, and `shared`, and resolves aliases.
@@ -161,10 +161,10 @@ Create an entity and a memory, then search for it:
 
 ```console
 $ topodb --db demo.redb create-entity --name ada
-{"id":"01KX2NZY1CCS7GVF59C8H909GG"}
+{"created":true,"id":"01KX2NZY1CCS7GVF59C8H909GG"}
 
 $ topodb --db demo.redb create-memory --content "ada wrote the first program"
-{"id":"01KX2NZY4VH5QQC16VHXHJSKFE"}
+{"deduplicated":false,"id":"01KX2NZY4VH5QQC16VHXHJSKFE"}
 
 $ topodb --db demo.redb search "first program"
 [{"node":{"id":"01KX2NZY4VH5QQC16VHXHJSKFE","label":"Memory","props":{"content":"ada wrote the first program"},"scope":"shared"},"score":0.5753642320632935}]
