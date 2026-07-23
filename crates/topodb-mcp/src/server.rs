@@ -1080,7 +1080,7 @@ fn default_dup_limit() -> u32 {
 }
 
 /// One unordered pair of near-duplicate memories found by `find_duplicate_memories`.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 struct DuplicatePair {
     /// The two memories' ULIDs (ascending, so a pair is reported once).
     ids: [String; 2],
@@ -1106,12 +1106,16 @@ struct FindDuplicateMemoriesResult {
     /// Near-duplicate pairs, most-similar first, at most `limit`. Empty when the
     /// embedder is off/not-ready (no semantic signal) or nothing clears the floor.
     pairs: Vec<DuplicatePair>,
-    /// How many embedded, non-superseded memories were actually compared.
+    /// How many non-superseded memories were actually compared.
     scanned: usize,
     /// `true` when the result is NOT exhaustive — either more memories existed
     /// than the scan cap, or more pairs cleared the floor than `limit`. A hint to
     /// narrow scopes or raise `limit`, not an error.
     truncated: bool,
+    /// Detection method used: `"vector"` when embedder is Ready, `"text"` when using
+    /// text-based fallback (token-Jaccard similarity). Text mode cannot distinguish
+    /// duplicates from supersessions — all pairs are reported as duplicates.
+    method: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2161,7 +2165,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are semantically near-duplicates (cosine >= min_similarity, default 0.70), most-similar first. Read-only and advisory. Each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80, a wider net where genuine restatements overlap merely-related facts, so judge the contents before acting) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates what the other asserts, so it's a fact that replaced the older one -> retire the stale side with `supersede`, don't merge). The relation matters because cosine scores contradictions HIGHER than restatements, so similarity alone can't tell them apart. Empty when the embedder is off/not-ready. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
+        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Relation splitting requires vector embeddings. Text mode (embeddings off): detects token-Jaccard similarity (>= 0.6 by default); cannot distinguish duplicates from supersessions, so all pairs are reported as `duplicate`. The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
     )]
     fn find_duplicate_memories(
         &self,
@@ -2223,39 +2227,113 @@ impl TopoServer {
             })
             .collect();
 
-        // Bound the O(n^2) comparison. Beyond the cap we compare a prefix and
-        // flag the result non-exhaustive rather than doing unbounded work — the
-        // candidates come from `nodes_by_label` in id (mint-time) order, so the
-        // prefix is the oldest memories, the ones most likely to have accreted
-        // duplicates.
-        let mut truncated = candidates.len() > DUP_SCAN_CAP;
-        candidates.truncate(DUP_SCAN_CAP);
-        let scanned = candidates.len();
+        // Vector path: when the embedder is Ready and we have vector candidates.
+        if !candidates.is_empty() {
+            // Bound the O(n^2) comparison. Beyond the cap we compare a prefix and
+            // flag the result non-exhaustive rather than doing unbounded work — the
+            // candidates come from `nodes_by_label` in id (mint-time) order, so the
+            // prefix is the oldest memories, the ones most likely to have accreted
+            // duplicates.
+            let mut truncated = candidates.len() > DUP_SCAN_CAP;
+            candidates.truncate(DUP_SCAN_CAP);
+            let scanned = candidates.len();
 
-        // Complete pairwise cosine over the bounded set (not a k-capped index
-        // probe), so every pair above the floor is found, not just the top few
-        // per memory.
+            // Complete pairwise cosine over the bounded set (not a k-capped index
+            // probe), so every pair above the floor is found, not just the top few
+            // per memory.
+            let mut pairs: Vec<DuplicatePair> = Vec::new();
+            for i in 0..candidates.len() {
+                for j in (i + 1)..candidates.len() {
+                    if let Some(sim) = cosine(&candidates[i].2, &candidates[j].2) {
+                        if sim >= min_similarity {
+                            let (a, b) = (&candidates[i], &candidates[j]);
+                            // Canonical (ascending-id) order so a pair is reported once.
+                            let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                            pairs.push(DuplicatePair {
+                                ids: [lo.0.clone(), hi.0.clone()],
+                                similarity: sim,
+                                band: dup_band(sim).to_string(),
+                                relation: dup_relation(&lo.1, &hi.1).to_string(),
+                                contents: [lo.1.clone(), hi.1.clone()],
+                            });
+                        }
+                    }
+                }
+            }
+            // Most-similar first; NaN can't occur (finite vectors, non-zero norms
+            // filtered by `cosine`), so total_cmp is a safe total order.
+            pairs.sort_by(|x, y| y.similarity.total_cmp(&x.similarity));
+            if pairs.len() > limit {
+                truncated = true;
+                pairs.truncate(limit);
+            }
+            return FindDuplicateMemoriesResult {
+                pairs,
+                scanned,
+                truncated,
+                method: "vector".to_string(),
+            };
+        }
+
+        // Text fallback: use token-Jaccard similarity when embeddings are not ready.
+        // Enumerate all live, non-superseded memories using the same non-bumping scan
+        // so `scanned` semantics match the vector path.
+        let mut text_candidates: Vec<(String, String)> = self
+            .db
+            .nodes_by_label_unbumped(scope_set, MEMORY_LABEL)
+            .into_iter()
+            .filter(|n| !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP))
+            .filter_map(|n| {
+                let content = match n.props.get(MEMORY_CONTENT_PROP) {
+                    Some(PropValue::Str(c)) => c.clone(),
+                    _ => return None,
+                };
+                Some((n.id.to_string(), content))
+            })
+            .collect();
+
+        // Bound to the same cap as vector scan for consistency.
+        let mut truncated = text_candidates.len() > DUP_SCAN_CAP;
+        text_candidates.truncate(DUP_SCAN_CAP);
+        let scanned = text_candidates.len();
+
+        // Complete pairwise token-Jaccard over the bounded set.
+        // Text detection uses TEXT_NEAR_DUP_JACCARD as its floor (0.6), not the
+        // vector similarity threshold. This provides a consistent text-based signal
+        // independent of vector tuning parameters.
+        let text_min_sim = TEXT_NEAR_DUP_JACCARD as f32;
         let mut pairs: Vec<DuplicatePair> = Vec::new();
-        for i in 0..candidates.len() {
-            for j in (i + 1)..candidates.len() {
-                if let Some(sim) = cosine(&candidates[i].2, &candidates[j].2) {
-                    if sim >= min_similarity {
-                        let (a, b) = (&candidates[i], &candidates[j]);
-                        // Canonical (ascending-id) order so a pair is reported once.
+        let mut seen_pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+
+        for i in 0..text_candidates.len() {
+            for j in (i + 1)..text_candidates.len() {
+                let jaccard = token_jaccard(&text_candidates[i].1, &text_candidates[j].1);
+                if jaccard >= text_min_sim as f64 {
+                    let (a, b) = (&text_candidates[i], &text_candidates[j]);
+                    // Canonical (ascending-id) order so a pair is reported once.
+                    let (lo_id, hi_id) = if a.0 <= b.0 {
+                        (a.0.clone(), b.0.clone())
+                    } else {
+                        (b.0.clone(), a.0.clone())
+                    };
+                    let pair_key = (lo_id.clone(), hi_id.clone());
+                    if seen_pairs.insert(pair_key) {
                         let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                        // Text mode cannot distinguish duplicates from supersessions.
+                        // All pairs are reported as "duplicate"; the split requires vectors.
                         pairs.push(DuplicatePair {
                             ids: [lo.0.clone(), hi.0.clone()],
-                            similarity: sim,
-                            band: dup_band(sim).to_string(),
-                            relation: dup_relation(&lo.1, &hi.1).to_string(),
+                            similarity: jaccard as f32,
+                            band: dup_band(jaccard as f32).to_string(),
+                            relation: "duplicate".to_string(),
                             contents: [lo.1.clone(), hi.1.clone()],
                         });
                     }
                 }
             }
         }
-        // Most-similar first; NaN can't occur (finite vectors, non-zero norms
-        // filtered by `cosine`), so total_cmp is a safe total order.
+        // Most-similar first; sort by descending Jaccard.
         pairs.sort_by(|x, y| y.similarity.total_cmp(&x.similarity));
         if pairs.len() > limit {
             truncated = true;
@@ -2265,6 +2343,7 @@ impl TopoServer {
             pairs,
             scanned,
             truncated,
+            method: "text".to_string(),
         }
     }
 
@@ -2528,7 +2607,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. Near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). `duplicate_pairs`/`supersession_pairs` are 0 when the embedder is off — check `embeddings_enabled` to tell 'none' from 'couldn't check'. Counts cap at an internal limit; truncated=true means lower bounds."
+        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When embeddings are off, text-based detection (token-Jaccard) runs instead; all pairs count as `duplicate_pairs` and `supersession_pairs` is 0 (relation splitting requires vectors). Check `embeddings_enabled` to distinguish 'none found' from 'couldn't check with vectors'. Counts cap at an internal limit; truncated=true means lower bounds."
     )]
     fn memory_health(
         &self,
@@ -2558,10 +2637,18 @@ impl TopoServer {
         // Split the near-dup pairs by relation: same-fact restatements are
         // duplicates (merge), contradictions are supersessions (retire the stale
         // side). Sample only the true duplicates.
-        let (mut sample_duplicates, supersessions): (Vec<DuplicatePair>, Vec<DuplicatePair>) = dups
-            .pairs
-            .into_iter()
-            .partition(|p| p.relation == "duplicate");
+        // Text mode cannot distinguish duplicates from supersessions, so when
+        // method == "text", all pairs are duplicates and supersession_pairs is 0.
+        let (mut sample_duplicates, supersessions): (Vec<DuplicatePair>, Vec<DuplicatePair>) =
+            if dups.method == "text" {
+                // Text mode: all pairs are duplicates, none are supersessions.
+                (dups.pairs.clone(), Vec::new())
+            } else {
+                // Vector mode: split by relation.
+                dups.pairs
+                    .into_iter()
+                    .partition(|p| p.relation == "duplicate")
+            };
         let duplicate_pairs = sample_duplicates.len();
         let supersession_pairs = supersessions.len();
         let orphan_count = orphans.orphans.len();

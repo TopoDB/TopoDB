@@ -16,7 +16,7 @@ use common::{Server, DEFAULT_TIMEOUT};
 const A: &str = "01HZY0AAAAAAAAAAAAAAAAAAAA";
 
 #[test]
-fn find_duplicate_memories_is_empty_when_embeddings_are_off() {
+fn find_duplicate_memories_uses_text_fallback_when_embeddings_are_off() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Server::spawn(
         &dir.path().join("t.redb"),
@@ -24,8 +24,8 @@ fn find_duplicate_memories_is_empty_when_embeddings_are_off() {
     );
     s.initialize(DEFAULT_TIMEOUT);
 
-    // Two nearly-identical facts, but with embeddings off there is no semantic
-    // signal, so the scan must find nothing rather than guess.
+    // Two disjoint facts — with embeddings off, text-based detection (token-Jaccard)
+    // should still run but find no matches below the text threshold.
     s.call_tool_ok(
         "create_memory",
         serde_json::json!({ "content": "the auth service uses JWT tokens" }),
@@ -33,7 +33,7 @@ fn find_duplicate_memories_is_empty_when_embeddings_are_off() {
     );
     s.call_tool_ok(
         "create_memory",
-        serde_json::json!({ "content": "auth issues JSON Web Tokens" }),
+        serde_json::json!({ "content": "office plants need water on Thursdays" }),
         DEFAULT_TIMEOUT,
     );
 
@@ -42,12 +42,16 @@ fn find_duplicate_memories_is_empty_when_embeddings_are_off() {
         serde_json::json!({}),
         DEFAULT_TIMEOUT,
     );
+    // Method is "text" when embeddings are off (text fallback active).
+    assert_eq!(res["method"].as_str().unwrap(), "text", "{res}");
+    // No pairs because the memories are disjoint (low Jaccard similarity).
     assert_eq!(
         res["pairs"],
         serde_json::json!([]),
-        "no embeddings => no semantic signal, must be empty: {res}"
+        "disjoint memories should not pair even with text fallback: {res}"
     );
-    assert_eq!(res["scanned"], 0, "no embedded memories to scan: {res}");
+    // Scanned must reflect the actual number of memories examined.
+    assert_eq!(res["scanned"], 2, "must scan all memories stored: {res}");
     assert_eq!(res["truncated"], false, "{res}");
 }
 
