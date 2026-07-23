@@ -218,3 +218,40 @@ fn splits_supersessions_out_of_duplicate_count() {
     assert_eq!(res["duplicate_pairs"], 0, "and NOT as a duplicate: {res}");
     assert_eq!(res["needs_attention"], true, "{res}");
 }
+
+#[test]
+fn text_fallback_reports_all_pairs_as_duplicates_not_supersessions() {
+    let (_d, mut s) = fresh();
+    // Create two overlapping memories with embeddings off (text fallback).
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the login flow breaks when the session cookie exceeds four kilobytes"}),
+        T,
+    );
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the login flow breaks when the session cookie exceeds the size limit"}),
+        T,
+    );
+    // One disjoint memory (should not pair).
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the office plants are watered on Tuesdays"}),
+        T,
+    );
+
+    let res = s.call_tool_ok("memory_health", json!({}), T);
+    assert_eq!(
+        res["embeddings_enabled"], false,
+        "spawned --embeddings off: {res}"
+    );
+    // Text mode: all pairs are duplicate_pairs, supersession_pairs forced to 0.
+    assert!(
+        res["duplicate_pairs"].as_u64().unwrap() >= 1,
+        "text fallback should find the overlapping pair as a duplicate: {res}"
+    );
+    assert_eq!(
+        res["supersession_pairs"], 0,
+        "text mode must force supersession_pairs to 0 (split requires vectors): {res}"
+    );
+}
