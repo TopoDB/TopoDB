@@ -271,6 +271,41 @@ fn create_collision_with_reserved_prop_rejected() {
     assert_eq!(err["error"]["kind"], "rejected");
 }
 
+/// Malformed `--props` JSON is rejected (exit 2) even when the content is a
+/// dedup hit — `parse_props_arg` runs before the `existing_memory` check, so
+/// bad input never silently succeeds.
+#[test]
+fn malformed_props_on_dedup_rejected_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // Create a memory first.
+    let create_out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["create-memory", "--content", "test fact"])
+        .output()
+        .unwrap();
+    assert!(create_out.status.success());
+
+    // Try to re-create the same content with malformed --props; should fail
+    // with exit 2 (rejected), not exit 0 (deduplicated).
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "create-memory",
+            "--content",
+            "test fact",
+            "--props",
+            "NOT-JSON",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "rejected");
+}
+
 /// A db file created (outside the CLI) with a CUSTOM `IndexSpec` — one the
 /// CLI's own `topodb_json::default_spec()` does NOT declare — must have that
 /// custom equality index survive being opened by the CLI. `main.rs` only

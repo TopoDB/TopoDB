@@ -309,8 +309,8 @@ workspace are versioned and released independently (tags are per-package, e.g.
   dedup, alias-aware find-or-create entities, idempotent links, supersession) plus the lookup
   helpers (`find_existing_entity`, `existing_memory`, `content_hash`) and `RememberRequest::validate()`
   moved from `topodb-mcp` so both the MCP server and the CLI can delegate composition logic to the
-  same place. Also `open_with_busy_retry` — a helper that wraps `Db::open_stored` with configurable
-  retry on `TopoError::Busy`.
+  same place. Also `open_with_busy_retry` — a helper that retries any caller-supplied open closure
+  on `TopoError::Busy` with configurable budget and exponential backoff.
 
 ### 0.0.7 — 2026-07-22
 
@@ -788,14 +788,13 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 #### Changed
 
 - **Breaking: `create-entity` is now find-or-create by default** — the name is matched case- and
-  whitespace-insensitively across read scopes + write scope + shared, and resolves aliases.
+  whitespace-insensitively across write scope and shared, and resolves aliases.
   Existing entity is returned with `"created": false`; `--always-create` opts out (raw create,
   old behavior). Both paths now report the `created` flag in their output. When `created: false`,
   `--props` merges only NEW keys; a `name` key in props is always rejected.
 - **Breaking: `create-memory` now stamps `content_hash` and reports `deduplicated`** — identical
   content (after whitespace normalization) resolves to the existing memory; `"deduplicated": true`
-  indicates a hit, `false` a new memory. Links are still created/reused per the entity find-or-create
-  behavior.
+  indicates a hit, `false` a new memory.
 
 ### 0.0.7 — 2026-07-22
 
