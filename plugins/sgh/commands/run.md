@@ -3,7 +3,10 @@ description: Run an sgh graph, showing every shell command for approval first
 ---
 
 This command always runs the graph at the fixed path `.sgh/graph.yaml`, which
-`/sgh:plan` writes. It does not accept a path argument.
+`/sgh:plan` writes. It does not accept a path argument. The `--agent-bash`
+flag is available for direct CLI use to grant agent nodes Bash permissions by
+prefix; the plugin itself does not pass this flag and runs agents under your
+configured Claude Code permissions instead.
 
 If the user passed any argument to this command, do not silently run the
 default graph. Tell them this command only runs `.sgh/graph.yaml`, and ask
