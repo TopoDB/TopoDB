@@ -40,3 +40,15 @@ impl From<redb::Error> for TopoError {
 pub(crate) fn storage_err(e: impl Into<redb::Error>) -> TopoError {
     TopoError::Storage(Box::new(e.into()))
 }
+
+/// Maps a redb open failure: lock contention becomes the typed, retryable
+/// [`TopoError::Busy`]; everything else stays a storage error. Every call
+/// site that opens the underlying redb database must use this (there are
+/// two: `open_with_options` and `read_persisted_index_spec`) so a held
+/// file is `Busy` no matter which open path reaches it first.
+pub(crate) fn open_err(e: redb::DatabaseError) -> TopoError {
+    match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => TopoError::Busy,
+        other => storage_err(other),
+    }
+}

@@ -24,3 +24,17 @@ fn busy_clears_when_holder_drops() {
     }
     Db::open(&path).expect("open after drop must succeed");
 }
+
+#[test]
+fn open_stored_on_held_db_is_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    // Create the file first so open_stored takes the read-persisted-spec path.
+    drop(Db::open(&path).unwrap());
+    let _held = Db::open(&path).unwrap();
+    match Db::open_stored(&path) {
+        Err(TopoError::Busy) => {}
+        Ok(_) => panic!("open_stored of a held db unexpectedly succeeded"),
+        Err(other) => panic!("expected TopoError::Busy, got: {other}"),
+    }
+}

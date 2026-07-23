@@ -3,7 +3,7 @@ use crate::adj::{
 };
 use crate::counters::AccessStats;
 use crate::dict::{DictKind, Dicts, InternJournal, DICT};
-use crate::error::{storage_err, TopoError};
+use crate::error::{open_err, storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
 use crate::ids::{EdgeId, NodeId, Scope, ScopeSet};
 use crate::index::IndexSpec;
@@ -125,10 +125,7 @@ impl Storage {
         if let Some(bytes) = options.cache_size_bytes {
             builder.set_cache_size(bytes);
         }
-        let db = builder.create(path).map_err(|e| match e {
-            redb::DatabaseError::DatabaseAlreadyOpen => TopoError::Busy,
-            other => storage_err(other),
-        })?;
+        let db = builder.create(path).map_err(open_err)?;
         let s = Self {
             db,
             spec: spec.clone(),
@@ -804,7 +801,7 @@ impl Storage {
     /// spec persistence" (no `"index_spec"` key) — in both cases the caller
     /// falls back to `IndexSpec::default()`.
     pub(crate) fn read_persisted_index_spec(path: &Path) -> Result<Option<IndexSpec>, TopoError> {
-        let db = Database::create(path).map_err(storage_err)?;
+        let db = Database::create(path).map_err(open_err)?;
         let tx = db.begin_read().map_err(storage_err)?;
         let meta = match tx.open_table(META) {
             Ok(t) => t,
