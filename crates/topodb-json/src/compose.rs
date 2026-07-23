@@ -35,6 +35,7 @@ impl From<TopoError> for ComposeError {
 // --- moved verbatim from topodb-mcp/src/server.rs (self.db -> db) ---
 // Keep the original doc comments from server.rs on each of these when moving.
 
+/// In-call dedup key for `remember`'s entity names: whitespace-collapsed,
 /// lowercased — mirroring the engine's prop-index normalization
 /// (`prop_index::normalize_str`, which is pub(crate) and thus can't be
 /// called from here). Drift between the two only weakens IN-CALL dedup
@@ -66,7 +67,8 @@ pub fn content_hash(content: &str) -> String {
     format!("{h:016x}")
 }
 
-/// (Entity, name) matches followed through alias_of. Deduped by id,
+/// Canonical entities for `name`: direct (Entity, name) matches plus
+/// (Alias, name) matches followed through alias_of. Deduped by id,
 /// oldest first.
 ///
 /// Returns the raw `TopoError` (not `ErrorData`) rather than swallowing
