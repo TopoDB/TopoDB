@@ -140,6 +140,13 @@ pub struct RecallQuery {
     /// bounded below `1+w`. Live counters are db state: like wall-clock
     /// recency, results may shift as counters move.
     pub access_weight: f32,
+    /// Post-fusion score multipliers by node label. Each `(label, weight)`
+    /// applies a multiplicative factor to fused scores of matching nodes.
+    /// Empty (the default) changes nothing. Each weight is validated
+    /// finite and within 0.0..=10.0, same as the leg weights. Duplicate
+    /// labels keep the first match. The engine is policy-free: this is
+    /// mechanism only; policy defaults arrive from the host/MCP server.
+    pub label_weights: Vec<(String, f32)>,
 }
 
 pub(crate) const WEIGHT_TEXT: f32 = 1.0;
@@ -174,6 +181,7 @@ impl RecallQuery {
             vector_weight: WEIGHT_VECTOR,
             graph_weight: WEIGHT_GRAPH,
             access_weight: 0.0,
+            label_weights: Vec::new(),
         }
     }
 
@@ -213,6 +221,19 @@ impl RecallQuery {
                      omit it to search unfiltered"
                         .into(),
                 ));
+            }
+        }
+        for (label, w) in &self.label_weights {
+            if label.is_empty() {
+                return Err(TopoError::Rejected(
+                    "label_weights: label must not be empty".into(),
+                ));
+            }
+            if !weight_ok(*w) {
+                return Err(TopoError::Rejected(format!(
+                    "label_weights[\"{}\"] must be finite and within 0.0..=10.0, got {w}",
+                    label
+                )));
             }
         }
         Ok(())
@@ -359,9 +380,13 @@ impl Db {
                 _ => true,
             });
         }
-        apply_adjustments(&mut out, &q.options, q.access_weight, &|id| {
-            self.access_count_unbumped(id)
-        });
+        apply_adjustments(
+            &mut out,
+            &q.options,
+            q.access_weight,
+            &q.label_weights,
+            &|id| self.access_count_unbumped(id),
+        );
         out.truncate(q.k);
         Ok(out)
     }
@@ -379,19 +404,22 @@ pub(crate) fn access_factor(weight: f32, count: u64) -> f32 {
 }
 
 /// Combined post-fusion adjustment: recency (the same
-/// `(1-w) + w·2^(-age/half_life)` factor `search_text_with` uses) and the
-/// opt-in access boost (`access_factor`) multiply into one factor per
-/// candidate, applied once to fused scores, then re-sorted (score desc, id
-/// asc). No-op — and no counter reads — when both weights are 0, preserving
-/// today's early-return shape and the byte-identical-defaults requirement.
+/// `(1-w) + w·2^(-age/half_life)` factor `search_text_with` uses), the
+/// opt-in access boost (`access_factor`), and label-based score multipliers
+/// multiply into one factor per candidate, applied once to fused scores, then
+/// re-sorted (score desc, id asc). No-op — and no counter reads — when
+/// recency weight is 0, access_weight is 0, AND label_weights is empty,
+/// preserving today's early-return shape and the byte-identical-defaults
+/// requirement.
 pub(crate) fn apply_adjustments(
     out: &mut [(NodeRecord, f32)],
     options: &SearchOptions,
     access_weight: f32,
+    label_weights: &[(String, f32)],
     counts: &dyn Fn(crate::NodeId) -> u64,
 ) {
     let w = options.recency_weight;
-    if w <= 0.0 && access_weight <= 0.0 {
+    if w <= 0.0 && access_weight <= 0.0 && label_weights.is_empty() {
         return;
     }
     let now = options.now_ms.unwrap_or_else(|| {
@@ -415,6 +443,11 @@ pub(crate) fn apply_adjustments(
                 0
             },
         );
+        // Apply label-based score multiplier: first match wins, duplicate
+        // labels keep the first.
+        if let Some((_, wl)) = label_weights.iter().find(|(l, _)| rec.label == l.as_str()) {
+            factor *= wl;
+        }
         *score *= factor;
     }
     out.sort_by(|a, b| {
@@ -427,6 +460,25 @@ pub(crate) fn apply_adjustments(
 #[cfg(test)]
 mod adjustment_tests {
     use super::*;
+    use crate::ids::Scope;
+    use smol_str::SmolStr;
+
+    fn node_with_label(label: &str, id_num: u128) -> NodeRecord {
+        NodeRecord {
+            id: crate::NodeId::from_u128(id_num),
+            scope: Scope::Id(crate::ids::ScopeId::new()),
+            label: SmolStr::new(label),
+            props: std::collections::BTreeMap::new(),
+            embedding: None,
+        }
+    }
+
+    fn apply_adjustments_with_labels(
+        out: &mut [(NodeRecord, f32)],
+        label_weights: &[(String, f32)],
+    ) {
+        apply_adjustments(out, &SearchOptions::default(), 0.0, label_weights, &|_| 0);
+    }
 
     #[test]
     fn access_factor_is_neutral_monotone_bounded() {
@@ -437,6 +489,52 @@ mod adjustment_tests {
         assert!(f(1.0, 100) > f(1.0, 10));
         assert!(f(1.0, u64::MAX) < 2.0, "bounded below 1 + weight");
         assert!(f(0.5, u64::MAX) < 1.5);
+    }
+
+    #[test]
+    fn label_weight_downranks_matching_label() {
+        // Two candidates with adjacent fused scores; the down-weighted label's
+        // node must drop below the other after adjustment.
+        let mut out = vec![
+            (node_with_label("Entity", 1), 0.020f32),
+            (node_with_label("Memory", 2), 0.019f32),
+        ];
+        apply_adjustments_with_labels(&mut out, &[("Entity".to_string(), 0.5)]);
+        assert_eq!(
+            out[0].0.label.to_string(),
+            "Memory",
+            "down-weighted Entity must drop"
+        );
+        assert!(
+            (out[1].1 - 0.010).abs() < 1e-6,
+            "factor applied multiplicatively"
+        );
+    }
+
+    #[test]
+    fn empty_label_weights_change_nothing() {
+        // Same input twice: empty label_weights must be byte-identical to the
+        // pre-change behavior (scores AND order).
+        let mut out = vec![
+            (node_with_label("Entity", 1), 0.020f32),
+            (node_with_label("Memory", 2), 0.019f32),
+        ];
+        let original_order = out.iter().map(|(n, s)| (n.id, *s)).collect::<Vec<_>>();
+        let original_scores = out.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+
+        apply_adjustments_with_labels(&mut out, &[]);
+
+        let new_order = out.iter().map(|(n, s)| (n.id, *s)).collect::<Vec<_>>();
+        let new_scores = out.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+
+        assert_eq!(
+            original_order, new_order,
+            "order must not change with empty label_weights"
+        );
+        assert_eq!(
+            original_scores, new_scores,
+            "scores must not change with empty label_weights"
+        );
     }
 }
 
@@ -501,6 +599,55 @@ mod query_tests {
                 "must reject: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn label_weights_validation_rejects_bad_factors() {
+        // NaN, negative, and 10.1 all rejected; 0.0 and 10.0 accepted.
+        for build in [
+            |mut x: RecallQuery| {
+                x.label_weights = vec![("Entity".to_string(), -0.1)];
+                x
+            },
+            |mut x: RecallQuery| {
+                x.label_weights = vec![("Entity".to_string(), f32::NAN)];
+                x
+            },
+            |mut x: RecallQuery| {
+                x.label_weights = vec![("Entity".to_string(), 10.1)];
+                x
+            },
+            |mut x: RecallQuery| {
+                x.label_weights = vec![("".to_string(), 0.5)];
+                x
+            },
+        ] {
+            let bad = build(q());
+            assert!(
+                matches!(bad.validate_tuning(), Err(crate::TopoError::Rejected(_))),
+                "must reject: {bad:?}"
+            );
+        }
+
+        // Valid edge cases should pass.
+        assert!(RecallQuery {
+            label_weights: vec![("Entity".to_string(), 0.0)],
+            ..q()
+        }
+        .validate_tuning()
+        .is_ok());
+        assert!(RecallQuery {
+            label_weights: vec![("Entity".to_string(), 10.0)],
+            ..q()
+        }
+        .validate_tuning()
+        .is_ok());
+        assert!(RecallQuery {
+            label_weights: vec![("Entity".to_string(), 0.5), ("Memory".to_string(), 1.5)],
+            ..q()
+        }
+        .validate_tuning()
+        .is_ok());
     }
 
     #[test]
