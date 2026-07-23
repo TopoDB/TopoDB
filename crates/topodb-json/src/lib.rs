@@ -19,6 +19,9 @@ pub use compose::{
     RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
 };
 
+mod retry;
+pub use retry::open_with_busy_retry;
+
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::str::FromStr;

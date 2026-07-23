@@ -66,27 +66,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // power-user seam for creating a db with a custom spec or forcing a
     // re-declare. `Path::exists` is safe here — the parent-dir check above ran,
     // and a stdio MCP server is a single writer per db path.
-    let db = match &config.spec {
-        Some(spec) => Db::open_with(&config.db_path, spec.clone())?,
-        None if config.db_path.exists() => {
-            // Inherit the persisted spec — but a db still on an older STOCK
-            // default (never `--spec`-customized) is silently upgraded to the
-            // current default (`topodb_json::upgraded_spec`), e.g. picking up
-            // the (Entity, name) text index so entities are searchable by
-            // name. A one-time reindex on open is the cost. Customized specs
-            // are inherited verbatim, exactly as before.
-            let db = Db::open_stored(&config.db_path)?;
-            let persisted = db.index_spec();
-            let upgraded = topodb_json::upgraded_spec(persisted.clone());
-            if upgraded != persisted {
-                drop(db);
-                Db::open_with(&config.db_path, upgraded)?
-            } else {
-                db
+    let budget_ms = std::env::var("TOPODB_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3000);
+    let db = topodb_json::open_with_busy_retry(budget_ms, || {
+        match &config.spec {
+            Some(spec) => Db::open_with(&config.db_path, spec.clone()),
+            None if config.db_path.exists() => {
+                // Inherit the persisted spec — but a db still on an older STOCK
+                // default (never `--spec`-customized) is silently upgraded to the
+                // current default (`topodb_json::upgraded_spec`), e.g. picking up
+                // the (Entity, name) text index so entities are searchable by
+                // name. A one-time reindex on open is the cost. Customized specs
+                // are inherited verbatim, exactly as before.
+                let db = Db::open_stored(&config.db_path)?;
+                let persisted = db.index_spec();
+                let upgraded = topodb_json::upgraded_spec(persisted.clone());
+                if upgraded != persisted {
+                    drop(db);
+                    Db::open_with(&config.db_path, upgraded)
+                } else {
+                    Ok(db)
+                }
             }
+            None => Db::open_with(&config.db_path, config::default_spec()),
         }
-        None => Db::open_with(&config.db_path, config::default_spec())?,
-    };
+    })?;
     // `--embeddings off` (case-insensitive) => permanently disabled.
     // Omitted, OR `--embeddings auto` (case-insensitive) => auto (start with
     // the default model) — "auto" is accepted as an explicit spelling of the

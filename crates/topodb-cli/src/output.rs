@@ -2,11 +2,11 @@
 //!
 //! The contract (see the plan's Global Constraints): success is a JSON value
 //! on stdout with exit 0; failure is `{"error":{"kind","message"}}` on stderr
-//! with exit 2 for a rejected/bad-input condition (engine `Rejected`, scope
-//! parse failure, ...) or exit 1 for an internal/storage/db-open failure.
-//! clap's own usage errors (missing `--db`, unknown subcommand, ...) are left
-//! to clap, whose default exit code is already 2 — callers never route those
-//! through `fail`.
+//! with exit 3 for a lock contention error (`Busy`), exit 2 for a
+//! rejected/bad-input condition (engine `Rejected`, scope parse failure, ...),
+//! or exit 1 for an internal/storage/db-open failure. clap's own usage errors
+//! (missing `--db`, unknown subcommand, ...) are left to clap, whose default
+//! exit code is already 2 — callers never route those through `fail`.
 
 use serde_json::Value;
 
@@ -41,12 +41,14 @@ pub fn fail(kind: &str, message: &str, code: i32) -> ! {
 
 /// Maps a `TopoError` to the right `(kind, exit-code)` pair and calls
 /// [`fail`]: `Rejected` (bad input the caller can fix — an undeclared index,
-/// an empty batch, a malformed query) is `("rejected", 2)`; every other
-/// variant (`Storage`, `Encoding`, `Compacted`, `Closed`, `UnsupportedFormat`)
-/// is `("internal", 1)` — the caller can't fix those by changing their input.
+/// an empty batch, a malformed query) is `("rejected", 2)`; `Busy` (lock
+/// contention) is `("busy", 3)`; every other variant (`Storage`, `Encoding`,
+/// `Compacted`, `Closed`, `UnsupportedFormat`) is `("internal", 1)` — the
+/// caller can't fix those by changing their input.
 pub fn fail_engine(e: &topodb::TopoError) -> ! {
     match e {
         topodb::TopoError::Rejected(_) => fail("rejected", &e.to_string(), 2),
+        topodb::TopoError::Busy => fail("busy", &e.to_string(), 3),
         _ => fail("internal", &e.to_string(), 1),
     }
 }

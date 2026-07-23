@@ -583,6 +583,51 @@ fn search_vector_empty_vector_is_rejected_exit_2() {
     );
 }
 
+// --- Task 7: Lock backoff — retry helper, CLI busy/exit 3, MCP startup retry ---
+
+#[test]
+fn lock_contention_is_busy_exit_3_and_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // Seed the file so it exists, and ensure it's fully initialized.
+    let _ = topodb::Db::open(&db).unwrap();
+
+    // Hold it from another thread, within THIS process (same as topodb's busy test).
+    let held = topodb::Db::open(&db).unwrap();
+
+    // Ensure the lock is established before subprocess tries to open
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Fail-fast: budget 0 -> busy, exit 3.
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "--lock-wait-ms", "0", "info"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected exit 3 (busy), got {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "busy");
+
+    // Retry-then-succeed: release the lock after ~300ms; default budget (3000ms) rides it out.
+    let db_clone = db.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+
+    let out = bin()
+        .args(["--db", db_clone.to_str().unwrap(), "info"])
+        .output()
+        .unwrap();
+    handle.join().unwrap();
+    assert!(out.status.success(), "retry succeeds once holder drops");
+}
+
 #[test]
 fn submit_batch_atomic_with_backrefs() {
     let dir = tempfile::tempdir().unwrap();
