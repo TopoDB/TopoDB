@@ -777,22 +777,8 @@ fn get_edges_with_as_of_parameter() {
         "edge at mid must point to E1"
     );
 
-    // Test 2: WITHOUT as_of but open_only unset returns both edges (history)
-    let history_edges_resp = server.call_tool_ok(
-        "get_edges",
-        serde_json::json!({
-            "from_id": memory_id,
-            "edge_type": "links",
-            "open_only": false
-        }),
-        DEFAULT_TIMEOUT,
-    );
-    let history_edges = history_edges_resp["edges"].as_array().expect("edges array");
-    assert_eq!(
-        history_edges.len(),
-        2,
-        "get_edges with open_only:false returns complete history"
-    );
+    // (Full-history coverage: the all_edges_resp assertion above already
+    // proves open_only:false returns both edges against this same state.)
 
     // Test 3: with as_of AFTER the close and after E2's link returns only E2's edge
     // DOCUMENTED CONTRACT: omit open_only when passing as_of
