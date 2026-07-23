@@ -4,7 +4,7 @@ use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
 /// Validate a bash grant prefix.
 ///
-/// This is a rails to catch obviously problematic prefixes — not a security boundary.
+/// This is a rail to catch obviously problematic prefixes — not a security boundary.
 /// Rejects:
 /// - Empty or whitespace-only strings
 /// - Base commands (first whitespace-separated token, basename after `/`) in {sh, bash, zsh, env}
@@ -31,7 +31,7 @@ pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
     // Reject shell commands and env
     if matches!(base_cmd, "sh" | "bash" | "zsh" | "env") {
         return Err(format!(
-            "bash grant prefix '{}' is a shell or package manager ({}), not a binary",
+            "bash grant prefix '{}' is a shell or generic launcher ({}), not a binary",
             prefix, base_cmd
         ));
     }
@@ -54,14 +54,14 @@ pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
 /// Returns a vector of arguments suitable for `std::process::Command`.
 /// Includes the prompt, allowedTools (with optional bash grants), output format,
 /// and model if specified.
-pub fn build_argv(model: Option<String>, bash_grants: Vec<String>) -> Vec<String> {
-    let mut argv = vec![
-        "claude".to_string(),
-        "-p".to_string(),
-        "".to_string(), // Placeholder; the prompt is typically added by the caller
-    ];
+pub fn build_argv(prompt: String, model: Option<String>, bash_grants: &[String]) -> Vec<String> {
+    let mut argv = vec!["claude".to_string(), "-p".to_string(), prompt];
 
-    // Build allowedTools value with optional bash grants
+    // Claude Code permission-rule syntax: Bash(<prefix>:*) is the documented
+    // prefix-matching rule form used in settings allowlists (the same grammar
+    // as settings.json "permissions.allow" entries). Verified against Claude
+    // Code's permission-rules documentation; the repo itself has no prior
+    // allowedTools usage to mirror.
     let mut allowed_tools = "Read,Write,Edit".to_string();
     for grant in bash_grants {
         allowed_tools.push_str(&format!(",Bash({}:*)", grant));
@@ -264,8 +264,6 @@ impl ClaudeCodeRunner {
 
 impl AgentRunner for ClaudeCodeRunner {
     fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
-        let mut cmd = Command::new("claude");
-        cmd.arg("-p").arg(build_prompt(req));
         // Without a tool grant, an agent node runs under the default
         // permission mode, where there is no one to approve a Write. The tool
         // call is blocked, the agent explains that it was blocked, and
@@ -289,18 +287,13 @@ impl AgentRunner for ClaudeCodeRunner {
         // `Bash(prefix:*)` widens what an UNGATED agent prompt can execute.
         // The run-level gate echo (shown before approval) is the human control —
         // grants here alone do not confine or restrict agent execution.
-        let mut allowed_tools = "Read,Write,Edit".to_string();
-        for grant in &self.bash_grants {
-            allowed_tools.push_str(&format!(",Bash({}:*)", grant));
-        }
-        cmd.arg("--allowedTools").arg(allowed_tools);
+        let argv = build_argv(build_prompt(req), self.model.clone(), &self.bash_grants);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+
         // Structured output is what makes a denied tool visible at all: in
         // plain-text mode a blocked Write is indistinguishable from a
         // completed one, since both exit 0 with prose on stdout.
-        cmd.arg("--output-format").arg("json");
-        if let Some(m) = &self.model {
-            cmd.arg("--model").arg(m);
-        }
 
         let out = cmd.output()?;
 
