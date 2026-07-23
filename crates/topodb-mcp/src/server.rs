@@ -1294,6 +1294,16 @@ struct MemoryHealthResult {
     /// because near-duplicate detection needs embeddings — NOT because there are
     /// none.
     embeddings_enabled: bool,
+    /// `true` if embedder status is Failed or Downloading — hygiene is degraded
+    /// (running text-only or incomplete). Deliberate `off` is `false`.
+    degraded: bool,
+    /// When `degraded`, explains the state and one-line fix. Absent (not null)
+    /// when not degraded. For Failed: "embedding model unavailable — hygiene
+    /// running in text-fallback mode; install ONNX Runtime or set ORT_DYLIB_PATH
+    /// for vector-grade detection". For Downloading: "embedding model still
+    /// downloading — hygiene in text-fallback mode until ready".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_reason: Option<String>,
     /// Near-duplicate pairs that look like the SAME fact (cosine >= 0.80,
     /// non-contradicting) — merge with `consolidate_memories`. 0 when embeddings
     /// are off.
@@ -1308,7 +1318,7 @@ struct MemoryHealthResult {
     /// Memories with no activity (creation or recall) within `stale_older_than_days`.
     stale_count: usize,
     /// `true` if any category is non-zero — the one-glance "does my memory need
-    /// tidying?" signal.
+    /// tidying?" signal. Forced `true` when degraded.
     needs_attention: bool,
     /// Up to a few most-similar duplicate pairs, for orientation. Use
     /// `find_duplicate_memories` for the full list.
@@ -2617,7 +2627,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When embeddings are off, text-based detection (token-Jaccard) runs instead; all pairs count as `duplicate_pairs` and `supersession_pairs` is 0 (relation splitting requires vectors). Check `embeddings_enabled` to distinguish 'none found' from 'couldn't check with vectors'. Counts cap at an internal limit; truncated=true means lower bounds."
+        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When embeddings are off, text-based detection (token-Jaccard) runs instead; all pairs count as `duplicate_pairs` and `supersession_pairs` is 0 (relation splitting requires vectors). Check `embeddings_enabled` to distinguish 'none found' from 'couldn't check with vectors'. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
     )]
     fn memory_health(
         &self,
@@ -2644,6 +2654,21 @@ impl TopoServer {
         // list cap bounds only the returned rows), so either gives the true total.
         let total_memories = stale.scanned;
         let embeddings_enabled = matches!(self.embedder.status(), EmbedderStatus::Ready);
+        // Determine degraded state: Failed or Downloading (not Off).
+        let embedder_status = self.embedder.status();
+        let degraded = matches!(
+            embedder_status,
+            EmbedderStatus::Failed | EmbedderStatus::Downloading
+        );
+        let degraded_reason = match embedder_status {
+            EmbedderStatus::Failed => {
+                Some("embedding model unavailable — hygiene running in text-fallback mode; install ONNX Runtime or set ORT_DYLIB_PATH for vector-grade detection".to_string())
+            }
+            EmbedderStatus::Downloading => {
+                Some("embedding model still downloading — hygiene in text-fallback mode until ready".to_string())
+            }
+            EmbedderStatus::Off | EmbedderStatus::Ready => None,
+        };
         // Split the near-dup pairs by relation: same-fact restatements are
         // duplicates (merge), contradictions are supersessions (retire the stale
         // side). Sample only the true duplicates.
@@ -2663,8 +2688,12 @@ impl TopoServer {
         let supersession_pairs = supersessions.len();
         let orphan_count = orphans.orphans.len();
         let stale_count = stale.stale.len();
-        let needs_attention =
-            duplicate_pairs > 0 || supersession_pairs > 0 || orphan_count > 0 || stale_count > 0;
+        // When degraded, force needs_attention true; otherwise use the normal logic.
+        let needs_attention = degraded
+            || duplicate_pairs > 0
+            || supersession_pairs > 0
+            || orphan_count > 0
+            || stale_count > 0;
         let truncated = dups.truncated || orphans.truncated || stale.truncated;
 
         sample_duplicates.truncate(HEALTH_SAMPLE);
@@ -2676,6 +2705,8 @@ impl TopoServer {
         Ok(Json(MemoryHealthResult {
             total_memories,
             embeddings_enabled,
+            degraded,
+            degraded_reason,
             duplicate_pairs,
             supersession_pairs,
             orphan_count,

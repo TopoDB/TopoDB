@@ -255,3 +255,55 @@ fn text_fallback_reports_all_pairs_as_duplicates_not_supersessions() {
         "text mode must force supersession_pairs to 0 (split requires vectors): {res}"
     );
 }
+
+#[test]
+fn reports_degraded_state_for_failed_embedder() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = topodb::ScopeId::new().to_string();
+    // Trigger Failed state with a bogus model name
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &[
+            "--scope",
+            scope.as_str(),
+            "--embeddings",
+            "not-a-real-model",
+        ],
+    );
+    s.initialize(T);
+
+    let res = s.call_tool_ok("memory_health", json!({}), T);
+    assert_eq!(
+        res["degraded"], true,
+        "embedder is Failed, so degraded: {res}"
+    );
+    assert_eq!(
+        res["needs_attention"], true,
+        "when degraded, needs_attention is forced true: {res}"
+    );
+    let reason = res["degraded_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("text-fallback"),
+        "reason should mention text fallback: {reason}"
+    );
+    assert!(
+        reason.contains("unavailable"),
+        "reason should mention the model is unavailable: {reason}"
+    );
+}
+
+#[test]
+fn does_not_report_degraded_for_embeddings_off() {
+    let (_d, mut s) = fresh();
+    // Spawned with --embeddings off (default in fresh())
+
+    let res = s.call_tool_ok("memory_health", json!({}), T);
+    assert_eq!(
+        res["degraded"], false,
+        "deliberate off is not degraded: {res}"
+    );
+    assert!(
+        res.get("degraded_reason").is_none(),
+        "degraded_reason key should be absent when not degraded (not null): {res}"
+    );
+}
