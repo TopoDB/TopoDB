@@ -1,7 +1,8 @@
 //! Semantic near-duplicate detection: on storing a NEW memory, the write tools
 //! surface existing memories that are semantically close (advisory — nothing is
 //! merged), so an agent can notice "same fact, different words" that exact dedup
-//! misses. Off/not-ready embeddings degrade to an empty list (no false signal).
+//! misses. When embeddings are Ready, vector-based detection applies; when not
+//! ready, text-based fallback (token-Jaccard) applies.
 //!
 //! The real-embedder test is #[ignore] (downloads ~34MB), matching
 //! tests/embeddings.rs; the off-path guard runs in CI.
@@ -13,32 +14,78 @@ use common::{Server, DEFAULT_TIMEOUT};
 const A: &str = "01HZY0AAAAAAAAAAAAAAAAAAAA";
 
 #[test]
-fn near_duplicates_is_empty_when_embeddings_are_off() {
+fn text_fallback_flags_overlapping_content() {
     let dir = tempfile::tempdir().unwrap();
-    // Default spawn is already --embeddings off; be explicit.
     let mut s = Server::spawn(
         &dir.path().join("t.redb"),
         &["--scope", A, "--embeddings", "off"],
     );
     s.initialize(DEFAULT_TIMEOUT);
 
-    let cm = s.call_tool_ok(
+    // Create the original memory.
+    let _original = s.call_tool_ok(
         "create_memory",
-        serde_json::json!({ "content": "the auth service uses JWT tokens" }),
+        serde_json::json!({ "content": "the login flow breaks when the session cookie exceeds four kilobytes" }),
         DEFAULT_TIMEOUT,
-    );
-    assert_eq!(
-        cm["near_duplicates"],
-        serde_json::json!([]),
-        "no embeddings => no semantic signal, must be an empty list: {cm}"
     );
 
-    let rm = s.call_tool_ok(
-        "remember",
-        serde_json::json!({ "content": "auth issues JSON Web Tokens", "entities": ["Auth"] }),
+    // Create a similar memory with significant token overlap (>0.6 Jaccard).
+    let similar = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the login flow breaks when the session cookie exceeds the size limit" }),
         DEFAULT_TIMEOUT,
     );
-    assert_eq!(rm["near_duplicates"], serde_json::json!([]), "{rm}");
+
+    let near = similar["near_duplicates"]
+        .as_array()
+        .expect("near_duplicates should be an array");
+    assert!(
+        !near.is_empty(),
+        "text fallback should surface overlapping content: {similar:#?}"
+    );
+
+    let first_hit = &near[0];
+    assert!(
+        first_hit["method"].as_str().unwrap() == "text",
+        "method should be 'text' when embeddings are off: {first_hit:#?}"
+    );
+    assert!(
+        first_hit["similarity"].as_f64().unwrap() > 0.0
+            && first_hit["similarity"].as_f64().unwrap() <= 1.0,
+        "similarity score should be between 0 and 1: {first_hit:#?}"
+    );
+}
+
+#[test]
+fn text_fallback_quiet_on_disjoint_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &["--scope", A, "--embeddings", "off"],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // Create an initial memory.
+    let _original = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the authentication system uses OAuth2 tokens" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Create a completely unrelated memory.
+    let unrelated = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the office plants need water on Thursdays" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let near = unrelated["near_duplicates"]
+        .as_array()
+        .expect("near_duplicates should be an array");
+    assert!(
+        near.is_empty(),
+        "text fallback should not surface disjoint content: {unrelated:#?}"
+    );
 }
 
 /// Requires the real embedder (ONNX Runtime + a model download). Run locally:
@@ -103,14 +150,18 @@ fn semantically_similar_fact_is_surfaced_as_a_near_duplicate() {
         near.iter().any(|n| n["id"] == original),
         "the original fact should surface as a near-duplicate: {similar:#?}"
     );
-    let sim = near
+    let dup = near
         .iter()
         .find(|n| n["id"] == original)
-        .and_then(|n| n["similarity"].as_f64())
-        .unwrap();
+        .expect("original should be in near_duplicates");
+    let sim = dup["similarity"].as_f64().unwrap();
     assert!(
         sim >= 0.80,
         "similarity should clear the 0.80 near-dup floor, got {sim}"
+    );
+    assert!(
+        dup["method"].as_str().unwrap() == "vector",
+        "method should be 'vector' when embeddings are ready: {dup:#?}"
     );
 
     // An UNRELATED fact must NOT surface the auth memory (guards false merges).
