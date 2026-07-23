@@ -457,6 +457,15 @@ workspace are versioned and released independently (tags are per-package, e.g.
   `topodb-json::compose` module instead of maintaining separate logic in the MCP server. The
   startup open path now retries on `TopoError::Busy` using the same `TOPODB_LOCK_WAIT_MS` env
   var. No tool-surface change.
+- **Near-duplicate detection falls back to text mode** when the embedder is not Ready — `find_duplicate_memories`
+  and `memory_health` now serve advisory scans even with embeddings off or failed. **Vector mode** (embedder Ready):
+  cosine similarity with negation-cue contradiction detection (distinguishes contradictions from restatements);
+  banded pairs (`likely`/`possible`). **Text mode** (embedder Failed/Downloading): BM25 candidate matching +
+  token-Jaccard similarity at fixed 0.6 floor; no contradiction detection; all pairs reported as `duplicate`,
+  `supersession_pairs` forced to 0, `min_similarity` ignored (text scores are Jaccard, not comparable to cosine).
+  Each pair in both modes carries a `method` field (`"vector"` / `"text"`). `memory_health` gains `degraded`/`degraded_reason`
+  fields and forces `needs_attention: true` when the embedder is Failed or Downloading (text mode is degraded hygiene).
+  Deliberately off (`--embeddings off`) is not degraded — scans are empty by design, not by failure.
 
 ### 0.0.12 — 2026-07-22
 
