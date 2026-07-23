@@ -18,6 +18,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`RecallQuery.label_weights`** — post-fusion per-label score multipliers
+  (`Vec<(String, f32)>`), validated and applied multiplicatively alongside recency/access weighting
+  in a single re-sort. Default empty (`vec![]`) changes nothing (byte-identical behavior by
+  construction, no-op at defaults contract preserved). Enables host policies like down-weighting
+  Entity hits relative to Memory for question-shaped queries. **Breaking for struct-literal
+  construction** (new field) — use `RecallQuery::new(scopes, query, k)` with struct-update
+  syntax so future additions don't break call sites.
 - **`TopoError::Busy`**: lock contention on ANY open path (`open`, `open_with`, `open_stored`,
   including the persisted-spec read) is a typed, retryable variant instead of an opaque storage
   error. Enables graceful degradation and callers to implement retry loops (e.g. with
@@ -416,6 +423,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Changed
 
+- **`search_memories` defaults to down-weighting Entity hits (`label_weights: {"Entity": 0.5}`)** —
+  facts (Memory nodes) now outrank bare entity handles for question-shaped queries. Pass an explicit
+  `label_weights: {}` to disable and restore the old ranking (facts and entities equally weighted).
+  Full per-label control available via the new `label_weights` param — factors are validated 0.0–10.0,
+  default empty = unchanged behavior. Enables MCP hosts to implement semantic policies without
+  modifying the engine.
 - **`remember` and `create_memory` tools reject reserved props keys `content_hash`/`superseded_at`**
   in the `props` param (returns `invalid_params` error) — these are system-maintained and
   caller-settable only via dedup and supersession primitives, not arbitrary props.
@@ -426,6 +439,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **Startup warning on unparseable `TOPODB_LOCK_WAIT_MS`** — if the env var is set but not a valid
   millisecond integer, the server now logs one stderr warning and falls back to the default (3000 ms)
   instead of silently ignoring the invalid value.
+- **Batch DSL `#N` references are 0-indexed** — documentation clarified at every site (`submit_batch`
+  tool description, README, `topodb-cli submit` doc comment, `topodb-json` batch module) to explicitly
+  state that `#0` refers to the first command's produced id, `#1` to the second, etc. (doc-only).
 - **Internal refactor**: `remember` and entity-lookup composition now delegates to the shared
   `topodb-json::compose` module instead of maintaining separate logic in the MCP server. The
   startup open path now retries on `TopoError::Busy` using the same `TOPODB_LOCK_WAIT_MS` env
