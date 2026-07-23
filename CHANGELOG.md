@@ -808,6 +808,16 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ---
 
+## `topodb-sgh`
+
+### Unreleased
+
+#### Added
+
+- **`--agent-bash <prefix>`** — direct CLI flag to grant agent nodes Bash permissions by prefix (e.g. `--agent-bash 'topodb'` grants `Bash(topodb:*)` additively on top of Read/Write/Edit). The flag is only available for direct CLI use; the Claude Code plugin never passes it and runs agents under configured global permissions instead. Grant the narrowest binary scoped to your task (never shells or package managers). The approval gate echoes every grant before execution.
+
+---
+
 ## Claude Code plugin
 
 ### Unreleased
