@@ -1650,3 +1650,157 @@ fn pretty_flag_works_after_subcommand_with_search() {
         "pretty output should be multi-line, got: {stdout}"
     );
 }
+
+// --- Task 2: get-edges ---
+
+/// get-edges: test history filtering with as_of and open_only flags.
+/// Create M→E1, capture mid timestamp, close E1, create M→E2.
+/// Then test various combinations:
+/// - default (open-only true) shows only E2
+/// - --as-of mid shows only E1
+/// - --open-only false shows both
+/// - --as-of and --open-only together is rejected
+/// - --as-of 0 is rejected
+#[test]
+fn get_edges_history_and_as_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    // Create a memory M and entity E1.
+    let (m_json, _) = run_cmd(&["create-memory", "--content", "test"]);
+    let m_id = m_json["id"].as_str().unwrap().to_string();
+
+    let (e1_json, _) = run_cmd(&["create-entity", "--name", "e1"]);
+    let e1_id = e1_json["id"].as_str().unwrap().to_string();
+
+    // Link M→E1.
+    let (edge1_json, _) = run_cmd(&[
+        "link", "--from", &m_id, "--to", &e1_id, "--type", "mentions",
+    ]);
+    let edge1_id = edge1_json["id"].as_str().unwrap().to_string();
+
+    // Capture a timestamp in the middle (before E1 is closed but after it was created).
+    let mid = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Close E1.
+    let _ = run_cmd(&["close-edge", &edge1_id]);
+
+    // Capture E1's valid_to by fetching with open_only=false.
+    let (hist, code) = run_cmd(&["get-edges", &m_id, "--open-only", "false"]);
+    assert_eq!(code, 0, "get-edges should succeed, got: {:?}", hist);
+    let edges_arr = hist["edges"]
+        .as_array()
+        .expect("expected 'edges' key in response");
+    let e1_record = edges_arr
+        .iter()
+        .find(|e| e["id"] == edge1_id)
+        .expect("E1 edge should exist in history");
+    let e1_valid_to = e1_record["valid_to"]
+        .as_i64()
+        .expect("E1 should have valid_to set after closing");
+
+    // Create entity E2 and link M→E2.
+    let (e2_json, _) = run_cmd(&["create-entity", "--name", "e2"]);
+    let e2_id = e2_json["id"].as_str().unwrap().to_string();
+
+    let (edge2_json, _) = run_cmd(&[
+        "link", "--from", &m_id, "--to", &e2_id, "--type", "mentions",
+    ]);
+    let edge2_id = edge2_json["id"].as_str().unwrap().to_string();
+
+    // Capture E2's creation timestamp by fetching it with get-edges.
+    let (e2_edges, _) = run_cmd(&["get-edges", &m_id, "--open-only", "false"]);
+    let e2_record = e2_edges["edges"]
+        .as_array()
+        .expect("should have edges")
+        .iter()
+        .find(|e| e["id"] == edge2_id)
+        .expect("E2 edge should exist");
+    let e2_valid_from = e2_record["valid_from"]
+        .as_i64()
+        .expect("E2 edge should have valid_from");
+
+    // Test 1: default (open-only true) → only E2.
+    let (result, code) = run_cmd(&["get-edges", &m_id]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "should have only 1 edge (E2)");
+    assert_eq!(edges[0]["id"], edge2_id);
+
+    // Test 2: explicit --open-only true → only E2.
+    let (result, code) = run_cmd(&["get-edges", &m_id, "--open-only", "true"]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["id"], edge2_id);
+
+    // Test 3: --as-of mid (before E1 closed) → only E1.
+    let (result, code) = run_cmd(&["get-edges", &m_id, "--as-of", &mid.to_string()]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "should have only E1 at mid timestamp");
+    assert_eq!(edges[0]["id"], edge1_id);
+
+    // Test 4: --as-of exactly at E1's valid_to (exclusive upper bound).
+    // At E1's valid_to instant, E1 should not appear (exclusive boundary),
+    // and E2 hasn't been created yet, so we should get 0 edges.
+    let (result, code) = run_cmd(&["get-edges", &m_id, "--as-of", &(e1_valid_to).to_string()]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(
+        edges.len(),
+        0,
+        "at E1's valid_to (exclusive boundary), neither edge should appear"
+    );
+
+    // Test 4b: --as-of at E2's creation timestamp (after E1's valid_to).
+    let (result, code) = run_cmd(&["get-edges", &m_id, "--as-of", &e2_valid_from.to_string()]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(
+        edges.len(),
+        1,
+        "at E2's creation time, only E2 should appear (E1 was closed before this)"
+    );
+    assert_eq!(edges[0]["id"], edge2_id);
+
+    // Test 5: --open-only false → both edges.
+    let (result, code) = run_cmd(&["get-edges", &m_id, "--open-only", "false"]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2, "should have both E1 (closed) and E2 (open)");
+
+    // Test 6: --as-of 0 → rejected/exit 2.
+    let (_, code) = run_cmd(&["get-edges", &m_id, "--as-of", "0"]);
+    assert_eq!(code, 2, "as-of 0 should be rejected");
+
+    // Test 7: --as-of with --open-only flag → rejected/exit 2 (mutual exclusion).
+    let (_, code) = run_cmd(&[
+        "get-edges",
+        &m_id,
+        "--as-of",
+        &mid.to_string(),
+        "--open-only",
+        "false",
+    ]);
+    assert_eq!(code, 2, "as-of and open-only together should be rejected");
+}

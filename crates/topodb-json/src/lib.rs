@@ -432,6 +432,18 @@ pub fn edge_to_json(e: &EdgeRecord) -> Result<Value, String> {
     Ok(Value::Object(map))
 }
 
+/// Determine whether an edge is "live" (valid/present) at a given Unix-ms
+/// timestamp. The validity window is inclusive on the lower bound
+/// (`valid_from <= t`) and exclusive on the upper bound (`valid_to > t`).
+/// Open edges (no `valid_to`) are treated as eternally open.
+///
+/// Used by both `topodb-mcp`'s `get_edges` tool and `topodb-cli`'s
+/// `get-edges` command to filter edges by `--as-of` time, ensuring consistent
+/// liveness semantics across all frontends.
+pub fn edge_live_at(e: &EdgeRecord, t: i64) -> bool {
+    e.valid_from <= t && e.valid_to.is_none_or(|vt| vt > t)
+}
+
 /// A `Subgraph` → `{"nodes": [...], "edges": [...]}`, each element per
 /// [`node_to_json`]/[`edge_to_json`].
 pub fn subgraph_to_json(sg: &Subgraph) -> Result<Value, String> {

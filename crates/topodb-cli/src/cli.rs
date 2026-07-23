@@ -184,6 +184,32 @@ pub enum Command {
         #[arg(long)]
         as_of: Option<i64>,
     },
+    /// List edges from a source node, with optional time-travel (as_of) and
+    /// history access (open_only). Defaults to currently-open edges when neither
+    /// flag is set; pass `--open-only false` to see closed edges (history).
+    /// `--as-of <UNIX_MS>` filters to edges live at that Unix-millisecond instant
+    /// (mutually exclusive with `--open-only`).
+    GetEdges {
+        /// Source node id (ULID) whose outgoing edges to list.
+        from: String,
+        /// Restrict to edges pointing at this target node ULID.
+        #[arg(long)]
+        to: Option<String>,
+        /// Restrict to this edge type (normalized like `link` normalizes it;
+        /// edges stored under the raw un-normalized form are matched too).
+        #[arg(long = "edge-type")]
+        edge_type: Option<String>,
+        /// Include closed edges in the result. Defaults to true when `as_of`
+        /// is absent — only currently-open edges. Mutually exclusive with `as_of`.
+        /// Pass `--open-only false` to see full edge history.
+        #[arg(long, value_name = "true|false")]
+        open_only: Option<bool>,
+        /// View edges as they were at this Unix-millisecond instant: only edges
+        /// live at that time. Mutually exclusive with `--open-only` — omit
+        /// `--open-only` when passing `--as-of`. Must be a positive timestamp.
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
     /// Read a node's access statistics (count, last-accessed timestamp).
     /// `{"found":false}` (exit 0) if the node doesn't exist or is out of the
     /// default scope. Reading stats never itself counts as an access.

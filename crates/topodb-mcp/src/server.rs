@@ -3556,9 +3556,7 @@ impl TopoServer {
         // If as_of is set, filter edges to only those live at that timestamp
         // (inclusive lower bound, exclusive upper bound: valid_from <= t < valid_to).
         if let Some(timestamp) = p.as_of {
-            edges.retain(|e| {
-                e.valid_from <= timestamp && e.valid_to.is_none_or(|vt| vt > timestamp)
-            });
+            edges.retain(|e| convert::edge_live_at(e, timestamp));
         }
 
         let edges = edges

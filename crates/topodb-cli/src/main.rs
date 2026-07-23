@@ -163,6 +163,22 @@ fn main() {
             as_of,
             cli.pretty,
         ),
+        Command::GetEdges {
+            from,
+            to,
+            edge_type,
+            open_only,
+            as_of,
+        } => get_edges(
+            &db,
+            default_scope,
+            &from,
+            to.as_deref(),
+            edge_type.as_deref(),
+            open_only,
+            as_of,
+            cli.pretty,
+        ),
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
         Command::Changes { since } => changes(&db, since, cli.pretty),
         Command::Compact { keep_from } => compact(&db, keep_from, cli.pretty),
@@ -329,6 +345,108 @@ fn traverse(
         Err(e) => output::fail("internal", &e, 1),
     };
     output::ok(&serde_json::json!({ "subgraph": subgraph }), pretty);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_edges(
+    db: &Db,
+    scope: Scope,
+    from: &str,
+    to: Option<&str>,
+    edge_type: Option<&str>,
+    open_only: Option<bool>,
+    as_of: Option<i64>,
+    pretty: bool,
+) -> ! {
+    let from_id = match NodeId::from_str(from) {
+        Ok(id) => id,
+        Err(e) => output::fail("rejected", &format!("invalid from id {from:?}: {e}"), 2),
+    };
+    #[allow(clippy::manual_map)]
+    let to_id = match to {
+        Some(s) => Some(match NodeId::from_str(s) {
+            Ok(id) => id,
+            Err(e) => output::fail("rejected", &format!("invalid to id {s:?}: {e}"), 2),
+        }),
+        None => None,
+    };
+
+    // Validate as_of timestamp FIRST (so as_of: 0 gets the timestamp error,
+    // not the exclusivity one).
+    if let Some(timestamp) = as_of {
+        if timestamp <= 0 {
+            output::fail(
+                "rejected",
+                "as-of must be a positive Unix-millisecond timestamp",
+                2,
+            );
+        }
+    }
+
+    // Check mutually exclusive parameters: as_of and open_only cannot both
+    // be specified. When as_of is present, omit open_only entirely.
+    if as_of.is_some() && open_only.is_some() {
+        output::fail(
+            "rejected",
+            "as_of and open_only are mutually exclusive — omit open_only when passing as_of (as_of already means \"open at that instant\")",
+            2,
+        );
+    }
+
+    let scopes = topodb_json::scope_to_scope_set(scope);
+
+    // Determine whether to fetch only open edges: when as_of is present,
+    // always fetch with open_only=false to see the full history, then filter
+    // below. When as_of is absent, use the provided open_only or default to true.
+    let open_only_to_use = if as_of.is_some() {
+        false
+    } else {
+        open_only.unwrap_or(true)
+    };
+
+    let mut edges = match edge_type {
+        None => match db.edges_from(&scopes, from_id, to_id, None, open_only_to_use) {
+            Ok(e) => e,
+            Err(e) => output::fail_engine(&e),
+        },
+        Some(raw) => {
+            let norm = match topodb_json::normalize_edge_type(raw) {
+                Ok(n) => n,
+                Err(e) => output::fail("rejected", &e, 2),
+            };
+            let mut es = match db.edges_from(&scopes, from_id, to_id, Some(&norm), open_only_to_use)
+            {
+                Ok(e) => e,
+                Err(e) => output::fail_engine(&e),
+            };
+            // Edges written before type normalization are stored under
+            // the raw form — probe it too so they stay findable.
+            if norm != *raw {
+                match db.edges_from(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
+                    Ok(raw_edges) => es.extend(raw_edges),
+                    Err(e) => output::fail_engine(&e),
+                };
+            }
+            es
+        }
+    };
+    edges.sort_by_key(|e| e.id);
+    edges.dedup_by_key(|e| e.id);
+
+    // If as_of is set, filter edges to only those live at that timestamp
+    // (inclusive lower bound, exclusive upper bound: valid_from <= t < valid_to).
+    if let Some(timestamp) = as_of {
+        edges.retain(|e| topodb_json::edge_live_at(e, timestamp));
+    }
+
+    let edges = edges
+        .iter()
+        .map(topodb_json::edge_to_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| output::fail("internal", &e, 1))
+        .unwrap_or_else(|_| unreachable!());
+
+    output::ok(&serde_json::json!({ "edges": edges }), pretty);
 }
 
 fn stats(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
