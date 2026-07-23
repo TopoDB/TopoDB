@@ -439,3 +439,119 @@ fn validate_bash_grant_rejects_dollar_expansion() {
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("$var"));
 }
+
+// --- Rule injection: reject metacharacters that enable multiple rules
+
+#[test]
+fn validate_bash_grant_rejects_comma() {
+    let result = validate_bash_grant("a,b");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("a,b"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_open_paren() {
+    let result = validate_bash_grant("a(b");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("a(b"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_close_paren() {
+    let result = validate_bash_grant("a)b");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("a)b"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_colon() {
+    let result = validate_bash_grant("a:b");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("a:b"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_complex_injection_attempt() {
+    let result = validate_bash_grant("x:*),Bash(rm");
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(msg.contains("x:*),Bash(rm") || msg.contains("forbidden"));
+}
+
+// --- Case-insensitive shell denylist
+
+#[test]
+fn validate_bash_grant_rejects_bash_uppercase() {
+    let result = validate_bash_grant("BASH");
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err();
+    assert!(err_msg.contains("bash") || err_msg.contains("BASH"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_bash_mixed_case() {
+    let result = validate_bash_grant("Bash");
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_bash_grant_rejects_sh_uppercase() {
+    let result = validate_bash_grant("SH");
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_bash_grant_rejects_zsh_mixed_case() {
+    let result = validate_bash_grant("Zsh");
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_bash_grant_rejects_dash_shell() {
+    let result = validate_bash_grant("dash");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("dash"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_ksh_shell() {
+    let result = validate_bash_grant("ksh");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("ksh"));
+}
+
+#[test]
+fn validate_bash_grant_rejects_fish_shell() {
+    let result = validate_bash_grant("fish");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("fish"));
+}
+
+// --- All tokens checked, not just the first
+
+#[test]
+fn validate_bash_grant_rejects_bash_as_wrapped_command() {
+    let result = validate_bash_grant("nice bash");
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_bash_grant_rejects_bash_after_timeout() {
+    let result = validate_bash_grant("timeout 5 bash");
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_bash_grant_rejects_bash_after_xargs() {
+    let result = validate_bash_grant("xargs bash");
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_bash_grant_accepts_topodb_search() {
+    let result = validate_bash_grant("topodb search");
+    assert!(
+        result.is_ok(),
+        "topodb search should be allowed (neither token is a shell)"
+    );
+}
