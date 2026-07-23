@@ -220,9 +220,11 @@ fn splits_supersessions_out_of_duplicate_count() {
 }
 
 #[test]
-fn text_fallback_reports_all_pairs_as_duplicates_not_supersessions() {
+fn text_mode_reports_lexical_relation_split() {
+    // TDD item 2: text mode runs dup_relation to distinguish duplicates from
+    // supersessions using negation-cue lexical heuristics (same as vector mode).
     let (_d, mut s) = fresh();
-    // Create two overlapping memories with embeddings off (text fallback).
+    // Create a duplicate pair: overlapping memories without contradiction.
     s.call_tool_ok(
         "create_memory",
         json!({"content": "the login flow breaks when the session cookie exceeds four kilobytes"}),
@@ -231,6 +233,18 @@ fn text_fallback_reports_all_pairs_as_duplicates_not_supersessions() {
     s.call_tool_ok(
         "create_memory",
         json!({"content": "the login flow breaks when the session cookie exceeds the size limit"}),
+        T,
+    );
+    // Create a supersession pair: contradictory memories with high Jaccard overlap and negation cues.
+    // Content must have sufficient token overlap (>= 0.6 Jaccard) to be detected as a pair.
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the database backend supports sharding the database backend supports transactions"}),
+        T,
+    );
+    s.call_tool_ok(
+        "create_memory",
+        json!({"content": "the database backend not supports sharding the database backend not supports transactions"}),
         T,
     );
     // One disjoint memory (should not pair).
@@ -245,14 +259,14 @@ fn text_fallback_reports_all_pairs_as_duplicates_not_supersessions() {
         res["embeddings_enabled"], false,
         "spawned --embeddings off: {res}"
     );
-    // Text mode: all pairs are duplicate_pairs, supersession_pairs forced to 0.
+    // Text mode: both duplicate and supersession pairs are reported using lexical relation split.
     assert!(
         res["duplicate_pairs"].as_u64().unwrap() >= 1,
-        "text fallback should find the overlapping pair as a duplicate: {res}"
+        "text mode should find at least the duplicate pair: {res}"
     );
-    assert_eq!(
-        res["supersession_pairs"], 0,
-        "text mode must force supersession_pairs to 0 (split requires vectors): {res}"
+    assert!(
+        res["supersession_pairs"].as_u64().unwrap() >= 1,
+        "text mode should find the contradictory pair as supersession using negation cues: {res}"
     );
 }
 
