@@ -441,11 +441,11 @@ fn traverse_with_as_of_parameter() {
     let mut server = Server::spawn(&db_path, &scope_args);
     server.initialize(DEFAULT_TIMEOUT);
 
-    // Create entity and memory
-    let entity_id = server
+    // Create entity E1
+    let e1_id = server
         .call_tool_ok(
             "create_entity",
-            serde_json::json!({ "name": "alice" }),
+            serde_json::json!({ "name": "entity_one" }),
             DEFAULT_TIMEOUT,
         )
         .get("id")
@@ -453,10 +453,11 @@ fn traverse_with_as_of_parameter() {
         .expect("create_entity should return id")
         .to_string();
 
+    // Create memory M
     let memory_id = server
         .call_tool_ok(
             "create_memory",
-            serde_json::json!({ "content": "alice likes rust" }),
+            serde_json::json!({ "content": "temporal test memory" }),
             DEFAULT_TIMEOUT,
         )
         .get("id")
@@ -464,13 +465,13 @@ fn traverse_with_as_of_parameter() {
         .expect("create_memory should return id")
         .to_string();
 
-    // Create link M -> A
-    let edge_id = server
+    // Link M -> E1
+    let edge1_id = server
         .call_tool_ok(
             "link",
             serde_json::json!({
                 "from_id": memory_id,
-                "to_id": entity_id,
+                "to_id": e1_id,
                 "edge_type": "mentions"
             }),
             DEFAULT_TIMEOUT,
@@ -480,26 +481,30 @@ fn traverse_with_as_of_parameter() {
         .expect("link should return id")
         .to_string();
 
-    // Capture current time before closing
-    let close_time = std::time::SystemTime::now()
+    // Guard ms-granularity by sleeping before capture
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Capture `mid` BETWEEN E1 link creation and close_edge call
+    let mid = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
 
-    // Close the edge
-    let close_resp = server.call_tool_ok(
+    // Guard ms-granularity by sleeping before close
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Close the E1 edge
+    server.call_tool_ok(
         "close_edge",
-        serde_json::json!({ "id": edge_id }),
+        serde_json::json!({ "id": edge1_id }),
         DEFAULT_TIMEOUT,
     );
-    let valid_to = close_resp.get("seq").is_some();
-    assert!(valid_to, "close_edge should succeed");
 
-    // Create a new entity and link it
-    let entity2_id = server
+    // Create entity E2
+    let e2_id = server
         .call_tool_ok(
             "create_entity",
-            serde_json::json!({ "name": "bob" }),
+            serde_json::json!({ "name": "entity_two" }),
             DEFAULT_TIMEOUT,
         )
         .get("id")
@@ -507,12 +512,13 @@ fn traverse_with_as_of_parameter() {
         .expect("create_entity should return id")
         .to_string();
 
+    // Link M to E2
     let _edge2_id = server
         .call_tool_ok(
             "link",
             serde_json::json!({
                 "from_id": memory_id,
-                "to_id": entity2_id,
+                "to_id": e2_id,
                 "edge_type": "mentions"
             }),
             DEFAULT_TIMEOUT,
@@ -522,26 +528,7 @@ fn traverse_with_as_of_parameter() {
         .expect("link should return id")
         .to_string();
 
-    // Now traverse with as_of at close_time (before the second link)
-    // Should only see entity_id, not entity2_id
-    let traverse_historical = server.call_tool_ok(
-        "traverse",
-        serde_json::json!({
-            "seed_id": memory_id,
-            "max_hops": 1,
-            "as_of": close_time
-        }),
-        DEFAULT_TIMEOUT,
-    );
-    let sg = &traverse_historical["subgraph"];
-    let nodes = sg["nodes"].as_array().expect("subgraph nodes");
-    // The traverse at close_time should NOT include entity2_id (linked after close_time)
-    // but the closed edge should not appear either since valid_to < close_time is wrong
-    // Actually, we need to check: at close_time, the first edge is closed, so neither entity should be there
-    // Let's just assert that we can call it without error for now
-    assert!(!nodes.is_empty(), "traverse should return nodes");
-
-    // Traverse now (without as_of) should show both entities
+    // Traverse WITHOUT as_of should contain E2 and NOT E1
     let traverse_current = server.call_tool_ok(
         "traverse",
         serde_json::json!({
@@ -552,9 +539,48 @@ fn traverse_with_as_of_parameter() {
     );
     let sg_current = &traverse_current["subgraph"];
     let nodes_current = sg_current["nodes"].as_array().expect("subgraph nodes");
+    let current_ids: Vec<String> = nodes_current
+        .iter()
+        .filter_map(|n| n["id"].as_str().map(|s| s.to_string()))
+        .collect();
+
     assert!(
-        nodes_current.iter().any(|n| n["id"] == entity2_id),
-        "traverse without as_of should reach the newly linked entity"
+        current_ids.contains(&e2_id),
+        "traverse WITHOUT as_of must contain E2's id: nodes={:?}",
+        current_ids
+    );
+    assert!(
+        !current_ids.contains(&e1_id),
+        "traverse WITHOUT as_of must NOT contain E1's id (edge is closed): nodes={:?}",
+        current_ids
+    );
+
+    // Traverse WITH as_of=mid should contain E1 and NOT E2
+    let traverse_historical = server.call_tool_ok(
+        "traverse",
+        serde_json::json!({
+            "seed_id": memory_id,
+            "max_hops": 1,
+            "as_of": mid
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let sg_historical = &traverse_historical["subgraph"];
+    let nodes_historical = sg_historical["nodes"].as_array().expect("subgraph nodes");
+    let historical_ids: Vec<String> = nodes_historical
+        .iter()
+        .filter_map(|n| n["id"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    assert!(
+        historical_ids.contains(&e1_id),
+        "traverse WITH as_of=mid must contain E1's id (edge was open at mid): nodes={:?}",
+        historical_ids
+    );
+    assert!(
+        !historical_ids.contains(&e2_id),
+        "traverse WITH as_of=mid must NOT contain E2's id (linked after mid): nodes={:?}",
+        historical_ids
     );
 
     // Test: as_of with invalid value (non-positive) should error
@@ -589,11 +615,11 @@ fn get_edges_with_as_of_parameter() {
     let mut server = Server::spawn(&db_path, &scope_args);
     server.initialize(DEFAULT_TIMEOUT);
 
-    // Create entity and memory
-    let entity_id = server
+    // Create entity E1
+    let e1_id = server
         .call_tool_ok(
             "create_entity",
-            serde_json::json!({ "name": "charlie" }),
+            serde_json::json!({ "name": "edge_test_one" }),
             DEFAULT_TIMEOUT,
         )
         .get("id")
@@ -601,10 +627,11 @@ fn get_edges_with_as_of_parameter() {
         .expect("create_entity should return id")
         .to_string();
 
+    // Create memory M
     let memory_id = server
         .call_tool_ok(
             "create_memory",
-            serde_json::json!({ "content": "charlie knows systems" }),
+            serde_json::json!({ "content": "edge temporal test" }),
             DEFAULT_TIMEOUT,
         )
         .get("id")
@@ -612,14 +639,14 @@ fn get_edges_with_as_of_parameter() {
         .expect("create_memory should return id")
         .to_string();
 
-    // Create link M -> E
-    let edge_id = server
+    // Create link M -> E1
+    let edge1_id = server
         .call_tool_ok(
             "link",
             serde_json::json!({
                 "from_id": memory_id,
-                "to_id": entity_id,
-                "edge_type": "expertise"
+                "to_id": e1_id,
+                "edge_type": "links"
             }),
             DEFAULT_TIMEOUT,
         )
@@ -628,24 +655,30 @@ fn get_edges_with_as_of_parameter() {
         .expect("link should return id")
         .to_string();
 
-    // Capture time before closing
-    let close_time = std::time::SystemTime::now()
+    // Guard ms-granularity by sleeping before capture
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Capture `mid` BETWEEN E1 link creation and close_edge call
+    let mid = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
 
-    // Close the edge
+    // Guard ms-granularity by sleeping before close
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Close the E1 edge
     server.call_tool_ok(
         "close_edge",
-        serde_json::json!({ "id": edge_id }),
+        serde_json::json!({ "id": edge1_id }),
         DEFAULT_TIMEOUT,
     );
 
-    // Create another entity and link
-    let entity2_id = server
+    // Create entity E2
+    let e2_id = server
         .call_tool_ok(
             "create_entity",
-            serde_json::json!({ "name": "diana" }),
+            serde_json::json!({ "name": "edge_test_two" }),
             DEFAULT_TIMEOUT,
         )
         .get("id")
@@ -653,13 +686,14 @@ fn get_edges_with_as_of_parameter() {
         .expect("create_entity should return id")
         .to_string();
 
-    let _edge2_id = server
+    // Link M to E2
+    let edge2_id = server
         .call_tool_ok(
             "link",
             serde_json::json!({
                 "from_id": memory_id,
-                "to_id": entity2_id,
-                "edge_type": "expertise"
+                "to_id": e2_id,
+                "edge_type": "links"
             }),
             DEFAULT_TIMEOUT,
         )
@@ -668,61 +702,143 @@ fn get_edges_with_as_of_parameter() {
         .expect("link should return id")
         .to_string();
 
-    // get_edges with no as_of/open_only: should return both edges
-    let all_edges = server.call_tool_ok(
+    // Capture current time after E2 is linked
+    let future_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Get all edges (history: both closed and open)
+    let all_edges_resp = server.call_tool_ok(
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
-            "edge_type": "expertise",
+            "edge_type": "links",
             "open_only": false
         }),
         DEFAULT_TIMEOUT,
     );
-    let edges_all = all_edges["edges"].as_array().expect("edges array");
+    let all_edges = all_edges_resp["edges"].as_array().expect("edges array");
     assert_eq!(
-        edges_all.len(),
+        all_edges.len(),
         2,
-        "get_edges with open_only:false should return both edges (closed + open)"
+        "get_edges with open_only:false should return both edges (closed E1 + open E2): {:?}",
+        all_edges
+            .iter()
+            .map(|e| e["id"].as_str())
+            .collect::<Vec<_>>()
     );
 
-    // Extract the valid_to timestamp from the closed edge to use for as_of query
-    // We'll query at a time between valid_from and valid_to of the first edge
-    let first_edge = edges_all
+    // Find the closed edge's valid_to to verify exclusive boundary
+    let closed_edge = all_edges
         .iter()
-        .find(|e| e["id"] == edge_id)
-        .expect("first edge should be in results");
-    let first_valid_from = first_edge["valid_from"]
+        .find(|e| e["id"].as_str() == Some(edge1_id.as_str()))
+        .expect("closed edge should be in results");
+    let closed_valid_to = closed_edge["valid_to"]
         .as_i64()
-        .expect("valid_from should be a number");
-    let _first_valid_to = first_edge["valid_to"].as_i64();
+        .expect("closed edge should have valid_to");
 
-    // Use a timestamp that's between valid_from and valid_to (the edge is open at that time)
-    let query_time = first_valid_from + 1;
-
-    // get_edges with as_of at query_time: should return only the first closed edge
-    // The first edge should be visible (it's open at query_time), the second edge wasn't created yet
-    // Note: as_of requires open_only:false (mutually exclusive)
-    let historical_edges = server.call_tool_ok(
+    // Test 1: get_edges(from=M) with as_of=mid returns EXACTLY the E1 edge
+    let mid_edges_resp = server.call_tool_ok(
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
-            "edge_type": "expertise",
-            "as_of": query_time,
+            "edge_type": "links",
+            "as_of": mid,
             "open_only": false
         }),
         DEFAULT_TIMEOUT,
     );
-    let edges_historical = historical_edges["edges"].as_array().expect("edges array");
-    // At query_time, only the first edge should be visible (second wasn't created yet)
+    let mid_edges = mid_edges_resp["edges"].as_array().expect("edges array");
     assert_eq!(
-        edges_historical.len(),
+        mid_edges.len(),
         1,
-        "get_edges with as_of should return only edges live at that time"
+        "get_edges with as_of=mid should return exactly 1 edge (E1 only, E2 not created yet): {:?}",
+        mid_edges
+            .iter()
+            .map(|e| e["id"].as_str())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
-        edges_historical[0]["id"].as_str().unwrap(),
-        edge_id,
-        "historical edge should be the first one"
+        mid_edges[0]["id"].as_str().unwrap(),
+        edge1_id,
+        "edge at mid timestamp must be the E1 edge"
+    );
+    assert_eq!(
+        mid_edges[0]["to"].as_str().unwrap(),
+        e1_id,
+        "edge at mid must point to E1"
+    );
+
+    // Test 2: WITHOUT as_of but open_only unset returns both edges (history)
+    let history_edges_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": memory_id,
+            "edge_type": "links",
+            "open_only": false
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let history_edges = history_edges_resp["edges"].as_array().expect("edges array");
+    assert_eq!(
+        history_edges.len(),
+        2,
+        "get_edges with open_only:false returns complete history"
+    );
+
+    // Test 3: with as_of AFTER the close and after E2's link returns only E2's edge
+    let future_edges_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": memory_id,
+            "edge_type": "links",
+            "as_of": future_time,
+            "open_only": false
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let future_edges = future_edges_resp["edges"].as_array().expect("edges array");
+    assert_eq!(
+        future_edges.len(),
+        1,
+        "get_edges with as_of after close should return only E2's edge: {:?}",
+        future_edges
+            .iter()
+            .map(|e| e["id"].as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        future_edges[0]["id"].as_str().unwrap(),
+        edge2_id,
+        "edge at future time must be the E2 edge"
+    );
+    assert_eq!(
+        future_edges[0]["to"].as_str().unwrap(),
+        e2_id,
+        "edge at future must point to E2"
+    );
+
+    // Test 4: EXCLUSIVE boundary — as_of == edge's valid_to must NOT include the edge
+    let boundary_edges_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": memory_id,
+            "edge_type": "links",
+            "as_of": closed_valid_to,
+            "open_only": false
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let boundary_edges = boundary_edges_resp["edges"]
+        .as_array()
+        .expect("edges array");
+    // At the exact valid_to boundary, the edge must be excluded (valid_from <= t < valid_to)
+    assert!(
+        !boundary_edges
+            .iter()
+            .any(|e| e["id"].as_str() == Some(edge1_id.as_str())),
+        "get_edges with as_of == valid_to must NOT include the closed edge (exclusive boundary)"
     );
 
     // Test: as_of + open_only should error (mutually exclusive)
@@ -730,7 +846,7 @@ fn get_edges_with_as_of_parameter() {
         "get_edges",
         serde_json::json!({
             "from_id": memory_id,
-            "as_of": close_time,
+            "as_of": mid,
             "open_only": true
         }),
         DEFAULT_TIMEOUT,

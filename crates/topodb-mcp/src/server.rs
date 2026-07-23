@@ -2640,7 +2640,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Walk the graph outward from a seed node, following edges up to max_hops. Call this to gather the context AROUND something you already found — related entities, linked memories. Optionally view the graph at a past timestamp via as_of; omit for now. Returns the subgraph (nodes + edges)."
+        description = "Walk the graph outward from a seed node, following edges up to max_hops. Call this to gather the context AROUND something you already found — related entities, linked memories. Optionally view the graph at a past timestamp via as_of; omit for now. Returns the subgraph (nodes + edges). Combined with remember's supersedes, an as_of before the supersession shows the pre-supersession topology."
     )]
     fn traverse(
         &self,
@@ -3271,7 +3271,7 @@ impl TopoServer {
         // Check mutually exclusive parameters
         if p.as_of.is_some() && p.open_only {
             return Err(ErrorData::invalid_params(
-                "as_of and open_only are mutually exclusive".to_string(),
+                "as_of and open_only are mutually exclusive — as_of already means \"open at that instant\"".to_string(),
                 None,
             ));
         }
