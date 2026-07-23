@@ -199,9 +199,9 @@ pub enum Command {
         /// edges stored under the raw un-normalized form are matched too).
         #[arg(long = "edge-type")]
         edge_type: Option<String>,
-        /// Include closed edges in the result. Defaults to true when `as_of`
-        /// is absent — only currently-open edges. Mutually exclusive with `as_of`.
-        /// Pass `--open-only false` to see full edge history.
+        /// Only edges currently open (default true); pass false to include closed
+        /// edges (full history). Mutually exclusive with `--as-of` — omit this flag
+        /// when passing `--as-of`.
         #[arg(long, value_name = "true|false")]
         open_only: Option<bool>,
         /// View edges as they were at this Unix-millisecond instant: only edges

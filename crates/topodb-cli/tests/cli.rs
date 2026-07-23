@@ -1614,8 +1614,8 @@ fn pretty_flag_works_after_subcommand_with_create_entity() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Pretty-printed JSON should be multi-line (has newlines).
     assert!(
-        stdout.contains('\n'),
-        "pretty output should be multi-line, got: {stdout}"
+        stdout.trim_end().contains('\n'),
+        "expected multi-line pretty JSON: {stdout}"
     );
 }
 
@@ -1646,8 +1646,8 @@ fn pretty_flag_works_after_subcommand_with_search() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Pretty-printed JSON should be multi-line.
     assert!(
-        stdout.contains('\n'),
-        "pretty output should be multi-line, got: {stdout}"
+        stdout.trim_end().contains('\n'),
+        "expected multi-line pretty JSON: {stdout}"
     );
 }
 

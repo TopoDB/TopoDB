@@ -4,7 +4,7 @@ A direct-embedded, script-friendly command-line interface over a [TopoDB](https:
 agent-memory database file. JSON in, JSON out, predictable exit codes — no server process, no
 network hop.
 
-Status: **v1** — the full read/write surface (17 commands). See [v1 limitations](#v1-limitations).
+Status: **v1** — the full read/write surface (19 commands). See [v1 limitations](#v1-limitations).
 
 ## Install
 
@@ -34,7 +34,7 @@ var for the former).
 
 ## Commands
 
-All 17 subcommands, in scaffold + write + read order:
+All 19 subcommands, in scaffold + write + read order:
 
 | Command | Key flags | Output |
 |---|---|---|
@@ -47,7 +47,7 @@ All 17 subcommands, in scaffold + write + read order:
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
 | `search <query>` | positional query, `--k <n>` (default 10) | `[ {"node":..., "score": f}, ... ]` |
 | `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
-| `get-edges <from>` | positional source node id, `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `[ {"id","from","to","type","valid_from","valid_to"}, ... ]` |
+| `get-edges <from>` | positional source node id, `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
