@@ -42,7 +42,7 @@ All 17 subcommands, in scaffold + write + read order:
 | `get <id>` | positional node id | `{"found": bool, "node"?: {...}}` |
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
 | `search <query>` | positional query, `--k <n>` (default 10) | `[ {"node":..., "score": f}, ... ]` |
-| `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable) | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
+| `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
@@ -77,7 +77,8 @@ Notes on individual commands:
   and comes back rejected. `find` errors (exit 2) if `(label, prop)` isn't declared in the open
   db's index spec.
 - **`traverse`**: omitting `--edge-type` entirely follows every edge type; passing it (once or
-  repeated) restricts the walk to exactly those types.
+  repeated) restricts the walk to exactly those types. `--as-of <unix-ms>` performs a temporal read
+  at the given Unix millisecond timestamp (closed edges reappear, later edges vanish); omit to read "now".
 - **`changes`**: the one unscoped command — see [Scoping](#scoping) — and `Compacted` (the
   requested `--since` is below the retained floor) is a rejected/exit-2 condition, not an
   internal error; the caller re-anchors from `info`'s `current_seq` rather than trusting a
