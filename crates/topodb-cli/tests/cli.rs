@@ -1004,3 +1004,127 @@ fn per_command_bad_scope_is_rejected_before_db_is_opened() {
         "a rejected per-command --scope must not leave an empty db file behind"
     );
 }
+
+// --- Task 4: remember verb ---
+
+#[test]
+fn remember_stores_links_and_dedups() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let out = run(&[
+        "remember",
+        "--content",
+        "vega uses sqlite",
+        "--entity",
+        "vega",
+        "--entity",
+        "sqlite",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["deduplicated"], false);
+    assert_eq!(v["entities"].as_array().unwrap().len(), 2);
+    assert_eq!(v["entities"][0]["created"], true);
+    assert_eq!(v["edge_ids"].as_array().unwrap().len(), 2);
+    assert!(
+        v.get("near_duplicates").is_none(),
+        "CLI must omit near_duplicates"
+    );
+    let memory_id = v["memory_id"].as_str().unwrap().to_string();
+
+    // Byte-identical content dedups to the same node, reusing entities.
+    let out2 = run(&[
+        "remember",
+        "--content",
+        "vega uses sqlite",
+        "--entity",
+        "vega",
+        "--entity",
+        "sqlite",
+    ]);
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(v2["deduplicated"], true);
+    assert_eq!(v2["memory_id"].as_str().unwrap(), memory_id);
+    assert_eq!(v2["entities"][0]["created"], false);
+
+    // The link is traversable from the entity.
+    let entity_id = v["entities"][0]["id"].as_str().unwrap();
+    let out3 = run(&["traverse", entity_id, "--max-hops", "1"]);
+    let v3: serde_json::Value = serde_json::from_slice(&out3.stdout).unwrap();
+    let contents: Vec<String> = v3["subgraph"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["props"]["content"].as_str().map(String::from))
+        .collect();
+    assert!(
+        contents.contains(&"vega uses sqlite".to_string()),
+        "memory reachable via traverse"
+    );
+}
+
+#[test]
+fn remember_supersedes_retires_the_old_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let old: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "vega uses postgres",
+            "--entity",
+            "vega",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let old_id = old["memory_id"].as_str().unwrap();
+    let new: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "vega uses sqlite now",
+            "--entity",
+            "vega",
+            "--supersedes",
+            old_id,
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(new["superseded"][0].as_str().unwrap(), old_id);
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", old_id]).stdout).unwrap();
+    assert!(
+        got["node"]["props"]["superseded_at"].is_number(),
+        "old memory carries the stamp"
+    );
+}
+
+#[test]
+fn remember_requires_an_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "remember", "--content", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "clap missing-required is exit 2"
+    );
+}

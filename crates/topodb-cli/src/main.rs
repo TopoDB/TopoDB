@@ -40,7 +40,8 @@ fn main() {
     let write_scope = match &cli.cmd {
         Command::CreateMemory { scope, .. }
         | Command::CreateEntity { scope, .. }
-        | Command::Link { scope, .. } => resolve_cmd_scope(scope.as_deref(), default_scope),
+        | Command::Link { scope, .. }
+        | Command::Remember { scope, .. } => resolve_cmd_scope(scope.as_deref(), default_scope),
         _ => default_scope,
     };
 
@@ -90,6 +91,23 @@ fn main() {
             ty,
             props.as_deref(),
             valid_from,
+            cli.pretty,
+        ),
+        Command::Remember {
+            content,
+            entity,
+            edge_type,
+            supersedes,
+            props,
+            ..
+        } => remember(
+            &db,
+            write_scope,
+            content,
+            entity,
+            edge_type,
+            supersedes,
+            props.as_deref(),
             cli.pretty,
         ),
         Command::Get { id } => get(&db, default_scope, &id, cli.pretty),
@@ -442,6 +460,71 @@ fn link(
         output::fail_engine(&e);
     }
     output::ok(&serde_json::json!({ "id": id.to_string() }), pretty);
+}
+
+/// Composed store+link (see the spec): plan via the shared
+/// `topodb_json::plan_remember`, submit the one batch, echo the plan.
+#[allow(clippy::too_many_arguments)]
+fn remember(
+    db: &Db,
+    scope: Scope,
+    content: String,
+    entities: Vec<String>,
+    edge_type: Option<String>,
+    supersedes: Vec<String>,
+    props: Option<&str>,
+    pretty: bool,
+) -> ! {
+    let extra = parse_props_arg(props);
+    let req = topodb_json::RememberRequest {
+        content,
+        entities,
+        edge_type,
+        supersedes,
+        props: extra,
+    };
+    // Collision surface: the write scope plus shared — a shared entity must
+    // be found from a project-scoped write, not shadowed by a local twin.
+    let lookup = topodb_json::scopes_to_scope_set(&[scope, Scope::Shared]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let plan = match topodb_json::plan_remember(db, scope, &lookup, now, &req) {
+        Ok(p) => p,
+        Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
+        Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
+    };
+    let topodb_json::RememberPlan {
+        ops,
+        memory_id,
+        deduplicated,
+        entities,
+        edge_ids,
+        superseded,
+        ..
+    } = plan;
+    if !ops.is_empty() {
+        if let Err(e) = db.submit(ops) {
+            output::fail_engine(&e);
+        }
+    }
+    let entities: Vec<serde_json::Value> = entities
+        .into_iter()
+        .map(
+            |e| serde_json::json!({ "name": e.name, "id": e.id.to_string(), "created": e.created }),
+        )
+        .collect();
+    output::ok(
+        &serde_json::json!({
+            "memory_id": memory_id.to_string(),
+            "deduplicated": deduplicated,
+            "entities": entities,
+            "edge_ids": edge_ids,
+            "superseded": superseded,
+        }),
+        pretty,
+    );
 }
 
 fn set_props(db: &Db, id: &str, props: &str, pretty: bool) -> ! {
