@@ -26,7 +26,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, RecallQuery, Scope, ScopeSet,
+    Db, Direction, EdgeId, NodeId, NodeRecord, Op, PropValue, Props, RecallQuery, Scope, ScopeSet,
     SearchOptions, TopoError, TraversalQuery, VectorQuery,
 };
 
@@ -414,53 +414,146 @@ impl TopoServer {
         Ok((ops, marked))
     }
 
-    /// Existing memories in `write_scope` semantically close to the just-embedded
-    /// content (cosine `>=` [`NEAR_DUP_THRESHOLD`]), most-similar first, at most
-    /// [`NEAR_DUP_K`]. Advisory only — the caller judges whether a hit is truly
-    /// the same fact. Empty when `embedding` is `None` (embedder not Ready): no
-    /// semantic signal, so no guessing. Superseded memories are skipped (already
-    /// retired), as are non-Memory nodes. Called BEFORE the new memory is
-    /// written, so it never returns the node being created. A vector-search
-    /// error degrades to empty rather than failing the write — this is a hint.
-    fn near_duplicates(
+    /// Text-based near-duplicate detection using token-Jaccard similarity
+    /// when the embedder is not Ready. Performs BM25 text search to fetch
+    /// candidates, filters by token-Jaccard floor, and returns ranked results.
+    /// Excludes `exclude` node (if provided), non-Memory labels, and superseded nodes.
+    fn text_near_duplicates(
         &self,
         write_scope: Scope,
         content: &str,
-        embedding: Option<&[f32]>,
+        exclude: Option<NodeId>,
     ) -> Vec<NearDuplicate> {
-        let Some(vector) = embedding else {
+        let scope_set = convert::scopes_to_scope_set(&[write_scope]);
+        // Fetch BM25 candidates with a small buffer over NEAR_DUP_K to account for filtering.
+        let query = RecallQuery {
+            vector: None,
+            expansions: Vec::new(),
+            graph_boost: false,
+            options: SearchOptions {
+                recency_weight: 0.0,
+                recency_half_life_ms: 0,
+                now_ms: None,
+                fuzzy_fallback: false,
+            },
+            labels: Some(vec![MEMORY_LABEL.to_string()]),
+            tombstone_prop: Some(convert::MEMORY_SUPERSEDED_AT_PROP.to_string()),
+            text_weight: 1.0,
+            vector_weight: 0.0,
+            graph_weight: 0.0,
+            access_weight: 0.0,
+            label_weights: vec![],
+            ..RecallQuery::new(scope_set, content.to_string(), NEAR_DUP_K + 5)
+        };
+
+        let Ok(hits) = self.db.recall(&query) else {
             return Vec::new();
         };
-        let query = VectorQuery {
-            scopes: convert::scopes_to_scope_set(&[write_scope]),
-            model: self.embedder.model_name(),
-            vector: vector.to_vec(),
-            k: NEAR_DUP_K,
-            candidates: None,
-        };
-        let Ok(hits) = self.db.search_vector(&query) else {
-            return Vec::new();
-        };
-        hits.into_iter()
-            .filter(|(n, score)| {
-                *score >= NEAR_DUP_REVIEW
-                    && n.label == MEMORY_LABEL
-                    && !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
+
+        let mut scored: Vec<(NodeRecord, f64)> = hits
+            .into_iter()
+            .filter_map(|(n, _)| {
+                // Skip excluded node, non-Memory labels, and superseded nodes.
+                if Some(n.id) == exclude
+                    || n.label != MEMORY_LABEL
+                    || n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
+                {
+                    return None;
+                }
+
+                let existing = match n.props.get(MEMORY_CONTENT_PROP) {
+                    Some(PropValue::Str(c)) => c.clone(),
+                    _ => return None,
+                };
+
+                let jaccard = token_jaccard(content, &existing);
+                if jaccard >= TEXT_NEAR_DUP_JACCARD {
+                    Some((n, jaccard))
+                } else {
+                    None
+                }
             })
-            .map(|(n, score)| {
+            .collect();
+
+        // Sort by Jaccard score (descending) and truncate to NEAR_DUP_K.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(NEAR_DUP_K);
+
+        scored
+            .into_iter()
+            .map(|(n, jaccard)| {
                 let existing = match n.props.get(MEMORY_CONTENT_PROP) {
                     Some(PropValue::Str(c)) => c.clone(),
                     _ => String::new(),
                 };
                 NearDuplicate {
                     id: n.id.to_string(),
-                    similarity: score,
-                    band: dup_band(score).to_string(),
+                    similarity: jaccard as f32,
+                    band: dup_band(jaccard as f32).to_string(),
                     relation: dup_relation(content, &existing).to_string(),
                     content: existing,
+                    method: "text".to_string(),
                 }
             })
             .collect()
+    }
+
+    /// Existing memories in `write_scope` semantically close to the just-stored
+    /// content. When the embedder is Ready, uses cosine similarity
+    /// (>= [`NEAR_DUP_THRESHOLD`]), most-similar first, at most [`NEAR_DUP_K`].
+    /// When the embedder is not Ready, falls back to token-Jaccard text similarity
+    /// (>= [`TEXT_NEAR_DUP_JACCARD`]). Advisory only — the caller judges whether
+    /// a hit is truly the same fact. Superseded memories are skipped (already
+    /// retired), as are non-Memory nodes. Called BEFORE the new memory is
+    /// written, so it never returns the node being created. A search error
+    /// degrades to empty rather than failing the write — this is a hint.
+    fn near_duplicates(
+        &self,
+        write_scope: Scope,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> Vec<NearDuplicate> {
+        // Dispatcher: vector path if embedding is available, text fallback otherwise.
+        match (&self.embedder.status(), embedding) {
+            (EmbedderStatus::Ready, Some(vector)) => {
+                // Vector path: existing behavior, plus method field.
+                let query = VectorQuery {
+                    scopes: convert::scopes_to_scope_set(&[write_scope]),
+                    model: self.embedder.model_name(),
+                    vector: vector.to_vec(),
+                    k: NEAR_DUP_K,
+                    candidates: None,
+                };
+                let Ok(hits) = self.db.search_vector(&query) else {
+                    return Vec::new();
+                };
+                hits.into_iter()
+                    .filter(|(n, score)| {
+                        *score >= NEAR_DUP_REVIEW
+                            && n.label == MEMORY_LABEL
+                            && !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
+                    })
+                    .map(|(n, score)| {
+                        let existing = match n.props.get(MEMORY_CONTENT_PROP) {
+                            Some(PropValue::Str(c)) => c.clone(),
+                            _ => String::new(),
+                        };
+                        NearDuplicate {
+                            id: n.id.to_string(),
+                            similarity: score,
+                            band: dup_band(score).to_string(),
+                            relation: dup_relation(content, &existing).to_string(),
+                            content: existing,
+                            method: "vector".to_string(),
+                        }
+                    })
+                    .collect()
+            }
+            _ => {
+                // Text fallback when embedder is not Ready.
+                self.text_near_duplicates(write_scope, content, None)
+            }
+        }
     }
 }
 
@@ -487,6 +580,33 @@ const NEAR_DUP_K: usize = 3;
 /// not an automatic merge. Widening recall at the cost of precision is the right
 /// trade for an advisory tool where a human/agent makes the final call.
 const NEAR_DUP_REVIEW: f32 = 0.68;
+
+/// Token-Jaccard floor for text-based near-duplicate fallback when the embedder
+/// isn't Ready. Token Jaccard (|∩|/|∪| of whitespace-split lowercase tokens)
+/// is coarser than cosine but provides a non-embedder signal; 0.6 catches
+/// meaningful overlap without false positives on tangentially-related content.
+const TEXT_NEAR_DUP_JACCARD: f64 = 0.6;
+
+/// Jaccard similarity of two strings' token sets (lowercase, whitespace-split).
+/// Returns 1.0 if both strings are empty.
+fn token_jaccard(a: &str, b: &str) -> f64 {
+    use std::collections::BTreeSet;
+    let tokens_a: BTreeSet<String> = a.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let tokens_b: BTreeSet<String> = b.split_whitespace().map(|t| t.to_lowercase()).collect();
+
+    if tokens_a.is_empty() && tokens_b.is_empty() {
+        return 1.0;
+    }
+
+    let intersection = tokens_a.intersection(&tokens_b).count() as f64;
+    let union = tokens_a.union(&tokens_b).count() as f64;
+
+    if union == 0.0 {
+        1.0
+    } else {
+        intersection / union
+    }
+}
 
 /// Confidence band for a near-dup similarity: `"likely"` at/above the strong
 /// floor ([`NEAR_DUP_THRESHOLD`]), `"possible"` in the review band below it.
@@ -1577,7 +1697,8 @@ struct RememberResult {
     /// requested `supersedes` — an already-superseded id is not re-marked).
     superseded: Vec<String>,
     /// Existing memories semantically close to the one just stored (advisory —
-    /// nothing was merged). Non-empty only when embeddings are on. Empty on a
+    /// nothing was merged). Uses vector-based detection when embeddings are Ready,
+    /// falls back to text-based (token-Jaccard) detection otherwise. Empty on a
     /// dedup hit. See `NearDuplicate`.
     near_duplicates: Vec<NearDuplicate>,
 }
@@ -1664,7 +1785,8 @@ struct CreateResult {
     /// returned instead of creating a duplicate.
     deduplicated: bool,
     /// Existing memories semantically close to the one just stored (advisory —
-    /// nothing was merged). Non-empty only when embeddings are on; consider
+    /// nothing was merged). Uses vector-based detection when embeddings are Ready,
+    /// falls back to text-based (token-Jaccard) detection otherwise. Consider
     /// whether a hit is actually the same fact and, if so, `supersedes` or
     /// `remove_node` the redundant one. Empty on a dedup hit.
     near_duplicates: Vec<NearDuplicate>,
@@ -1687,6 +1809,9 @@ struct NearDuplicate {
     /// one being stored (negates what it asserts), this is the fact being
     /// replaced; `supersede` it rather than treating it as a duplicate.
     relation: String,
+    /// Method used to detect the similarity: `"vector"` when embedder is Ready,
+    /// `"text"` when using token-Jaccard text fallback.
+    method: String,
 }
 
 /// Result of a find-or-create write (`create_entity`).
