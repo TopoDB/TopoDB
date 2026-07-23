@@ -1103,6 +1103,7 @@ fn group_pre_read_error(e: &TopoError) -> TopoError {
     let ctx = |m: String| format!("group pre-validation read failed: {m}");
     match e {
         TopoError::Storage(_) => TopoError::Storage(Box::new(redb::Error::Corrupted(ctx(msg)))),
+        TopoError::Busy => TopoError::Busy,
         TopoError::Encoding(m) => TopoError::Encoding(ctx(m.clone())),
         TopoError::Rejected(m) => TopoError::Rejected(ctx(m.clone())),
         TopoError::Compacted { oldest } => TopoError::Compacted { oldest: *oldest },

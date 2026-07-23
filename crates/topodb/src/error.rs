@@ -4,6 +4,11 @@ use thiserror::Error;
 pub enum TopoError {
     #[error("storage error: {0}")]
     Storage(Box<redb::Error>),
+    /// The database file is exclusively locked by another live handle
+    /// (usually another process). Transient by nature — callers may retry
+    /// with backoff; every other error variant is not retryable this way.
+    #[error("database is held by another process (lock not acquired)")]
+    Busy,
     #[error("encoding error: {0}")]
     Encoding(String),
     /// An invalid request, rejected before anything was committed. Raised by

@@ -125,7 +125,10 @@ impl Storage {
         if let Some(bytes) = options.cache_size_bytes {
             builder.set_cache_size(bytes);
         }
-        let db = builder.create(path).map_err(storage_err)?;
+        let db = builder.create(path).map_err(|e| match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => TopoError::Busy,
+            other => storage_err(other),
+        })?;
         let s = Self {
             db,
             spec: spec.clone(),
