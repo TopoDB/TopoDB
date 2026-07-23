@@ -2815,17 +2815,8 @@ impl TopoServer {
         // embedder isn't Ready — no semantic signal then.
         let embedding = self.embedder.embed(&p.content);
         let near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
-        let hash = convert::content_hash(&p.content);
-        let mut props = convert::merge_required_prop(
-            MEMORY_CONTENT_PROP,
-            PropValue::Str(p.content),
-            p.props.as_ref(),
-        )
-        .map_err(|e| ErrorData::invalid_params(e, None))?;
-        props.insert(
-            convert::MEMORY_CONTENT_HASH_PROP.into(),
-            PropValue::Str(hash),
-        );
+        let props = convert::memory_props(&p.content, p.props.as_ref())
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
         let mut ops = vec![Op::CreateNode {
             id,
             scope,
