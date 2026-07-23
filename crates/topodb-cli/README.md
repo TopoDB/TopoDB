@@ -59,7 +59,7 @@ Notes on individual commands:
   (after whitespace normalization) was already stored, `"deduplicated": true` and the existing
   memory id is returned; `--props` is ignored on a hit. `"deduplicated": false` indicates a new
   memory. The response is `{"id":…,"deduplicated":…}`. `--props` is a JSON *object* string merged in alongside `content`; a `--props` that
-  tries to set `content` itself is rejected (exit 2).
+  tries to set `content` itself is rejected (exit 2). The system-maintained keys `content_hash` and `superseded_at` are reserved — attempts to set them are rejected (exit 2).
 - **`create-entity`**: now find-or-create by default — the name is matched case- and
   whitespace-insensitively across write scope and `shared`, and resolves aliases.
   An existing entity is returned with `"created": false`; `--always-create` restores the old
@@ -69,7 +69,7 @@ Notes on individual commands:
   each named entity (same semantics as `create-entity`), and links them. Combines three operations
   into a single engine batch so facts never strand unlinked. `--entity` is repeatable (must pass
   ≥1). `--supersedes` is repeatable and marks the listed memory ids as superseded. `--edge-type`
-  defaults to `"about"` and describes the link from memory→entity.
+  defaults to `"about"` and describes the link from memory→entity. The system-maintained keys `content_hash` and `superseded_at` are reserved — attempts to set them in `--props` are rejected (exit 2). Re-storing identical content from a superseded memory creates a new memory instead of deduping to the retired tombstone.
 - **`link`**: `--valid-from` is Unix milliseconds; omit it to let the engine resolve "now".
 - **`find`**: `--value` is parsed as a JSON scalar first (`42` → `Int`, `true` → `Bool`, `"ada"`
   → `Str`); if it doesn't parse as JSON at all, the raw string is taken as `Str` — so

@@ -303,8 +303,21 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Changed
+
+- **`existing_memory` no longer matches superseded memories** — re-storing identical content from a
+  memory marked `superseded_at` creates a fresh new memory instead of deduping to the retired
+  tombstone. The tombstone keeps its `as_of`-historical visibility and `content_hash` but is never
+  returned as a dedup hit for the live write path. Reflects the fact pattern: if you're submitting
+  a fact again, even if the wording matches a superseded memory, the fact is live again and deserves
+  a live node — the old one is history.
+
 #### Added
 
+- **`memory_props` constructor** — the shared new-Memory props builder used by both CLI and MCP
+  servers. Rejects the system-maintained `content_hash` and `superseded_at` keys (caller-level
+  validation, fails fast with an actionable error) so front ends can validate early without
+  reaching the storage layer.
 - **`compose` module** — the shared remember verb planning layer: `plan_remember` (exact-content
   dedup, alias-aware find-or-create entities, idempotent links, supersession) plus the lookup
   helpers (`find_existing_entity`, `existing_memory`, `content_hash`) and `RememberRequest::validate()`
@@ -403,6 +416,16 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Changed
 
+- **`remember` and `create_memory` tools reject reserved props keys `content_hash`/`superseded_at`**
+  in the `props` param (returns `invalid_params` error) — these are system-maintained and
+  caller-settable only via dedup and supersession primitives, not arbitrary props.
+- **Re-storing identical content from a superseded memory creates a new live memory** — `create_memory`
+  and `remember` no longer dedup against superseded memories (tombstones). If you submit identical
+  content for a retired fact, it mints a fresh memory; the old tombstone retains its history for
+  `as_of`-past queries but never surfaces as a dedup hit.
+- **Startup warning on unparseable `TOPODB_LOCK_WAIT_MS`** — if the env var is set but not a valid
+  millisecond integer, the server now logs one stderr warning and falls back to the default (3000 ms)
+  instead of silently ignoring the invalid value.
 - **Internal refactor**: `remember` and entity-lookup composition now delegates to the shared
   `topodb-json::compose` module instead of maintaining separate logic in the MCP server. The
   startup open path now retries on `TopoError::Busy` using the same `TOPODB_LOCK_WAIT_MS` env
@@ -787,6 +810,13 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Changed
 
+- **`create-memory` and `remember` reject reserved props keys `content_hash`/`superseded_at`** in
+  `--props` (exit 2) — these are system-maintained and caller-settable only via dedup and
+  supersession primitives, not arbitrary props.
+- **Re-storing identical content from a superseded memory creates a new live memory** — `create-memory`
+  and `remember` no longer dedup against superseded memories (tombstones). If you submit identical
+  wording for a retired fact, it mints a fresh memory; the old tombstone retains its history for
+  `as_of`-past queries but never surfaces as a dedup hit.
 - **Breaking: `create-entity` is now find-or-create by default** — the name is matched case- and
   whitespace-insensitively across write scope and shared, and resolves aliases.
   Existing entity is returned with `"created": false`; `--always-create` opts out (raw create,
