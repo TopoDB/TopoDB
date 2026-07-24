@@ -839,6 +839,17 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## Claude Code plugin
 
+### 0.1.1 — 2026-07-23
+
+#### Changed
+
+- **Server pin bumped to topodb-mcp 0.0.13** (`SERVER_VERSION` + the e2e devDependency, in the
+  same commit per the release rule). Brings the plugin's server current with today's release:
+  `as_of` temporal reads on traverse/get_edges, Entity down-weighting in `search_memories`
+  (`label_weights`), superseded-content re-remember semantics, reserved memory prop keys, and
+  text-fallback hygiene with `method`/`degraded` reporting. `SKILL.md` now teaches
+  `remember`'s `supersedes` and `as_of` history reads.
+
 ### Unreleased
 
 #### Added
