@@ -2,7 +2,7 @@
 //! surface existing memories that are semantically close (advisory — nothing is
 //! merged), so an agent can notice "same fact, different words" that exact dedup
 //! misses. When embeddings are Ready, vector-based detection applies; when not
-//! ready, text-based fallback (token-Jaccard) applies.
+//! ready, text-based fallback (token-Jaccard containment) applies.
 //!
 //! The real-embedder test is #[ignore] (downloads ~34MB), matching
 //! tests/embeddings.rs; the off-path guard runs in CI.
@@ -29,7 +29,7 @@ fn text_fallback_flags_overlapping_content() {
         DEFAULT_TIMEOUT,
     );
 
-    // Create a similar memory with significant token overlap (>0.6 Jaccard).
+    // Create a similar memory with significant token overlap (>0.7 containment).
     let similar = s.call_tool_ok(
         "create_memory",
         serde_json::json!({ "content": "the login flow breaks when the session cookie exceeds the size limit" }),
@@ -233,7 +233,7 @@ fn text_fallback_canonical_containment_pair() {
 }
 
 #[test]
-fn text_fallback_flags_boundary_pair_at_approximately_0_556() {
+fn text_fallback_detects_exact_subset_at_1_0_containment() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Server::spawn(
         &dir.path().join("t.redb"),
