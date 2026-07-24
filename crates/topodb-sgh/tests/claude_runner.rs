@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use topodb_sgh::runner::claude::{
     build_argv, build_prompt, extract_json, interpret_result, validate_bash_grant,
+    validate_mcp_server_command,
 };
 use topodb_sgh::runner::{NodeOutcome, NodeRequest};
 
@@ -554,4 +555,31 @@ fn validate_bash_grant_accepts_topodb_search() {
         result.is_ok(),
         "topodb search should be allowed (neither token is a shell)"
     );
+}
+
+// --- validate_mcp_server_command -----------------------------------------
+
+#[test]
+fn mcp_command_splits_into_argv() {
+    let argv =
+        validate_mcp_server_command("/abs/topodb-mcp --db /tmp/m.redb --scope shared").unwrap();
+    assert_eq!(argv[0], "/abs/topodb-mcp");
+    assert_eq!(argv[1..], ["--db", "/tmp/m.redb", "--scope", "shared"]);
+}
+
+#[test]
+fn mcp_command_rejects_empty_and_metacharacters() {
+    assert!(validate_mcp_server_command("   ").is_err());
+    let err = validate_mcp_server_command("topodb-mcp --db a.redb; rm -rf /").unwrap_err();
+    assert!(
+        err.contains(";"),
+        "error should name the forbidden character: {err}"
+    );
+}
+
+#[test]
+fn mcp_command_rejects_shell_launchers() {
+    let err = validate_mcp_server_command("bash -c topodb-mcp").unwrap_err();
+    assert!(err.contains("shell"), "{err}");
+    assert!(validate_mcp_server_command("/usr/bin/env topodb-mcp").is_err());
 }
