@@ -71,6 +71,7 @@ pub fn build_plan_prompt(
          \x20   run: \"<shell command>\"        # required for kind: command\n\
          \x20   output:\n\
          \x20     schema: {<JSON Schema>}     # optional; if set, output MUST match\n\
+         \x20   tools: [topodb]              # optional; ONLY if the step must read/write persistent memory\n\
          \x20   budget: {retries: <n>, repairs: <n>}   # required on every node\n\n",
     );
 
@@ -104,7 +105,11 @@ pub fn build_plan_prompt(
          the run is visible to it, so declare every dependency a step actually needs.\n\
          - Prefer `kind: command` for deterministic work (builds, tests, file moves): it \
          costs no model calls and is exactly reproducible.\n\
-         - Commands run in a shell and are shown to a human for approval before executing.\n\n",
+         - Commands run in a shell and are shown to a human for approval before executing.\n\
+         - `tools: [topodb]` opts an agent node into TopoDB memory tools (MCP). Emit it \
+         ONLY when the goal or context says persistent memory is available and the step \
+         genuinely needs to remember or recall across runs — a graph that declares it \
+         requires the operator to pass `--agent-mcp` at run time.\n\n",
     );
 
     if !previous.is_empty() {

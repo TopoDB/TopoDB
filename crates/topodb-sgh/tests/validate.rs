@@ -180,3 +180,61 @@ fn an_agent_declaring_no_output_is_left_alone() {
     );
     validate(&g).expect("a node that claims nothing needs nothing to check it");
 }
+
+#[test]
+fn unknown_tool_value_is_rejected_naming_node_and_value() {
+    let yaml = r#"
+version: 1
+goal: g
+nodes:
+  - id: a
+    kind: agent
+    prompt: p
+    tools: [jira]
+    budget: {retries: 0, repairs: 0}
+"#;
+    let g = graph(yaml);
+    let errs = validate(&g).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("a") && e.to_string().contains("jira")),
+        "expected UnknownTool naming node and value: {errs:?}"
+    );
+}
+
+#[test]
+fn tools_on_non_agent_node_is_rejected() {
+    let yaml = r#"
+version: 1
+goal: g
+nodes:
+  - id: c
+    kind: command
+    run: "true"
+    tools: [topodb]
+    budget: {retries: 0, repairs: 0}
+"#;
+    let g = graph(yaml);
+    let errs = validate(&g).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.to_string().contains("c") && e.to_string().contains("tools")),
+        "expected ToolsOnNonAgent naming the node: {errs:?}"
+    );
+}
+
+#[test]
+fn topodb_tool_on_agent_node_validates() {
+    let yaml = r#"
+version: 1
+goal: g
+nodes:
+  - id: a
+    kind: agent
+    prompt: p
+    tools: [topodb]
+    budget: {retries: 0, repairs: 0}
+"#;
+    let g = graph(yaml);
+    assert!(validate(&g).is_ok());
+}

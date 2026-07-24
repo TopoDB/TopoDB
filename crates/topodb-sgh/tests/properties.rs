@@ -80,6 +80,7 @@ fn dag() -> impl Strategy<Value = Graph> {
                         prompt,
                         run,
                         output: None,
+                        tools: vec![],
                         budget: Budget {
                             retries: budgets[i].0,
                             repairs: budgets[i].1,

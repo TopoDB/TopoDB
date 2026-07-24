@@ -21,6 +21,10 @@ pub enum ValidationError {
          add a `kind: command` node that depends on it and verifies the claim"
     )]
     UncheckedClaim { node: String },
+    #[error("node {node} declares unknown tool {tool:?} — only \"topodb\" is supported")]
+    UnknownTool { node: String, tool: String },
+    #[error("node {node} declares `tools` but is not an agent node — only agent nodes call tools")]
+    ToolsOnNonAgent { node: String },
 }
 
 /// A graph that has passed validation. Only a `Validated` may be executed.
@@ -64,6 +68,17 @@ pub fn validate(graph: &Graph) -> Result<Validated, Vec<ValidationError>> {
                 errors.push(ValidationError::InvalidSchema {
                     node: n.id.clone(),
                     reason: e.to_string(),
+                });
+            }
+        }
+        if !n.tools.is_empty() && n.kind != NodeKind::Agent {
+            errors.push(ValidationError::ToolsOnNonAgent { node: n.id.clone() });
+        }
+        for t in &n.tools {
+            if t != super::TOPODB_TOOL {
+                errors.push(ValidationError::UnknownTool {
+                    node: n.id.clone(),
+                    tool: t.clone(),
                 });
             }
         }

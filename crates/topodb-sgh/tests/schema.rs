@@ -26,3 +26,27 @@ fn rejects_unknown_node_kind() {
     let src = "version: 1\ngoal: g\nnodes:\n  - id: a\n    kind: wizard\n    budget: {retries: 0, repairs: 0}\n";
     assert!(Graph::from_yaml(src).is_err());
 }
+
+#[test]
+fn tools_field_parses_and_defaults_empty() {
+    let yaml = r#"
+version: 1
+goal: g
+nodes:
+  - id: a
+    kind: agent
+    prompt: p
+    tools: [topodb]
+    budget: {retries: 0, repairs: 0}
+  - id: b
+    kind: agent
+    prompt: p
+    budget: {retries: 0, repairs: 0}
+"#;
+    let g = Graph::from_yaml(yaml).unwrap();
+    assert_eq!(g.nodes[0].tools, vec!["topodb".to_string()]);
+    assert!(
+        g.nodes[1].tools.is_empty(),
+        "absent tools must default to empty"
+    );
+}
