@@ -568,13 +568,17 @@ const NEAR_DUP_REVIEW: f32 = 0.68;
 const TEXT_NEAR_DUP_CONTAINMENT: f64 = 0.7;
 
 /// Containment similarity of two precomputed token sets: |∩| / min(|A|,|B|).
-/// Returns 1.0 if both sets are empty.
+/// Returns 1.0 if both sets are empty. Returns 0.0 if exactly one set is empty
+/// (no overlap is possible, so containment is a deliberate 0.0 rather than NaN).
 fn containment_of_sets(
     a: &std::collections::BTreeSet<String>,
     b: &std::collections::BTreeSet<String>,
 ) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
     }
 
     let intersection = a.intersection(b).count() as f64;
@@ -3841,7 +3845,7 @@ impl ServerHandler for TopoServer {
 
 #[cfg(test)]
 mod dup_classify_tests {
-    use super::{dup_band, dup_relation, is_supersession};
+    use super::{containment_of_sets, dup_band, dup_relation, is_supersession};
 
     // Labeled battery from the calibration experiment (raw cosine can't separate
     // these — the negation cue must). SAME/UNRELATED => "duplicate" relation,
@@ -3911,5 +3915,18 @@ mod dup_classify_tests {
         assert_eq!(dup_band(0.80), "likely");
         assert_eq!(dup_band(0.799), "possible");
         assert_eq!(dup_band(0.70), "possible");
+    }
+
+    #[test]
+    fn containment_empty_set_rules() {
+        use std::collections::BTreeSet;
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let full: BTreeSet<String> = ["staging".to_string()].into_iter().collect();
+        // Both empty: identical, containment 1.0 (existing, deliberate).
+        assert_eq!(containment_of_sets(&empty, &empty), 1.0);
+        // Exactly one empty: no overlap is possible — 0.0, NOT NaN (which would
+        // silently fail every >= floor comparison).
+        assert_eq!(containment_of_sets(&empty, &full), 0.0);
+        assert_eq!(containment_of_sets(&full, &empty), 0.0);
     }
 }
