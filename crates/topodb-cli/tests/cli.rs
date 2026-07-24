@@ -6,6 +6,21 @@ fn bin() -> Command {
 }
 
 #[test]
+fn holder_helper() {
+    // When TOPODB_TEST_HOLD_DB is not set, this is a no-op pass.
+    // When set to a path, this holds the db open for the specified duration (TOPODB_TEST_HOLD_MS).
+    if let Ok(db_path) = std::env::var("TOPODB_TEST_HOLD_DB") {
+        let hold_ms: u64 = std::env::var("TOPODB_TEST_HOLD_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(900);
+
+        let _held = topodb::Db::open_stored(&db_path).expect("holder: failed to open db");
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    }
+}
+
+#[test]
 fn info_reports_fields_on_fresh_db() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
@@ -665,83 +680,151 @@ fn lock_contention_is_busy_exit_3_and_retry_succeeds() {
 
 #[test]
 fn lock_contention_retrying_note_appears_after_500ms_elapsed() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("t.redb");
-    // Seed the file so it exists, and ensure it's fully initialized.
-    let _ = topodb::Db::open(&db).unwrap();
+    for iteration in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.redb");
+        // Seed the file so it exists, and ensure it's fully initialized.
+        let _ = topodb::Db::open(&db).unwrap();
 
-    // Hold it from another thread, releasing after ~1200ms (well exceeds 500ms threshold).
-    let held = topodb::Db::open(&db).unwrap();
+        let db_str = db.to_str().unwrap().to_string();
+        let db_clone = db_str.clone();
 
-    // Ensure the lock is established before subprocess tries to open
-    std::thread::sleep(std::time::Duration::from_millis(50));
+        // Spawn a separate OS process to hold the db lock for ~3000ms (gives time for CLI to retry).
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .args(["holder_helper", "--exact", "--nocapture"])
+            .env("TOPODB_TEST_HOLD_DB", &db_str)
+            .env("TOPODB_TEST_HOLD_MS", "3000")
+            .spawn()
+            .expect("failed to spawn holder process");
 
-    let db_clone = db.clone();
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        drop(held);
-    });
+        // Wait ~500ms for holder to establish the lock.
+        std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let out = bin()
-        .args(["--db", db_clone.to_str().unwrap(), "info"])
-        .output()
-        .unwrap();
-    handle.join().unwrap();
+        // Poll to confirm lock is held: check stderr for lock-held message.
+        let mut lock_detected = false;
+        for attempt in 0..20 {
+            let probe = bin()
+                .args(["--db", &db_clone, "--lock-wait-ms", "0", "info"])
+                .output()
+                .expect("probe failed");
+            let stderr_text = String::from_utf8_lossy(&probe.stderr);
+            let stdout_text = String::from_utf8_lossy(&probe.stdout);
+            let combined = format!("{}{}", stdout_text, stderr_text);
+            if combined.contains("another process holds")
+                || combined.contains("held by another process")
+            {
+                lock_detected = true;
+                break;
+            }
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            lock_detected,
+            "iteration {}: holder never acquired lock; retried 20 times",
+            iteration
+        );
 
-    assert!(
-        out.status.success(),
-        "retry should eventually succeed: stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        // Now run the CLI with --lock-wait-ms 3000 and assert it succeeds with retry message.
+        let out = bin()
+            .args(["--db", &db_clone, "--lock-wait-ms", "3000", "info"])
+            .output()
+            .expect("CLI call failed");
 
-    let stderr_text = String::from_utf8_lossy(&out.stderr);
-    // stderr is empty in this test context; the retry note is printed but not captured.
-    // Just verify that the command succeeded and the retry mechanism worked.
-    assert!(
-        !stderr_text.is_empty() || out.status.success(),
-        "command should have succeeded through retry: stderr={:?}, status={:?}",
-        stderr_text,
-        out.status
-    );
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "iteration {}: CLI should succeed; stderr: {}",
+            iteration,
+            stderr_text
+        );
+
+        assert!(
+            stderr_text
+                .contains("topodb: database held by another process; retrying (budget 3000ms)"),
+            "iteration {}: stderr must contain exact retry message; got: {}",
+            iteration,
+            stderr_text
+        );
+
+        // Wait for holder process to finish.
+        holder.wait().expect("holder process wait failed");
+    }
 }
 
 #[test]
 fn lock_contention_no_retrying_note_before_500ms_elapsed() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("t.redb");
-    // Seed the file so it exists, and ensure it's fully initialized.
-    let _ = topodb::Db::open(&db).unwrap();
+    for iteration in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.redb");
+        // Seed the file so it exists, and ensure it's fully initialized.
+        let _ = topodb::Db::open(&db).unwrap();
 
-    // Hold it from another thread, releasing after ~100ms (under 500ms threshold).
-    let held = topodb::Db::open(&db).unwrap();
+        let db_str = db.to_str().unwrap().to_string();
+        let db_clone = db_str.clone();
 
-    // Ensure the lock is established before subprocess tries to open
-    std::thread::sleep(std::time::Duration::from_millis(50));
+        // Spawn a separate OS process to hold the db lock for ~600ms (under 500ms threshold, enough for probing).
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .args(["holder_helper", "--exact", "--nocapture"])
+            .env("TOPODB_TEST_HOLD_DB", &db_str)
+            .env("TOPODB_TEST_HOLD_MS", "600")
+            .spawn()
+            .expect("failed to spawn holder process");
 
-    let db_clone = db.clone();
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        drop(held);
-    });
+        // Wait ~200ms for holder to establish the lock.
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let out = bin()
-        .args(["--db", db_clone.to_str().unwrap(), "info"])
-        .output()
-        .unwrap();
-    handle.join().unwrap();
+        // Poll to confirm lock is held: check stderr for lock-held message.
+        let mut lock_detected = false;
+        for attempt in 0..20 {
+            let probe = bin()
+                .args(["--db", &db_clone, "--lock-wait-ms", "0", "info"])
+                .output()
+                .expect("probe failed");
+            let stderr_text = String::from_utf8_lossy(&probe.stderr);
+            let stdout_text = String::from_utf8_lossy(&probe.stdout);
+            let combined = format!("{}{}", stdout_text, stderr_text);
+            if combined.contains("another process holds")
+                || combined.contains("held by another process")
+            {
+                lock_detected = true;
+                break;
+            }
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        assert!(
+            lock_detected,
+            "iteration {}: holder never acquired lock; retried 20 times",
+            iteration
+        );
 
-    assert!(
-        out.status.success(),
-        "retry should eventually succeed: stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        // Now run the CLI and assert it succeeds WITHOUT retry message (lock released <500ms).
+        let out = bin()
+            .args(["--db", &db_clone, "info"])
+            .output()
+            .expect("CLI call failed");
 
-    let stderr_text = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr_text.contains("retrying"),
-        "stderr should NOT contain 'retrying' message when lock released <500ms: {}",
-        stderr_text
-    );
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "iteration {}: CLI should succeed; stderr: {}",
+            iteration,
+            stderr_text
+        );
+
+        assert!(
+            !stderr_text.contains("retrying"),
+            "iteration {}: stderr must NOT contain 'retrying' message when lock <500ms; got: {}",
+            iteration,
+            stderr_text
+        );
+
+        // Wait for holder process to finish.
+        holder.wait().expect("holder process wait failed");
+    }
 }
 
 #[test]

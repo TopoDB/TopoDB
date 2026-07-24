@@ -414,7 +414,7 @@ impl TopoServer {
         Ok((ops, marked))
     }
 
-    /// Text-based near-duplicate detection using token-Jaccard similarity
+    /// Text-based near-duplicate detection using token-Jaccard containment
     /// when the embedder is not Ready. Performs BM25 text search to fetch
     /// candidates, filters by token-containment floor, and returns ranked results.
     /// Excludes `exclude` node (if provided), non-Memory labels, and superseded nodes.
@@ -1053,7 +1053,7 @@ struct FindDuplicateMemoriesParams {
     /// model scores the same fact in different words ~0.83, unrelated facts well
     /// under 0.5. Raise it for stricter matches, lower to cast a wider (noisier)
     /// net. Ignored in text mode; text mode always uses the fixed token-Jaccard
-    /// floor (0.6).
+    /// containment floor (0.7).
     #[serde(default = "default_dup_similarity")]
     #[schemars(range(min = 0.0, max = 1.0))]
     min_similarity: f32,
@@ -1088,7 +1088,7 @@ struct DuplicatePair {
     /// Their contents, index-aligned with `ids`, so the caller can judge "same
     /// fact" from "similar topic" without a follow-up read.
     contents: [String; 2],
-    /// Similarity between them (cosine in vector mode, token-Jaccard in text mode;
+    /// Similarity between them (cosine in vector mode, token-Jaccard containment in text mode;
     /// not comparable across modes). 1.0 = identical.
     similarity: f32,
     /// Confidence band: `"likely"` (cosine >= 0.80) or `"possible"` (the widened
@@ -1115,7 +1115,7 @@ struct FindDuplicateMemoriesResult {
     /// narrow scopes or raise `limit`, not an error.
     truncated: bool,
     /// Detection method used: `"vector"` when embedder is Ready, `"text"` when using
-    /// text-based fallback (token-Jaccard similarity). Both modes apply negation-cue
+    /// text-based fallback (token-Jaccard containment). Both modes apply negation-cue
     /// heuristics to distinguish duplicates from supersessions.
     method: String,
 }
@@ -1297,7 +1297,7 @@ struct MemoryHealthResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
     /// Near-duplicate pairs that look like the SAME fact (cosine >= 0.80 in
-    /// vector mode, token-Jaccard >= 0.6 in text mode, non-contradicting) —
+    /// vector mode, token-Jaccard containment >= 0.7 in text mode, non-contradicting) —
     /// merge with `consolidate_memories`. 0 only when embeddings are deliberately off.
     duplicate_pairs: usize,
     /// High-similarity pairs that CONTRADICT each other (one negates what the
@@ -1699,7 +1699,7 @@ struct RememberResult {
     superseded: Vec<String>,
     /// Existing memories semantically close to the one just stored (advisory —
     /// nothing was merged). Uses vector-based detection when embeddings are Ready,
-    /// falls back to text-based (token-Jaccard) detection otherwise. Empty on a
+    /// falls back to text-based (token-Jaccard containment) detection otherwise. Empty on a
     /// dedup hit. See `NearDuplicate`.
     near_duplicates: Vec<NearDuplicate>,
 }
@@ -1787,7 +1787,7 @@ struct CreateResult {
     deduplicated: bool,
     /// Existing memories semantically close to the one just stored (advisory —
     /// nothing was merged). Uses vector-based detection when embeddings are Ready,
-    /// falls back to text-based (token-Jaccard) detection otherwise. Consider
+    /// falls back to text-based (token-Jaccard containment) detection otherwise. Consider
     /// whether a hit is actually the same fact and, if so, `supersedes` or
     /// `remove_node` the redundant one. Empty on a dedup hit.
     near_duplicates: Vec<NearDuplicate>,
@@ -1803,7 +1803,7 @@ struct NearDuplicate {
     /// Its content, so the caller can tell "same fact" from "similar topic".
     content: String,
     /// Similarity to the memory just stored: cosine in vector mode (1.0 =
-    /// identical direction), token-Jaccard in text mode (see `method`) — the
+    /// identical direction), token-Jaccard containment in text mode (see `method`) — the
     /// two scales are NOT comparable.
     similarity: f32,
     /// Confidence band: `"likely"` (cosine >= 0.80) or `"possible"` (review band).
@@ -1813,7 +1813,7 @@ struct NearDuplicate {
     /// replaced; `supersede` it rather than treating it as a duplicate.
     relation: String,
     /// Method used to detect the similarity: `"vector"` when embedder is Ready,
-    /// `"text"` when using token-Jaccard text fallback.
+    /// `"text"` when using token-Jaccard containment text fallback.
     method: String,
 }
 
@@ -2189,7 +2189,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Text mode (embedder not Ready, including deliberate off): exhaustive pairwise token-Jaccard over the scope (>= 0.6, fixed); the same lexical negation-cue relation check runs, so pairs still split into `duplicate` vs `supersession` (heuristic — lower confidence than the vector split; bands reuse the cosine cutoffs applied to Jaccard, treat as rough). The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
+        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Text mode (embedder not Ready, including deliberate off): exhaustive pairwise token-Jaccard containment over the scope (>= 0.7, fixed); the same lexical negation-cue relation check runs, so pairs still split into `duplicate` vs `supersession` (heuristic — lower confidence than the vector split; bands reuse the cosine cutoffs applied to containment, treat as rough). The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
     )]
     fn find_duplicate_memories(
         &self,
@@ -2305,7 +2305,7 @@ impl TopoServer {
             // No vector candidates found, but embedder is Ready; fall through to text.
         }
 
-        // Text fallback: use token-Jaccard similarity when embeddings are not ready.
+        // Text fallback: use token-Jaccard containment when embeddings are not ready.
         // Enumerate all live, non-superseded memories using the same non-bumping scan
         // so `scanned` semantics match the vector path.
         let mut text_candidates: Vec<(String, String)> = self
@@ -2358,7 +2358,7 @@ impl TopoServer {
                 }
             }
         }
-        // Most-similar first; sort by descending Jaccard.
+        // Most-similar first; sort by descending containment similarity.
         pairs.sort_by(|x, y| y.similarity.total_cmp(&x.similarity));
         if pairs.len() > limit {
             truncated = true;
@@ -2632,7 +2632,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When the embedder is not Ready (including deliberate off), text-based detection (token-Jaccard) runs instead, and the duplicate/supersession split still applies via the lexical negation-cue check (heuristic — lower confidence than vectors). Check `embeddings_enabled` to tell which detection grade produced the counts. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
+        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When the embedder is not Ready (including deliberate off), text-based detection (token-Jaccard containment) runs instead, and the duplicate/supersession split still applies via the lexical negation-cue check (heuristic — lower confidence than vectors). Check `embeddings_enabled` to tell which detection grade produced the counts. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
     )]
     fn memory_health(
         &self,

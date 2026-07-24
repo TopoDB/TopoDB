@@ -24,7 +24,7 @@ fn find_duplicate_memories_uses_text_fallback_when_embeddings_are_off() {
     );
     s.initialize(DEFAULT_TIMEOUT);
 
-    // Two disjoint facts — with embeddings off, text-based detection (token-Jaccard)
+    // Two disjoint facts — with embeddings off, text-based detection (token-Jaccard containment)
     // should still run but find no matches below the text threshold.
     s.call_tool_ok(
         "create_memory",
@@ -44,7 +44,7 @@ fn find_duplicate_memories_uses_text_fallback_when_embeddings_are_off() {
     );
     // Method is "text" when embeddings are off (text fallback active).
     assert_eq!(res["method"].as_str().unwrap(), "text", "{res}");
-    // No pairs because the memories are disjoint (low Jaccard similarity).
+    // No pairs because the memories are disjoint (low containment similarity).
     assert_eq!(
         res["pairs"],
         serde_json::json!([]),

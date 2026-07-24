@@ -220,7 +220,7 @@ fn find_duplicate_memories_text_fallback_with_embeddings_off() {
 }
 
 #[test]
-fn find_duplicate_memories_exact_boundary_at_0_6() {
+fn find_duplicate_memories_exact_boundary_at_0_75_containment() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Server::spawn(
         &dir.path().join("t.redb"),
@@ -351,7 +351,7 @@ fn duplicate_scan_dispatches_on_embedder_status_not_stored_vectors() {
         "text mode should find the overlapping pair: {result}"
     );
 
-    // The pair should use text-mode similarity (token-Jaccard)
+    // The pair should use text-mode similarity (token-Jaccard containment)
     let pair = &result["pairs"][0];
     let ids = [
         pair["ids"][0].as_str().unwrap(),
