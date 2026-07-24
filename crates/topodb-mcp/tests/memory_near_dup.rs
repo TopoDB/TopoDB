@@ -232,6 +232,49 @@ fn text_fallback_canonical_containment_pair() {
     );
 }
 
+/// A short memory fully contained in a longer one hits containment 1.0, but
+/// with min(|A|,|B|) under the small-set floor the band is capped at
+/// "possible" — incidental token subsets must not read as "likely".
+#[test]
+fn text_fallback_short_subset_band_capped_at_possible() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &["--scope", A, "--embeddings", "off"],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // 3 tokens: {the, postgres, db}.
+    let _short = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "the postgres db" }),
+        DEFAULT_TIMEOUT,
+    );
+    // Superset sentence: containment = 3/min(3, 8) = 1.0, min set 3 < 6.
+    let similar = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "we keep the postgres db for analytics workloads" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let near = similar["near_duplicates"].as_array().unwrap();
+    assert!(
+        !near.is_empty(),
+        "containment 1.0 must still SURFACE the pair: {similar:#?}"
+    );
+    let hit = &near[0];
+    let sim = hit["similarity"].as_f64().unwrap();
+    assert!(
+        (sim - 1.0).abs() < 1e-6,
+        "containment should be 1.0, got {sim}"
+    );
+    assert_eq!(
+        hit["band"].as_str().unwrap(),
+        "possible",
+        "short-set containment 1.0 must be capped at 'possible': {hit:#?}"
+    );
+}
+
 #[test]
 fn text_fallback_detects_exact_subset_at_1_0_containment() {
     let dir = tempfile::tempdir().unwrap();
