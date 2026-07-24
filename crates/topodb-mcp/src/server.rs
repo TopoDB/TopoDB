@@ -431,7 +431,8 @@ impl TopoServer {
             return Vec::new();
         };
 
-        let mut scored: Vec<(NodeRecord, String, f64)> = hits
+        let content_tokens = tokens(content);
+        let mut scored: Vec<(NodeRecord, String, f64, usize)> = hits
             .into_iter()
             .filter_map(|(n, _)| {
                 // Skip non-Memory labels and superseded nodes.
@@ -446,9 +447,11 @@ impl TopoServer {
                     _ => return None,
                 };
 
-                let containment = token_containment(content, &existing);
+                let existing_tokens = tokens(&existing);
+                let min_len = content_tokens.len().min(existing_tokens.len());
+                let containment = containment_of_sets(&content_tokens, &existing_tokens);
                 if containment >= TEXT_NEAR_DUP_CONTAINMENT {
-                    Some((n, existing, containment))
+                    Some((n, existing, containment, min_len))
                 } else {
                     None
                 }
@@ -461,10 +464,10 @@ impl TopoServer {
 
         scored
             .into_iter()
-            .map(|(n, existing, containment)| NearDuplicate {
+            .map(|(n, existing, containment, min_len)| NearDuplicate {
                 id: n.id.to_string(),
                 similarity: containment as f32,
-                band: dup_band(containment as f32).to_string(),
+                band: text_dup_band(containment, min_len).to_string(),
                 relation: dup_relation(content, &existing).to_string(),
                 content: existing,
                 method: "text".to_string(),
@@ -592,12 +595,6 @@ fn tokens(s: &str) -> std::collections::BTreeSet<String> {
     s.split_whitespace().map(|t| t.to_lowercase()).collect()
 }
 
-/// Containment similarity of two strings' token sets (lowercase, whitespace-split).
-/// Returns 1.0 if both strings are empty.
-fn token_containment(a: &str, b: &str) -> f64 {
-    containment_of_sets(&tokens(a), &tokens(b))
-}
-
 /// Confidence band for a near-dup similarity: `"likely"` at/above the strong
 /// floor ([`NEAR_DUP_THRESHOLD`]), `"possible"` in the review band below it.
 fn dup_band(similarity: f32) -> &'static str {
@@ -605,6 +602,26 @@ fn dup_band(similarity: f32) -> &'static str {
         "likely"
     } else {
         "possible"
+    }
+}
+
+/// Floor on the SMALLER token set's size before a text-mode containment score
+/// may claim the "likely" band. Whitespace tokens include stopwords, so a short
+/// memory's set is trivially contained in any longer memory that happens to
+/// mention the same words — containment 1.0 from 3 shared tokens is weak
+/// evidence, not strong. 6 keeps the calibrated canonical pair ("Vega stores
+/// its data in postgres", 6 tokens, 0.833 → likely) exactly at its band.
+const TEXT_BAND_MIN_TOKENS: usize = 6;
+
+/// Band for a TEXT-mode (containment) score: [`dup_band`]'s cosine-derived
+/// cutoffs, except capped at "possible" when the smaller token set is under
+/// [`TEXT_BAND_MIN_TOKENS`] — the score is real (the pair still surfaces), but
+/// small-set containment can't justify "likely".
+fn text_dup_band(containment: f64, min_set_len: usize) -> &'static str {
+    if min_set_len < TEXT_BAND_MIN_TOKENS {
+        "possible"
+    } else {
+        dup_band(containment as f32)
     }
 }
 
@@ -2352,12 +2369,13 @@ impl TopoServer {
                     let (a, b) = (&text_candidates[i], &text_candidates[j]);
                     // Canonical (ascending-id) order so a pair is reported once.
                     let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                    let min_len = token_sets[i].len().min(token_sets[j].len());
                     // Text mode uses lexical heuristics (negation-cue check) to distinguish
                     // duplicates from supersessions, same as the advisory (text advisory run time).
                     pairs.push(DuplicatePair {
                         ids: [lo.0.clone(), hi.0.clone()],
                         similarity: containment as f32,
-                        band: dup_band(containment as f32).to_string(),
+                        band: text_dup_band(containment, min_len).to_string(),
                         relation: dup_relation(&lo.1, &hi.1).to_string(),
                         contents: [lo.1.clone(), hi.1.clone()],
                     });
@@ -3845,7 +3863,7 @@ impl ServerHandler for TopoServer {
 
 #[cfg(test)]
 mod dup_classify_tests {
-    use super::{containment_of_sets, dup_band, dup_relation, is_supersession};
+    use super::{containment_of_sets, dup_band, dup_relation, is_supersession, text_dup_band};
 
     // Labeled battery from the calibration experiment (raw cosine can't separate
     // these — the negation cue must). SAME/UNRELATED => "duplicate" relation,
@@ -3915,6 +3933,17 @@ mod dup_classify_tests {
         assert_eq!(dup_band(0.80), "likely");
         assert_eq!(dup_band(0.799), "possible");
         assert_eq!(dup_band(0.70), "possible");
+    }
+
+    #[test]
+    fn text_band_caps_small_sets_at_possible() {
+        // Stopword-driven containment 1.0 on a tiny set must not read "likely".
+        assert_eq!(text_dup_band(1.0, 3), "possible");
+        assert_eq!(text_dup_band(1.0, 5), "possible");
+        // At the boundary (the calibrated canonical pair has 6 tokens) the
+        // normal cosine-derived cutoffs apply unchanged.
+        assert_eq!(text_dup_band(0.8333, 6), "likely");
+        assert_eq!(text_dup_band(0.75, 6), "possible");
     }
 
     #[test]
