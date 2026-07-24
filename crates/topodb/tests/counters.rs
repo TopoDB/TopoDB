@@ -366,3 +366,63 @@ fn search_text_unbumped_leaves_access_counters_untouched() {
         "search_text_unbumped must not bump access counters"
     );
 }
+
+#[test]
+fn search_vector_unbumped_leaves_access_counters_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let id = NodeId::new();
+
+    db.submit(vec![
+        Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: Default::default(),
+        },
+        Op::SetEmbedding {
+            id,
+            model: "test-model".into(),
+            vector: vec![1.0, 0.0, 0.0],
+        },
+    ])
+    .unwrap();
+
+    let q = VectorQuery {
+        scopes: scopes.clone(),
+        model: "test-model".into(),
+        vector: vec![1.0, 0.0, 0.0],
+        k: 10,
+        candidates: None,
+    };
+
+    // Bumped call: count must rise.
+    let hits = db.search_vector(&q).unwrap();
+    assert_eq!(hits.len(), 1, "search_vector must find the node");
+    assert_eq!(hits[0].0.id, id);
+    let bumped_score = hits[0].1;
+    let bumped_stats = wait_for_count(&db, &scopes, id, 1);
+    let count_after_bumped = bumped_stats.access_count;
+
+    // Unbumped call: same hits, same scores, count unchanged.
+    let unbumped_hits = db.search_vector_unbumped(&q).unwrap();
+    assert_eq!(unbumped_hits.len(), 1);
+    assert_eq!(unbumped_hits[0].0.id, id);
+    assert_eq!(
+        unbumped_hits[0].1, bumped_score,
+        "unbumped must score identically (same cosine, only the bump differs)"
+    );
+
+    std::thread::sleep(Duration::from_millis(300)); // > one bumper flush interval
+    let final_stats = db.access_stats(&scopes, id).unwrap();
+    assert_eq!(
+        final_stats,
+        Some(AccessStats {
+            access_count: count_after_bumped,
+            last_accessed_at: bumped_stats.last_accessed_at,
+        }),
+        "search_vector_unbumped must not bump access counters"
+    );
+}
