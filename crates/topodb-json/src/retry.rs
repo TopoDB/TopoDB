@@ -2,6 +2,7 @@
 //! Retries ONLY on [`TopoError::Busy`]; every other outcome (success or a
 //! different error) is returned from the first attempt that produced it.
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use topodb::{Db, TopoError};
@@ -11,12 +12,16 @@ use topodb::{Db, TopoError};
 /// jitter (from the clock's nanoseconds — no rand dependency) so two
 /// contending processes don't retry in lockstep. `budget_ms == 0` means
 /// exactly one attempt (fail fast). Exhaustion returns `Err(Busy)`.
+///
+/// Prints one stderr line when cumulative elapsed exceeds 500ms and another
+/// retry is about to sleep, at most once per call.
 pub fn open_with_busy_retry(
     budget_ms: u64,
     mut open: impl FnMut() -> Result<Db, TopoError>,
 ) -> Result<Db, TopoError> {
     let start = Instant::now();
     let mut delay_ms: u64 = 25;
+    let mut printed_retry_note = false;
     loop {
         match open() {
             Err(TopoError::Busy) => {
@@ -27,6 +32,17 @@ pub fn open_with_busy_retry(
                 }
                 let jitter = u64::from(elapsed.subsec_nanos()) % (delay_ms / 4 + 1);
                 let remaining = budget_ms - elapsed_ms;
+
+                // Print retry note once cumulative elapsed exceeds 500ms.
+                if !printed_retry_note && elapsed_ms >= 500 {
+                    eprintln!(
+                        "topodb: database held by another process; retrying (budget {}ms)",
+                        remaining
+                    );
+                    let _ = std::io::stderr().flush();
+                    printed_retry_note = true;
+                }
+
                 std::thread::sleep(Duration::from_millis((delay_ms + jitter).min(remaining)));
                 delay_ms = (delay_ms * 2).min(500);
             }
