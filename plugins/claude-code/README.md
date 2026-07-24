@@ -37,7 +37,10 @@ rather than ever blocking a session:
   2k tokens. No broker running yet (the very first session of a project)
   means no injection; it appears from the next session on. The recall
   injection needs a 0.0.11+ server and the hygiene nudge below needs 0.0.12+;
-  the plugin pins 0.0.12, so both are live. When the
+  the plugin pins 0.0.13, so both are live (0.0.13 also adds `as_of` temporal
+  reads on traverse/get_edges, an Entity down-weight default in
+  search_memories, and text-fallback hygiene with honest `degraded`
+  reporting when no embedder is available). When the
   store has accumulated cruft, the injection also carries a one-line
   **memory-health nudge** (`🧹 Memory hygiene: N duplicate pairs, N
   supersessions, N orphans, N stale …`) from a `memory_health` scan run

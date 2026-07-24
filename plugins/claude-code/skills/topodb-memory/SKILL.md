@@ -69,9 +69,16 @@ created automatically.
 Facts supersede, they don't overwrite. When a to-one relation changes — new
 employer, new owner, moved teams — `link` the new edge with `supersede: true`:
 it atomically closes the other open same-type edges from that node, keeping the
-old fact as history. For anything else that stops being true, find the edge
-with `get_edges` and `close_edge` it. Then store a memory recording *why* it
+old fact as history. When a whole *memory* is replaced by a newer fact, pass
+`supersedes: [old_id]` to `remember` — the old memory is retired (invisible to
+recall from that moment, visible to history) in the same atomic write as the
+new one. For anything else that stops being true, find the edge with
+`get_edges` and `close_edge` it. Then store a memory recording *why* it
 changed, if you know.
+
+History stays readable: pass `as_of` (Unix ms) to `traverse` or `get_edges` to
+see the graph as it was at that instant — superseded topology reappears,
+later edges vanish. Nodes are current-state; the time axis lives on edges.
 
 ## Project or shared — the one choice that matters
 
