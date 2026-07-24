@@ -10,7 +10,7 @@ use topodb_sgh::runner::claude::ClaudeCodeRunner;
 use topodb_sgh::runner::command::ShellCommandRunner;
 use topodb_sgh::schema::bound::worst_case;
 use topodb_sgh::schema::validate::{validate, Validated};
-use topodb_sgh::schema::{Graph, NodeKind};
+use topodb_sgh::schema::{Graph, NodeKind, TOPODB_TOOL};
 use topodb_sgh::store::run::RunStore;
 
 #[derive(Parser)]
@@ -25,7 +25,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Validate a graph and print its worst-case bound.
-    Validate { graph: PathBuf },
+    Validate {
+        graph: PathBuf,
+        /// Supply agent nodes with the TopoDB MCP server: the full server
+        /// command (binary + args), e.g.
+        /// "--agent-mcp '/abs/topodb-mcp --db /abs/memory.redb --scope <ulid>'".
+        /// Whitespace-split with no shell; same character rail as --agent-bash
+        /// (prefer an absolute binary path; paths with spaces unsupported).
+        /// Only agent nodes declaring `tools: [topodb]` see the server
+        /// (additive, echoed at the approval gate). Nodes opting in without
+        /// this flag are a validate error.
+        #[arg(long = "agent-mcp")]
+        agent_mcp: Option<String>,
+    },
     /// Execute a graph after showing its bound.
     ///
     /// Exit codes a script may rely on:
@@ -65,6 +77,16 @@ enum Cmd {
         /// --agent-bash /abs/path/topodb, not --agent-bash topodb.
         #[arg(long = "agent-bash")]
         agent_bash: Vec<String>,
+        /// Supply agent nodes with the TopoDB MCP server: the full server
+        /// command (binary + args), e.g.
+        /// "--agent-mcp '/abs/topodb-mcp --db /abs/memory.redb --scope <ulid>'".
+        /// Whitespace-split with no shell; same character rail as --agent-bash
+        /// (prefer an absolute binary path; paths with spaces unsupported).
+        /// Only agent nodes declaring `tools: [topodb]` see the server
+        /// (additive, echoed at the approval gate). Nodes opting in without
+        /// this flag are a validate error.
+        #[arg(long = "agent-mcp")]
+        agent_mcp: Option<String>,
         /// Seconds a single command node may run before it is killed.
         #[arg(long, default_value_t = 120)]
         command_timeout: u64,
@@ -112,6 +134,47 @@ fn command_preview(v: &Validated) -> Vec<String> {
 /// Empty input yields empty output. Formatting is applied at the call site.
 fn grants_preview(grants: &[String]) -> Vec<String> {
     grants.to_vec()
+}
+
+/// Agent nodes opted into the TopoDB MCP surface, in declaration order.
+/// Recomputed per loop iteration so replan revisions are covered.
+fn mcp_nodes(v: &Validated) -> Vec<String> {
+    v.graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Agent && n.tools.iter().any(|t| t == TOPODB_TOOL))
+        .map(|n| n.id.clone())
+        .collect()
+}
+
+/// The pairing rule: a graph whose nodes opt into `tools: [topodb]` cannot
+/// run (or validate clean) without `--agent-mcp` supplying the server —
+/// failing here, at the gate, beats failing mid-run inside a model call.
+fn mcp_pairing_error(v: &Validated, agent_mcp: Option<&str>) -> Option<String> {
+    let nodes = mcp_nodes(v);
+    if nodes.is_empty() || agent_mcp.is_some() {
+        return None;
+    }
+    Some(format!(
+        "node(s) {} declare tools: [topodb] but no --agent-mcp was given — \
+         pass --agent-mcp '<topodb-mcp binary + args>' or remove the opt-in",
+        nodes.join(", ")
+    ))
+}
+
+/// Write the mcp-config JSON claude consumes (`--mcp-config`). One file per
+/// run in the OS temp dir; content is identical for every node. Left behind
+/// after the run — it is temp-dir housekeeping, and deleting it while claude
+/// subprocesses might still read it would be a race.
+fn write_mcp_config(server_argv: &[String]) -> std::io::Result<std::path::PathBuf> {
+    let body = serde_json::json!({
+        "mcpServers": {
+            "topodb": { "command": server_argv[0], "args": &server_argv[1..] }
+        }
+    });
+    let path = std::env::temp_dir().join(format!("sgh-mcp-{}.json", ulid::Ulid::new()));
+    std::fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+    Ok(path)
 }
 
 /// Agent nodes with no declared `output.schema`.
@@ -261,7 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Validate { graph } => {
+        Cmd::Validate { graph, agent_mcp } => {
             let src = std::fs::read_to_string(&graph)?;
             let g = Graph::from_yaml(&src)?;
             match validate(&g) {
@@ -276,6 +339,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     print_unconstrained(&v);
+
+                    if let Some(cmd) = &agent_mcp {
+                        if let Err(e) = topodb_sgh::runner::claude::validate_mcp_server_command(cmd)
+                        {
+                            eprintln!("error: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                    if let Some(err) = mcp_pairing_error(&v, agent_mcp.as_deref()) {
+                        eprintln!("error: {err}");
+                        std::process::exit(2);
+                    }
                 }
                 Err(errors) => {
                     for e in &errors {
@@ -291,6 +366,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             yes,
             yes_including_revisions,
             agent_bash,
+            agent_mcp,
             command_timeout,
             replan,
             max_replans,
@@ -328,10 +404,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            let mcp_argv = match agent_mcp.as_deref() {
+                Some(cmd) => match topodb_sgh::runner::claude::validate_mcp_server_command(cmd) {
+                    Ok(argv) => Some(argv),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+            let mcp_wiring = match &mcp_argv {
+                Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
+                    config_path: write_mcp_config(argv)?.to_string_lossy().into_owned(),
+                }),
+                None => None,
+            };
+
             let db = Db::open(&cli.db)?;
             let command_runner =
                 ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
-            let runner = ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), None);
+            let runner = ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring);
 
             let mut current = v;
             let mut replans_used = 0u32;
@@ -364,6 +457,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 print_unconstrained(&current);
+
+                if let Some(err) = mcp_pairing_error(&current, agent_mcp.as_deref()) {
+                    eprintln!("error: {err}");
+                    std::process::exit(2);
+                }
+
+                if let Some(cmd) = &agent_mcp {
+                    let nodes = mcp_nodes(&current);
+                    println!("\nAgent-node MCP server (additive; agent prompts are ungated):");
+                    println!("  {cmd}");
+                    if nodes.is_empty() {
+                        println!("  tools: mcp__topodb -> no node opts in (flag is inert for this graph)");
+                    } else {
+                        println!("  tools: mcp__topodb -> nodes: {}", nodes.join(", "));
+                    }
+                }
 
                 // The gate preview above (commands + grants) prints on stdout
                 // whether or not a prompt follows, so a --yes run is never
@@ -558,6 +667,18 @@ mod tests {
         validate(&Graph::from_yaml(yaml).expect("parses")).expect("valid")
     }
 
+    fn graph_with_tools(tools_on_a: &[&str]) -> Validated {
+        let yaml = if tools_on_a.is_empty() {
+            "version: 1\ngoal: g\nnodes:\n  - id: a\n    kind: agent\n    prompt: p\n    budget: {retries: 0, repairs: 0}\n  - id: b\n    kind: agent\n    prompt: p\n    budget: {retries: 0, repairs: 0}\n".to_string()
+        } else {
+            format!(
+                "version: 1\ngoal: g\nnodes:\n  - id: a\n    kind: agent\n    prompt: p\n    tools: [{}]\n    budget: {{retries: 0, repairs: 0}}\n  - id: b\n    kind: agent\n    prompt: p\n    budget: {{retries: 0, repairs: 0}}\n",
+                tools_on_a.join(", ")
+            )
+        };
+        validate(&Graph::from_yaml(&yaml).expect("parses")).expect("valid")
+    }
+
     #[test]
     fn grants_preview_returns_grants_unchanged() {
         let grants = vec!["topodb".to_string()];
@@ -577,6 +698,40 @@ mod tests {
         let grants = vec!["topodb".to_string(), "cargo".to_string()];
         let lines = grants_preview(&grants);
         assert_eq!(lines, vec!["topodb".to_string(), "cargo".to_string()]);
+    }
+
+    #[test]
+    fn mcp_nodes_lists_opted_in_agent_ids_in_order() {
+        let v = graph_with_tools(&["topodb"]);
+        assert_eq!(mcp_nodes(&v), vec!["a".to_string()]);
+        let v_none = graph_with_tools(&[]);
+        assert!(mcp_nodes(&v_none).is_empty());
+    }
+
+    #[test]
+    fn pairing_error_when_tools_without_flag() {
+        let v = graph_with_tools(&["topodb"]);
+        let err = mcp_pairing_error(&v, None).expect("must error");
+        assert!(err.contains("a") && err.contains("--agent-mcp"), "{err}");
+        assert!(mcp_pairing_error(&v, Some("cmd")).is_none());
+        let v_none = graph_with_tools(&[]);
+        assert!(mcp_pairing_error(&v_none, None).is_none());
+    }
+
+    #[test]
+    fn mcp_config_file_names_the_topodb_server() {
+        let path = write_mcp_config(&[
+            "/abs/topodb-mcp".to_string(),
+            "--db".to_string(),
+            "/tmp/m.redb".to_string(),
+        ])
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["mcpServers"]["topodb"]["command"], "/abs/topodb-mcp");
+        assert_eq!(body["mcpServers"]["topodb"]["args"][0], "--db");
+        assert_eq!(body["mcpServers"]["topodb"]["args"][1], "/tmp/m.redb");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
