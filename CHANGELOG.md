@@ -19,6 +19,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 #### Added
 
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
+- **`Db::search_vector_unbumped`** — cosine vector search with the same population, order, and scores as `search_vector`, but WITHOUT bumping access counters. For maintenance and advisory reads (near-duplicate checks) that must not spend the recency signal they exist to protect — the same rationale as `search_text_unbumped`. One shared implementation with the bumping variant.
 
 ### 0.0.11 — 2026-07-23
 
@@ -446,6 +447,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 #### Added
 
 - **`get_edges` — `direction` parameter** (enum: `"out"`/`"in"`/`"both"`, default `"out"`). For `"out"` (default), lists the node's outgoing edges as before. For `"in"`, the anchor shifts to the target and `to_id` filters the far source end (incoming edges, mirrored view). For `"both"`, returns an id-deduped union of incoming and outgoing edges.
+
+#### Fixed
+
+- **Text-mode near-duplicate detection improvements** — the lexical duplicate-vs-supersession classifier now handles short token sets correctly: band is capped at "possible" (not "likely") when the smaller memory's token set has fewer than 6 tokens (`TEXT_BAND_MIN_TOKENS = 6`); negation-cue windows now count content tokens (stopwords and cues don't consume slots) and are clause-bounded at sentence marks (`.,;:!?()`); sentence-initial "never …" contradictions (e.g. "use the staging db" vs "never point load tests at the staging db") now correctly classify as supersession instead of duplicate; "at" added to the classifier stopword list.
+- **Write-time near-duplicate advisory no longer bumps access counters** — the MCP advisory check on write now uses `Db::search_vector_unbumped` instead of `search_vector`, so advisory reads no longer corrupt the staleness signal that memory-hygiene sweeps rely on to detect stale content.
+- **`containment_of_sets` returns 0.0 for empty sets** — when exactly one token set is empty, `containment_of_sets` now returns 0.0 (deliberate, well-defined value) instead of NaN.
 
 #### Changed
 
