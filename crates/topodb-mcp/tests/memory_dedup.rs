@@ -228,12 +228,11 @@ fn find_duplicate_memories_exact_boundary_at_0_6() {
     );
     s.initialize(DEFAULT_TIMEOUT);
 
-    // Seed two memories with token Jaccard exactly 0.6:
-    // "alpha beta gamma delta" → {alpha, beta, gamma, delta}
-    // "alpha beta gamma epsilon" → {alpha, beta, gamma, epsilon}
+    // Seed two memories with token containment exactly 0.75:
+    // "alpha beta gamma delta" → {alpha, beta, gamma, delta} = 4 tokens
+    // "alpha beta gamma epsilon" → {alpha, beta, gamma, epsilon} = 4 tokens
     // Intersection: {alpha, beta, gamma} = 3
-    // Union: {alpha, beta, gamma, delta, epsilon} = 5
-    // Jaccard = 3/5 = 0.6
+    // Containment = 3 / min(4, 4) = 3/4 = 0.75 >= 0.7 floor → flagged as "likely"
     let exact_boundary1 = s.call_tool_ok(
         "create_memory",
         serde_json::json!({ "content": "alpha beta gamma delta" }),
@@ -251,18 +250,18 @@ fn find_duplicate_memories_exact_boundary_at_0_6() {
         .unwrap()
         .to_string();
 
-    // Call find_duplicate_memories with min_similarity 0.6 (should include the boundary pair).
+    // Call find_duplicate_memories with min_similarity 0.6 (should include the boundary pair, which has containment 0.75).
     let result = s.call_tool_ok(
         "find_duplicate_memories",
         serde_json::json!({ "min_similarity": 0.6 }),
         DEFAULT_TIMEOUT,
     );
 
-    // Check that we found the pair with exactly 0.6 similarity.
+    // Check that we found the pair with containment 0.75 similarity.
     let pairs = result["pairs"].as_array().unwrap();
     assert!(
         !pairs.is_empty(),
-        "should find at least 1 pair at exactly 0.6 boundary: {result:#?}"
+        "should find at least 1 pair with containment 0.75: {result:#?}"
     );
 
     let pair = &pairs[0];
@@ -279,11 +278,11 @@ fn find_duplicate_memories_exact_boundary_at_0_6() {
 
     assert_eq!(
         pair_ids_set, expected_pair,
-        "should find the exact 0.6 boundary pair: {result:#?}"
+        "should find the 0.75-containment boundary pair: {result:#?}"
     );
     assert!(
-        (pair["similarity"].as_f64().unwrap() - 0.6).abs() < 0.001,
-        "pair similarity should be approximately 0.6: {result:#?}"
+        (pair["similarity"].as_f64().unwrap() - 0.75).abs() < 0.001,
+        "pair similarity should be approximately 0.75 (containment): {result:#?}"
     );
 }
 
@@ -366,13 +365,13 @@ fn duplicate_scan_dispatches_on_embedder_status_not_stored_vectors() {
 
 #[test]
 fn text_mode_ignores_min_similarity_threshold() {
-    // Item 6: min_similarity is ignored in text mode. A pair at the exact
-    // 0.6 Jaccard boundary is returned even with min_similarity: 0.99.
+    // Item 6: min_similarity is ignored in text mode. A pair with token-containment
+    // >= 0.7 is returned even with min_similarity: 0.99.
     let dir = tempfile::tempdir().unwrap();
     let mut s = Server::spawn(&dir.path().join("t.redb"), &["--scope", A]);
     s.initialize(DEFAULT_TIMEOUT);
 
-    // Create the exact 0.6 Jaccard boundary pair
+    // Create a pair with high token containment (>= 0.7 floor)
     let mem1_id = s.call_tool_ok(
         "create_memory",
         serde_json::json!({"content": "the login breaks when the cookie exceeds size"}),
@@ -388,7 +387,7 @@ fn text_mode_ignores_min_similarity_threshold() {
     let mem2_id = mem2_id["id"].as_str().unwrap();
 
     // Call find_duplicate_memories with min_similarity: 0.99 (very high).
-    // In text mode, this should be ignored; the 0.6-Jaccard pair should still
+    // In text mode, this should be ignored; the containment pair (>= 0.7) should still
     // be returned.
     let result = s.call_tool_ok(
         "find_duplicate_memories",
@@ -402,7 +401,7 @@ fn text_mode_ignores_min_similarity_threshold() {
     );
     assert!(
         !result["pairs"].as_array().unwrap().is_empty(),
-        "text mode should return the 0.6-Jaccard pair despite min_similarity: 0.99: {result}"
+        "text mode should return the containment pair despite min_similarity: 0.99: {result}"
     );
 
     let pair = &result["pairs"][0];

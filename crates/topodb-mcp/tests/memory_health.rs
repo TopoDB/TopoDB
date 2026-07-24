@@ -235,8 +235,8 @@ fn text_mode_reports_lexical_relation_split() {
         json!({"content": "the login flow breaks when the session cookie exceeds the size limit"}),
         T,
     );
-    // Create a supersession pair: contradictory memories with high Jaccard overlap and negation cues.
-    // Content must have sufficient token overlap (>= 0.6 Jaccard) to be detected as a pair.
+    // Create a supersession pair: contradictory memories with high token containment and negation cues.
+    // Content must have sufficient token overlap (>= 0.7 containment) to be detected as a pair.
     s.call_tool_ok(
         "create_memory",
         json!({"content": "the database backend supports sharding the database backend supports transactions"}),

@@ -37,7 +37,7 @@ pub fn open_with_busy_retry(
                 if !printed_retry_note && elapsed_ms >= 500 {
                     eprintln!(
                         "topodb: database held by another process; retrying (budget {}ms)",
-                        remaining
+                        budget_ms
                     );
                     let _ = std::io::stderr().flush();
                     printed_retry_note = true;

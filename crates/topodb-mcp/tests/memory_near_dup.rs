@@ -177,6 +177,61 @@ fn semantically_similar_fact_is_surfaced_as_a_near_duplicate() {
     );
 }
 
+/// Canonical pair from the near-dup metric rewrite: "Vega stores its data in postgres"
+/// vs "Vega now stores its data in sqlite for embedded mode". Under Jaccard,
+/// they score ~0.455 (uncatchable with 0.5 floor). Under CONTAINMENT, they score
+/// 5/6 ≈ 0.833 (caught); band is "likely" (>= 0.80 threshold).
+#[test]
+fn text_fallback_canonical_containment_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &["--scope", A, "--embeddings", "off"],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // Original memory with six tokens: {vega, stores, its, data, in, postgres}.
+    let _original = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "Vega stores its data in postgres" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Restatement with ten tokens: {vega, now, stores, its, data, in, sqlite, for, embedded, mode}.
+    // Intersection: {vega, stores, its, data, in} = 5 tokens.
+    // Containment = 5 / min(6, 10) = 5/6 ≈ 0.8333 >= 0.7 floor → caught as "likely".
+    let similar = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "Vega now stores its data in sqlite for embedded mode" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let near = similar["near_duplicates"]
+        .as_array()
+        .expect("near_duplicates should be an array");
+    assert!(
+        !near.is_empty(),
+        "text fallback should surface the canonical pair (containment ≈0.833): {similar:#?}"
+    );
+
+    let first_hit = &near[0];
+    assert_eq!(
+        first_hit["method"].as_str().unwrap(),
+        "text",
+        "method should be 'text' when embeddings are off"
+    );
+    assert_eq!(
+        first_hit["band"].as_str().unwrap(),
+        "likely",
+        "band should be 'likely' since 0.8333 >= 0.80 threshold: {first_hit:#?}"
+    );
+    let similarity = first_hit["similarity"].as_f64().unwrap();
+    assert!(
+        (similarity - 0.8333).abs() < 0.01,
+        "similarity should be ≈0.8333 (5/6), got {similarity}: {first_hit:#?}"
+    );
+}
+
 #[test]
 fn text_fallback_flags_boundary_pair_at_approximately_0_556() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,10 +248,10 @@ fn text_fallback_flags_boundary_pair_at_approximately_0_556() {
         DEFAULT_TIMEOUT,
     );
 
-    // Create a memory with ~0.556 Jaccard similarity (between 0.5 and 0.6 floor).
+    // Create a memory with 1.0 containment (exact subset).
     // Set 1: {alpha, beta, gamma, delta} = 4 tokens
     // Set 2: {alpha, beta, gamma, delta, zeta, eta, theta} = 7 tokens
-    // Intersection: 4, Union: 7, Jaccard = 4/7 ≈ 0.5714
+    // Intersection: 4, min(|A|, |B|) = 4, Containment = 4/4 = 1.0 >= 0.7 floor
     let similar = s.call_tool_ok(
         "create_memory",
         serde_json::json!({ "content": "alpha beta gamma delta zeta eta theta" }),
@@ -208,7 +263,7 @@ fn text_fallback_flags_boundary_pair_at_approximately_0_556() {
         .expect("near_duplicates should be an array");
     assert!(
         !near.is_empty(),
-        "text fallback should surface content at ~0.556 Jaccard (between 0.5 floor and 0.6): {similar:#?}"
+        "text fallback should surface content with containment 1.0 (exact subset): {similar:#?}"
     );
 
     let first_hit = &near[0];
