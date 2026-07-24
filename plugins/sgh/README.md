@@ -82,7 +82,11 @@ shell commands matching the prefix `topodb:*`). The rail rejects only shells
 and launchers (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`, `env`), not binary
 restrictions — `npm` would pass through. As guidance, grant the narrowest
 binary scoped to your task. The gate echoes every grant so you can see what
-permissions an agent receives before it runs. **The plugin itself never passes
+permissions an agent receives before it runs. **The grant must textually
+prefix-match the exact command your prompts issue** — if a prompt invokes an
+absolute path like `/abs/path/topodb`, pass `--agent-bash /abs/path/topodb`,
+not `--agent-bash topodb` (relative or `PATH`-resolved prefixes work only when
+the prompts use the same form). **The plugin itself never passes
 `--agent-bash`** — it runs agents under the permissions you configure globally
 in Claude Code settings.
 

@@ -14,6 +14,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Added
+
+- **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
+
 ### 0.0.11 — 2026-07-23
 
 #### Added
@@ -313,6 +319,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### Unreleased
+
+#### Changed
+
+- **Batch unknown-op error hints** — when an unknown `op` field is encountered in a batch command, the error message hints that ops use underscore names (e.g. `create_memory` not `createMemory`).
+- **`open_with_busy_retry` audible note** — after 500ms of retrying on `TopoError::Busy`, one stderr note is printed: `topodb: database held by another process; retrying (budget <N>ms)`.
+
 ### 0.0.8 — 2026-07-23
 
 #### Changed
@@ -427,6 +440,16 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### Unreleased
+
+#### Added
+
+- **`get_edges` — `direction` parameter** (enum: `"out"`/`"in"`/`"both"`, default `"out"`). For `"out"` (default), lists the node's outgoing edges as before. For `"in"`, the anchor shifts to the target and `to_id` filters the far source end (incoming edges, mirrored view). For `"both"`, returns an id-deduped union of incoming and outgoing edges.
+
+#### Changed
+
+- **Text near-duplicate scoring** — switched from Jaccard (`|A∩B|/|A∪B|`) to token containment (`|A∩B|/min(|A|,|B|)`), floor 0.7 (was 0.6). The field test's canonical contradiction pair (similarity ≈0.833) is now correctly caught as band `"likely"`. In text mode (`find_duplicate_memories`, `memory_health` when embedder is not Ready), text-mode `similarity` field is now a containment score (not cosine, not Jaccard).
 
 ### 0.0.13 — 2026-07-23
 
@@ -875,6 +898,16 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 ---
 
 ## `topodb-cli`
+
+### Unreleased
+
+#### Added
+
+- **`get-edges` — `--direction out|in|both` flag** (default `out`). For `out` (default), lists the node's outgoing edges as before. For `in`, the anchor shifts to the target and `--to` filters the far source end (incoming edges, mirrored view). For `both`, returns an id-deduped union of incoming and outgoing edges.
+
+#### Changed
+
+- **Audible retry note on lock contention** — when `--lock-wait-ms` is set and the database remains locked after 500ms, a stderr note is printed once: `topodb: database held by another process; retrying (budget <N>ms)`.
 
 ### 0.0.8 — 2026-07-23
 
