@@ -331,7 +331,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db = Db::open(&cli.db)?;
             let command_runner =
                 ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
-            let runner = ClaudeCodeRunner::new(model.clone(), agent_bash.clone());
+            let runner = ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), None);
 
             let mut current = v;
             let mut replans_used = 0u32;

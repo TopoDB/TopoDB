@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use topodb_sgh::runner::claude::{
     build_argv, build_prompt, extract_json, interpret_result, validate_bash_grant,
-    validate_mcp_server_command,
+    validate_mcp_server_command, McpWiring,
 };
 use topodb_sgh::runner::{NodeOutcome, NodeRequest};
 
@@ -16,6 +16,7 @@ fn prompt_contains_only_declared_inputs() {
         prompt: "Apply the edits".into(),
         inputs,
         output_schema: None,
+        tools: vec![],
     };
 
     let p = build_prompt(&req);
@@ -31,6 +32,7 @@ fn prompt_demands_bare_json_when_a_schema_is_declared() {
         prompt: "Do the thing".into(),
         inputs: BTreeMap::new(),
         output_schema: Some(serde_json::json!({"type": "object"})),
+        tools: vec![],
     };
 
     let p = build_prompt(&req);
@@ -48,6 +50,7 @@ fn prompt_omits_the_input_section_when_there_are_none() {
         prompt: "Start here".into(),
         inputs: BTreeMap::new(),
         output_schema: None,
+        tools: vec![],
     };
     let p = build_prompt(&req);
     assert!(!p.contains("## Inputs"));
@@ -212,7 +215,7 @@ fn interpret_result_leaves_prose_alone_when_no_json_is_expected() {
 
 #[test]
 fn build_argv_with_no_grants_includes_base_allowed_tools() {
-    let argv = build_argv("Test prompt".to_string(), None, &[]);
+    let argv = build_argv("Test prompt".to_string(), None, &[], None);
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -222,7 +225,12 @@ fn build_argv_with_no_grants_includes_base_allowed_tools() {
 
 #[test]
 fn build_argv_with_single_grant_appends_bash_grant() {
-    let argv = build_argv("Test prompt".to_string(), None, &["topodb".to_string()]);
+    let argv = build_argv(
+        "Test prompt".to_string(),
+        None,
+        &["topodb".to_string()],
+        None,
+    );
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -236,6 +244,7 @@ fn build_argv_with_multiple_grants_appends_all_in_order() {
         "Test prompt".to_string(),
         None,
         &["topodb".to_string(), "cargo".to_string()],
+        None,
     );
     let idx = argv
         .iter()
@@ -253,6 +262,7 @@ fn build_argv_with_model_includes_model_flag() {
         "Test prompt".to_string(),
         Some("claude-opus".to_string()),
         &[],
+        None,
     );
     let has_model = argv
         .iter()
@@ -267,7 +277,7 @@ fn build_argv_with_model_includes_model_flag() {
 
 #[test]
 fn build_argv_includes_base_flags() {
-    let argv = build_argv("Test prompt".to_string(), None, &[]);
+    let argv = build_argv("Test prompt".to_string(), None, &[], None);
     assert!(
         argv.iter().any(|arg| arg == "-p"),
         "argv should include -p flag"
@@ -293,6 +303,7 @@ fn build_argv_full_order_empty_grants_with_model() {
         "Do the thing".to_string(),
         Some("claude-opus".to_string()),
         &[],
+        None,
     );
     assert_eq!(
         argv,
@@ -312,7 +323,12 @@ fn build_argv_full_order_empty_grants_with_model() {
 
 #[test]
 fn build_argv_full_order_one_grant_no_model() {
-    let argv = build_argv("Fix the code".to_string(), None, &["topodb".to_string()]);
+    let argv = build_argv(
+        "Fix the code".to_string(),
+        None,
+        &["topodb".to_string()],
+        None,
+    );
     assert_eq!(
         argv,
         vec![
@@ -582,4 +598,57 @@ fn mcp_command_rejects_shell_launchers() {
     let err = validate_mcp_server_command("bash -c topodb-mcp").unwrap_err();
     assert!(err.contains("shell"), "{err}");
     assert!(validate_mcp_server_command("/usr/bin/env topodb-mcp").is_err());
+}
+
+// --- build_argv MCP wiring ------------------------------------------------
+
+#[test]
+fn build_argv_with_mcp_appends_config_and_tool() {
+    let mcp = McpWiring {
+        config_path: "/tmp/sgh-mcp.json".to_string(),
+    };
+    let argv = build_argv("p".to_string(), None, &[], Some(&mcp));
+    let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+    assert_eq!(argv[at + 1], "Read,Write,Edit,mcp__topodb");
+    let mc = argv.iter().position(|a| a == "--mcp-config").unwrap();
+    assert_eq!(argv[mc + 1], "/tmp/sgh-mcp.json");
+}
+
+#[test]
+fn build_argv_without_mcp_is_byte_identical_to_today() {
+    let argv = build_argv("p".to_string(), None, &["topodb".to_string()], None);
+    assert_eq!(
+        argv,
+        vec![
+            "claude",
+            "-p",
+            "p",
+            "--allowedTools",
+            "Read,Write,Edit,Bash(topodb:*)",
+            "--output-format",
+            "json",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn build_argv_mcp_composes_with_bash_grants_and_model() {
+    let mcp = McpWiring {
+        config_path: "/tmp/c.json".to_string(),
+    };
+    let argv = build_argv(
+        "p".to_string(),
+        Some("haiku".to_string()),
+        &["topodb".to_string()],
+        Some(&mcp),
+    );
+    let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+    assert_eq!(argv[at + 1], "Read,Write,Edit,Bash(topodb:*),mcp__topodb");
+    assert!(argv.iter().any(|a| a == "--mcp-config"));
+    assert!(argv
+        .windows(2)
+        .any(|w| w[0] == "--model" && w[1] == "haiku"));
 }
