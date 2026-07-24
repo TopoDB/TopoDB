@@ -90,6 +90,27 @@ the prompts use the same form). **The plugin itself never passes
 `--agent-bash`** — it runs agents under the permissions you configure globally
 in Claude Code settings.
 
+Agent nodes may also carry `tools: [topodb]` to opt into the TopoDB MCP server
+surface (`mcp__topodb`, the full server API). Running such a graph requires
+`--agent-mcp '<absolute topodb-mcp path> --db <path> --scope <ulid|shared> …'`
+(from the `sgh` CLI); the server command is whitespace-split with no shell and
+echoed at the gate exactly like bash grants, subject to the same textual-honesty
+rule (grant the exact binary path you use in the prompt).
+
+### Worked examples
+
+Agent node with bash:
+
+```sh
+sgh run graph.yaml --agent-bash topodb
+```
+
+Agent node with MCP (TopoDB memory tools):
+
+```sh
+sgh run graph.yaml --agent-mcp '/abs/topodb-mcp --db ~/.topodb/agent.redb --scope shared --embeddings off'
+```
+
 `--yes-including-revisions` is not used anywhere in this plugin, and `--replan`
 is off unless you ask for it by name. Both exist because a replan lets a model
 rewrite the shell commands; anything a model authored goes back through the
