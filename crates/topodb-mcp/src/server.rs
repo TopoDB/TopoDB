@@ -1956,12 +1956,14 @@ struct GetEdgesParams {
     /// (from_id is target), or `"both"` (union of out and in, id-deduped).
     /// For `in`, to_id filters sources; `to_id` filters the far end of each
     /// edge, whichever side that is.
-    #[serde(default = "default_direction")]
-    direction: Option<String>,
+    #[serde(default = "get_edges_default_direction")]
+    direction: DirectionParam,
 }
 
-fn default_direction() -> Option<String> {
-    Some("out".to_string())
+fn get_edges_default_direction() -> DirectionParam {
+    // get_edges defaults to "out" (an entity's own relations), unlike traverse
+    // whose DirectionParam default is Both.
+    DirectionParam::Out
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3551,15 +3553,6 @@ impl TopoServer {
         // not the exclusivity one).
         validate_as_of(p.as_of)?;
 
-        // Validate and parse direction (default to "out").
-        let direction_str = p.direction.unwrap_or_else(|| "out".to_string());
-        if !["out", "in", "both"].contains(&direction_str.as_str()) {
-            return Err(ErrorData::invalid_params(
-                format!("direction must be \"out\", \"in\", or \"both\"; got {direction_str:?}"),
-                None,
-            ));
-        }
-
         // Check mutually exclusive parameters: as_of and open_only cannot both
         // be specified. When as_of is present, omit open_only entirely.
         if p.as_of.is_some() && p.open_only.is_some() {
@@ -3585,8 +3578,8 @@ impl TopoServer {
             p.open_only.unwrap_or(true)
         };
 
-        let mut edges = match direction_str.as_str() {
-            "out" => match &p.edge_type {
+        let mut edges = match p.direction {
+            DirectionParam::Out => match &p.edge_type {
                 None => self
                     .db
                     .edges_from(&scope_set, from, to, None, open_only_to_use)
@@ -3608,7 +3601,7 @@ impl TopoServer {
                     es
                 }
             },
-            "in" => match &p.edge_type {
+            DirectionParam::In => match &p.edge_type {
                 None => self
                     .db
                     .edges_to(&scope_set, from, to, None, open_only_to_use)
@@ -3630,7 +3623,7 @@ impl TopoServer {
                     es
                 }
             },
-            "both" => {
+            DirectionParam::Both => {
                 let mut out = match &p.edge_type {
                     None => self
                         .db
@@ -3678,7 +3671,6 @@ impl TopoServer {
                 out.extend(in_edges);
                 out
             }
-            _ => unreachable!(), // Already validated above
         };
 
         edges.sort_by_key(|e| e.id);

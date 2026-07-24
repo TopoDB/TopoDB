@@ -1066,17 +1066,17 @@ fn get_edges_direction_parameter() {
         DEFAULT_TIMEOUT,
     );
     expect_tool_error(&invalid_resp);
-    let error = invalid_resp.get("error").expect("error key should exist");
-    // JSON-RPC invalid_params code is -32602
-    assert_eq!(
-        error.get("code").and_then(|v| v.as_i64()),
-        Some(-32602),
-        "invalid direction should return invalid_params (code -32602)"
-    );
-    let error_msg = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let error_msg = invalid_resp
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.get(0))
+        .and_then(|c0| c0.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Schema-level rejection: serde names the allowed variants, not the field.
     assert!(
-        error_msg.contains("direction"),
-        "error message should name the 'direction' field: {}",
+        error_msg.contains("out") && error_msg.contains("both"),
+        "error message should name the allowed directions: {}",
         error_msg
     );
 
