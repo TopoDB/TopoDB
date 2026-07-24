@@ -14,6 +14,10 @@ pub struct NodeRequest {
     /// upstream node id -> that node's output JSON
     pub inputs: BTreeMap<String, String>,
     pub output_schema: Option<serde_json::Value>,
+    /// MCP tool surfaces the node opted into (`Node.tools`, validated
+    /// upstream). The runner maps these to `--allowedTools` entries; empty
+    /// means the node gets no MCP surface even when the run supplies one.
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

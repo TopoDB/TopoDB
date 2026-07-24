@@ -7,6 +7,7 @@ fn req(id: &str) -> NodeRequest {
         prompt: "p".to_string(),
         inputs: Default::default(),
         output_schema: None,
+        tools: vec![],
     }
 }
 

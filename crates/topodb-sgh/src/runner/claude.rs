@@ -2,6 +2,14 @@ use std::process::Command;
 
 use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
+/// Run-level MCP wiring for opted-in agent nodes: the path of the generated
+/// mcp-config file naming the `topodb` stdio server. Presence of a value
+/// means the RUN supplies the capability; whether a given node sees it is
+/// the node's own `tools` opt-in (checked by the caller of [`build_argv`]).
+pub struct McpWiring {
+    pub config_path: String,
+}
+
 /// Shared character/shell rail behind [`validate_bash_grant`] and
 /// [`validate_mcp_server_command`]. `what` names the value in error messages
 /// ("bash grant prefix" / "agent-mcp server command"). A rail, not a security
@@ -65,14 +73,22 @@ pub fn validate_mcp_server_command(cmd: &str) -> Result<Vec<String>, String> {
 /// Build the command-line arguments for invoking `claude -p`.
 ///
 /// Returns a vector of arguments suitable for `std::process::Command`.
-/// Includes the prompt, allowedTools (with optional bash grants), output format,
-/// and model if specified.
+/// Includes the prompt, allowedTools (with optional bash grants and MCP tools),
+/// output format, and model if specified.
 ///
 /// Structured output (--output-format json) is what makes a denied tool visible at all:
 /// in plain-text mode a blocked tool call is indistinguishable from a completed one,
 /// since both exit 0 with prose on stdout. This ensures that when a node's Write is
 /// denied, we can detect it in the JSON response's permission_denials field.
-pub fn build_argv(prompt: String, model: Option<String>, bash_grants: &[String]) -> Vec<String> {
+///
+/// The `mcp` parameter adds `mcp__topodb` to allowedTools and `--mcp-config <path>` to argv;
+/// `None` keeps the argv byte-identical to the legacy behavior.
+pub fn build_argv(
+    prompt: String,
+    model: Option<String>,
+    bash_grants: &[String],
+    mcp: Option<&McpWiring>,
+) -> Vec<String> {
     let mut argv = vec!["claude".to_string(), "-p".to_string(), prompt];
 
     // Claude Code permission-rule syntax: Bash(<prefix>:*) is the documented
@@ -84,12 +100,24 @@ pub fn build_argv(prompt: String, model: Option<String>, bash_grants: &[String])
     for grant in bash_grants {
         allowed_tools.push_str(&format!(",Bash({}:*)", grant));
     }
+    // `mcp__topodb` grants the whole topodb server's tools (decision: full
+    // surface). Additive like everything else in --allowedTools; the server
+    // itself is spawned by claude from the --mcp-config file, so sgh never
+    // owns an MCP server process.
+    if mcp.is_some() {
+        allowed_tools.push_str(",mcp__topodb");
+    }
 
     argv.push("--allowedTools".to_string());
     argv.push(allowed_tools);
 
     argv.push("--output-format".to_string());
     argv.push("json".to_string());
+
+    if let Some(m) = mcp {
+        argv.push("--mcp-config".to_string());
+        argv.push(m.config_path.clone());
+    }
 
     if let Some(m) = model {
         argv.push("--model".to_string());
@@ -272,11 +300,16 @@ fn elide(s: &str) -> String {
 pub struct ClaudeCodeRunner {
     model: Option<String>,
     bash_grants: Vec<String>,
+    mcp: Option<McpWiring>,
 }
 
 impl ClaudeCodeRunner {
-    pub fn new(model: Option<String>, bash_grants: Vec<String>) -> Self {
-        ClaudeCodeRunner { model, bash_grants }
+    pub fn new(model: Option<String>, bash_grants: Vec<String>, mcp: Option<McpWiring>) -> Self {
+        ClaudeCodeRunner {
+            model,
+            bash_grants,
+            mcp,
+        }
     }
 }
 
@@ -305,7 +338,18 @@ impl AgentRunner for ClaudeCodeRunner {
         // `Bash(prefix:*)` widens what an UNGATED agent prompt can execute.
         // The run-level gate echo (shown before approval) is the human control —
         // grants here alone do not confine or restrict agent execution.
-        let argv = build_argv(build_prompt(req), self.model.clone(), &self.bash_grants);
+        // MCP grants follow the same additive doctrine.
+        let node_mcp = if req.tools.iter().any(|t| t == crate::schema::TOPODB_TOOL) {
+            self.mcp.as_ref()
+        } else {
+            None
+        };
+        let argv = build_argv(
+            build_prompt(req),
+            self.model.clone(),
+            &self.bash_grants,
+            node_mcp,
+        );
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
 

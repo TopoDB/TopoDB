@@ -235,6 +235,7 @@ impl<'r> Executor<'r> {
                     prompt: node.prompt.clone().or(node.run.clone()).unwrap_or_default(),
                     inputs: inputs.clone(),
                     output_schema: node.output.as_ref().map(|o| o.schema.clone()),
+                    tools: node.tools.clone(),
                 };
 
                 if node.kind == NodeKind::Agent {
