@@ -281,7 +281,9 @@ pub fn resolve_batch(
                 produced.push(None);
                 ops.push(Op::SetEmbedding { id, model, vector });
             }
-            other => return Err(format!("command #{idx}: unknown op {other:?}")),
+            other => return Err(format!(
+                "command #{idx}: unknown op {other:?} (ops use underscore names like \"create_entity\" — not the CLI's hyphenated command names)"
+            )),
         }
     }
 
@@ -397,6 +399,16 @@ mod tests {
         let batch = serde_json::json!([{ "op": "nope" }]);
         let err = resolve_batch(&batch, Scope::Shared).unwrap_err();
         assert!(err.contains("#0") && err.contains("nope"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_op_error_includes_underscore_hint() {
+        let batch = serde_json::json!([{ "op": "create-entity" }]);
+        let err = resolve_batch(&batch, Scope::Shared).unwrap_err();
+        assert!(
+            err.contains("underscore"),
+            "error should hint about underscore names: {err}"
+        );
     }
 
     #[test]

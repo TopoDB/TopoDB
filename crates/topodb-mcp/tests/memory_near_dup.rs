@@ -176,3 +176,44 @@ fn semantically_similar_fact_is_surfaced_as_a_near_duplicate() {
         "an unrelated fact must not be flagged similar to the auth memory: {unrelated:#?}"
     );
 }
+
+#[test]
+fn text_fallback_flags_boundary_pair_at_approximately_0_556() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Server::spawn(
+        &dir.path().join("t.redb"),
+        &["--scope", A, "--embeddings", "off"],
+    );
+    s.initialize(DEFAULT_TIMEOUT);
+
+    // Create the first memory.
+    let _original = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "alpha beta gamma delta" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    // Create a memory with ~0.556 Jaccard similarity (between 0.5 and 0.6 floor).
+    // Set 1: {alpha, beta, gamma, delta} = 4 tokens
+    // Set 2: {alpha, beta, gamma, delta, zeta, eta, theta} = 7 tokens
+    // Intersection: 4, Union: 7, Jaccard = 4/7 ≈ 0.5714
+    let similar = s.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "alpha beta gamma delta zeta eta theta" }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let near = similar["near_duplicates"]
+        .as_array()
+        .expect("near_duplicates should be an array");
+    assert!(
+        !near.is_empty(),
+        "text fallback should surface content at ~0.556 Jaccard (between 0.5 floor and 0.6): {similar:#?}"
+    );
+
+    let first_hit = &near[0];
+    assert!(
+        first_hit["method"].as_str().unwrap() == "text",
+        "method should be 'text' when embeddings are off: {first_hit:#?}"
+    );
+}

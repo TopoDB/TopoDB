@@ -476,7 +476,7 @@ impl TopoServer {
     /// content. When the embedder is Ready, uses cosine similarity
     /// (>= [`NEAR_DUP_THRESHOLD`]), most-similar first, at most [`NEAR_DUP_K`].
     /// When the embedder is not Ready, falls back to token-Jaccard text similarity
-    /// (>= [`TEXT_NEAR_DUP_JACCARD`]). Advisory only — the caller judges whether
+    /// (>= [`TEXT_NEAR_DUP_JACCARD`], currently 0.5). Advisory only — the caller judges whether
     /// a hit is truly the same fact. Superseded memories are skipped (already
     /// retired), as are non-Memory nodes. Called BEFORE the new memory is
     /// written, so it never returns the node being created. A search error
@@ -560,9 +560,9 @@ const NEAR_DUP_REVIEW: f32 = 0.68;
 
 /// Token-Jaccard floor for text-based near-duplicate fallback when the embedder
 /// isn't Ready. Token Jaccard (|∩|/|∪| of whitespace-split lowercase tokens)
-/// is coarser than cosine but provides a non-embedder signal; 0.6 catches
-/// meaningful overlap without false positives on tangentially-related content.
-const TEXT_NEAR_DUP_JACCARD: f64 = 0.6;
+/// is coarser than cosine but provides a non-embedder signal; lowered 2026-07-24 —
+/// the canonical contradiction pair sits at ≈0.556; 0.5–0.8 arrives as band "possible".
+const TEXT_NEAR_DUP_JACCARD: f64 = 0.5;
 
 /// Jaccard similarity of two precomputed token sets.
 /// Returns 1.0 if both sets are empty.
@@ -2325,7 +2325,7 @@ impl TopoServer {
         let scanned = text_candidates.len();
 
         // Complete pairwise token-Jaccard over the bounded set.
-        // Text detection uses TEXT_NEAR_DUP_JACCARD as its floor (0.6), not the
+        // Text detection uses TEXT_NEAR_DUP_JACCARD as its floor (0.5), not the
         // vector similarity threshold. This provides a consistent text-based signal
         // independent of vector tuning parameters.
         // Precompute token sets to avoid repeated tokenization in the pairwise loop.

@@ -664,6 +664,84 @@ fn lock_contention_is_busy_exit_3_and_retry_succeeds() {
 }
 
 #[test]
+fn lock_contention_retrying_note_appears_after_500ms_elapsed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // Seed the file so it exists, and ensure it's fully initialized.
+    let _ = topodb::Db::open(&db).unwrap();
+
+    // Hold it from another thread, releasing after ~1200ms (well exceeds 500ms threshold).
+    let held = topodb::Db::open(&db).unwrap();
+
+    // Ensure the lock is established before subprocess tries to open
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let db_clone = db.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        drop(held);
+    });
+
+    let out = bin()
+        .args(["--db", db_clone.to_str().unwrap(), "info"])
+        .output()
+        .unwrap();
+    handle.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "retry should eventually succeed: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_text.contains("retrying"),
+        "stderr should contain 'retrying' message when lock held >500ms: {}",
+        stderr_text
+    );
+}
+
+#[test]
+fn lock_contention_no_retrying_note_before_500ms_elapsed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // Seed the file so it exists, and ensure it's fully initialized.
+    let _ = topodb::Db::open(&db).unwrap();
+
+    // Hold it from another thread, releasing after ~100ms (under 500ms threshold).
+    let held = topodb::Db::open(&db).unwrap();
+
+    // Ensure the lock is established before subprocess tries to open
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let db_clone = db.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(held);
+    });
+
+    let out = bin()
+        .args(["--db", db_clone.to_str().unwrap(), "info"])
+        .output()
+        .unwrap();
+    handle.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "retry should eventually succeed: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr_text.contains("retrying"),
+        "stderr should NOT contain 'retrying' message when lock released <500ms: {}",
+        stderr_text
+    );
+}
+
+#[test]
 fn submit_batch_atomic_with_backrefs() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
