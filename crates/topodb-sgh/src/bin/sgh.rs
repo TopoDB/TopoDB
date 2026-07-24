@@ -60,6 +60,9 @@ enum Cmd {
         /// Grant agent nodes permission to run shell commands starting with this
         /// prefix (repeatable). Additive on top of Read/Write/Edit. Echoed at the
         /// approval gate. Grant the narrowest binary (e.g. 'topodb'), never a shell.
+        /// The grant must textually prefix-match the exact command your prompts
+        /// issue — if a prompt invokes an absolute path like /abs/path/topodb, pass
+        /// --agent-bash /abs/path/topodb, not --agent-bash topodb.
         #[arg(long = "agent-bash")]
         agent_bash: Vec<String>,
         /// Seconds a single command node may run before it is killed.

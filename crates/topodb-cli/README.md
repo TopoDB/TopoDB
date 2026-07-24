@@ -29,7 +29,7 @@ var for the former).
 |---|---|---|---|
 | `--db <path>` (env `TOPODB_DB`) | yes | — | Path to the redb database file. A missing file is created fresh (with the canonical default index spec — equality on `Entity/name`, text on `Memory/content`); an existing file is opened with **its own persisted index spec** via `Db::open_stored` — no `--spec` flag exists on this CLI, and none is ever needed. A missing *parent directory* is a db-open failure. |
 | `--scope <ulid\|shared>` | no | `shared` | The default scope every scoped command uses. `"shared"` (case-insensitive) resolves to the shared scope; any other value is parsed as a `ScopeId` ULID. An invalid value is rejected before the db is even opened. |
-| `--lock-wait-ms <ms>` (env `TOPODB_LOCK_WAIT_MS`) | no | `3000` | How long to retry on lock contention (`TopoError::Busy`) during database open. `0` disables retries and fails immediately. See **Exit-code contract** below for the exit code on lock exhaustion. |
+| `--lock-wait-ms <ms>` (env `TOPODB_LOCK_WAIT_MS`) | no | `3000` | How long to retry on lock contention (`TopoError::Busy`) during database open. `0` disables retries and fails immediately. After 500ms of waiting, an audible note is printed to stderr: `topodb: database held by another process; retrying (budget <N>ms)`. See **Exit-code contract** below for the exit code on lock exhaustion. |
 | `--pretty` | no | off | Pretty-print the JSON output instead of compact one-line JSON. |
 
 ## Commands
@@ -47,7 +47,7 @@ All 19 subcommands, in scaffold + write + read order:
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
 | `search <query>` | positional query, `--k <n>` (default 10) | `[ {"node":..., "score": f}, ... ]` |
 | `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
-| `get-edges <from>` | positional source node id, `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
+| `get-edges <from>` | positional source node id (or target when `--direction in`), `--direction out\|in\|both` (default `out`; for `in`, the anchor shifts to the target and `--to` filters the far source end), `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
