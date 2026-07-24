@@ -7,7 +7,8 @@ use std::str::FromStr;
 use clap::Parser;
 use cli::{Cli, Command};
 use topodb::{
-    Db, Direction, EdgeId, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery, VectorQuery,
+    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery,
+    VectorQuery,
 };
 
 fn main() {
@@ -349,6 +350,31 @@ fn traverse(
     output::ok(&serde_json::json!({ "subgraph": subgraph }), pretty);
 }
 
+/// Run `fetch` with the normalized form of `edge_type`, then — when the raw
+/// form differs — again with the raw form, merging results (legacy edges carry
+/// the raw spelling). `None` = no type filter, single probe. Engine errors
+/// exit via `output::fail_engine`, matching every other CLI fetch.
+fn fetch_typed<F>(edge_type: Option<&str>, fetch: F) -> Vec<EdgeRecord>
+where
+    F: Fn(Option<&str>) -> Result<Vec<EdgeRecord>, TopoError>,
+{
+    let run = |t: Option<&str>| fetch(t).unwrap_or_else(|e| output::fail_engine(&e));
+    match edge_type {
+        None => run(None),
+        Some(raw) => {
+            let norm = match topodb_json::normalize_edge_type(raw) {
+                Ok(n) => n,
+                Err(e) => output::fail("rejected", &e, 2),
+            };
+            let mut es = run(Some(&norm));
+            if norm != raw {
+                es.extend(run(Some(raw)));
+            }
+            es
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn get_edges(
     db: &Db,
@@ -407,102 +433,15 @@ fn get_edges(
         open_only.unwrap_or(true)
     };
 
-    let mut edges = match edge_type {
-        None => {
-            // Fetch with no type filter.
-            match direction {
-                cli::DirectionArg::Out => {
-                    match db.edges_from(&scopes, from_id, to_id, None, open_only_to_use) {
-                        Ok(e) => e,
-                        Err(e) => output::fail_engine(&e),
-                    }
-                }
-                cli::DirectionArg::In => {
-                    match db.edges_to(&scopes, from_id, to_id, None, open_only_to_use) {
-                        Ok(e) => e,
-                        Err(e) => output::fail_engine(&e),
-                    }
-                }
-                cli::DirectionArg::Both => {
-                    let out = match db.edges_from(&scopes, from_id, to_id, None, open_only_to_use) {
-                        Ok(e) => e,
-                        Err(e) => output::fail_engine(&e),
-                    };
-                    let in_edges =
-                        match db.edges_to(&scopes, from_id, to_id, None, open_only_to_use) {
-                            Ok(e) => e,
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    let mut combined = out;
-                    combined.extend(in_edges);
-                    combined
-                }
-            }
-        }
-        Some(raw) => {
-            // Fetch with type filtering (normalized + raw form double-probe).
-            let norm = match topodb_json::normalize_edge_type(raw) {
-                Ok(n) => n,
-                Err(e) => output::fail("rejected", &e, 2),
-            };
-            match direction {
-                cli::DirectionArg::Out => {
-                    let mut es =
-                        match db.edges_from(&scopes, from_id, to_id, Some(&norm), open_only_to_use)
-                        {
-                            Ok(e) => e,
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    if norm != *raw {
-                        match db.edges_from(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
-                            Ok(raw_edges) => es.extend(raw_edges),
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    }
-                    es
-                }
-                cli::DirectionArg::In => {
-                    let mut es =
-                        match db.edges_to(&scopes, from_id, to_id, Some(&norm), open_only_to_use) {
-                            Ok(e) => e,
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    if norm != *raw {
-                        match db.edges_to(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
-                            Ok(raw_edges) => es.extend(raw_edges),
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    }
-                    es
-                }
-                cli::DirectionArg::Both => {
-                    let mut out =
-                        match db.edges_from(&scopes, from_id, to_id, Some(&norm), open_only_to_use)
-                        {
-                            Ok(e) => e,
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    if norm != *raw {
-                        match db.edges_from(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
-                            Ok(raw_edges) => out.extend(raw_edges),
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    }
-                    let mut in_edges =
-                        match db.edges_to(&scopes, from_id, to_id, Some(&norm), open_only_to_use) {
-                            Ok(e) => e,
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    if norm != *raw {
-                        match db.edges_to(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
-                            Ok(raw_edges) => in_edges.extend(raw_edges),
-                            Err(e) => output::fail_engine(&e),
-                        };
-                    }
-                    out.extend(in_edges);
-                    out
-                }
-            }
+    let fetch_from = |t: Option<&str>| db.edges_from(&scopes, from_id, to_id, t, open_only_to_use);
+    let fetch_to = |t: Option<&str>| db.edges_to(&scopes, from_id, to_id, t, open_only_to_use);
+    let mut edges = match direction {
+        cli::DirectionArg::Out => fetch_typed(edge_type, fetch_from),
+        cli::DirectionArg::In => fetch_typed(edge_type, fetch_to),
+        cli::DirectionArg::Both => {
+            let mut es = fetch_typed(edge_type, fetch_from);
+            es.extend(fetch_typed(edge_type, fetch_to));
+            es
         }
     };
 
