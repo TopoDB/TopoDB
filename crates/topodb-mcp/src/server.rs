@@ -26,8 +26,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, NodeId, NodeRecord, Op, PropValue, Props, RecallQuery, Scope, ScopeSet,
-    SearchOptions, TopoError, TraversalQuery, VectorQuery,
+    Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props, RecallQuery,
+    Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
@@ -2028,6 +2028,29 @@ fn default_vector_k() -> usize {
     10
 }
 
+/// Run `fetch` with the normalized form of `edge_type`, then — when the raw
+/// form differs — again with the raw form, merging results: edges written
+/// before vocabulary normalization carry the raw type, so both spellings must
+/// be probed. `None` = no type filter, single probe. The 3 direction arms × 2
+/// surfaces all funnel through this one probe.
+fn fetch_typed<F>(edge_type: Option<&str>, fetch: F) -> Result<Vec<EdgeRecord>, ErrorData>
+where
+    F: Fn(Option<&str>) -> Result<Vec<EdgeRecord>, ErrorData>,
+{
+    match edge_type {
+        None => fetch(None),
+        Some(raw) => {
+            let norm = convert::normalize_edge_type(raw)
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
+            let mut es = fetch(Some(&norm))?;
+            if norm != raw {
+                es.extend(fetch(Some(raw))?);
+            }
+            Ok(es)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchVectorsParams {
@@ -3578,98 +3601,24 @@ impl TopoServer {
             p.open_only.unwrap_or(true)
         };
 
+        let fetch_from = |t: Option<&str>| {
+            self.db
+                .edges_from(&scope_set, from, to, t, open_only_to_use)
+                .map_err(classify_topo_error)
+        };
+        let fetch_to = |t: Option<&str>| {
+            self.db
+                .edges_to(&scope_set, from, to, t, open_only_to_use)
+                .map_err(classify_topo_error)
+        };
+        let edge_type = p.edge_type.as_deref();
         let mut edges = match p.direction {
-            DirectionParam::Out => match &p.edge_type {
-                None => self
-                    .db
-                    .edges_from(&scope_set, from, to, None, open_only_to_use)
-                    .map_err(classify_topo_error)?,
-                Some(raw) => {
-                    let norm = convert::normalize_edge_type(raw)
-                        .map_err(|e| ErrorData::invalid_params(e, None))?;
-                    let mut es = self
-                        .db
-                        .edges_from(&scope_set, from, to, Some(&norm), open_only_to_use)
-                        .map_err(classify_topo_error)?;
-                    if norm != *raw {
-                        es.extend(
-                            self.db
-                                .edges_from(&scope_set, from, to, Some(raw), open_only_to_use)
-                                .map_err(classify_topo_error)?,
-                        );
-                    }
-                    es
-                }
-            },
-            DirectionParam::In => match &p.edge_type {
-                None => self
-                    .db
-                    .edges_to(&scope_set, from, to, None, open_only_to_use)
-                    .map_err(classify_topo_error)?,
-                Some(raw) => {
-                    let norm = convert::normalize_edge_type(raw)
-                        .map_err(|e| ErrorData::invalid_params(e, None))?;
-                    let mut es = self
-                        .db
-                        .edges_to(&scope_set, from, to, Some(&norm), open_only_to_use)
-                        .map_err(classify_topo_error)?;
-                    if norm != *raw {
-                        es.extend(
-                            self.db
-                                .edges_to(&scope_set, from, to, Some(raw), open_only_to_use)
-                                .map_err(classify_topo_error)?,
-                        );
-                    }
-                    es
-                }
-            },
+            DirectionParam::Out => fetch_typed(edge_type, fetch_from)?,
+            DirectionParam::In => fetch_typed(edge_type, fetch_to)?,
             DirectionParam::Both => {
-                let mut out = match &p.edge_type {
-                    None => self
-                        .db
-                        .edges_from(&scope_set, from, to, None, open_only_to_use)
-                        .map_err(classify_topo_error)?,
-                    Some(raw) => {
-                        let norm = convert::normalize_edge_type(raw)
-                            .map_err(|e| ErrorData::invalid_params(e, None))?;
-                        let mut es = self
-                            .db
-                            .edges_from(&scope_set, from, to, Some(&norm), open_only_to_use)
-                            .map_err(classify_topo_error)?;
-                        if norm != *raw {
-                            es.extend(
-                                self.db
-                                    .edges_from(&scope_set, from, to, Some(raw), open_only_to_use)
-                                    .map_err(classify_topo_error)?,
-                            );
-                        }
-                        es
-                    }
-                };
-                let in_edges = match &p.edge_type {
-                    None => self
-                        .db
-                        .edges_to(&scope_set, from, to, None, open_only_to_use)
-                        .map_err(classify_topo_error)?,
-                    Some(raw) => {
-                        let norm = convert::normalize_edge_type(raw)
-                            .map_err(|e| ErrorData::invalid_params(e, None))?;
-                        let mut es = self
-                            .db
-                            .edges_to(&scope_set, from, to, Some(&norm), open_only_to_use)
-                            .map_err(classify_topo_error)?;
-                        if norm != *raw {
-                            es.extend(
-                                self.db
-                                    .edges_to(&scope_set, from, to, Some(raw), open_only_to_use)
-                                    .map_err(classify_topo_error)?,
-                            );
-                        }
-                        es
-                    }
-                };
-                out.extend(in_edges);
-                out
+                let mut es = fetch_typed(edge_type, fetch_from)?;
+                es.extend(fetch_typed(edge_type, fetch_to)?);
+                es
             }
         };
 
