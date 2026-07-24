@@ -351,7 +351,7 @@ fn duplicate_scan_dispatches_on_embedder_status_not_stored_vectors() {
         "text mode should find the overlapping pair: {result}"
     );
 
-    // The pair should use text-mode similarity (token-Jaccard containment)
+    // The pair should use text-mode similarity (token containment)
     let pair = &result["pairs"][0];
     let ids = [
         pair["ids"][0].as_str().unwrap(),
