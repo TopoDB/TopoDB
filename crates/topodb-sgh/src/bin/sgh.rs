@@ -712,7 +712,10 @@ mod tests {
     fn pairing_error_when_tools_without_flag() {
         let v = graph_with_tools(&["topodb"]);
         let err = mcp_pairing_error(&v, None).expect("must error");
-        assert!(err.contains("a") && err.contains("--agent-mcp"), "{err}");
+        assert!(
+            err.contains("node(s) a ") && err.contains("--agent-mcp"),
+            "{err}"
+        );
         assert!(mcp_pairing_error(&v, Some("cmd")).is_none());
         let v_none = graph_with_tools(&[]);
         assert!(mcp_pairing_error(&v_none, None).is_none());

@@ -71,7 +71,7 @@ pub fn build_plan_prompt(
          \x20   run: \"<shell command>\"        # required for kind: command\n\
          \x20   output:\n\
          \x20     schema: {<JSON Schema>}     # optional; if set, output MUST match\n\
-         \x20   tools: [topodb]              # optional; ONLY if the step must read/write persistent memory\n\
+         \x20   tools: [topodb]              # optional, agent nodes ONLY; use only if the step must read/write persistent memory\n\
          \x20   budget: {retries: <n>, repairs: <n>}   # required on every node\n\n",
     );
 

@@ -108,7 +108,7 @@ sgh run graph.yaml --agent-bash topodb
 Agent node with MCP (TopoDB memory tools):
 
 ```sh
-sgh run graph.yaml --agent-mcp '/abs/topodb-mcp --db ~/.topodb/agent.redb --scope shared --embeddings off'
+sgh run graph.yaml --agent-mcp '/abs/topodb-mcp --db /Users/you/.topodb/agent.redb --scope shared --embeddings off'
 ```
 
 `--yes-including-revisions` is not used anywhere in this plugin, and `--replan`

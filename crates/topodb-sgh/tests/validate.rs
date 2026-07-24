@@ -197,7 +197,7 @@ nodes:
     let errs = validate(&g).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.to_string().contains("a") && e.to_string().contains("jira")),
+            .any(|e| e.to_string().contains("node a ") && e.to_string().contains("jira")),
         "expected UnknownTool naming node and value: {errs:?}"
     );
 }
@@ -218,7 +218,7 @@ nodes:
     let errs = validate(&g).unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.to_string().contains("c") && e.to_string().contains("tools")),
+            .any(|e| e.to_string().contains("node c ") && e.to_string().contains("tools")),
         "expected ToolsOnNonAgent naming the node: {errs:?}"
     );
 }
