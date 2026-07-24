@@ -209,6 +209,12 @@ pub enum Command {
         /// `--open-only` when passing `--as-of`. Must be a positive timestamp.
         #[arg(long)]
         as_of: Option<i64>,
+        /// Which direction to follow: `out` (from node → target, default),
+        /// `in` (target ← from node), or `both` (union, id-deduped).
+        /// For `in`, the positional node is the target and `--to` filters sources;
+        /// `--to` filters the far end of each edge, whichever side that is.
+        #[arg(long, value_enum, default_value_t = DirectionArg::Out)]
+        direction: DirectionArg,
     },
     /// Read a node's access statistics (count, last-accessed timestamp).
     /// `{"found":false}` (exit 0) if the node doesn't exist or is out of the

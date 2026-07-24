@@ -169,6 +169,7 @@ fn main() {
             edge_type,
             open_only,
             as_of,
+            direction,
         } => get_edges(
             &db,
             default_scope,
@@ -177,6 +178,7 @@ fn main() {
             edge_type.as_deref(),
             open_only,
             as_of,
+            direction,
             cli.pretty,
         ),
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
@@ -356,6 +358,7 @@ fn get_edges(
     edge_type: Option<&str>,
     open_only: Option<bool>,
     as_of: Option<i64>,
+    direction: cli::DirectionArg,
     pretty: bool,
 ) -> ! {
     // Validate as_of timestamp first (so as_of: 0 gets the timestamp error,
@@ -405,31 +408,104 @@ fn get_edges(
     };
 
     let mut edges = match edge_type {
-        None => match db.edges_from(&scopes, from_id, to_id, None, open_only_to_use) {
-            Ok(e) => e,
-            Err(e) => output::fail_engine(&e),
-        },
+        None => {
+            // Fetch with no type filter.
+            match direction {
+                cli::DirectionArg::Out => {
+                    match db.edges_from(&scopes, from_id, to_id, None, open_only_to_use) {
+                        Ok(e) => e,
+                        Err(e) => output::fail_engine(&e),
+                    }
+                }
+                cli::DirectionArg::In => {
+                    match db.edges_to(&scopes, from_id, to_id, None, open_only_to_use) {
+                        Ok(e) => e,
+                        Err(e) => output::fail_engine(&e),
+                    }
+                }
+                cli::DirectionArg::Both => {
+                    let out = match db.edges_from(&scopes, from_id, to_id, None, open_only_to_use) {
+                        Ok(e) => e,
+                        Err(e) => output::fail_engine(&e),
+                    };
+                    let in_edges =
+                        match db.edges_to(&scopes, from_id, to_id, None, open_only_to_use) {
+                            Ok(e) => e,
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    let mut combined = out;
+                    combined.extend(in_edges);
+                    combined
+                }
+            }
+        }
         Some(raw) => {
+            // Fetch with type filtering (normalized + raw form double-probe).
             let norm = match topodb_json::normalize_edge_type(raw) {
                 Ok(n) => n,
                 Err(e) => output::fail("rejected", &e, 2),
             };
-            let mut es = match db.edges_from(&scopes, from_id, to_id, Some(&norm), open_only_to_use)
-            {
-                Ok(e) => e,
-                Err(e) => output::fail_engine(&e),
-            };
-            // Edges written before type normalization are stored under
-            // the raw form — probe it too so they stay findable.
-            if norm != *raw {
-                match db.edges_from(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
-                    Ok(raw_edges) => es.extend(raw_edges),
-                    Err(e) => output::fail_engine(&e),
-                };
+            match direction {
+                cli::DirectionArg::Out => {
+                    let mut es =
+                        match db.edges_from(&scopes, from_id, to_id, Some(&norm), open_only_to_use)
+                        {
+                            Ok(e) => e,
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    if norm != *raw {
+                        match db.edges_from(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
+                            Ok(raw_edges) => es.extend(raw_edges),
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    }
+                    es
+                }
+                cli::DirectionArg::In => {
+                    let mut es =
+                        match db.edges_to(&scopes, from_id, to_id, Some(&norm), open_only_to_use) {
+                            Ok(e) => e,
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    if norm != *raw {
+                        match db.edges_to(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
+                            Ok(raw_edges) => es.extend(raw_edges),
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    }
+                    es
+                }
+                cli::DirectionArg::Both => {
+                    let mut out =
+                        match db.edges_from(&scopes, from_id, to_id, Some(&norm), open_only_to_use)
+                        {
+                            Ok(e) => e,
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    if norm != *raw {
+                        match db.edges_from(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
+                            Ok(raw_edges) => out.extend(raw_edges),
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    }
+                    let mut in_edges =
+                        match db.edges_to(&scopes, from_id, to_id, Some(&norm), open_only_to_use) {
+                            Ok(e) => e,
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    if norm != *raw {
+                        match db.edges_to(&scopes, from_id, to_id, Some(raw), open_only_to_use) {
+                            Ok(raw_edges) => in_edges.extend(raw_edges),
+                            Err(e) => output::fail_engine(&e),
+                        };
+                    }
+                    out.extend(in_edges);
+                    out
+                }
             }
-            es
         }
     };
+
     edges.sort_by_key(|e| e.id);
     edges.dedup_by_key(|e| e.id);
 

@@ -1881,9 +1881,10 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GetEdgesParams {
-    /// ULID of the source node whose outgoing edges to list.
+    /// ULID of the anchor node: source for `out`, target for `in`.
     from_id: String,
-    /// Restrict to edges pointing at this target node ULID.
+    /// Restrict to edges pointing at (for `out`) or coming from (for `in`) this
+    /// target node ULID. Filters the far end of each edge, whichever side that is.
     #[serde(default)]
     to_id: Option<String>,
     /// Restrict to this edge type (normalized like `link` normalizes it;
@@ -1913,6 +1914,16 @@ struct GetEdgesParams {
     /// those with `valid_from <= t < valid_to` (open edges have no `valid_to`).
     #[serde(default)]
     as_of: Option<i64>,
+    /// Direction to follow: `"out"` (from_id is source, default), `"in"`
+    /// (from_id is target), or `"both"` (union of out and in, id-deduped).
+    /// For `in`, to_id filters sources; `to_id` filters the far end of each
+    /// edge, whichever side that is.
+    #[serde(default = "default_direction")]
+    direction: Option<String>,
+}
+
+fn default_direction() -> Option<String> {
+    Some("out".to_string())
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3491,7 +3502,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "List a node's outgoing edges, optionally filtered by target node and/or edge type; open edges only by default. Optionally view edges at a past timestamp via as_of (omit open_only when passing as_of; as_of already means \"open at that instant\") — use as_of to see edges superseded at that point in time. A future as_of behaves like \"now\". This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
+        description = "List a node's edges in a given direction (default: outgoing), optionally filtered by target node and/or edge type; open edges only by default. For direction=\"in\", the node is the target and to_id filters sources; to_id filters the far end of each edge, whichever side that is. Optionally view edges at a past timestamp via as_of (omit open_only when passing as_of; as_of already means \"open at that instant\") — use as_of to see edges superseded at that point in time. A future as_of behaves like \"now\". This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
     )]
     fn get_edges(
         &self,
@@ -3500,6 +3511,15 @@ impl TopoServer {
         // Validate as_of timestamp FIRST (so as_of: 0 gets the timestamp error,
         // not the exclusivity one).
         validate_as_of(p.as_of)?;
+
+        // Validate and parse direction (default to "out").
+        let direction_str = p.direction.unwrap_or_else(|| "out".to_string());
+        if !["out", "in", "both"].contains(&direction_str.as_str()) {
+            return Err(ErrorData::invalid_params(
+                format!("direction must be \"out\", \"in\", or \"both\"; got {direction_str:?}"),
+                None,
+            ));
+        }
 
         // Check mutually exclusive parameters: as_of and open_only cannot both
         // be specified. When as_of is present, omit open_only entirely.
@@ -3526,30 +3546,102 @@ impl TopoServer {
             p.open_only.unwrap_or(true)
         };
 
-        let mut edges = match &p.edge_type {
-            None => self
-                .db
-                .edges_from(&scope_set, from, to, None, open_only_to_use)
-                .map_err(classify_topo_error)?,
-            Some(raw) => {
-                let norm = convert::normalize_edge_type(raw)
-                    .map_err(|e| ErrorData::invalid_params(e, None))?;
-                let mut es = self
+        let mut edges = match direction_str.as_str() {
+            "out" => match &p.edge_type {
+                None => self
                     .db
-                    .edges_from(&scope_set, from, to, Some(&norm), open_only_to_use)
-                    .map_err(classify_topo_error)?;
-                // Edges written before type normalization are stored under
-                // the raw form — probe it too so they stay findable.
-                if norm != *raw {
-                    es.extend(
-                        self.db
-                            .edges_from(&scope_set, from, to, Some(raw), open_only_to_use)
-                            .map_err(classify_topo_error)?,
-                    );
+                    .edges_from(&scope_set, from, to, None, open_only_to_use)
+                    .map_err(classify_topo_error)?,
+                Some(raw) => {
+                    let norm = convert::normalize_edge_type(raw)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    let mut es = self
+                        .db
+                        .edges_from(&scope_set, from, to, Some(&norm), open_only_to_use)
+                        .map_err(classify_topo_error)?;
+                    if norm != *raw {
+                        es.extend(
+                            self.db
+                                .edges_from(&scope_set, from, to, Some(raw), open_only_to_use)
+                                .map_err(classify_topo_error)?,
+                        );
+                    }
+                    es
                 }
-                es
+            },
+            "in" => match &p.edge_type {
+                None => self
+                    .db
+                    .edges_to(&scope_set, from, to, None, open_only_to_use)
+                    .map_err(classify_topo_error)?,
+                Some(raw) => {
+                    let norm = convert::normalize_edge_type(raw)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    let mut es = self
+                        .db
+                        .edges_to(&scope_set, from, to, Some(&norm), open_only_to_use)
+                        .map_err(classify_topo_error)?;
+                    if norm != *raw {
+                        es.extend(
+                            self.db
+                                .edges_to(&scope_set, from, to, Some(raw), open_only_to_use)
+                                .map_err(classify_topo_error)?,
+                        );
+                    }
+                    es
+                }
+            },
+            "both" => {
+                let mut out = match &p.edge_type {
+                    None => self
+                        .db
+                        .edges_from(&scope_set, from, to, None, open_only_to_use)
+                        .map_err(classify_topo_error)?,
+                    Some(raw) => {
+                        let norm = convert::normalize_edge_type(raw)
+                            .map_err(|e| ErrorData::invalid_params(e, None))?;
+                        let mut es = self
+                            .db
+                            .edges_from(&scope_set, from, to, Some(&norm), open_only_to_use)
+                            .map_err(classify_topo_error)?;
+                        if norm != *raw {
+                            es.extend(
+                                self.db
+                                    .edges_from(&scope_set, from, to, Some(raw), open_only_to_use)
+                                    .map_err(classify_topo_error)?,
+                            );
+                        }
+                        es
+                    }
+                };
+                let in_edges = match &p.edge_type {
+                    None => self
+                        .db
+                        .edges_to(&scope_set, from, to, None, open_only_to_use)
+                        .map_err(classify_topo_error)?,
+                    Some(raw) => {
+                        let norm = convert::normalize_edge_type(raw)
+                            .map_err(|e| ErrorData::invalid_params(e, None))?;
+                        let mut es = self
+                            .db
+                            .edges_to(&scope_set, from, to, Some(&norm), open_only_to_use)
+                            .map_err(classify_topo_error)?;
+                        if norm != *raw {
+                            es.extend(
+                                self.db
+                                    .edges_to(&scope_set, from, to, Some(raw), open_only_to_use)
+                                    .map_err(classify_topo_error)?,
+                            );
+                        }
+                        es
+                    }
+                };
+                out.extend(in_edges);
+                out
             }
+            _ => unreachable!(), // Already validated above
         };
+
         edges.sort_by_key(|e| e.id);
         edges.dedup_by_key(|e| e.id);
 
