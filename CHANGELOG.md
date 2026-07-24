@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.11 — 2026-07-23
 
 #### Added
 
@@ -313,7 +313,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
-### Unreleased
+### 0.0.8 — 2026-07-23
 
 #### Changed
 
@@ -428,7 +428,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
-### Unreleased
+### 0.0.13 — 2026-07-23
 
 #### Added
 
@@ -474,12 +474,22 @@ workspace are versioned and released independently (tags are per-package, e.g.
   Each pair carries a `method` field (`"vector"` / `"text"`), `relation` (`duplicate` / `supersession`),
   and `band` (omitted only in text mode). `memory_health` gains `degraded`/`degraded_reason` fields and forces
   `needs_attention: true` when the embedder is Failed or Downloading (text mode is degraded hygiene).
-  Deliberately off (`--embeddings off`) is not degraded — scans are empty by design, not by failure.
+  Deliberately off (`--embeddings off`) is not degraded — the text fallback still runs; only the
+  `degraded` flag distinguishes wanted-but-broken from chosen-off.
 
 #### Fixed
 
 - **`--help`/`-h` and `--version`/`-V` flags now print to stdout and exit 0** — previously these flags
   were not available. They now match conventional behavior for CLI tools.
+
+#### Release checklist
+
+- Publish to npm (automatic on the `topodb-mcp-v0.0.13` tag), then **bump the Claude Code
+  plugin's server pin** (`plugins/claude-code/server-args.js`'s `SERVER_VERSION`) to 0.0.13,
+  re-verify `plugins/claude-code/test/broker.test.js` against the real published package, and
+  update the plugin's `SKILL.md`/commands for the 0.0.13 surface (as_of on traverse/get_edges,
+  `label_weights`, hygiene `method`/`degraded`) **in the same commit as the pin bump** — the
+  plugin must never document tools its pinned server doesn't have.
 
 ### 0.0.12 — 2026-07-22
 
@@ -855,7 +865,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## `topodb-cli`
 
-### Unreleased
+### 0.0.8 — 2026-07-23
 
 #### Added
 
