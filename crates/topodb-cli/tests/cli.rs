@@ -1804,3 +1804,113 @@ fn get_edges_history_and_as_of() {
     ]);
     assert_eq!(code, 2, "as-of and open-only together should be rejected");
 }
+
+/// get-edges: test --direction out|in|both with incoming/outgoing edge filtering.
+/// Build M→E (about edge). Test get-edges E with default (out) = [], with --direction in = the about edge,
+/// with --direction both on M = same edge once, and invalid direction exits with code 2.
+/// Also test --direction in --as-of composes (filtering by time in incoming direction).
+#[test]
+fn get_edges_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    // Create a memory M and entity E.
+    let (m_json, _) = run_cmd(&["create-memory", "--content", "test"]);
+    let m_id = m_json["id"].as_str().unwrap().to_string();
+
+    let (e_json, _) = run_cmd(&["create-entity", "--name", "e"]);
+    let e_id = e_json["id"].as_str().unwrap().to_string();
+
+    // Link M→E with type "about".
+    let (edge_json, _) = run_cmd(&["link", "--from", &m_id, "--to", &e_id, "--type", "about"]);
+    let edge_id = edge_json["id"].as_str().unwrap().to_string();
+
+    // Test 1: get-edges E with default (out) = [] (E has no outgoing edges).
+    let (result, code) = run_cmd(&["get-edges", &e_id]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 0, "E should have no outgoing edges");
+
+    // Test 2: get-edges E --direction in = the about edge (M→E).
+    let (result, code) = run_cmd(&["get-edges", &e_id, "--direction", "in"]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "E should have 1 incoming edge");
+    assert_eq!(edges[0]["id"], edge_id);
+    assert_eq!(edges[0]["type"], "about");
+
+    // Test 3: get-edges M --direction both = same edge once (M has outgoing, E has incoming).
+    let (result, code) = run_cmd(&["get-edges", &m_id, "--direction", "both"]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(
+        edges.len(),
+        1,
+        "M should have 1 edge total (out+in deduped)"
+    );
+    assert_eq!(edges[0]["id"], edge_id);
+
+    // Test 4: get-edges E --direction sideways = exit 2 (invalid direction).
+    let (_, code) = run_cmd(&["get-edges", &e_id, "--direction", "sideways"]);
+    assert_eq!(code, 2, "invalid direction should be rejected");
+
+    // Test 5: get-edges E --direction in --as-of <mid> composes.
+    // Capture a timestamp BEFORE closing the edge.
+    let mid = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Close the edge.
+    let _ = run_cmd(&["close-edge", &edge_id]);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Create entity E2.
+    let (e2_json, _) = run_cmd(&["create-entity", "--name", "e2"]);
+    let e2_id = e2_json["id"].as_str().unwrap().to_string();
+
+    // Link M→E2.
+    let (edge2_json, _) = run_cmd(&["link", "--from", &m_id, "--to", &e2_id, "--type", "about"]);
+    let _edge2_id = edge2_json["id"].as_str().unwrap().to_string();
+
+    // Now test as_of on incoming edges: get-edges E --direction in --as-of <mid>
+    // should find the M→E edge (it was valid at mid and E is the target).
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &e_id,
+        "--direction",
+        "in",
+        "--as-of",
+        &mid.to_string(),
+    ]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "E should have 1 incoming edge at mid");
+    assert_eq!(edges[0]["id"], edge_id);
+
+    // Verify E has no incoming edges in the default (now) view.
+    let (result, code) = run_cmd(&["get-edges", &e_id, "--direction", "in"]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(
+        edges.len(),
+        0,
+        "E should have no open incoming edges (closed)"
+    );
+}

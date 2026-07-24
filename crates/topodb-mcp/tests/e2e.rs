@@ -942,3 +942,223 @@ fn get_edges_with_as_of_parameter() {
         error_msg
     );
 }
+
+#[test]
+fn get_edges_direction_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("direction_edges.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let scope_args = ["--scope", scope.as_str(), "--allow-unscoped-changes"];
+
+    let mut server = Server::spawn(&db_path, &scope_args);
+    server.initialize(DEFAULT_TIMEOUT);
+
+    // Create memory M and entity E.
+    let memory_id = server
+        .call_tool_ok(
+            "create_memory",
+            serde_json::json!({ "content": "direction test" }),
+            DEFAULT_TIMEOUT,
+        )
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("create_memory should return id")
+        .to_string();
+
+    let entity_id = server
+        .call_tool_ok(
+            "create_entity",
+            serde_json::json!({ "name": "direction_test_entity" }),
+            DEFAULT_TIMEOUT,
+        )
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("create_entity should return id")
+        .to_string();
+
+    // Create link M→E with type "about".
+    let edge_id = server
+        .call_tool_ok(
+            "link",
+            serde_json::json!({
+                "from_id": memory_id,
+                "to_id": entity_id,
+                "edge_type": "about"
+            }),
+            DEFAULT_TIMEOUT,
+        )
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("link should return id")
+        .to_string();
+
+    // Test 1: get_edges(E) with default direction (out) should return 0 edges
+    // (E has no outgoing edges).
+    let default_edges_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": entity_id,
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let default_edges = default_edges_resp["edges"].as_array().expect("edges array");
+    assert_eq!(
+        default_edges.len(),
+        0,
+        "E should have 0 outgoing edges (default direction)"
+    );
+
+    // Test 2: get_edges(E, direction=in) should return the M→E edge.
+    let in_edges_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": entity_id,
+            "direction": "in"
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let in_edges = in_edges_resp["edges"].as_array().expect("edges array");
+    assert_eq!(in_edges.len(), 1, "E should have 1 incoming edge (M→E)");
+    assert_eq!(
+        in_edges[0]["id"].as_str().unwrap(),
+        edge_id,
+        "incoming edge should be M→E"
+    );
+    assert_eq!(
+        in_edges[0]["from"].as_str().unwrap(),
+        memory_id,
+        "incoming edge source should be M"
+    );
+    assert_eq!(
+        in_edges[0]["to"].as_str().unwrap(),
+        entity_id,
+        "incoming edge target should be E"
+    );
+
+    // Test 3: get_edges(M, direction=both) should return 1 edge (M→E, deduped).
+    let both_edges_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": memory_id,
+            "direction": "both"
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let both_edges = both_edges_resp["edges"].as_array().expect("edges array");
+    assert_eq!(
+        both_edges.len(),
+        1,
+        "M should have 1 total edge (out+in deduped)"
+    );
+    assert_eq!(
+        both_edges[0]["id"].as_str().unwrap(),
+        edge_id,
+        "union should contain M→E"
+    );
+
+    // Test 4: get_edges(E, direction=invalid) should error with invalid_params.
+    let invalid_resp = server.call_tool(
+        "get_edges",
+        serde_json::json!({
+            "from_id": entity_id,
+            "direction": "sideways"
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&invalid_resp);
+    let error = invalid_resp.get("error").expect("error key should exist");
+    // JSON-RPC invalid_params code is -32602
+    assert_eq!(
+        error.get("code").and_then(|v| v.as_i64()),
+        Some(-32602),
+        "invalid direction should return invalid_params (code -32602)"
+    );
+    let error_msg = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        error_msg.contains("direction"),
+        "error message should name the 'direction' field: {}",
+        error_msg
+    );
+
+    // Test 5: get_edges(E, direction=in, as_of=<mid>) composes.
+    // Capture a timestamp BEFORE closing the edge.
+    let mid = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    std::thread::sleep(Duration::from_millis(10));
+
+    // Close the edge.
+    server.call_tool_ok(
+        "close_edge",
+        serde_json::json!({ "id": edge_id }),
+        DEFAULT_TIMEOUT,
+    );
+    std::thread::sleep(Duration::from_millis(10));
+
+    // Create entity E2 and link M→E2.
+    let entity2_id = server
+        .call_tool_ok(
+            "create_entity",
+            serde_json::json!({ "name": "direction_test_entity_2" }),
+            DEFAULT_TIMEOUT,
+        )
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("create_entity should return id")
+        .to_string();
+
+    let _edge2_id = server
+        .call_tool_ok(
+            "link",
+            serde_json::json!({
+                "from_id": memory_id,
+                "to_id": entity2_id,
+                "edge_type": "about"
+            }),
+            DEFAULT_TIMEOUT,
+        )
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("link should return id")
+        .to_string();
+
+    // Test as_of on incoming edges: get_edges(E, direction=in, as_of=mid)
+    // should find the M→E edge (it was valid at mid and E is the target).
+    let in_asof_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": entity_id,
+            "direction": "in",
+            "as_of": mid
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let in_asof_edges = in_asof_resp["edges"].as_array().expect("edges array");
+    assert_eq!(
+        in_asof_edges.len(),
+        1,
+        "E should have 1 incoming edge at mid (M→E was valid)"
+    );
+    assert_eq!(
+        in_asof_edges[0]["id"].as_str().unwrap(),
+        edge_id,
+        "edge at mid should be M→E"
+    );
+
+    // Verify E has no open incoming edges in the default (now) view.
+    let in_now_resp = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({
+            "from_id": entity_id,
+            "direction": "in"
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let in_now_edges = in_now_resp["edges"].as_array().expect("edges array");
+    assert_eq!(
+        in_now_edges.len(),
+        0,
+        "E should have 0 open incoming edges now (M→E was closed)"
+    );
+}
