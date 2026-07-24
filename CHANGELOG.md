@@ -907,7 +907,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Changed
 
-- **Audible retry note on lock contention** — when `--lock-wait-ms` is set and the database remains locked after 500ms, a stderr note is printed once: `topodb: database held by another process; retrying (budget <N>ms)`.
+- **Audible retry note on lock contention** — when the database remains locked after 500ms of retrying (under the default 3000ms budget or an explicit `--lock-wait-ms`), a stderr note is printed once: `topodb: database held by another process; retrying (budget <N>ms)`.
 
 ### 0.0.8 — 2026-07-23
 

@@ -1105,8 +1105,9 @@ struct DuplicatePair {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct FindDuplicateMemoriesResult {
-    /// Near-duplicate pairs, most-similar first, at most `limit`. Empty when the
-    /// embedder is deliberately off (no signal) or nothing clears the floor.
+    /// Near-duplicate pairs, most-similar first, at most `limit`. Text-mode
+    /// detection runs whenever the embedder is not Ready — including
+    /// deliberately off — so this is empty only when nothing clears the floor.
     pairs: Vec<DuplicatePair>,
     /// How many non-superseded memories were actually compared.
     scanned: usize,
@@ -1298,7 +1299,8 @@ struct MemoryHealthResult {
     degraded_reason: Option<String>,
     /// Near-duplicate pairs that look like the SAME fact (cosine >= 0.80 in
     /// vector mode, token containment >= 0.7 in text mode, non-contradicting) —
-    /// merge with `consolidate_memories`. 0 only when embeddings are deliberately off.
+    /// merge with `consolidate_memories`. Text mode counts are real, including
+    /// with embeddings deliberately off.
     duplicate_pairs: usize,
     /// High-similarity pairs that CONTRADICT each other (one negates what the
     /// other asserts) — likely a fact that replaced an older one; retire the
