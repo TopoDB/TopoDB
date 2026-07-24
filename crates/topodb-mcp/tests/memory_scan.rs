@@ -24,7 +24,7 @@ fn find_duplicate_memories_uses_text_fallback_when_embeddings_are_off() {
     );
     s.initialize(DEFAULT_TIMEOUT);
 
-    // Two disjoint facts — with embeddings off, text-based detection (token-Jaccard containment)
+    // Two disjoint facts — with embeddings off, text-based detection (token containment)
     // should still run but find no matches below the text threshold.
     s.call_tool_ok(
         "create_memory",
