@@ -857,6 +857,13 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 #### Added
 
 - **`--agent-bash <prefix>`** — direct CLI flag to grant agent nodes Bash permissions by prefix (e.g. `--agent-bash 'topodb'` grants `Bash(topodb:*)` additively on top of Read/Write/Edit). The flag is only available for direct CLI use; the Claude Code plugin never passes it and runs agents under configured global permissions instead. Grant the narrowest binary scoped to your task (never shells or package managers). The approval gate echoes every grant before execution.
+- **`--agent-mcp` + `tools: [topodb]`** — agent nodes can opt into the TopoDB
+  MCP tool surface (`mcp__topodb`, full server). The run/validate flag supplies
+  the server command (rail-validated, whitespace-split, no shell); the graph
+  opts nodes in per-node; the approval gate echoes the server and the opted-in
+  node ids. Nodes without the opt-in produce byte-identical `claude -p`
+  invocations to before. A graph opting in without the flag fails validation
+  at the gate, not mid-run.
 
 ---
 
