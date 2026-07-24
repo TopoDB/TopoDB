@@ -56,8 +56,28 @@ impl Db {
     /// A resolved id storage no longer carries (removed between the scan and
     /// the resolve, both inside the same transaction so this is only a
     /// theoretical race with a concurrent writer's *next* transaction) is
-    /// dropped — harmless. Result nodes are bumped (access counters).
+    /// dropped — harmless. Result nodes are bumped (access counters); [`Db::search_vector_unbumped`] is the non-bumping variant.
     pub fn search_vector(&self, q: &VectorQuery) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_vector_internal(q, true)
+    }
+
+    /// [`Db::search_vector`] without bumping access counters. For maintenance
+    /// reads that fetch candidates for advisory purposes (near-duplicate
+    /// detection, hygiene inspection) rather than to recall them — a hygiene
+    /// read that bumps `last_accessed_at` erases the very staleness signal it
+    /// exists to protect. Mirrors [`Db::search_text_unbumped`].
+    pub fn search_vector_unbumped(
+        &self,
+        q: &VectorQuery,
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_vector_internal(q, false)
+    }
+
+    fn search_vector_internal(
+        &self,
+        q: &VectorQuery,
+        bump: bool,
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if q.k == 0 || q.vector.is_empty() {
             return Err(TopoError::Rejected(
                 "vector search requires k > 0 and a non-empty query vector".into(),
@@ -99,7 +119,9 @@ impl Db {
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
         out.truncate(q.k);
-        self.bump(out.iter().map(|(n, _)| n.id));
+        if bump {
+            self.bump(out.iter().map(|(n, _)| n.id));
+        }
         Ok(out)
     }
 }

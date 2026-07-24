@@ -501,7 +501,8 @@ impl TopoServer {
                     k: NEAR_DUP_K,
                     candidates: None,
                 };
-                let Ok(hits) = self.db.search_vector(&query) else {
+                // Advisory read, not a recall — don't corrupt the staleness signal.
+                let Ok(hits) = self.db.search_vector_unbumped(&query) else {
                     return Vec::new();
                 };
                 hits.into_iter()
