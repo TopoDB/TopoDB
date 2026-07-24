@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 pub mod bound;
 pub mod validate;
 
+/// The one MCP tool surface a node may opt into today.
+pub const TOPODB_TOOL: &str = "topodb";
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
     #[error("yaml parse error: {0}")]
@@ -28,6 +31,11 @@ pub struct Node {
     pub run: Option<String>,
     #[serde(default)]
     pub output: Option<OutputSpec>,
+    /// MCP tool surfaces this node opts into. `"topodb"` is the only accepted
+    /// value; the capability itself is supplied at run time by `--agent-mcp`
+    /// (invoker authority) — the graph only declares which nodes may use it.
+    #[serde(default)]
+    pub tools: Vec<String>,
     pub budget: Budget,
 }
 
