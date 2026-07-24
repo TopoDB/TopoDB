@@ -658,13 +658,15 @@ const DUP_BWD_CUES: &[&str] = &[
 /// Function words (and a few high-frequency verbs) dropped before comparing
 /// content tokens, so overlap reflects the salient nouns, not scaffolding.
 const DUP_STOP: &[&str] = &[
-    "a", "an", "the", "of", "to", "in", "on", "for", "its", "it", "is", "are", "as", "by", "with",
-    "and", "or", "now", "only", "both", "this", "that", "using", "use", "uses", "chose", "runs",
-    "run", "was", "were", "be", "been", "their", "them", "people", "up",
+    "a", "an", "at", "the", "of", "to", "in", "on", "for", "its", "it", "is", "are", "as", "by",
+    "with", "and", "or", "now", "only", "both", "this", "that", "using", "use", "uses", "chose",
+    "runs", "run", "was", "were", "be", "been", "their", "them", "people", "up",
 ];
 
-/// How many tokens after a PRE cue are treated as governed by it (POST cues take
-/// just the one content token before them, to avoid over-negating).
+/// How many CONTENT tokens after a PRE cue are treated as governed by it —
+/// stopwords and cues in between don't consume window slots, and the window
+/// never crosses a clause boundary. (POST cues take just the one content token
+/// before them, to avoid over-negating.)
 const DUP_FWD_WINDOW: usize = 4;
 
 fn dup_is_cue(w: &str) -> bool {
@@ -680,44 +682,53 @@ fn dup_singularize(t: &str) -> &str {
 }
 
 /// Tokenize `s` (lowercased alphanumeric runs) into (asserted, negated) content
-/// sets: `negated` = content tokens governed by a cue (PRE cues take the tokens
-/// after them within [`DUP_FWD_WINDOW`]; POST cues take the nearest content token
-/// before them); `asserted` = every other content token. Stopwords and cues are
-/// dropped.
+/// sets: `negated` = content tokens governed by a cue; `asserted` = every other
+/// content token. Stopwords and cues are dropped. Cue windows are
+/// CLAUSE-BOUNDED (a cue never governs tokens past a `.,;:!?()` boundary — "no
+/// longer runs on windows, only ubuntu" must not negate "ubuntu") and the
+/// forward window counts CONTENT tokens only, so filler like "point load tests
+/// at the" can't exhaust it before the salient object.
 fn dup_analyze(s: &str) -> (HashSet<String>, HashSet<String>) {
-    let toks: Vec<String> = s
-        .to_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(String::from)
-        .collect();
+    let lower = s.to_lowercase();
     let is_stop = |w: &str| DUP_STOP.contains(&w);
-    let mut negated = HashSet::new();
-    for (i, t) in toks.iter().enumerate() {
-        if DUP_FWD_CUES.contains(&t.as_str()) {
-            let end = (i + 1 + DUP_FWD_WINDOW).min(toks.len());
-            for w in &toks[i + 1..end] {
-                if !is_stop(w) && !dup_is_cue(w) {
+    let mut negated: HashSet<String> = HashSet::new();
+    let mut content: HashSet<String> = HashSet::new();
+    for clause in lower.split(['.', ',', ';', ':', '!', '?', '(', ')']) {
+        let toks: Vec<&str> = clause
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        for (i, t) in toks.iter().enumerate() {
+            if DUP_FWD_CUES.contains(t) {
+                let mut taken = 0usize;
+                for w in &toks[i + 1..] {
+                    if taken == DUP_FWD_WINDOW {
+                        break;
+                    }
+                    if is_stop(w) || dup_is_cue(w) {
+                        continue;
+                    }
                     negated.insert(dup_singularize(w).to_string());
+                    taken += 1;
+                }
+            }
+            if DUP_BWD_CUES.contains(t) {
+                // Nearest content token before the cue: "windows dropped" -> windows.
+                for w in toks[..i].iter().rev() {
+                    if is_stop(w) || dup_is_cue(w) {
+                        continue;
+                    }
+                    negated.insert(dup_singularize(w).to_string());
+                    break;
                 }
             }
         }
-        if DUP_BWD_CUES.contains(&t.as_str()) {
-            // Nearest content token before the cue: "windows dropped" -> windows.
-            for w in toks[..i].iter().rev() {
-                if is_stop(w) || dup_is_cue(w) {
-                    continue;
-                }
-                negated.insert(dup_singularize(w).to_string());
-                break;
-            }
-        }
+        content.extend(
+            toks.iter()
+                .filter(|w| !is_stop(w) && !dup_is_cue(w))
+                .map(|w| dup_singularize(w).to_string()),
+        );
     }
-    let content: HashSet<String> = toks
-        .iter()
-        .filter(|w| !is_stop(w) && !dup_is_cue(w))
-        .map(|w| dup_singularize(w).to_string())
-        .collect();
     let asserted = content.difference(&negated).cloned().collect();
     (asserted, negated)
 }
@@ -3902,6 +3913,13 @@ mod dup_classify_tests {
             (
                 "the redb backend is used for storage",
                 "the redb backend was removed",
+            ),
+            // Field-test canonical probe: sentence-initial "never" whose scope
+            // must reach past filler ("point load tests at the") to the salient
+            // object — requires the content-token window, not the raw one.
+            (
+                "use the staging db",
+                "never point load tests at the staging db",
             ),
         ];
         for (a, b) in same {
