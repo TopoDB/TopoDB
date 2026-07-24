@@ -2,7 +2,7 @@
 //! surface existing memories that are semantically close (advisory — nothing is
 //! merged), so an agent can notice "same fact, different words" that exact dedup
 //! misses. When embeddings are Ready, vector-based detection applies; when not
-//! ready, text-based fallback (token-Jaccard containment) applies.
+//! ready, text-based fallback (token containment) applies.
 //!
 //! The real-embedder test is #[ignore] (downloads ~34MB), matching
 //! tests/embeddings.rs; the off-path guard runs in CI.
