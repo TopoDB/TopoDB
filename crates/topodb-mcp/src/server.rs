@@ -416,7 +416,7 @@ impl TopoServer {
 
     /// Text-based near-duplicate detection using token-Jaccard similarity
     /// when the embedder is not Ready. Performs BM25 text search to fetch
-    /// candidates, filters by token-Jaccard floor, and returns ranked results.
+    /// candidates, filters by token-containment floor, and returns ranked results.
     /// Excludes `exclude` node (if provided), non-Memory labels, and superseded nodes.
     /// Uses the non-bumping text search path — a maintenance read is not a recall.
     fn text_near_duplicates(&self, write_scope: Scope, content: &str) -> Vec<NearDuplicate> {
@@ -446,25 +446,25 @@ impl TopoServer {
                     _ => return None,
                 };
 
-                let jaccard = token_jaccard(content, &existing);
-                if jaccard >= TEXT_NEAR_DUP_JACCARD {
-                    Some((n, existing, jaccard))
+                let containment = token_containment(content, &existing);
+                if containment >= TEXT_NEAR_DUP_CONTAINMENT {
+                    Some((n, existing, containment))
                 } else {
                     None
                 }
             })
             .collect();
 
-        // Sort by Jaccard score (descending) and truncate to NEAR_DUP_K.
+        // Sort by containment score (descending) and truncate to NEAR_DUP_K.
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(NEAR_DUP_K);
 
         scored
             .into_iter()
-            .map(|(n, existing, jaccard)| NearDuplicate {
+            .map(|(n, existing, containment)| NearDuplicate {
                 id: n.id.to_string(),
-                similarity: jaccard as f32,
-                band: dup_band(jaccard as f32).to_string(),
+                similarity: containment as f32,
+                band: dup_band(containment as f32).to_string(),
                 relation: dup_relation(content, &existing).to_string(),
                 content: existing,
                 method: "text".to_string(),
@@ -475,8 +475,8 @@ impl TopoServer {
     /// Existing memories in `write_scope` semantically close to the just-stored
     /// content. When the embedder is Ready, uses cosine similarity
     /// (>= [`NEAR_DUP_THRESHOLD`]), most-similar first, at most [`NEAR_DUP_K`].
-    /// When the embedder is not Ready, falls back to token-Jaccard text similarity
-    /// (>= [`TEXT_NEAR_DUP_JACCARD`], currently 0.5). Advisory only — the caller judges whether
+    /// When the embedder is not Ready, falls back to token-containment text similarity
+    /// (>= [`TEXT_NEAR_DUP_CONTAINMENT`], currently 0.7). Advisory only — the caller judges whether
     /// a hit is truly the same fact. Superseded memories are skipped (already
     /// retired), as are non-Memory nodes. Called BEFORE the new memory is
     /// written, so it never returns the node being created. A search error
@@ -558,15 +558,18 @@ const TEXT_NEAR_DUP_CANDIDATES: usize = NEAR_DUP_K + 5;
 /// trade for an advisory tool where a human/agent makes the final call.
 const NEAR_DUP_REVIEW: f32 = 0.68;
 
-/// Token-Jaccard floor for text-based near-duplicate fallback when the embedder
-/// isn't Ready. Token Jaccard (|∩|/|∪| of whitespace-split lowercase tokens)
-/// is coarser than cosine but provides a non-embedder signal; lowered 2026-07-24 —
-/// the canonical contradiction pair sits at ≈0.556; 0.5–0.8 arrives as band "possible".
-const TEXT_NEAR_DUP_JACCARD: f64 = 0.5;
+/// Text containment floor for text-based near-duplicate fallback when the embedder
+/// isn't Ready. CONTAINMENT = |∩| / min(|A|,|B|) scores candidates by how completely
+/// one fact is contained in another — the canonical restatement shape. Floor 0.7
+/// catches the canonical pair ("Vega stores data in postgres" / "Vega now stores data
+/// in sqlite for embedded mode" = 5/6 ≈ 0.833) while leaving unrelated disjoint facts
+/// near 0; a short fact fully contained in a longer restatement scores 1.0 exactly
+/// (supersession/rewording). See [`dup_band`] for confidence levels.
+const TEXT_NEAR_DUP_CONTAINMENT: f64 = 0.7;
 
-/// Jaccard similarity of two precomputed token sets.
+/// Containment similarity of two precomputed token sets: |∩| / min(|A|,|B|).
 /// Returns 1.0 if both sets are empty.
-fn jaccard_of_sets(
+fn containment_of_sets(
     a: &std::collections::BTreeSet<String>,
     b: &std::collections::BTreeSet<String>,
 ) -> f64 {
@@ -575,9 +578,9 @@ fn jaccard_of_sets(
     }
 
     let intersection = a.intersection(b).count() as f64;
-    let union = a.union(b).count() as f64;
+    let min_len = (a.len().min(b.len())) as f64;
 
-    intersection / union
+    intersection / min_len
 }
 
 /// Tokenize a string into a set of lowercase tokens (whitespace-split).
@@ -585,10 +588,10 @@ fn tokens(s: &str) -> std::collections::BTreeSet<String> {
     s.split_whitespace().map(|t| t.to_lowercase()).collect()
 }
 
-/// Jaccard similarity of two strings' token sets (lowercase, whitespace-split).
+/// Containment similarity of two strings' token sets (lowercase, whitespace-split).
 /// Returns 1.0 if both strings are empty.
-fn token_jaccard(a: &str, b: &str) -> f64 {
-    jaccard_of_sets(&tokens(a), &tokens(b))
+fn token_containment(a: &str, b: &str) -> f64 {
+    containment_of_sets(&tokens(a), &tokens(b))
 }
 
 /// Confidence band for a near-dup similarity: `"likely"` at/above the strong
@@ -2324,8 +2327,8 @@ impl TopoServer {
         text_candidates.truncate(DUP_SCAN_CAP);
         let scanned = text_candidates.len();
 
-        // Complete pairwise token-Jaccard over the bounded set.
-        // Text detection uses TEXT_NEAR_DUP_JACCARD as its floor (0.5), not the
+        // Complete pairwise token-containment over the bounded set.
+        // Text detection uses TEXT_NEAR_DUP_CONTAINMENT as its floor (0.7), not the
         // vector similarity threshold. This provides a consistent text-based signal
         // independent of vector tuning parameters.
         // Precompute token sets to avoid repeated tokenization in the pairwise loop.
@@ -2338,8 +2341,8 @@ impl TopoServer {
 
         for i in 0..text_candidates.len() {
             for j in (i + 1)..text_candidates.len() {
-                let jaccard = jaccard_of_sets(&token_sets[i], &token_sets[j]);
-                if jaccard >= TEXT_NEAR_DUP_JACCARD {
+                let containment = containment_of_sets(&token_sets[i], &token_sets[j]);
+                if containment >= TEXT_NEAR_DUP_CONTAINMENT {
                     let (a, b) = (&text_candidates[i], &text_candidates[j]);
                     // Canonical (ascending-id) order so a pair is reported once.
                     let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
@@ -2347,8 +2350,8 @@ impl TopoServer {
                     // duplicates from supersessions, same as the advisory (text advisory run time).
                     pairs.push(DuplicatePair {
                         ids: [lo.0.clone(), hi.0.clone()],
-                        similarity: jaccard as f32,
-                        band: dup_band(jaccard as f32).to_string(),
+                        similarity: containment as f32,
+                        band: dup_band(containment as f32).to_string(),
                         relation: dup_relation(&lo.1, &hi.1).to_string(),
                         contents: [lo.1.clone(), hi.1.clone()],
                     });
