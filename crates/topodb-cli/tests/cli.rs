@@ -1515,7 +1515,11 @@ fn create_memory_stamps_hash_and_dedups() {
 fn create_memory_rejects_reserved_prop_keys() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
-    for props in [r#"{"content_hash":"x"}"#, r#"{"superseded_at":1}"#] {
+    for props in [
+        r#"{"content_hash":"x"}"#,
+        r#"{"superseded_at":1}"#,
+        r#"{"forgotten_at":1}"#,
+    ] {
         let out = bin()
             .args([
                 "--db",
@@ -1556,7 +1560,11 @@ fn create_memory_rejects_reserved_keys_even_on_dedup() {
     assert_eq!(out1.status.code(), Some(0));
 
     // Second: re-send the SAME content WITH reserved-key props → must be rejected, not deduplicated
-    for props in [r#"{"content_hash":"boom"}"#, r#"{"superseded_at":1}"#] {
+    for props in [
+        r#"{"content_hash":"boom"}"#,
+        r#"{"superseded_at":1}"#,
+        r#"{"forgotten_at":1}"#,
+    ] {
         let out = bin()
             .args([
                 "--db",
@@ -1631,7 +1639,11 @@ fn re_remember_of_superseded_content_is_a_fresh_memory() {
 fn remember_rejects_reserved_prop_keys() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
-    for props in [r#"{"content_hash":"boom"}"#, r#"{"superseded_at":1}"#] {
+    for props in [
+        r#"{"content_hash":"boom"}"#,
+        r#"{"superseded_at":1}"#,
+        r#"{"forgotten_at":1}"#,
+    ] {
         let out = bin()
             .args([
                 "--db",

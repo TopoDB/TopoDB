@@ -50,6 +50,16 @@ pub const MEMORY_CONTENT_HASH_PROP: &str = "content_hash";
 /// `<=` the query's `now` (so an `as_of` before it still sees the old fact).
 /// The node is not deleted — supersession dates a fact, keeping its history.
 pub const MEMORY_SUPERSEDED_AT_PROP: &str = "superseded_at";
+/// Millisecond timestamp at which a memory was forgotten (the `forget` verb).
+/// Distinct from supersession — a forgotten fact was not replaced, just
+/// judged not worth keeping. Same tombstone mechanics: recall drops a memory
+/// whose value here is `<=` the query's now; the node is not deleted.
+pub const MEMORY_FORGOTTEN_AT_PROP: &str = "forgotten_at";
+/// The canonical liveness set: a Memory is live iff NONE of these props
+/// tombstones it. Every read surface (CLI search, MCP search_memories,
+/// dedup, advisories, hygiene) filters on this same set so "live" cannot
+/// drift between surfaces.
+pub const MEMORY_TOMBSTONE_PROPS: [&str; 2] = [MEMORY_SUPERSEDED_AT_PROP, MEMORY_FORGOTTEN_AT_PROP];
 pub const ALIAS_LABEL: &str = "Alias";
 pub const ALIAS_NAME_PROP: &str = "name";
 pub const ALIAS_EDGE_TYPE: &str = "alias_of";
