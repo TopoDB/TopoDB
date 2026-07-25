@@ -1744,6 +1744,7 @@ struct RememberResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ForgetParams {
     /// Memory ULIDs to forget. Every id must be a live Memory in the write
     /// scope; any invalid id (unknown, non-Memory, already forgotten,
@@ -3714,7 +3715,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Hard-delete a node and cascade-remove its incident edges. Call this to forget something entirely. Errors if the node doesn't exist. Returns the committed seq."
+        description = "Hard-delete a node and cascade-remove its incident edges. Unlike `forget` (soft retirement — history preserved, as_of still sees the node), this erases the node entirely. Errors if the node doesn't exist. Returns the committed seq."
     )]
     fn remove_node(
         &self,
