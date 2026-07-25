@@ -45,7 +45,7 @@ All 19 subcommands, in scaffold + write + read order:
 | `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
 | `get <id>` | positional node id | `{"found": bool, "node"?: {...}}` |
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
-| `search <query>` | positional query, `--k <n>` (default 10) | `[ {"node":..., "score": f}, ... ]` |
+| `search <query>` | positional query, `--k <n>` (default 10), `--include-superseded` | `[ {"node":..., "score": f}, ... ]` |
 | `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
 | `get-edges <from>` | positional source node id (or target when `--direction in`), `--direction out\|in\|both` (default `out`; for `in`, the anchor shifts to the target and `--to` filters the far source end), `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
@@ -76,6 +76,11 @@ Notes on individual commands:
   ≥1). `--supersedes` is repeatable and marks the listed memory ids as superseded. `--edge-type`
   defaults to `"about"` and describes the link from memory→entity. The system-maintained keys `content_hash` and `superseded_at` are reserved — attempts to set them in `--props` are rejected (exit 2). Re-storing identical content from a superseded memory creates a new memory instead of deduping to the retired tombstone.
 - **`link`**: `--valid-from` is Unix milliseconds; omit it to let the engine resolve "now".
+- **`search`**: memories retired by `remember --supersedes` (a `superseded_at` timestamp in the
+  past) are skipped by default — they neither surface, nor consume the `--k` window, nor get
+  access-bumped. `--include-superseded` searches the full history too — the same default-liveness
+  shape `get-edges` has with `--open-only`. Matches the MCP server's `search` tool, which already
+  filters supersession.
 - **`find`**: `--value` is parsed as a JSON scalar first (`42` → `Int`, `true` → `Bool`, `"ada"`
   → `Str`); if it doesn't parse as JSON at all, the raw string is taken as `Str` — so
   `--value ada` and `--value '"ada"'` are equivalent. A float value is never equality-indexable

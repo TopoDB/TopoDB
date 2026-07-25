@@ -20,6 +20,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
 - **`Db::search_vector_unbumped`** — cosine vector search with the same population, order, and scores as `search_vector`, but WITHOUT bumping access counters. For maintenance and advisory reads (near-duplicate checks) that must not spend the recency signal they exist to protect — the same rationale as `search_text_unbumped`. One shared implementation with the bumping variant.
+- **`Db::search_text_live`** — `search_text_with` plus a liveness filter: a candidate whose named tombstone prop holds an `Int` timestamp `<=` "now" (`options.now_ms`, else wall clock) is dropped BEFORE the top-`k` truncation — a retired hit never consumes the result window — and is never access-bumped. Same tombstone semantics as `RecallQuery.tombstone_prop` (a mark in the query's future keeps the node; a non-`Int` value is not a mark), now available to plain BM25 callers.
 
 ### 0.0.11 — 2026-07-23
 
@@ -921,6 +922,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Changed
 
+- **`search` now skips superseded memories by default** — a memory retired by `remember --supersedes` (an `Int` `superseded_at` prop in the past) no longer surfaces, consumes the `--k` window, or gets access-bumped; previously raw BM25 could rank a retired memory above its live successor. `--include-superseded` restores the full-history behavior — the same default-liveness shape `get-edges` has with `--open-only`. Matches `topodb-mcp`'s `search` tool, which already filtered supersession via recall's `tombstone_prop`. `find` is untouched: it is an exact-property lookup, not a recall surface.
 - **Audible retry note on lock contention** — when the database remains locked after 500ms of retrying (under the default 3000ms budget or an explicit `--lock-wait-ms`), a stderr note is printed once: `topodb: database held by another process; retrying (budget <N>ms)`.
 
 ### 0.0.8 — 2026-07-23
