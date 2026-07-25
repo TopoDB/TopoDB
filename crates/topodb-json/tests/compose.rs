@@ -472,3 +472,129 @@ fn memory_props_rejects_reserved_keys_and_stamps_hash() {
     );
     assert_eq!(props["source"], PropValue::Str("chat".into()));
 }
+
+#[test]
+fn plan_forget_stamps_and_closes_edges_for_a_live_memory() {
+    use topodb_json::plan_forget;
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let seeded = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        1_000,
+        &req("a memory", &["entity"]),
+    )
+    .unwrap();
+    let m = seeded.memory_id;
+    db.submit(seeded.ops).unwrap();
+    let scope = Scope::Shared;
+    let (ops, forgotten) = plan_forget(&db, scope, &[m.to_string()], 5_000).unwrap();
+    assert_eq!(forgotten, vec![m.to_string()]);
+    assert!(matches!(
+        &ops[0],
+        topodb::Op::SetNodeProps { id, props }
+            if id == &m && props.get("forgotten_at") == Some(&Some(PropValue::Int(5_000)))
+    ));
+    assert!(
+        ops.iter()
+            .skip(1)
+            .all(|op| matches!(op, topodb::Op::CloseEdge { .. })),
+        "everything after the stamp closes an open edge"
+    );
+    assert!(ops.len() >= 2, "the memory->entity edge must be closed");
+}
+
+#[test]
+fn plan_forget_rejects_every_invalid_target_before_building_ops() {
+    use topodb_json::plan_forget;
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let seeded = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        1_000,
+        &req("live memory", &["entity"]),
+    )
+    .unwrap();
+    let m = seeded.memory_id;
+    let e = seeded.entities[0].id;
+    db.submit(seeded.ops).unwrap();
+    // Create a forgotten memory for testing
+    let forg_seeded = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        2_000,
+        &req("forgotten memory", &["entity"]),
+    )
+    .unwrap();
+    let forg = forg_seeded.memory_id;
+    db.submit(forg_seeded.ops).unwrap();
+    let (forg_ops, _) = plan_forget(&db, Scope::Shared, &[forg.to_string()], 3_000).unwrap();
+    db.submit(forg_ops).unwrap();
+    // Create a superseded memory for testing
+    let sup_seeded = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        4_000,
+        &req("superseded memory", &["entity"]),
+    )
+    .unwrap();
+    let sup = sup_seeded.memory_id;
+    db.submit(sup_seeded.ops).unwrap();
+    let mut sup_req = req("newer version", &["entity"]);
+    sup_req.supersedes = vec![sup.to_string()];
+    let sup_plan = plan_remember(&db, Scope::Shared, &lookup(), 5_000, &sup_req).unwrap();
+    db.submit(sup_plan.ops).unwrap();
+    let scope = Scope::Shared;
+    for (ids, needle) in [
+        (vec!["not-a-ulid".to_string()], "invalid node id"),
+        (
+            vec![topodb::NodeId::new().to_string()],
+            "not a node in the write scope",
+        ),
+        (vec![e.to_string()], "not a Memory"),
+        (vec![forg.to_string()], "already forgotten"),
+        (vec![sup.to_string()], "already superseded"),
+        // one bad id poisons the whole call — atomicity of judgment
+        (vec![m.to_string(), e.to_string()], "not a Memory"),
+    ] {
+        match plan_forget(&db, scope, &ids, 5_000) {
+            Err(ComposeError::Invalid(msg)) => {
+                assert!(msg.contains(needle), "{needle:?} not in {msg:?}")
+            }
+            other => panic!("expected Invalid({needle}), got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn plan_forget_rejects_empty_and_dedups_repeats() {
+    use topodb_json::plan_forget;
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let seeded = plan_remember(
+        &db,
+        Scope::Shared,
+        &lookup(),
+        1_000,
+        &req("a memory", &["entity"]),
+    )
+    .unwrap();
+    let m = seeded.memory_id;
+    db.submit(seeded.ops).unwrap();
+    let scope = Scope::Shared;
+    assert!(matches!(
+        plan_forget(&db, scope, &[], 5_000),
+        Err(ComposeError::Invalid(msg)) if msg.contains("at least one")
+    ));
+    let (_, forgotten) = plan_forget(&db, scope, &[m.to_string(), m.to_string()], 5_000).unwrap();
+    assert_eq!(
+        forgotten,
+        vec![m.to_string()],
+        "repeat of the same id is one forget"
+    );
+}

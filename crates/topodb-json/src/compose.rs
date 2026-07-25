@@ -240,6 +240,70 @@ fn plan_supersede(
     Ok((ops, marked))
 }
 
+/// Ops marking `ids` forgotten (stamp `forgotten_at` + close open out-edges)
+/// plus the forgotten ids. The disconnect motion is `plan_supersede`'s, but
+/// the contract is STRICTER: supersede is a bulk mark that skips
+/// already-retired ids; `forget` is an explicit judgment, so EVERY id must
+/// be a live Memory in the write scope and any violation rejects the whole
+/// call before ops build. `now_ms` is a parameter so tests are deterministic.
+pub fn plan_forget(
+    db: &Db,
+    write_scope: Scope,
+    ids: &[String],
+    now_ms: i64,
+) -> Result<(Vec<Op>, Vec<String>), ComposeError> {
+    if ids.is_empty() {
+        return Err(ComposeError::Invalid(
+            "forget requires at least one memory id".into(),
+        ));
+    }
+    let scope_set = scopes_to_scope_set(&[write_scope]);
+    let mut ops = Vec::new();
+    let mut forgotten = Vec::new();
+    let mut seen = BTreeSet::new();
+    for raw in ids {
+        let id: NodeId = raw
+            .parse()
+            .map_err(|e| ComposeError::Invalid(format!("invalid node id {raw:?}: {e}")))?;
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = db.node(&scope_set, id).ok_or_else(|| {
+            ComposeError::Invalid(format!("forget id {raw} is not a node in the write scope"))
+        })?;
+        if node.label != MEMORY_LABEL {
+            return Err(ComposeError::Invalid(format!(
+                "forget id {raw} is a {}, not a Memory",
+                node.label
+            )));
+        }
+        if node.props.contains_key(MEMORY_FORGOTTEN_AT_PROP) {
+            return Err(ComposeError::Invalid(format!(
+                "forget id {raw} is already forgotten"
+            )));
+        }
+        if node.props.contains_key(MEMORY_SUPERSEDED_AT_PROP) {
+            return Err(ComposeError::Invalid(format!(
+                "forget id {raw} is already superseded — it has already left recall"
+            )));
+        }
+        let mut props: BTreeMap<String, Option<PropValue>> = BTreeMap::new();
+        props.insert(
+            MEMORY_FORGOTTEN_AT_PROP.into(),
+            Some(PropValue::Int(now_ms)),
+        );
+        ops.push(Op::SetNodeProps { id, props });
+        for e in db.edges_from(&scope_set, id, None, None, true)? {
+            ops.push(Op::CloseEdge {
+                id: e.id,
+                valid_to: None,
+            });
+        }
+        forgotten.push(id.to_string());
+    }
+    Ok((ops, forgotten))
+}
+
 // --- the composed verb ---
 
 pub struct RememberRequest {
