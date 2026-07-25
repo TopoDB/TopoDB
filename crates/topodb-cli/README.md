@@ -42,6 +42,7 @@ All 19 subcommands, in scaffold + write + read order:
 | `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>", "deduplicated": bool}` |
 | `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>`, `--always-create` | `{"id": "<ulid>", "created": bool}` |
 | `remember` | `--content <text>` (required), `--entity <name>` (required, repeatable), `--edge-type <ty>` (default `"about"`), `--supersedes <id>` (repeatable), `--props <json-object>`, `--scope <ulid\|shared>` | `{"memory_id": "<ulid>", "deduplicated": bool, "entities": [{"name": "<name>", "id": "<ulid>", "created": bool}], "edge_ids": ["<ulid>", ...], "superseded": ["<ulid>", ...]}` |
+| `forget <id>...` | positional memory ids (≥1), `--scope <ulid\|shared>` | `{"forgotten": ["<ulid>", ...]}` |
 | `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
 | `get <id>` | positional node id | `{"found": bool, "node"?: {...}}` |
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
@@ -75,12 +76,17 @@ Notes on individual commands:
   into a single engine batch so facts never strand unlinked. `--entity` is repeatable (must pass
   ≥1). `--supersedes` is repeatable and marks the listed memory ids as superseded. `--edge-type`
   defaults to `"about"` and describes the link from memory→entity. The system-maintained keys `content_hash` and `superseded_at` are reserved — attempts to set them in `--props` are rejected (exit 2). Re-storing identical content from a superseded memory creates a new memory instead of deduping to the retired tombstone.
+- **`forget`**: soft retirement — stamps `forgotten_at` (same tombstone mechanics as supersession)
+  and closes the memory's open edges. Nothing is deleted: `search --include-superseded` and
+  temporal reads still see the node. Every id must be a live Memory in the write scope; any
+  invalid id rejects the whole call (exit 2). Re-remembering identical content later creates a
+  fresh live memory — a tombstoned node is never a dedup target.
 - **`link`**: `--valid-from` is Unix milliseconds; omit it to let the engine resolve "now".
-- **`search`**: memories retired by `remember --supersedes` (a `superseded_at` timestamp in the
-  past) are skipped by default — they neither surface, nor consume the `--k` window, nor get
-  access-bumped. `--include-superseded` searches the full history too — the same default-liveness
-  shape `get-edges` has with `--open-only`. Matches the MCP server's `search` tool, which already
-  filters supersession.
+- **`search`**: memories retired by `remember --supersedes` or `forget` (a `superseded_at` or
+  `forgotten_at` timestamp in the past) are skipped by default — they neither surface, nor
+  consume the `--k` window, nor get access-bumped. `--include-superseded` is the general history
+  switch over the whole tombstone set — the same default-liveness shape `get-edges` has with
+  `--open-only`. Matches the MCP server's `search` tool, which filters the same set.
 - **`find`**: `--value` is parsed as a JSON scalar first (`42` → `Int`, `true` → `Bool`, `"ada"`
   → `Str`); if it doesn't parse as JSON at all, the raw string is taken as `Str` — so
   `--value ada` and `--value '"ada"'` are equivalent. A float value is never equality-indexable
