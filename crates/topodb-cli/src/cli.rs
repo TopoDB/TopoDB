@@ -170,7 +170,7 @@ pub enum Command {
         normalized: bool,
     },
     /// Full-text BM25 search over indexed text properties. Memories retired
-    /// by `remember --supersedes` are skipped by default; pass
+    /// (superseded or forgotten) are skipped by default; pass
     /// `--include-superseded` to search history too.
     Search {
         /// The search query.
@@ -178,8 +178,8 @@ pub enum Command {
         /// Max hits to return.
         #[arg(long, default_value_t = 10)]
         k: usize,
-        /// Also return superseded (retired) memories — the history escape
-        /// hatch, same shape as `get-edges --open-only false`.
+        /// Also return retired memories (superseded OR forgotten) — the
+        /// history escape hatch, same shape as `get-edges --open-only false`.
         #[arg(long)]
         include_superseded: bool,
     },

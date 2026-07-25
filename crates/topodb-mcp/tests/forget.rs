@@ -87,3 +87,29 @@ fn forget_rejects_invalid_targets_whole_call() {
         );
     }
 }
+
+/// Read-side parity with supersession: a forgotten memory is not a dedup
+/// target — re-remembering identical content mints a FRESH live memory.
+#[test]
+fn forgotten_memories_are_never_dedup_targets() {
+    let (_dir, mut server) = fresh_server();
+    let stored = server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "vesta uses nats", "entities": ["vesta"] }),
+        DEFAULT_TIMEOUT,
+    );
+    let mem = stored["memory_id"].as_str().unwrap().to_string();
+    server.call_tool_ok(
+        "forget",
+        serde_json::json!({ "ids": [mem] }),
+        DEFAULT_TIMEOUT,
+    );
+
+    let again = server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "vesta uses nats", "entities": ["vesta"] }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(again["deduplicated"], false, "no dedup to a forgotten node");
+    assert_ne!(again["memory_id"].as_str().unwrap(), mem);
+}
