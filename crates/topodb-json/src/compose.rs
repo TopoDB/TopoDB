@@ -12,7 +12,7 @@ use topodb::{Db, EdgeId, NodeId, NodeRecord, Op, PropValue, Props, Scope, ScopeS
 use crate::{
     merge_required_prop, normalize_edge_type, scopes_to_scope_set, ALIAS_EDGE_TYPE, ALIAS_LABEL,
     ALIAS_NAME_PROP, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_HASH_PROP, MEMORY_CONTENT_PROP,
-    MEMORY_LABEL, MEMORY_SUPERSEDED_AT_PROP,
+    MEMORY_FORGOTTEN_AT_PROP, MEMORY_LABEL, MEMORY_SUPERSEDED_AT_PROP,
 };
 
 /// Edge type `remember` uses when the caller doesn't name one.
@@ -75,7 +75,11 @@ pub fn content_hash(content: &str) -> String {
 /// set cannot drift between surfaces.
 pub fn memory_props(content: &str, extra: Option<&Value>) -> Result<Props, String> {
     if let Some(Value::Object(map)) = extra {
-        for reserved in [MEMORY_CONTENT_HASH_PROP, MEMORY_SUPERSEDED_AT_PROP] {
+        for reserved in [
+            MEMORY_CONTENT_HASH_PROP,
+            MEMORY_SUPERSEDED_AT_PROP,
+            MEMORY_FORGOTTEN_AT_PROP,
+        ] {
             if map.contains_key(reserved) {
                 return Err(format!(
                     "props must not include {reserved:?}: it is maintained by the engine write path"

@@ -455,7 +455,7 @@ fn alias_name_resolves_to_canonical_entity() {
 #[test]
 fn memory_props_rejects_reserved_keys_and_stamps_hash() {
     use topodb_json::memory_props;
-    for key in ["content_hash", "superseded_at"] {
+    for key in ["content_hash", "superseded_at", "forgotten_at"] {
         let extra = serde_json::json!({ key: "boom" });
         let err = memory_props("a fact", Some(&extra)).unwrap_err();
         assert!(err.contains(key), "error must name the reserved key: {err}");
