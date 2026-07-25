@@ -4,7 +4,7 @@ An MCP (Model Context Protocol) server exposing the [TopoDB](https://crates.io/c
 agent-memory engine over stdio. Point an MCP client at a `.redb` database file and it gets
 recall (get/find/search-memories/search-vectors/traverse/access-stats/changes) — hybrid
 BM25 + vector + graph search under the hood — and write (create memory, create entity, add
-alias, add synonym, link, set-props, remove-node, close-edge, set-embedding, batch) tools
+alias, add synonym, link, set-props, remove-node, close-edge, set-embedding, forget, batch) tools
 backed by a scoped, temporal property graph — no separate database process, no network hop.
 
 Status: **v0** — read + write tools, including vector search and node/edge mutation.
@@ -42,8 +42,8 @@ The `--help`/`-h` and `--version`/`-V` flags print to stdout and exit 0.
 
 ## Tools
 
-`tools/list` reports exactly 27 tools: `db_info`, 14 read tools (`get_changes` included), and
-12 write tools.
+`tools/list` reports exactly 28 tools: `db_info`, 14 read tools (`get_changes` included), and
+13 write tools.
 
 | Tool | Params | Description |
 |---|---|---|
@@ -63,6 +63,7 @@ The `--help`/`-h` and `--version`/`-V` flags print to stdout and exit 0.
 | `search_vectors` | `model` (string, required), `vector` (number array, required), `k` (integer, default 10), `candidates` (array of node ids, optional), `scope?`, `scopes?` | Cosine similarity search over embeddings stored under `model`. Call this when you have a host-computed query embedding and want nodes ranked by vector similarity rather than text relevance. `candidates` restricts scoring to a given node id set (e.g. narrow to a `traverse` result for hybrid recall). Errors if `k` is 0 or the vector is empty. |
 | `get_changes` | `since_seq` (integer, required) | Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The `db_info` tool reports `current_seq`. Rejected with `invalid_params` unless the server was started with `--allow-unscoped-changes`. |
 | `remember` | `content` (string, required), `entities` (non-empty string array, required), `edge_type` (string, default `"about"`), `supersedes` (array of memory ids, optional), `props` (object, optional), `scope?` | Store a linked fact in ONE call: creates the memory, find-or-creates each named entity (`create_entity` semantics — case/whitespace-insensitive, alias-aware, never duplicates; repeated names in one call collapse), and links memory→entity — atomically, in a single write batch. Re-storing identical content resolves to the existing memory (`deduplicated: true`). `supersedes` retires named memories (marks `superseded_at`, closes their open edges) when a fact changes. Returns advisory `near_duplicates` (banded, relation-labeled) for the just-stored content. The preferred storage verb; the tools below are its building blocks. |
+| `forget` | `ids` (non-empty string array, required), `scope?` | Soft-retire memories you judge not worth keeping: stamps `forgotten_at` and closes their open edges, atomically. Recall and search stop returning them as of the stamp; history remains (an `as_of` before the stamp still sees them) and nothing is deleted. Distinct from `remember`'s `supersedes` — supersede says a fact was REPLACED by a newer one; forget says it never needs to come back. Every id must be a live Memory in the write scope: unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call. Returns `{"forgotten": ["<ulid>", ...]}`. |
 | `create_memory` | `content` (string, required), `supersedes` (array of memory ids, optional), `props` (object, optional), `scope?` | Store a new memory. Call this when the user or task produces information worth remembering later. `content` becomes the full-text-searchable body; `props` holds structured metadata (strings/numbers/bools). Identical content is deduplicated to the existing node; `supersedes` retires older memories. Returns the node's id and advisory `near_duplicates`. Prefer `remember`, which links as it stores. |
 | `consolidate_memories` | `keep` (memory id, required), `drop` (memory id, required), `scope?` | Merge a near-duplicate PAIR into one memory. YOU pick which survives (`keep`) and which is retired (`drop`) after judging they are the same fact — never inferred from similarity (contradictions score high too). `keep` inherits `drop`'s unique relationships, `drop` is superseded (marked + disconnected), atomically. Pair with `find_duplicate_memories`. |
 | `create_entity` | `name` (string, required), `props` (object, optional), `scope?` | **Find-or-create** an entity node (person, project, concept). The name is matched case- and whitespace-insensitively across the read scopes, the write scope, and `shared`, and — via registered aliases — resolves an alternate name to its canonical entity too; an existing entity is returned with `created: false` (oldest node wins when pre-existing duplicates match) and any NEW `props` keys are merged without overwriting. Only when nothing matches is a node created (`created: true`). |

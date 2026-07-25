@@ -465,6 +465,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 #### Changed
 
 - **Text near-duplicate scoring** — switched from Jaccard (`|A∩B|/|A∪B|`) to token containment (`|A∩B|/min(|A|,|B|)`), floor 0.7 (was 0.6). The field test's canonical contradiction pair (similarity ≈0.833) is now correctly caught as band `"likely"`. In text mode (`find_duplicate_memories`, `memory_health` when embedder is not Ready), text-mode `similarity` field is now a containment score (not cosine, not Jaccard).
+- **`consolidate_memories` now requires both `keep` and `drop` to be live under the full tombstone set** — a `forgotten` id is now rejected the same way an already-superseded one is (previously only `superseded_at` was checked). The rejection message changed from `"... is already superseded"` to `"... is already superseded or forgotten"` — a note for anyone string-matching on it.
 
 ### 0.0.13 — 2026-07-23
 
@@ -935,8 +936,8 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Changed
 
-- **`search --include-superseded` now reveals forgotten memories too** — the flag is the general history switch over the whole tombstone set (`superseded_at`, `forgotten_at`); default search hides both.
 - **`search` now skips superseded memories by default** — a memory retired by `remember --supersedes` (an `Int` `superseded_at` prop in the past) no longer surfaces, consumes the `--k` window, or gets access-bumped; previously raw BM25 could rank a retired memory above its live successor. `--include-superseded` restores the full-history behavior — the same default-liveness shape `get-edges` has with `--open-only`. Matches `topodb-mcp`'s `search` tool, which already filtered supersession via recall's `tombstone_prop`. `find` is untouched: it is an exact-property lookup, not a recall surface.
+- **`search --include-superseded` now reveals forgotten memories too** — the flag is the general history switch over the whole tombstone set (`superseded_at`, `forgotten_at`); default search hides both.
 - **Audible retry note on lock contention** — when the database remains locked after 500ms of retrying (under the default 3000ms budget or an explicit `--lock-wait-ms`), a stderr note is printed once: `topodb: database held by another process; retrying (budget <N>ms)`.
 
 ### 0.0.8 — 2026-07-23
