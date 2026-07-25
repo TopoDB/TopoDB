@@ -2465,7 +2465,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Consolidate a near-duplicate PAIR into one memory: keep one, retire the other. YOU pick which survives (keep) and which is retired (drop) after judging they are the same fact — never let the tool infer it, because near-dup similarity is topical, not factual (a contradicting correction about the same subsystem scores high too). keep inherits drop's unique relationships (so no graph knowledge is lost) and drop is superseded — marked and disconnected — atomically. Pair this with find_duplicate_memories: scan for pairs, judge them, consolidate the true duplicates. Errors unless both are live (non-superseded) Memory nodes in the write scope and keep != drop."
+        description = "Consolidate a near-duplicate PAIR into one memory: keep one, retire the other. YOU pick which survives (keep) and which is retired (drop) after judging they are the same fact — never let the tool infer it, because near-dup similarity is topical, not factual (a contradicting correction about the same subsystem scores high too). keep inherits drop's unique relationships (so no graph knowledge is lost) and drop is superseded — marked and disconnected — atomically. Pair this with find_duplicate_memories: scan for pairs, judge them, consolidate the true duplicates. Errors unless both are live (non-superseded, non-forgotten) Memory nodes in the write scope and keep != drop."
     )]
     fn consolidate_memories(
         &self,

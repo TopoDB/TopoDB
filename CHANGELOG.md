@@ -18,6 +18,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`RecallQuery.tombstone_props` / `Db::search_text_live` takes a prop SET** — tombstone filtering generalizes from one prop (`tombstone_prop: Option<String>`) to any number (`tombstone_props: Vec<String>` / `&[&str]`): a candidate is dropped when ANY listed prop holds an `Int` timestamp `<=` the query's effective now. Per-prop semantics unchanged (future marks kept, non-`Int` values ignored, filtered before top-k, never access-bumped). **Breaking for struct-literal construction** of `RecallQuery` and for `search_text_live` callers — pass `vec![prop]` / `&[prop]` for the old behavior.
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
 - **`Db::search_vector_unbumped`** — cosine vector search with the same population, order, and scores as `search_vector`, but WITHOUT bumping access counters. For maintenance and advisory reads (near-duplicate checks) that must not spend the recency signal they exist to protect — the same rationale as `search_text_unbumped`. One shared implementation with the bumping variant.
 - **`Db::search_text_live`** — `search_text_with` plus a liveness filter: a candidate whose named tombstone prop holds an `Int` timestamp `<=` "now" (`options.now_ms`, else wall clock) is dropped BEFORE the top-`k` truncation — a retired hit never consumes the result window — and is never access-bumped. Same tombstone semantics as `RecallQuery.tombstone_prop` (a mark in the query's future keeps the node; a non-`Int` value is not a mark), now available to plain BM25 callers.
@@ -323,6 +324,10 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Added
+
+- **`MEMORY_FORGOTTEN_AT_PROP` + `MEMORY_TOMBSTONE_PROPS`** — the second tombstone and the canonical liveness set every surface filters on. `plan_forget(db, write_scope, ids, now_ms)` — strict shared ops builder for the `forget` verb (stamp + close open edges; ANY invalid id rejects the whole call, unlike `plan_supersede`'s skip-if-retired). `memory_props` now also rejects `forgotten_at` as reserved; `existing_memory` excludes forgotten nodes from dedup.
+
 #### Changed
 
 - **Batch unknown-op error hints** — when an unknown `op` field is encountered in a batch command, the error message hints that ops use underscore names (e.g. `create_memory` not `createMemory`).
@@ -447,6 +452,8 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`forget` tool** — soft-retire memories (`ids`, optional `scope`): stamps `forgotten_at` + closes open edges atomically via the same shared planner as the CLI. Strict targets: any invalid id rejects the whole call. Distinct from `remember.supersedes` (replacement) — forget is "never needs to come back".
+- **Liveness is now the shared tombstone set** — `search`, the dedup path, the near-duplicate advisory, and the hygiene scans all treat `forgotten_at` exactly like `superseded_at`.
 - **`get_edges` — `direction` parameter** (enum: `"out"`/`"in"`/`"both"`, default `"out"`). For `"out"` (default), lists the node's outgoing edges as before. For `"in"`, the anchor shifts to the target and `to_id` filters the far source end (incoming edges, mirrored view). For `"both"`, returns an id-deduped union of incoming and outgoing edges.
 
 #### Fixed
@@ -918,10 +925,12 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`forget <id>...`** — soft-retire memories: stamps `forgotten_at` and closes their open edges atomically. Recall and default `search` stop returning them; history stays reachable (`search --include-superseded`, temporal reads). Every id must be a live Memory in the write scope — unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call (exit 2). Output: `{"forgotten": [ids]}`.
 - **`get-edges` — `--direction out|in|both` flag** (default `out`). For `out` (default), lists the node's outgoing edges as before. For `in`, the anchor shifts to the target and `--to` filters the far source end (incoming edges, mirrored view). For `both`, returns an id-deduped union of incoming and outgoing edges.
 
 #### Changed
 
+- **`search --include-superseded` now reveals forgotten memories too** — the flag is the general history switch over the whole tombstone set (`superseded_at`, `forgotten_at`); default search hides both.
 - **`search` now skips superseded memories by default** — a memory retired by `remember --supersedes` (an `Int` `superseded_at` prop in the past) no longer surfaces, consumes the `--k` window, or gets access-bumped; previously raw BM25 could rank a retired memory above its live successor. `--include-superseded` restores the full-history behavior — the same default-liveness shape `get-edges` has with `--open-only`. Matches `topodb-mcp`'s `search` tool, which already filtered supersession via recall's `tombstone_prop`. `find` is untouched: it is an exact-property lookup, not a recall surface.
 - **Audible retry note on lock contention** — when the database remains locked after 500ms of retrying (under the default 3000ms budget or an explicit `--lock-wait-ms`), a stderr note is printed once: `topodb: database held by another process; retrying (budget <N>ms)`.
 
