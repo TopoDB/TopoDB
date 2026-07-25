@@ -147,7 +147,18 @@ fn main() {
             normalized,
             cli.pretty,
         ),
-        Command::Search { query, k } => search(&db, default_scope, &query, k, cli.pretty),
+        Command::Search {
+            query,
+            k,
+            include_superseded,
+        } => search(
+            &db,
+            default_scope,
+            &query,
+            k,
+            include_superseded,
+            cli.pretty,
+        ),
         Command::Traverse {
             seed,
             max_hops,
@@ -276,9 +287,31 @@ fn find(
     output::ok(&serde_json::Value::Array(nodes), pretty);
 }
 
-fn search(db: &Db, scope: Scope, query: &str, k: usize, pretty: bool) -> ! {
+fn search(
+    db: &Db,
+    scope: Scope,
+    query: &str,
+    k: usize,
+    include_superseded: bool,
+    pretty: bool,
+) -> ! {
     let scopes = topodb_json::scope_to_scope_set(scope);
-    let hits = match db.search_text(&scopes, query, k) {
+    // Search is a recall surface: memories retired by `remember --supersedes`
+    // are dropped by default (before top-k, unbumped), matching the MCP
+    // server's `search_memories`. `--include-superseded` restores raw BM25
+    // over the full history.
+    let hits = if include_superseded {
+        db.search_text(&scopes, query, k)
+    } else {
+        db.search_text_live(
+            &scopes,
+            query,
+            k,
+            &topodb::SearchOptions::default(),
+            topodb_json::MEMORY_SUPERSEDED_AT_PROP,
+        )
+    };
+    let hits = match hits {
         Ok(hits) => hits,
         Err(e) => output::fail_engine(&e),
     };

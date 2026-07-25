@@ -155,13 +155,19 @@ pub enum Command {
         #[arg(long)]
         normalized: bool,
     },
-    /// Full-text BM25 search over indexed text properties.
+    /// Full-text BM25 search over indexed text properties. Memories retired
+    /// by `remember --supersedes` are skipped by default; pass
+    /// `--include-superseded` to search history too.
     Search {
         /// The search query.
         query: String,
         /// Max hits to return.
         #[arg(long, default_value_t = 10)]
         k: usize,
+        /// Also return superseded (retired) memories — the history escape
+        /// hatch, same shape as `get-edges --open-only false`.
+        #[arg(long)]
+        include_superseded: bool,
     },
     /// Bounded BFS from a seed node, following edges up to `max_hops`.
     Traverse {

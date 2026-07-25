@@ -2081,3 +2081,77 @@ fn get_edges_direction() {
         "E should have no open incoming edges (closed)"
     );
 }
+
+/// `search` is a recall surface: a memory retired by `--supersedes` must not
+/// come back (nor outrank its live successor). `--include-superseded` is the
+/// history escape hatch — same default-liveness shape `get-edges` has with
+/// `open_only`.
+#[test]
+fn search_skips_superseded_by_default_with_include_superseded_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let old: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "vega uses postgres",
+            "--entity",
+            "vega",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let old_id = old["memory_id"].as_str().unwrap();
+    let new: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "vega uses sqlite now",
+            "--entity",
+            "vega",
+            "--supersedes",
+            old_id,
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let new_id = new["memory_id"].as_str().unwrap();
+
+    let ids = |out: std::process::Output| -> Vec<String> {
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["node"]["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let live = ids(run(&["search", "vega postgres sqlite"]));
+    assert!(live.contains(&new_id.to_string()), "live successor found");
+    assert!(
+        !live.contains(&old_id.to_string()),
+        "retired memory must not surface by default"
+    );
+
+    let all = ids(run(&[
+        "search",
+        "vega postgres sqlite",
+        "--include-superseded",
+    ]));
+    assert!(
+        all.contains(&old_id.to_string()),
+        "escape hatch shows history"
+    );
+    assert!(all.contains(&new_id.to_string()));
+}
