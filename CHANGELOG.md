@@ -872,6 +872,11 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   node ids. Nodes without the opt-in produce byte-identical `claude -p`
   invocations to before. A graph opting in without the flag fails validation
   at the gate, not mid-run.
+- **Plugin `$SGH_MCP` helper** — `sgh-env.sh` now composes and exports `SGH_MCP`, the ready-made value for `sgh run --agent-mcp`: an absolute `topodb-mcp` binary (resolution mirrors `$SGH_BIN`: override, in-repo release, PATH, cargo bin dir) plus a per-project agent-memory database derived from `$SGH_DB` (`<same path>-memory.redb`, so an `SGH_DB` override keeps the pair together), with `--scope shared --embeddings off`. A missing `topodb-mcp` leaves `SGH_MCP` unset with a stderr note instead of failing — MCP is per-node opt-in, and graphs without opted-in nodes must keep working.
+
+#### Fixed
+
+- **`sgh validate` prints failures without a preceding success line** — the `--agent-mcp` rail and pairing checks now run before "valid: N node(s)" prints, so a failing validate no longer emits success-then-error.
 
 ---
 
