@@ -42,7 +42,8 @@ fn main() {
         Command::CreateMemory { scope, .. }
         | Command::CreateEntity { scope, .. }
         | Command::Link { scope, .. }
-        | Command::Remember { scope, .. } => resolve_cmd_scope(scope.as_deref(), default_scope),
+        | Command::Remember { scope, .. }
+        | Command::Forget { scope, .. } => resolve_cmd_scope(scope.as_deref(), default_scope),
         _ => default_scope,
     };
 
@@ -132,6 +133,7 @@ fn main() {
             props.as_deref(),
             cli.pretty,
         ),
+        Command::Forget { ids, .. } => forget(&db, write_scope, &ids, cli.pretty),
         Command::Get { id } => get(&db, default_scope, &id, cli.pretty),
         Command::Find {
             label,
@@ -299,7 +301,8 @@ fn search(
     // Search is a recall surface: memories retired by `remember --supersedes`
     // are dropped by default (before top-k, unbumped), matching the MCP
     // server's `search_memories`. `--include-superseded` restores raw BM25
-    // over the full history.
+    // over the full history. Forgotten memories are also dropped from default
+    // search (same liveness model as superseded).
     let hits = if include_superseded {
         db.search_text(&scopes, query, k)
     } else {
@@ -308,7 +311,10 @@ fn search(
             query,
             k,
             &topodb::SearchOptions::default(),
-            &[topodb_json::MEMORY_SUPERSEDED_AT_PROP],
+            &[
+                topodb_json::MEMORY_SUPERSEDED_AT_PROP,
+                topodb_json::MEMORY_FORGOTTEN_AT_PROP,
+            ],
         )
     };
     let hits = match hits {
@@ -784,6 +790,24 @@ fn remember(
         }),
         pretty,
     );
+}
+
+/// Soft-retire memories: plan via `topodb_json::plan_forget` (strict — any
+/// invalid id rejects the whole call), submit the one batch, echo the ids.
+fn forget(db: &Db, scope: Scope, ids: &[String], pretty: bool) -> ! {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let (ops, forgotten) = match topodb_json::plan_forget(db, scope, ids, now) {
+        Ok(plan) => plan,
+        Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
+        Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
+    };
+    if let Err(e) = db.submit(ops) {
+        output::fail_engine(&e);
+    }
+    output::ok(&serde_json::json!({ "forgotten": forgotten }), pretty);
 }
 
 fn set_props(db: &Db, id: &str, props: &str, pretty: bool) -> ! {
