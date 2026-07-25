@@ -399,3 +399,108 @@ fn stale_analyzer_version_triggers_fts_rebuild_on_open() {
     assert_eq!(hits.len(), 1, "stale analyzer stamp must force a rebuild");
     assert_eq!(hits[0].0.id, a);
 }
+
+fn superseded_memory(content: &str, scope: Scope, superseded_at: i64) -> (NodeId, Op) {
+    let id = NodeId::new();
+    let mut props = Props::new();
+    props.insert("content".into(), PropValue::Str(content.into()));
+    props.insert("superseded_at".into(), PropValue::Int(superseded_at));
+    (
+        id,
+        Op::CreateNode {
+            id,
+            scope,
+            label: "Memory".into(),
+            props,
+        },
+    )
+}
+
+/// The liveness filter must run BEFORE top-k truncation (a dead hit must not
+/// consume the k window), and the tombstone is a timestamp: a mark in the
+/// query's future keeps the node (same semantics as `recall`'s
+/// `tombstone_prop`). Ranking premise: `dead` matches all three query terms,
+/// `future` two, `live` one — strictly descending BM25.
+#[test]
+fn search_text_live_drops_tombstoned_hits_before_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (dead, op_dead) = superseded_memory("alpha beta gamma", Scope::Id(s), 1_000);
+    let (future, op_future) = superseded_memory("alpha beta", Scope::Id(s), 3_000);
+    let (live, op_live) = memory("alpha", Scope::Id(s));
+    db.submit(vec![op_dead, op_future, op_live]).unwrap();
+
+    // Raw search still sees everything; `dead` outranks all (premise check).
+    let raw = db.search_text(&scopes, "alpha beta gamma", 1).unwrap();
+    assert_eq!(raw[0].0.id, dead);
+
+    // now = 2000 sits between the two marks: `dead` (1000) is gone, `future`
+    // (3000) survives — and fills the k=1 window `dead` would have eaten.
+    let now2000 = SearchOptions {
+        now_ms: Some(2_000),
+        ..SearchOptions::default()
+    };
+    let hits = db
+        .search_text_live(&scopes, "alpha beta gamma", 1, &now2000, "superseded_at")
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.id, future);
+
+    let hits = db
+        .search_text_live(&scopes, "alpha beta gamma", 3, &now2000, "superseded_at")
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+        vec![future, live]
+    );
+
+    // Default options read the wall clock: both millisecond-era marks are in
+    // the past, so only the unmarked node survives.
+    let hits = db
+        .search_text_live(
+            &scopes,
+            "alpha beta gamma",
+            3,
+            &SearchOptions::default(),
+            "superseded_at",
+        )
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+        vec![live]
+    );
+}
+
+/// A non-Int value under the tombstone prop is not a tombstone — the node is
+/// kept (mirrors `recall`, which only drops `PropValue::Int` marks).
+#[test]
+fn search_text_live_keeps_nodes_with_non_int_tombstone_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let id = NodeId::new();
+    let mut props = Props::new();
+    props.insert("content".into(), PropValue::Str("delta epsilon".into()));
+    props.insert("superseded_at".into(), PropValue::Str("not-a-mark".into()));
+    db.submit(vec![Op::CreateNode {
+        id,
+        scope: Scope::Id(s),
+        label: "Memory".into(),
+        props,
+    }])
+    .unwrap();
+
+    let hits = db
+        .search_text_live(
+            &ScopeSet::of(&[s]),
+            "delta",
+            10,
+            &SearchOptions::default(),
+            "superseded_at",
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.id, id);
+}

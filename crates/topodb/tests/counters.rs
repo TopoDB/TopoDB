@@ -426,3 +426,65 @@ fn search_vector_unbumped_leaves_access_counters_untouched() {
         "search_vector_unbumped must not bump access counters"
     );
 }
+
+/// A hit dropped by `search_text_live`'s tombstone filter was never recalled —
+/// its access counter must not move. The live hit from the SAME call is
+/// bumped; both bumps would ride the same flush, so once the live node's
+/// count is visible, the dead node's still-zero stats are a real absence,
+/// not an unflushed one.
+#[test]
+fn search_text_live_does_not_bump_filtered_tombstoned_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+
+    let (live, dead) = (NodeId::new(), NodeId::new());
+    let mut live_props = Props::new();
+    live_props.insert("content".into(), PropValue::Str("zeta corpus".into()));
+    let mut dead_props = Props::new();
+    dead_props.insert("content".into(), PropValue::Str("zeta corpus".into()));
+    dead_props.insert("superseded_at".into(), PropValue::Int(1_000));
+    db.submit(vec![
+        Op::CreateNode {
+            id: live,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: live_props,
+        },
+        Op::CreateNode {
+            id: dead,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: dead_props,
+        },
+    ])
+    .unwrap();
+
+    let hits = db
+        .search_text_live(
+            &scopes,
+            "zeta",
+            10,
+            &SearchOptions::default(),
+            "superseded_at",
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.id, live);
+
+    let live_stats = wait_for_count(&db, &scopes, live, 1);
+    assert!(live_stats.access_count >= 1);
+    assert_eq!(
+        db.access_stats(&scopes, dead).unwrap(),
+        Some(AccessStats::default()),
+        "a tombstone-filtered hit must not be access-bumped"
+    );
+}
