@@ -474,7 +474,7 @@ fn search_text_live_does_not_bump_filtered_tombstoned_nodes() {
             "zeta",
             10,
             &SearchOptions::default(),
-            "superseded_at",
+            &["superseded_at"],
         )
         .unwrap();
     assert_eq!(hits.len(), 1);

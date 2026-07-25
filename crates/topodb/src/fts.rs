@@ -1064,7 +1064,7 @@ impl Db {
         options: &SearchOptions,
         expansions: &[(String, Vec<String>)],
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
-        self.search_text_expanded_internal(scopes, query, k, options, expansions, true, None)
+        self.search_text_expanded_internal(scopes, query, k, options, expansions, true, &[])
     }
 
     /// [`Db::search_text_expanded`] without bumping access counters. For
@@ -1085,35 +1085,27 @@ impl Db {
             &SearchOptions::default(),
             &[],
             false,
-            None,
+            &[],
         )
     }
 
-    /// [`Db::search_text_with`] plus a liveness filter: a candidate whose
-    /// `tombstone_prop` holds an `Int` timestamp `<=` "now" is dropped BEFORE
+    /// [`Db::search_text_with`] plus a liveness filter: a candidate whose ANY
+    /// listed prop holds an `Int` timestamp `<=` "now" is dropped BEFORE
     /// the top-`k` truncation — a retired hit never consumes the result
     /// window — and is never access-bumped (a hit the caller can't see was
     /// not a recall). "now" is `options.now_ms`, falling back to the wall
     /// clock; the mark is a timestamp, so one in the query's future keeps the
-    /// node. Same tombstone semantics as [`crate::RecallQuery::tombstone_prop`]:
-    /// a non-`Int` value under the prop is not a mark.
+    /// node. Same tombstone semantics as [`crate::RecallQuery::tombstone_props`]:
+    /// a non-`Int` value under a prop is not a mark.
     pub fn search_text_live(
         &self,
         scopes: &ScopeSet,
         query: &str,
         k: usize,
         options: &SearchOptions,
-        tombstone_prop: &str,
+        tombstone_props: &[&str],
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
-        self.search_text_expanded_internal(
-            scopes,
-            query,
-            k,
-            options,
-            &[],
-            true,
-            Some(tombstone_prop),
-        )
+        self.search_text_expanded_internal(scopes, query, k, options, &[], true, tombstone_props)
     }
 
     /// Internal implementation of text search with a `bump` flag to control
@@ -1129,7 +1121,7 @@ impl Db {
         options: &SearchOptions,
         expansions: &[(String, Vec<String>)],
         bump: bool,
-        tombstone_prop: Option<&str>,
+        tombstone_props: &[&str],
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if k == 0 {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
@@ -1296,7 +1288,7 @@ impl Db {
         // Tombstone clock, resolved once per call and only when filtering is
         // requested (like `recency_now` above, tombstone-less callers never
         // touch the wall clock).
-        let tombstone_now = tombstone_prop.map(|_| {
+        let tombstone_now = (!tombstone_props.is_empty()).then(|| {
             options.now_ms.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1326,8 +1318,10 @@ impl Db {
                     // query's "now" before it can reach the top-k window (or
                     // the bump below). A mark in the future is kept —
                     // supersession dates a fact, it doesn't erase its history.
-                    if let (Some(prop), Some(now)) = (tombstone_prop, tombstone_now) {
-                        if matches!(rec.props.get(prop), Some(PropValue::Int(ts)) if *ts <= now) {
+                    if let Some(now) = tombstone_now {
+                        if tombstone_props.iter().any(|prop| {
+                            matches!(rec.props.get(*prop), Some(PropValue::Int(ts)) if *ts <= now)
+                        }) {
                             continue;
                         }
                     }

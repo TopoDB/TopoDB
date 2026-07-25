@@ -813,7 +813,7 @@ fn tombstone_prop_excludes_a_memory_only_as_of_the_mark() {
         .unwrap();
 
     let query = |now: i64| RecallQuery {
-        tombstone_prop: Some("superseded_at".to_string()),
+        tombstone_props: vec!["superseded_at".to_string()],
         options: SearchOptions {
             now_ms: Some(now),
             ..SearchOptions::default()
@@ -842,5 +842,51 @@ fn tombstone_prop_excludes_a_memory_only_as_of_the_mark() {
     assert!(
         before.contains(&a_id),
         "an as_of before the supersession still sees the old fact (history preserved)"
+    );
+}
+
+/// RecallQuery.tombstone_props: any listed prop retires its node.
+#[test]
+fn recall_drops_candidates_tombstoned_by_any_listed_prop() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let mk = |content: &str, prop: Option<(&str, i64)>| {
+        let id = NodeId::new();
+        let mut props = Props::new();
+        props.insert("content".into(), PropValue::Str(content.into()));
+        if let Some((k, ts)) = prop {
+            props.insert(k.into(), PropValue::Int(ts));
+        }
+        (
+            id,
+            Op::CreateNode {
+                id,
+                scope: Scope::Id(s),
+                label: "Memory".into(),
+                props,
+            },
+        )
+    };
+    let (_sup, a) = mk("mu nu xi", Some(("superseded_at", 1_000)));
+    let (_forg, b) = mk("mu nu xi", Some(("forgotten_at", 1_000)));
+    let (live, c) = mk("mu nu", None);
+    db.submit(vec![a, b, c]).unwrap();
+
+    let q = RecallQuery {
+        tombstone_props: vec!["superseded_at".to_string(), "forgotten_at".to_string()],
+        ..RecallQuery::new(ScopeSet::of(&[s]), "mu", 10)
+    };
+    let hits = db.recall(&q).unwrap();
+    assert_eq!(
+        hits.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+        vec![live]
     );
 }

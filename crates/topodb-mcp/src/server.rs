@@ -2913,7 +2913,7 @@ impl TopoServer {
             labels: Some(p.labels.clone()),
             // Drop memories retired by `remember`'s supersedes; an `as_of`
             // before the retirement still sees them (the mark is a timestamp).
-            tombstone_prop: Some(convert::MEMORY_SUPERSEDED_AT_PROP.to_string()),
+            tombstone_props: vec![convert::MEMORY_SUPERSEDED_AT_PROP.to_string()],
             text_weight: p.text_weight,
             vector_weight: p.vector_weight,
             graph_weight: p.graph_weight,
