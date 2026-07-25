@@ -1740,6 +1740,25 @@ struct RememberResult {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ForgetParams {
+    /// Memory ULIDs to forget. Every id must be a live Memory in the write
+    /// scope; any invalid id (unknown, non-Memory, already forgotten,
+    /// already superseded) rejects the whole call.
+    #[schemars(length(min = 1))]
+    ids: Vec<String>,
+    /// Write scope: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ForgetResult {
+    /// The ULIDs marked forgotten by this call, in request order.
+    forgotten: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CreateMemoryParams {
     /// The memory's full-text-searchable body.
@@ -2911,9 +2930,12 @@ impl TopoServer {
             graph_boost: p.graph_boost,
             options,
             labels: Some(p.labels.clone()),
-            // Drop memories retired by `remember`'s supersedes; an `as_of`
+            // Drop memories retired by `remember`'s supersedes or forgotten by `forget`; an `as_of`
             // before the retirement still sees them (the mark is a timestamp).
-            tombstone_props: vec![convert::MEMORY_SUPERSEDED_AT_PROP.to_string()],
+            tombstone_props: vec![
+                convert::MEMORY_SUPERSEDED_AT_PROP.to_string(),
+                convert::MEMORY_FORGOTTEN_AT_PROP.to_string(),
+            ],
             text_weight: p.text_weight,
             vector_weight: p.vector_weight,
             graph_weight: p.graph_weight,
@@ -3189,6 +3211,23 @@ impl TopoServer {
             superseded: plan.superseded,
             near_duplicates,
         }))
+    }
+
+    #[tool(
+        description = "Soft-retire memories you judge not worth keeping: stamps forgotten_at and closes their open edges, atomically. Recall and search stop returning them as of the stamp; history remains (an as_of before the stamp still sees them) and nothing is deleted. Distinct from remember's supersedes — supersede says a fact was REPLACED by a newer one; forget says it never needs to come back. Every id must be a live Memory in the write scope: unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call. YOU decide what is forgotten — never infer it from staleness alone without reviewing the memory."
+    )]
+    fn forget(
+        &self,
+        Parameters(p): Parameters<ForgetParams>,
+    ) -> Result<Json<ForgetResult>, ErrorData> {
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let (ops, forgotten) =
+            convert::plan_forget(&self.db, scope, &p.ids, now_ms()).map_err(|e| match e {
+                convert::ComposeError::Invalid(m) => ErrorData::invalid_params(m, None),
+                convert::ComposeError::Engine(t) => classify_topo_error(t),
+            })?;
+        self.submit_write(ops)?;
+        Ok(Json(ForgetResult { forgotten }))
     }
 
     #[tool(
