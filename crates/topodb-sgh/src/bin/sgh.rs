@@ -147,6 +147,29 @@ fn mcp_nodes(v: &Validated) -> Vec<String> {
         .collect()
 }
 
+/// The gate's MCP echo block, one line per entry (the caller prints the
+/// separating blank line). A graph with no opted-in nodes still gets the
+/// header plus the inert-flag note — the flag WAS passed, and silence would
+/// hide that it does nothing for this graph.
+fn mcp_gate_lines(v: &Validated, server_cmd: &str) -> Vec<String> {
+    let nodes = mcp_nodes(v);
+    let mut lines = vec![
+        "Agent-node MCP server (additive; agent prompts are ungated):".to_string(),
+        format!("  {}", server_cmd),
+    ];
+    if nodes.is_empty() {
+        lines.push(
+            "  tools: mcp__topodb -> no node opts in (flag is inert for this graph)".to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "  tools: mcp__topodb -> nodes: {}",
+            nodes.join(", ")
+        ));
+    }
+    lines
+}
+
 /// The pairing rule: a graph whose nodes opt into `tools: [topodb]` cannot
 /// run (or validate clean) without `--agent-mcp` supplying the server —
 /// failing here, at the gate, beats failing mid-run inside a model call.
@@ -329,17 +352,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let g = Graph::from_yaml(&src)?;
             match validate(&g) {
                 Ok(v) => {
-                    println!("valid: {} node(s)", v.graph.nodes.len());
-                    println!("{}", worst_case(&v));
-                    let commands = command_preview(&v);
-                    if !commands.is_empty() {
-                        println!("command nodes ({}):", commands.len());
-                        for line in &commands {
-                            println!("  {line}");
-                        }
-                    }
-                    print_unconstrained(&v);
-
                     if let Some(cmd) = &agent_mcp {
                         if let Err(e) = topodb_sgh::runner::claude::validate_mcp_server_command(cmd)
                         {
@@ -351,6 +363,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("error: {err}");
                         std::process::exit(2);
                     }
+                    println!("valid: {} node(s)", v.graph.nodes.len());
+                    println!("{}", worst_case(&v));
+                    let commands = command_preview(&v);
+                    if !commands.is_empty() {
+                        println!("command nodes ({}):", commands.len());
+                        for line in &commands {
+                            println!("  {line}");
+                        }
+                    }
+                    print_unconstrained(&v);
                 }
                 Err(errors) => {
                     for e in &errors {
@@ -464,13 +486,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Some(cmd) = &agent_mcp {
-                    let nodes = mcp_nodes(&current);
-                    println!("\nAgent-node MCP server (additive; agent prompts are ungated):");
-                    println!("  {cmd}");
-                    if nodes.is_empty() {
-                        println!("  tools: mcp__topodb -> no node opts in (flag is inert for this graph)");
-                    } else {
-                        println!("  tools: mcp__topodb -> nodes: {}", nodes.join(", "));
+                    println!();
+                    for line in mcp_gate_lines(&current, cmd) {
+                        println!("{line}");
                     }
                 }
 
@@ -972,5 +990,64 @@ mod tests {
             "a genuine failure must dominate even when a gate also blocked"
         );
         assert_eq!(exit_code(&outcome), 1);
+    }
+
+    #[test]
+    fn agent_mcp_flag_rejects_repeats_on_run_subcommand() {
+        use clap::Parser;
+        let result = Cli::try_parse_from(vec![
+            "sgh",
+            "run",
+            "graph.yaml",
+            "--agent-mcp",
+            "cmd1",
+            "--agent-mcp",
+            "cmd2",
+        ]);
+        assert!(result.is_err(), "repeated --agent-mcp must be rejected");
+    }
+
+    #[test]
+    fn agent_mcp_flag_rejects_repeats_on_validate_subcommand() {
+        use clap::Parser;
+        let result = Cli::try_parse_from(vec![
+            "sgh",
+            "validate",
+            "graph.yaml",
+            "--agent-mcp",
+            "cmd1",
+            "--agent-mcp",
+            "cmd2",
+        ]);
+        assert!(result.is_err(), "repeated --agent-mcp must be rejected");
+    }
+
+    #[test]
+    fn mcp_gate_lines_formats_output_correctly_with_opted_in_nodes() {
+        let v = graph_with_tools(&["topodb"]);
+        let lines = mcp_gate_lines(&v, "/abs/topodb-mcp --db /tmp/m.redb");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "Agent-node MCP server (additive; agent prompts are ungated):"
+        );
+        assert_eq!(lines[1], "  /abs/topodb-mcp --db /tmp/m.redb");
+        assert_eq!(lines[2], "  tools: mcp__topodb -> nodes: a");
+    }
+
+    #[test]
+    fn mcp_gate_lines_formats_output_correctly_without_opted_in_nodes() {
+        let v = graph_with_tools(&[]);
+        let lines = mcp_gate_lines(&v, "/abs/topodb-mcp --db /tmp/m.redb");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "Agent-node MCP server (additive; agent prompts are ungated):"
+        );
+        assert_eq!(lines[1], "  /abs/topodb-mcp --db /tmp/m.redb");
+        assert_eq!(
+            lines[2],
+            "  tools: mcp__topodb -> no node opts in (flag is inert for this graph)"
+        );
     }
 }
