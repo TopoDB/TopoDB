@@ -159,9 +159,9 @@ pub fn find_existing_entity(
 
 /// The id of a Memory in `write_scope` whose normalized content equals
 /// `content`. Hash-bucket lookup, then exact normalized-content verify on
-/// every candidate; oldest id wins. Superseded memories (those with a
-/// `superseded_at` timestamp) are excluded — re-learning a retired fact is
-/// a NEW fact, and the tombstone's `as_of` history stays intact.
+/// every candidate; oldest id wins. Superseded or forgotten memories …
+/// are excluded — re-learning a retired fact is a NEW fact, and the
+/// tombstone's `as_of` history stays intact.
 pub fn existing_memory(
     db: &Db,
     write_scope: Scope,
@@ -179,7 +179,9 @@ pub fn existing_memory(
     Ok(candidates
         .into_iter()
         .filter(|n| {
-            !n.props.contains_key(MEMORY_SUPERSEDED_AT_PROP)
+            crate::MEMORY_TOMBSTONE_PROPS
+                .iter()
+                .all(|p| !n.props.contains_key(*p))
                 && matches!(n.props.get(MEMORY_CONTENT_PROP), Some(PropValue::Str(c)) if normalize_content(c) == want)
         })
         .min_by_key(|n| n.id)

@@ -435,9 +435,11 @@ impl TopoServer {
         let mut scored: Vec<(NodeRecord, String, f64, usize)> = hits
             .into_iter()
             .filter_map(|(n, _)| {
-                // Skip non-Memory labels and superseded nodes.
+                // Skip non-Memory labels and superseded or forgotten nodes.
                 if n.label != MEMORY_LABEL
-                    || n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
+                    || convert::MEMORY_TOMBSTONE_PROPS
+                        .iter()
+                        .any(|p| n.props.contains_key(*p))
                 {
                     return None;
                 }
@@ -509,7 +511,9 @@ impl TopoServer {
                     .filter(|(n, score)| {
                         *score >= NEAR_DUP_REVIEW
                             && n.label == MEMORY_LABEL
-                            && !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP)
+                            && convert::MEMORY_TOMBSTONE_PROPS
+                                .iter()
+                                .all(|p| !n.props.contains_key(*p))
                     })
                     .map(|(n, score)| {
                         let existing = match n.props.get(MEMORY_CONTENT_PROP) {
@@ -2314,13 +2318,17 @@ impl TopoServer {
             let model = self.embedder.model_name();
 
             // Candidates: Memory nodes carrying a same-model embedding that are NOT
-            // already retired. Superseded memories are excluded — they were retired
-            // on purpose, so re-flagging them as duplicates is noise.
+            // already retired. Superseded or forgotten memories are excluded — they
+            // were retired on purpose, so re-flagging them as duplicates is noise.
             let mut candidates: Vec<(String, String, Vec<f32>)> = self
                 .db
                 .nodes_by_label_unbumped(scope_set, MEMORY_LABEL)
                 .into_iter()
-                .filter(|n| !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP))
+                .filter(|n| {
+                    convert::MEMORY_TOMBSTONE_PROPS
+                        .iter()
+                        .all(|p| !n.props.contains_key(*p))
+                })
                 .filter_map(|n| {
                     let (m, v) = n.embedding?;
                     if m != model {
@@ -2385,13 +2393,17 @@ impl TopoServer {
         }
 
         // Text fallback: use token containment when embeddings are not ready.
-        // Enumerate all live, non-superseded memories using the same non-bumping scan
-        // so `scanned` semantics match the vector path.
+        // Enumerate all live, non-superseded, non-forgotten memories using the same
+        // non-bumping scan so `scanned` semantics match the vector path.
         let mut text_candidates: Vec<(String, String)> = self
             .db
             .nodes_by_label_unbumped(scope_set, MEMORY_LABEL)
             .into_iter()
-            .filter(|n| !n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP))
+            .filter(|n| {
+                convert::MEMORY_TOMBSTONE_PROPS
+                    .iter()
+                    .all(|p| !n.props.contains_key(*p))
+            })
             .filter_map(|n| {
                 let content = match n.props.get(MEMORY_CONTENT_PROP) {
                     Some(PropValue::Str(c)) => c.clone(),
@@ -2487,9 +2499,12 @@ impl TopoServer {
                     None,
                 ));
             }
-            if node.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+            if convert::MEMORY_TOMBSTONE_PROPS
+                .iter()
+                .any(|p| node.props.contains_key(*p))
+            {
                 return Err(ErrorData::invalid_params(
-                    format!("{role} id {raw} is already superseded"),
+                    format!("{role} id {raw} is already superseded or forgotten"),
                     None,
                 ));
             }
@@ -2586,7 +2601,10 @@ impl TopoServer {
         // list is bounded.
         for n in self.db.nodes_by_label_unbumped(scope_set, MEMORY_LABEL) {
             // Retired memories have closed edges by design — not orphans.
-            if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+            if convert::MEMORY_TOMBSTONE_PROPS
+                .iter()
+                .any(|p| n.props.contains_key(*p))
+            {
                 continue;
             }
             scanned += 1;
@@ -2667,7 +2685,10 @@ impl TopoServer {
         // very last_accessed_at we read, making the whole store look fresh on the
         // next scan.
         for n in self.db.nodes_by_label_unbumped(scope_set, MEMORY_LABEL) {
-            if n.props.contains_key(convert::MEMORY_SUPERSEDED_AT_PROP) {
+            if convert::MEMORY_TOMBSTONE_PROPS
+                .iter()
+                .any(|p| n.props.contains_key(*p))
+            {
                 continue;
             }
             scanned += 1;
@@ -2932,10 +2953,10 @@ impl TopoServer {
             labels: Some(p.labels.clone()),
             // Drop memories retired by `remember`'s supersedes or forgotten by `forget`; an `as_of`
             // before the retirement still sees them (the mark is a timestamp).
-            tombstone_props: vec![
-                convert::MEMORY_SUPERSEDED_AT_PROP.to_string(),
-                convert::MEMORY_FORGOTTEN_AT_PROP.to_string(),
-            ],
+            tombstone_props: convert::MEMORY_TOMBSTONE_PROPS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             text_weight: p.text_weight,
             vector_weight: p.vector_weight,
             graph_weight: p.graph_weight,

@@ -311,10 +311,7 @@ fn search(
             query,
             k,
             &topodb::SearchOptions::default(),
-            &[
-                topodb_json::MEMORY_SUPERSEDED_AT_PROP,
-                topodb_json::MEMORY_FORGOTTEN_AT_PROP,
-            ],
+            &topodb_json::MEMORY_TOMBSTONE_PROPS,
         )
     };
     let hits = match hits {

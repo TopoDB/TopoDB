@@ -2237,3 +2237,56 @@ fn forget_retires_a_memory_and_rejects_invalid_targets() {
         );
     }
 }
+
+/// Forgotten memories obey the same read-side liveness as superseded ones:
+/// hidden from default search, revealed by --include-superseded, and
+/// re-remembering identical content mints a FRESH live memory (no dedup
+/// resurrection of the tombstoned node).
+#[test]
+fn forgotten_memories_share_superseded_read_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let stored: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "ceres uses etcd",
+            "--entity",
+            "ceres",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let mem = stored["memory_id"].as_str().unwrap().to_string();
+    assert!(run(&["forget", &mem]).status.success());
+
+    let all: serde_json::Value =
+        serde_json::from_slice(&run(&["search", "ceres etcd", "--include-superseded"]).stdout)
+            .unwrap();
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["node"]["id"].as_str() == Some(mem.as_str())),
+        "history switch must reveal forgotten memories"
+    );
+
+    let again: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "ceres uses etcd",
+            "--entity",
+            "ceres",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(again["deduplicated"], false, "no dedup to a forgotten node");
+    assert_ne!(again["memory_id"].as_str().unwrap(), mem);
+}
