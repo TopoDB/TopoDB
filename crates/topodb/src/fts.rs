@@ -1064,7 +1064,7 @@ impl Db {
         options: &SearchOptions,
         expansions: &[(String, Vec<String>)],
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
-        self.search_text_expanded_internal(scopes, query, k, options, expansions, true)
+        self.search_text_expanded_internal(scopes, query, k, options, expansions, true, None)
     }
 
     /// [`Db::search_text_expanded`] without bumping access counters. For
@@ -1078,13 +1078,49 @@ impl Db {
         query: &str,
         k: usize,
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
-        self.search_text_expanded_internal(scopes, query, k, &SearchOptions::default(), &[], false)
+        self.search_text_expanded_internal(
+            scopes,
+            query,
+            k,
+            &SearchOptions::default(),
+            &[],
+            false,
+            None,
+        )
+    }
+
+    /// [`Db::search_text_with`] plus a liveness filter: a candidate whose
+    /// `tombstone_prop` holds an `Int` timestamp `<=` "now" is dropped BEFORE
+    /// the top-`k` truncation — a retired hit never consumes the result
+    /// window — and is never access-bumped (a hit the caller can't see was
+    /// not a recall). "now" is `options.now_ms`, falling back to the wall
+    /// clock; the mark is a timestamp, so one in the query's future keeps the
+    /// node. Same tombstone semantics as [`crate::RecallQuery::tombstone_prop`]:
+    /// a non-`Int` value under the prop is not a mark.
+    pub fn search_text_live(
+        &self,
+        scopes: &ScopeSet,
+        query: &str,
+        k: usize,
+        options: &SearchOptions,
+        tombstone_prop: &str,
+    ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
+        self.search_text_expanded_internal(
+            scopes,
+            query,
+            k,
+            options,
+            &[],
+            true,
+            Some(tombstone_prop),
+        )
     }
 
     /// Internal implementation of text search with a `bump` flag to control
     /// whether access counters are bumped. Both `search_text_expanded` and
     /// `search_text_unbumped` use this; the flag preserves the semantic
     /// boundary between advisory reads (maintenance scans) and recall reads.
+    #[allow(clippy::too_many_arguments)]
     fn search_text_expanded_internal(
         &self,
         scopes: &ScopeSet,
@@ -1093,6 +1129,7 @@ impl Db {
         options: &SearchOptions,
         expansions: &[(String, Vec<String>)],
         bump: bool,
+        tombstone_prop: Option<&str>,
     ) -> Result<Vec<(NodeRecord, f32)>, TopoError> {
         if k == 0 {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
@@ -1256,6 +1293,18 @@ impl Db {
             })
         });
 
+        // Tombstone clock, resolved once per call and only when filtering is
+        // requested (like `recency_now` above, tombstone-less callers never
+        // touch the wall clock).
+        let tombstone_now = tombstone_prop.map(|_| {
+            options.now_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before UNIX epoch")
+                    .as_millis() as i64
+            })
+        });
+
         let mut out: Vec<(NodeRecord, f32)> = Vec::with_capacity(scores.len());
         for (slot, score) in scores {
             if let Some(rec) = read_node_by_slot(
@@ -1273,6 +1322,15 @@ impl Db {
                 // is corrupt/desynced from its own postings row, not against
                 // cross-scope leakage.
                 if scopes.contains(rec.scope) {
+                    // Liveness: drop a candidate marked superseded as of this
+                    // query's "now" before it can reach the top-k window (or
+                    // the bump below). A mark in the future is kept —
+                    // supersession dates a fact, it doesn't erase its history.
+                    if let (Some(prop), Some(now)) = (tombstone_prop, tombstone_now) {
+                        if matches!(rec.props.get(prop), Some(PropValue::Int(ts)) if *ts <= now) {
+                            continue;
+                        }
+                    }
                     let score = match recency_now {
                         None => score,
                         Some(now) => {
