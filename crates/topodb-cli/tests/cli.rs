@@ -2167,3 +2167,73 @@ fn search_skips_superseded_by_default_with_include_superseded_escape() {
     );
     assert!(all.contains(&new_id.to_string()));
 }
+
+/// `forget` soft-retires: stamps forgotten_at, closes the memory's open
+/// edges, drops it from default search; history stays reachable.
+#[test]
+fn forget_retires_a_memory_and_rejects_invalid_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let stored: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "orion uses kafka",
+            "--entity",
+            "orion",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let mem = stored["memory_id"].as_str().unwrap().to_string();
+    let ent = stored["entities"][0]["id"].as_str().unwrap().to_string();
+
+    let out = run(&["forget", &mem]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["forgotten"][0].as_str().unwrap(), mem);
+
+    // Stamp visible on the node; open edges closed.
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", &mem]).stdout).unwrap();
+    assert!(got["node"]["props"]["forgotten_at"].is_number());
+    let edges: serde_json::Value =
+        serde_json::from_slice(&run(&["get-edges", &mem]).stdout).unwrap();
+    assert_eq!(
+        edges["edges"].as_array().unwrap().len(),
+        0,
+        "open edges must be closed by forget"
+    );
+
+    // Gone from default search; visible via the history switch.
+    let hits: serde_json::Value =
+        serde_json::from_slice(&run(&["search", "orion kafka"]).stdout).unwrap();
+    assert!(hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|h| h["node"]["id"].as_str() != Some(mem.as_str())));
+
+    // Rejection matrix, each exit 2: repeat-forget, entity target, bogus id.
+    for (args, needle) in [
+        (vec!["forget", mem.as_str()], "already forgotten"),
+        (vec!["forget", ent.as_str()], "not a Memory"),
+        (vec!["forget", "not-a-ulid"], "invalid node id"),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(needle)
+                || String::from_utf8_lossy(&out.stdout).contains(needle),
+            "{needle:?} missing for {args:?}"
+        );
+    }
+}

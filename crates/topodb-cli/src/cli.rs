@@ -130,6 +130,20 @@ pub enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
+    /// Soft-retire memories: stamps `forgotten_at` and closes their open
+    /// edges. Recall and default `search` stop returning them; history
+    /// stays reachable via `search --include-superseded` and temporal reads.
+    /// Every id must be a live Memory in the write scope — any invalid id
+    /// rejects the whole call.
+    Forget {
+        /// Memory ids (ULIDs) to forget.
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Write scope for this command: a scope ULID or "shared".
+        /// Overrides the global --scope.
+        #[arg(long)]
+        scope: Option<String>,
+    },
     /// Fetch one node by id. `{"found":false}` (exit 0) if it doesn't exist
     /// or is out of the default scope — the two are indistinguishable by
     /// design.
