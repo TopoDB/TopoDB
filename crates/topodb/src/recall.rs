@@ -119,14 +119,14 @@ pub struct RecallQuery {
     /// it is almost certainly a caller bug; omit the field to search
     /// unfiltered instead.
     pub labels: Option<Vec<String>>,
-    /// Tombstone filter: when `Some(prop)`, a fused candidate is dropped if it
-    /// carries that integer prop with a value `<=` the query's effective `now`
+    /// Tombstone filter: a fused candidate is dropped if ANY of these props
+    /// holds an integer value `<=` the query's effective `now`
     /// (`options.now_ms`, else wall clock). Used to exclude memories a caller
-    /// has marked superseded, while an `as_of`/`now_ms` set BEFORE the mark
-    /// still sees them — the marker is a timestamp, not a delete. `None` =
-    /// no tombstone filtering (today's behavior). Generic on purpose: the
-    /// engine never names the prop.
-    pub tombstone_prop: Option<String>,
+    /// has marked superseded/forgotten, while an `as_of`/`now_ms` set BEFORE
+    /// the mark still sees them — the marker is a timestamp, not a delete.
+    /// Empty (the default) = no tombstone filtering. Generic on purpose: the
+    /// engine never names the props.
+    pub tombstone_props: Vec<String>,
     /// Text leg's RRF weight. Defaults to `WEIGHT_TEXT`.
     pub text_weight: f32,
     /// Vector leg's RRF weight. Defaults to `WEIGHT_VECTOR`.
@@ -176,7 +176,7 @@ impl RecallQuery {
             graph_boost: true,
             options: SearchOptions::default(),
             labels: None,
-            tombstone_prop: None,
+            tombstone_props: Vec::new(),
             text_weight: WEIGHT_TEXT,
             vector_weight: WEIGHT_VECTOR,
             graph_weight: WEIGHT_GRAPH,
@@ -368,16 +368,17 @@ impl Db {
         // this query's "now". The marker is a timestamp, so an as_of/now_ms set
         // BEFORE the mark keeps the node (its tombstone is in that query's
         // future) — supersession dates a fact, it doesn't erase its history.
-        if let Some(prop) = &q.tombstone_prop {
+        if !q.tombstone_props.is_empty() {
             let now = q.options.now_ms.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0)
             });
-            out.retain(|(n, _)| match n.props.get(prop) {
-                Some(PropValue::Int(ts)) => *ts > now,
-                _ => true,
+            out.retain(|(n, _)| {
+                !q.tombstone_props.iter().any(|prop| {
+                    matches!(n.props.get(prop.as_str()), Some(PropValue::Int(ts)) if *ts <= now)
+                })
             });
         }
         apply_adjustments(

@@ -443,13 +443,13 @@ fn search_text_live_drops_tombstoned_hits_before_truncation() {
         ..SearchOptions::default()
     };
     let hits = db
-        .search_text_live(&scopes, "alpha beta gamma", 1, &now2000, "superseded_at")
+        .search_text_live(&scopes, "alpha beta gamma", 1, &now2000, &["superseded_at"])
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0.id, future);
 
     let hits = db
-        .search_text_live(&scopes, "alpha beta gamma", 3, &now2000, "superseded_at")
+        .search_text_live(&scopes, "alpha beta gamma", 3, &now2000, &["superseded_at"])
         .unwrap();
     assert_eq!(
         hits.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
@@ -464,7 +464,7 @@ fn search_text_live_drops_tombstoned_hits_before_truncation() {
             "alpha beta gamma",
             3,
             &SearchOptions::default(),
-            "superseded_at",
+            &["superseded_at"],
         )
         .unwrap();
     assert_eq!(
@@ -498,9 +498,72 @@ fn search_text_live_keeps_nodes_with_non_int_tombstone_values() {
             "delta",
             10,
             &SearchOptions::default(),
-            "superseded_at",
+            &["superseded_at"],
         )
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0.id, id);
+}
+
+/// The tombstone set: a node is dropped when ANY listed prop marks it dead.
+/// Two nodes, each dead under a DIFFERENT prop, both filtered in one call;
+/// the second prop alone must also work (order-independence).
+#[test]
+fn search_text_live_drops_nodes_tombstoned_by_any_listed_prop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let mk = |content: &str, prop: Option<(&str, i64)>| {
+        let id = NodeId::new();
+        let mut props = Props::new();
+        props.insert("content".into(), PropValue::Str(content.into()));
+        if let Some((k, ts)) = prop {
+            props.insert(k.into(), PropValue::Int(ts));
+        }
+        (
+            id,
+            Op::CreateNode {
+                id,
+                scope: Scope::Id(s),
+                label: "Memory".into(),
+                props,
+            },
+        )
+    };
+    let (_sup, op_a) = mk("kappa lambda", Some(("superseded_at", 1_000)));
+    let (_forg, op_b) = mk("kappa lambda", Some(("forgotten_at", 1_000)));
+    let (live, op_c) = mk("kappa", None);
+    db.submit(vec![op_a, op_b, op_c]).unwrap();
+
+    let both = db
+        .search_text_live(
+            &scopes,
+            "kappa",
+            10,
+            &SearchOptions::default(),
+            &["superseded_at", "forgotten_at"],
+        )
+        .unwrap();
+    assert_eq!(
+        both.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+        vec![live],
+        "either tombstone prop must drop its node"
+    );
+
+    // Only the second prop listed: the superseded node comes back, the
+    // forgotten one stays dead — per-prop filtering, not first-prop-only.
+    let only_forgotten = db
+        .search_text_live(
+            &scopes,
+            "kappa",
+            10,
+            &SearchOptions::default(),
+            &["forgotten_at"],
+        )
+        .unwrap();
+    assert_eq!(only_forgotten.len(), 2);
+    assert!(only_forgotten
+        .iter()
+        .all(|(n, _)| !n.props.contains_key("forgotten_at")));
 }
