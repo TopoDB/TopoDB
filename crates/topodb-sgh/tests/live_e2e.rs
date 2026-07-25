@@ -113,7 +113,15 @@ nodes:
         report.blocked_reasons
     );
     assert_eq!(report.succeeded, vec!["store".to_string()]);
-
+    // Direct assertion: the run store records an Attempt node per FAILED try,
+    // and a permission denial surfaces there as "claude was denied ..." even
+    // when the retry then succeeds (budget retries: 1 would mask it in
+    // `succeeded` alone). Zero recorded attempts = zero denials, unmasked.
+    let attempts = ex.store_ref().attempts("store").unwrap();
+    assert!(
+        attempts.is_empty(),
+        "run succeeded but earlier attempts failed (a denial masked by retry?): {attempts:?}"
+    );
     // The proof: the memory EXISTS in the target db. Open it with the engine
     // crate and full-text search the sentinel. A self-report cannot fake this.
     // Must use open_stored to read the persisted index spec (which has a text index);
