@@ -1,0 +1,118 @@
+# The reference memory-lifecycle loop (F6 Phase D). Three stages:
+#   sweep  — deterministic decay evidence, no model call
+#   judge  — an agent decides AND applies keep/forget + consolidation via
+#            mcp__topodb (requires: sgh run --agent-mcp "$SGH_MCP")
+#   verify — proves the db reflects every claimed action; a self-report
+#            cannot fake it
+# Command nodes read $SGH_TOPODB and $SGH_MEMORY_DB from the environment —
+# source plugins/sgh/lib/sgh-env.sh before running (as /sgh:lifecycle does).
+# The sweep only PROPOSES and the judge acts through explicit tools; no rule
+# in this graph ever stamps a tombstone on its own.
+version: 1
+goal: "Memory lifecycle pass: sweep decay candidates, judge keep/forget and duplicate consolidation, verify the db reflects every verdict"
+nodes:
+  - id: sweep
+    kind: command
+    run: |
+      "$SGH_TOPODB" --db "$SGH_MEMORY_DB" lifecycle-candidates --pretty
+    output:
+      schema:
+        type: array
+    budget: {retries: 1, repairs: 0}
+
+  - id: judge
+    kind: agent
+    needs: [sweep]
+    tools: [topodb]
+    prompt: |
+      You are the memory lifecycle judge. Your input from "sweep" is the
+      decay-candidate list: a JSON array of live memories ranked by staleness
+      (fields: id, content, kind, created_at, last_accessed_at, access_count,
+      staleness; higher staleness = longer unused relative to its kind's
+      half-life).
+
+      Work through this exactly:
+
+      1. Call the find_duplicate_memories tool (default parameters) to get
+         duplicate pairs.
+      2. Judge every decay candidate: keep or forget. Judge the CONTENT on
+         its merits, with staleness as supporting evidence — never forget
+         from staleness alone. Forget only memories whose content is clearly
+         obsolete, overtaken by events, or valueless (e.g. an episodic note
+         about a long-resolved incident). When unsure, keep.
+      3. Judge every duplicate pair: keep-both, or consolidate — choosing
+         which id survives (keep) and which is retired (drop). Consolidate
+         only true duplicates or redundant restatements; keep-both when the
+         two say different things.
+      4. Apply your own verdicts, in this order:
+         a. every consolidate verdict: one consolidate_memories call per
+            pair (keep = the survivor id, drop = the retired id);
+         b. every forget verdict: one forget call listing all forget ids.
+         Never forget an id a consolidation already retired, and never act
+         on an id you decided to keep.
+      5. Reply with ONLY the required JSON object. acted_ids lists every id
+         that should now be retired: all forget ids plus all consolidated
+         drop ids. If there is nothing to act on, reply with empty arrays —
+         do not invent action.
+    output:
+      schema:
+        type: object
+        required: [decay, duplicates, acted_ids]
+        properties:
+          decay:
+            type: array
+            items:
+              type: object
+              required: [id, verdict, rationale]
+              properties:
+                id: {type: string}
+                verdict: {enum: [keep, forget]}
+                rationale: {type: string}
+          duplicates:
+            type: array
+            items:
+              type: object
+              required: [keep_id, drop_id, verdict, rationale]
+              properties:
+                keep_id: {type: string}
+                drop_id: {type: string}
+                verdict: {enum: [keep-both, consolidate]}
+                rationale: {type: string}
+          acted_ids:
+            type: array
+            items: {type: string}
+    budget: {retries: 1, repairs: 1}
+
+  - id: verify
+    kind: command
+    needs: [sweep, judge]
+    run: |
+      set -eu
+      command -v jq >/dev/null 2>&1 || { echo "verify: jq is required" >&2; exit 4; }
+      acted=$(printf '%s' "$SGH_INPUT_JUDGE" | jq -r '.acted_ids[]')
+      still_live=""
+      for id in $acted; do
+        if "$SGH_TOPODB" --db "$SGH_MEMORY_DB" get "$id" \
+          | jq -e '.found and (.node.props.forgotten_at == null) and (.node.props.superseded_at == null)' >/dev/null; then
+          echo "verify: acted id still live: $id" >&2
+          still_live="$still_live $id"
+        fi
+      done
+      [ -z "$still_live" ] || exit 5
+      after=$("$SGH_TOPODB" --db "$SGH_MEMORY_DB" lifecycle-candidates)
+      printf '%s' "$SGH_INPUT_JUDGE" | jq \
+        --argjson before "$(printf '%s' "$SGH_INPUT_SWEEP" | jq 'length')" \
+        --argjson after "$(printf '%s' "$after" | jq 'length')" \
+        '{before_candidates: $before, after_candidates: $after,
+          acted: (.acted_ids | length), decay: .decay, duplicates: .duplicates}'
+    output:
+      schema:
+        type: object
+        required: [before_candidates, after_candidates, acted, decay, duplicates]
+        properties:
+          before_candidates: {type: integer}
+          after_candidates: {type: integer}
+          acted: {type: integer}
+          decay: {type: array}
+          duplicates: {type: array}
+    budget: {retries: 1, repairs: 0}
