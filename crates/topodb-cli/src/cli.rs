@@ -382,6 +382,17 @@ pub enum Command {
         #[arg(default_value = "-")]
         input: String,
     },
+    /// Ingest an Obsidian-format vault: one note = one memory; wikilinks
+    /// become entities; edited notes supersede their prior version.
+    ObsidianIngest {
+        /// Vault directory to walk for .md notes.
+        vault: std::path::PathBuf,
+        #[arg(long)]
+        scope: Option<String>,
+        /// Plan and report without writing to the db or the vault.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase
