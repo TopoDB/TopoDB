@@ -393,6 +393,25 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Materialize memories from the graph into an Obsidian-format vault
+    /// (one note per memory + entity stubs). Never overwrites differing
+    /// files unless --overwrite.
+    ObsidianSeed {
+        /// Vault directory to write notes into (created if missing).
+        vault: std::path::PathBuf,
+        /// Hybrid-recall selector (exclusive with --entity).
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, default_value_t = 12)]
+        k: usize,
+        /// Entity-neighborhood selector (exclusive with --query).
+        #[arg(long)]
+        entity: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        hops: u8,
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase

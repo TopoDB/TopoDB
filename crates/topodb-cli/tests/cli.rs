@@ -2598,3 +2598,84 @@ fn obsidian_ingest_creates_supersedes_and_stamps() {
     let s = run(&["search", "Delta"]);
     assert!(String::from_utf8_lossy(&s.stdout).contains("Delta uses"));
 }
+
+#[test]
+fn obsidian_seed_selects_writes_and_protects_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    run(&[
+        "remember",
+        "--content",
+        "Epsilon caches sessions in redis",
+        "--entity",
+        "redis",
+    ]);
+    let vault = dir.path().join("wm");
+
+    // Selector validation: neither, or both, → 2.
+    assert_eq!(
+        run(&["obsidian-seed", vault.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        run(&[
+            "obsidian-seed",
+            vault.to_str().unwrap(),
+            "--query",
+            "x",
+            "--entity",
+            "y"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+
+    // Entity mode materializes the neighborhood + stub.
+    let r = run(&[
+        "obsidian-seed",
+        vault.to_str().unwrap(),
+        "--entity",
+        "redis",
+    ]);
+    assert!(
+        r.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["seeded"], serde_json::json!(1));
+    assert_eq!(v["stubs"].as_u64(), Some(1));
+
+    // Query mode hits the same memory; existing identical files count unchanged.
+    let q = run(&[
+        "obsidian-seed",
+        vault.to_str().unwrap(),
+        "--query",
+        "sessions cache",
+        "--k",
+        "5",
+    ]);
+    let vq: serde_json::Value = serde_json::from_slice(&q.stdout).unwrap();
+    assert!(vq["unchanged"].as_u64().unwrap() >= 1);
+
+    // Unknown entity → rejected/2.
+    assert_eq!(
+        run(&[
+            "obsidian-seed",
+            vault.to_str().unwrap(),
+            "--entity",
+            "ghost"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+}
