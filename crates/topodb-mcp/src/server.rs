@@ -1471,6 +1471,15 @@ struct SearchMemoriesParams {
     /// values are rejected with invalid_params.
     #[serde(default)]
     label_weights: Option<serde_json::Map<String, Value>>,
+    /// Only return hits of these memory kinds: "episodic" | "semantic" |
+    /// "procedural". Omit for no kind filtering. Applied post-fusion to
+    /// EVERY hit; a node without a kind prop counts as "semantic" — that
+    /// covers entity hits too, so a filter excluding "semantic" hides
+    /// them (combine with labels: ["Memory"] when that is the intent).
+    /// Must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1706,6 +1715,12 @@ struct RememberParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     supersedes: Option<Vec<String>>,
+    /// Taxonomy kind for a NEW memory: "episodic" (a dated observation),
+    /// "semantic" (a standing fact — what an omitted kind reads as), or
+    /// "procedural" (a how-to). Ignored when the content dedups to an
+    /// existing memory — the stored kind wins.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2821,7 +2836,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting. For looking up an entity by its exact name, prefer labels: [\"Entity\"] (unaffected by the down-weight) over a plain search."
+        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting. For looking up an entity by its exact name, prefer labels: [\"Entity\"] (unaffected by the down-weight) over a plain search. kinds filters results by memory kind; a node without a kind prop counts as semantic."
     )]
     fn search_memories(
         &self,
@@ -2873,12 +2888,38 @@ impl TopoServer {
                 expansions.push((word.to_string(), terms));
             }
         }
+        // kinds → the engine's generic prop_retain: this layer names the
+        // prop and maps "absent" to the default kind. Runtime empty check
+        // mirrors `resolve_scopes`' Some([]) rejection — schemars minItems
+        // is only the advertised half of the rule.
+        let prop_retain = match &p.kinds {
+            None => None,
+            Some(kinds) if kinds.is_empty() => {
+                return Err(ErrorData::invalid_params(
+                    "kinds must not be empty when present — an empty filter admits \
+                     nothing; omit it to search all kinds"
+                        .to_string(),
+                    None,
+                ));
+            }
+            Some(kinds) => {
+                for kind in kinds {
+                    convert::validate_memory_kind(kind)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                }
+                Some(topodb::PropRetain {
+                    prop: convert::MEMORY_KIND_PROP.to_string(),
+                    any_of: kinds.clone(),
+                    absent_as: Some(convert::MEMORY_KIND_DEFAULT.to_string()),
+                })
+            }
+        };
         let options = SearchOptions {
             recency_weight: p.recency_weight,
             recency_half_life_ms: (p.recency_half_life_days * 86_400_000.0) as i64,
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
-            prop_retain: None,
+            prop_retain,
         };
 
         // Process label_weights: convert from JSON map to Vec<(String, f32)>.
@@ -3170,7 +3211,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Store a linked fact in ONE call: creates the memory, find-or-creates each named entity, and links memory→entity ('about' by default) — atomically, in a single write batch. This is the preferred way to store anything worth remembering. Use the lower-level create_memory / create_entity / link only when you need the pieces separately: an unlinked note, an entity carrying extra props, or entity↔entity relations (works_at, supersede)."
+        description = "Store a linked fact in ONE call: creates the memory, find-or-creates each named entity, and links memory→entity ('about' by default) — atomically, in a single write batch. This is the preferred way to store anything worth remembering. Use the lower-level create_memory / create_entity / link only when you need the pieces separately: an unlinked note, an entity carrying extra props, or entity↔entity relations (works_at, supersede). Optional kind classifies the memory (episodic | semantic | procedural; omitted reads as semantic); on a dedup hit the existing memory's stored kind wins."
     )]
     fn remember(
         &self,
@@ -3182,7 +3223,7 @@ impl TopoServer {
             edge_type: p.edge_type.clone(),
             supersedes: p.supersedes.clone().unwrap_or_default(),
             props: p.props.clone(),
-            kind: None,
+            kind: p.kind.clone(),
         };
         req.validate()
             .map_err(|e| ErrorData::invalid_params(e, None))?;
