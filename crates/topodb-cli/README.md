@@ -51,6 +51,7 @@ All 19 subcommands, in scaffold + write + read order:
 | `get-edges <from>` | positional source node id (or target when `--direction in`), `--direction out\|in\|both` (default `out`; for `in`, the anchor shifts to the target and `--to` filters the far source end), `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `lifecycle-candidates` | `--limit <N>`, `--half-life-episodic-days <F>`, `--half-life-semantic-days <F>`, `--half-life-procedural-days <F>`, `--now-ms <MS>` | JSON array of `{id, content, kind, created_at, last_accessed_at, access_count, staleness}` |
+| `purge` | `--tombstoned-before <MS>`, `--yes` | dry-run: `{dry_run, count, ids}`; with `--yes`: `{dry_run, count, ids, seq}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
 | `set-props <id>` | positional node id, `--props <json-object>` (required; a `null` value removes that key) | `{"seq": <seq>}` |
@@ -97,6 +98,12 @@ Notes on individual commands:
   episodic/semantic/procedural, absent kind counts as semantic). Deterministic under `--now-ms`,
   read-only, and unbumped (the sweep never perturbs the access signal it reads). It only
   PROPOSES: review the evidence and retire memories explicitly with `forget`.
+- **`purge`**: DESTRUCTIVE. Hard-deletes every memory whose `superseded_at`/`forgotten_at`
+  tombstone is strictly older than `--tombstoned-before` (unix-ms). Dry-run by default —
+  nothing is written until `--yes`. Purged history is gone: `--include-superseded` and
+  `as_of` queries stop seeing those nodes; that is the point. Deliberately CLI-only
+  (no MCP surface) and never part of the `/sgh:lifecycle` graph — reclamation is an
+  operator action, not an agent one.
 - **`find`**: `--value` is parsed as a JSON scalar first (`42` → `Int`, `true` → `Bool`, `"ada"`
   → `Str`); if it doesn't parse as JSON at all, the raw string is taken as `Str` — so
   `--value ada` and `--value '"ada"'` are equivalent. A float value is never equality-indexable
