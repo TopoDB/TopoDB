@@ -1519,6 +1519,7 @@ fn create_memory_rejects_reserved_prop_keys() {
         r#"{"content_hash":"x"}"#,
         r#"{"superseded_at":1}"#,
         r#"{"forgotten_at":1}"#,
+        r#"{"kind":"episodic"}"#,
     ] {
         let out = bin()
             .args([
@@ -1535,10 +1536,12 @@ fn create_memory_rejects_reserved_prop_keys() {
         assert_eq!(out.status.code(), Some(2), "props {props} must be rejected");
         let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
         assert_eq!(err["error"]["kind"], "rejected");
-        assert!(err["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("maintained by the engine write path"));
+        let msg = err["error"]["message"].as_str().unwrap();
+        if props.contains("kind") {
+            assert!(msg.contains("kind"));
+        } else {
+            assert!(msg.contains("maintained by the engine write path"));
+        }
     }
 }
 
@@ -1564,6 +1567,7 @@ fn create_memory_rejects_reserved_keys_even_on_dedup() {
         r#"{"content_hash":"boom"}"#,
         r#"{"superseded_at":1}"#,
         r#"{"forgotten_at":1}"#,
+        r#"{"kind":"episodic"}"#,
     ] {
         let out = bin()
             .args([
@@ -1643,6 +1647,7 @@ fn remember_rejects_reserved_prop_keys() {
         r#"{"content_hash":"boom"}"#,
         r#"{"superseded_at":1}"#,
         r#"{"forgotten_at":1}"#,
+        r#"{"kind":"episodic"}"#,
     ] {
         let out = bin()
             .args([
@@ -1661,10 +1666,12 @@ fn remember_rejects_reserved_prop_keys() {
         assert_eq!(out.status.code(), Some(2), "props {props} must be rejected");
         let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
         assert_eq!(err["error"]["kind"], "rejected");
-        assert!(err["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("maintained by the engine write path"));
+        let msg = err["error"]["message"].as_str().unwrap();
+        if props.contains("kind") {
+            assert!(msg.contains("kind"));
+        } else {
+            assert!(msg.contains("maintained by the engine write path"));
+        }
     }
 }
 
@@ -2289,4 +2296,161 @@ fn forgotten_memories_share_superseded_read_semantics() {
     .unwrap();
     assert_eq!(again["deduplicated"], false, "no dedup to a forgotten node");
     assert_ne!(again["memory_id"].as_str().unwrap(), mem);
+}
+
+/// Phase B kind taxonomy on the CLI: --kind stamps new memories (dedup
+/// ignores it; stored kind wins), --kinds filters search on both the live
+/// and history paths, absent kind reads as "semantic", and bad values
+/// reject with the vocabulary named.
+#[test]
+fn kind_taxonomy_stamps_filters_and_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+
+    // Stamp: --kind lands on the node's props.
+    let stored: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "deneb rotates keys weekly",
+            "--entity",
+            "deneb",
+            "--kind",
+            "procedural",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let proc_mem = stored["memory_id"].as_str().unwrap().to_string();
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", &proc_mem]).stdout).unwrap();
+    assert_eq!(got["node"]["props"]["kind"].as_str(), Some("procedural"));
+
+    // Unstamped memory: no kind prop, reads as semantic on the filter side.
+    let plain: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "deneb uses etcd",
+            "--entity",
+            "deneb",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let sem_mem = plain["memory_id"].as_str().unwrap().to_string();
+
+    // Filter: --kinds procedural sees only the stamped memory ...
+    let hits: serde_json::Value =
+        serde_json::from_slice(&run(&["search", "deneb", "--kinds", "procedural"]).stdout).unwrap();
+    let ids: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["node"]["id"].as_str())
+        .collect();
+    assert!(ids.contains(&proc_mem.as_str()));
+    assert!(!ids.contains(&sem_mem.as_str()));
+
+    // ... and --kinds semantic sees the UNSTAMPED one (absent = semantic).
+    let hits: serde_json::Value =
+        serde_json::from_slice(&run(&["search", "deneb", "--kinds", "semantic"]).stdout).unwrap();
+    let ids: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["node"]["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&sem_mem.as_str()),
+        "absent kind must match semantic"
+    );
+    assert!(!ids.contains(&proc_mem.as_str()));
+
+    // Comma-delimited multi-value admits both.
+    let hits: serde_json::Value =
+        serde_json::from_slice(&run(&["search", "deneb", "--kinds", "procedural,semantic"]).stdout)
+            .unwrap();
+    assert_eq!(
+        hits.as_array().unwrap().len(),
+        3,
+        "both memories + the entity node"
+    );
+
+    // Dedup ignores kind: same content, different kind → same id, stored kind wins.
+    let again: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "deneb rotates keys weekly",
+            "--entity",
+            "deneb",
+            "--kind",
+            "episodic",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(again["deduplicated"], true);
+    assert_eq!(again["memory_id"].as_str().unwrap(), proc_mem);
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", &proc_mem]).stdout).unwrap();
+    assert_eq!(
+        got["node"]["props"]["kind"].as_str(),
+        Some("procedural"),
+        "the stored kind must win on a dedup hit"
+    );
+
+    // --kinds combines with --include-superseded (the history path).
+    assert!(run(&["forget", &sem_mem]).status.success());
+    let hits: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "search",
+            "deneb",
+            "--kinds",
+            "semantic",
+            "--include-superseded",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let ids: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["node"]["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&sem_mem.as_str()),
+        "history search must combine with the kinds filter"
+    );
+
+    // Validation: bad values reject with the vocabulary named, exit 2.
+    for args in [
+        vec![
+            "remember",
+            "--content",
+            "x y",
+            "--entity",
+            "e",
+            "--kind",
+            "factual",
+        ],
+        vec!["search", "deneb", "--kinds", "Episodic"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("episodic"),
+            "vocabulary missing for {args:?}: {all}"
+        );
+    }
 }

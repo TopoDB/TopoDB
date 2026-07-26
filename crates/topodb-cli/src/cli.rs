@@ -129,6 +129,12 @@ pub enum Command {
         /// Scope override for THIS command: a ScopeId ULID, or "shared".
         #[arg(long)]
         scope: Option<String>,
+        /// Taxonomy kind for a NEW memory: "episodic" (dated observation),
+        /// "semantic" (standing fact — the default reading when omitted),
+        /// or "procedural" (how-to). Ignored on a dedup hit: the existing
+        /// memory's stored kind wins.
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Soft-retire memories: stamps `forgotten_at` and closes their open
     /// edges. Recall and default `search` stop returning them; history
@@ -182,6 +188,13 @@ pub enum Command {
         /// history escape hatch, same shape as `get-edges --open-only false`.
         #[arg(long)]
         include_superseded: bool,
+        /// Only return memories of these kinds ("episodic" | "semantic" |
+        /// "procedural"); repeatable or comma-delimited. A node without a
+        /// kind prop counts as "semantic" — note that covers non-Memory
+        /// nodes (entities) too, so a filter excluding "semantic" hides
+        /// them. Omit for no kind filtering.
+        #[arg(long = "kinds", value_delimiter = ',')]
+        kinds: Vec<String>,
     },
     /// Bounded BFS from a seed node, following edges up to `max_hops`.
     Traverse {

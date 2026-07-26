@@ -122,6 +122,7 @@ fn main() {
             edge_type,
             supersedes,
             props,
+            kind,
             ..
         } => remember(
             &db,
@@ -131,6 +132,7 @@ fn main() {
             edge_type,
             supersedes,
             props.as_deref(),
+            kind,
             cli.pretty,
         ),
         Command::Forget { ids, .. } => forget(&db, write_scope, &ids, cli.pretty),
@@ -153,12 +155,14 @@ fn main() {
             query,
             k,
             include_superseded,
+            kinds,
         } => search(
             &db,
             default_scope,
             &query,
             k,
             include_superseded,
+            &kinds,
             cli.pretty,
         ),
         Command::Traverse {
@@ -289,28 +293,50 @@ fn find(
     output::ok(&serde_json::Value::Array(nodes), pretty);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search(
     db: &Db,
     scope: Scope,
     query: &str,
     k: usize,
     include_superseded: bool,
+    kinds: &[String],
     pretty: bool,
 ) -> ! {
     let scopes = topodb_json::scope_to_scope_set(scope);
+    // The kinds filter is policy over the engine's generic prop_retain:
+    // this layer names the prop and maps "absent" to the default kind.
+    let prop_retain = if kinds.is_empty() {
+        None
+    } else {
+        for kind in kinds {
+            if let Err(e) = topodb_json::validate_memory_kind(kind) {
+                output::fail("rejected", &e, 2);
+            }
+        }
+        Some(topodb::PropRetain {
+            prop: topodb_json::MEMORY_KIND_PROP.to_string(),
+            any_of: kinds.to_vec(),
+            absent_as: Some(topodb_json::MEMORY_KIND_DEFAULT.to_string()),
+        })
+    };
+    let options = topodb::SearchOptions {
+        prop_retain,
+        ..topodb::SearchOptions::default()
+    };
     // Search is a recall surface: memories retired by `remember --supersedes`
     // are dropped by default (before top-k, unbumped), matching the MCP
     // server's `search_memories`. `--include-superseded` restores raw BM25
     // over the full history. Forgotten memories are also dropped from default
     // search (same liveness model as superseded).
     let hits = if include_superseded {
-        db.search_text(&scopes, query, k)
+        db.search_text_with(&scopes, query, k, &options)
     } else {
         db.search_text_live(
             &scopes,
             query,
             k,
-            &topodb::SearchOptions::default(),
+            &options,
             &topodb_json::MEMORY_TOMBSTONE_PROPS,
         )
     };
@@ -735,6 +761,7 @@ fn remember(
     edge_type: Option<String>,
     supersedes: Vec<String>,
     props: Option<&str>,
+    kind: Option<String>,
     pretty: bool,
 ) -> ! {
     let extra = parse_props_arg(props);
@@ -744,7 +771,7 @@ fn remember(
         edge_type,
         supersedes,
         props: extra,
-        kind: None,
+        kind,
     };
     // Collision surface: the write scope plus shared — a shared entity must
     // be found from a project-scoped write, not shadowed by a local twin.
