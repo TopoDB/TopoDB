@@ -488,3 +488,63 @@ fn search_text_live_does_not_bump_filtered_tombstoned_nodes() {
         "a tombstone-filtered hit must not be access-bumped"
     );
 }
+
+/// A candidate dropped by prop_retain was never visible to the caller, so
+/// it must not be access-bumped — same doctrine as tombstone filtering.
+#[test]
+fn search_text_does_not_bump_prop_retain_filtered_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+
+    let (live, filtered) = (NodeId::new(), NodeId::new());
+    let mut live_props = Props::new();
+    live_props.insert("content".into(), PropValue::Str("zeta corpus".into()));
+    live_props.insert("kind".into(), PropValue::Str("semantic".into()));
+    let mut filtered_props = Props::new();
+    filtered_props.insert("content".into(), PropValue::Str("zeta corpus".into()));
+    filtered_props.insert("kind".into(), PropValue::Str("episodic".into()));
+    db.submit(vec![
+        Op::CreateNode {
+            id: live,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: live_props,
+        },
+        Op::CreateNode {
+            id: filtered,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: filtered_props,
+        },
+    ])
+    .unwrap();
+
+    let options = SearchOptions {
+        prop_retain: Some(PropRetain {
+            prop: "kind".into(),
+            any_of: vec!["semantic".into()],
+            absent_as: Some("semantic".into()),
+        }),
+        ..SearchOptions::default()
+    };
+    let hits = db.search_text_with(&scopes, "zeta", 10, &options).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.id, live);
+
+    let live_stats = wait_for_count(&db, &scopes, live, 1);
+    assert!(live_stats.access_count >= 1);
+    assert_eq!(
+        db.access_stats(&scopes, filtered).unwrap(),
+        Some(AccessStats::default()),
+        "a prop-retain-filtered hit must not be access-bumped"
+    );
+}

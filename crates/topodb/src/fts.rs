@@ -67,6 +67,38 @@ pub(crate) const K1: f32 = 1.2;
 /// BM25 length-normalisation strength.
 pub(crate) const B: f32 = 0.75;
 
+/// Mechanism-only string-prop allowlist for search results: a candidate
+/// survives iff the value of `prop` — a `Str`; a missing or non-`Str`
+/// value reads as `absent_as` when that is set, otherwise never matches —
+/// equals one of `any_of`. Applied BEFORE top-k truncation (a filtered hit
+/// never consumes the result window) and never access-bumped on a dropped
+/// node. The engine names no prop and no vocabulary — the host owns both
+/// (e.g. the policy layer's Memory `kind` taxonomy, where the host passes
+/// `absent_as: Some("semantic")` to make an unstamped node match its
+/// default kind).
+#[derive(Debug, Clone)]
+pub struct PropRetain {
+    /// The `Str` prop to test.
+    pub prop: String,
+    /// The allowlist. Must be non-empty — an empty allowlist admits
+    /// nothing and is rejected as a caller bug.
+    pub any_of: Vec<String>,
+    /// Value a missing (or non-`Str`) prop reads as before the allowlist
+    /// test. `None` = a node without the prop never matches.
+    pub absent_as: Option<String>,
+}
+
+impl PropRetain {
+    /// True iff `props` passes this retain.
+    pub(crate) fn keeps(&self, props: &crate::Props) -> bool {
+        let val = match props.get(self.prop.as_str()) {
+            Some(PropValue::Str(s)) => Some(s.as_str()),
+            _ => self.absent_as.as_deref(),
+        };
+        val.is_some_and(|v| self.any_of.iter().any(|a| a == v))
+    }
+}
+
 /// Tuning for [`Db::search_text_with`]. `Default` disables every option, so
 /// `search_text_with(scopes, query, k, &SearchOptions::default())` behaves
 /// identically to [`Db::search_text`].
@@ -97,6 +129,9 @@ pub struct SearchOptions {
     /// always dominates a fuzzy one, and a query that already hits pays
     /// nothing. Purely query-time: no extra index, deterministic.
     pub fuzzy_fallback: bool,
+    /// Optional string-prop allowlist over results (see [`PropRetain`]).
+    /// `None` (the default) = no filtering.
+    pub prop_retain: Option<PropRetain>,
 }
 
 impl Default for SearchOptions {
@@ -106,6 +141,7 @@ impl Default for SearchOptions {
             recency_half_life_ms: 30 * 24 * 60 * 60 * 1000,
             now_ms: None,
             fuzzy_fallback: true,
+            prop_retain: None,
         }
     }
 }
@@ -128,6 +164,26 @@ impl SearchOptions {
                 "recency_half_life_ms must be > 0, got {}",
                 self.recency_half_life_ms
             )));
+        }
+        Ok(())
+    }
+
+    /// The prop_retain validation shared by the text paths and `recall` —
+    /// both must reject the same caller bugs before running.
+    pub(crate) fn validate_prop_retain(&self) -> Result<(), TopoError> {
+        if let Some(retain) = &self.prop_retain {
+            if retain.prop.is_empty() {
+                return Err(TopoError::Rejected(
+                    "prop_retain.prop must not be empty".into(),
+                ));
+            }
+            if retain.any_of.is_empty() {
+                return Err(TopoError::Rejected(
+                    "prop_retain.any_of must not be empty — an empty allowlist admits \
+                     nothing; omit prop_retain to search unfiltered"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1127,6 +1183,7 @@ impl Db {
             return Err(TopoError::Rejected("text search requires k > 0".into()));
         }
         options.validate_recency()?;
+        options.validate_prop_retain()?;
         let tokens = tokenize(query);
         if tokens.is_empty() {
             return Err(TopoError::Rejected("query has no searchable terms".into()));
@@ -1322,6 +1379,13 @@ impl Db {
                         if tombstone_props.iter().any(|prop| {
                             matches!(rec.props.get(*prop), Some(PropValue::Int(ts)) if *ts <= now)
                         }) {
+                            continue;
+                        }
+                    }
+                    // Prop-retain filter: same doctrine as the tombstone
+                    // filter above — dropped before top-k, never bumped.
+                    if let Some(retain) = &options.prop_retain {
+                        if !retain.keeps(&rec.props) {
                             continue;
                         }
                     }

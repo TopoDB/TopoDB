@@ -890,3 +890,115 @@ fn recall_drops_candidates_tombstoned_by_any_listed_prop() {
         vec![live]
     );
 }
+
+/// RecallQuery: options.prop_retain is applied POST-FUSION (the labels-retain
+/// slot), so it also drops candidates that arrive via the graph leg — which
+/// never passes through text search.
+#[test]
+fn recall_prop_retain_drops_graph_leg_candidates_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let seed = NodeId::new();
+    let mut seed_props = Props::new();
+    seed_props.insert("content".into(), PropValue::Str("chi psi omega".into()));
+    // Graph-leg-only neighbor: content does NOT match the query, kind is
+    // filtered out — reachable only through the 1-hop graph boost.
+    let neighbor = NodeId::new();
+    let mut n_props = Props::new();
+    n_props.insert("content".into(), PropValue::Str("unrelated words".into()));
+    n_props.insert("kind".into(), PropValue::Str("episodic".into()));
+    let edge = EdgeId::new();
+    db.submit(vec![
+        Op::CreateNode {
+            id: seed,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: seed_props,
+        },
+        Op::CreateNode {
+            id: neighbor,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: n_props,
+        },
+        Op::CreateEdge {
+            id: edge,
+            scope: Scope::Id(s),
+            ty: "about".into(),
+            from: seed,
+            to: neighbor,
+            props: Props::new(),
+            valid_from: None,
+        },
+    ])
+    .unwrap();
+
+    // Without the retain, graph boost surfaces the neighbor.
+    let plain = db
+        .recall(&RecallQuery::new(ScopeSet::of(&[s]), "chi psi", 10))
+        .unwrap();
+    assert!(
+        plain.iter().any(|(n, _)| n.id == neighbor),
+        "precondition: the graph leg must surface the linked neighbor"
+    );
+
+    // With it, the episodic neighbor is dropped post-fusion.
+    let q = RecallQuery {
+        options: SearchOptions {
+            prop_retain: Some(PropRetain {
+                prop: "kind".into(),
+                any_of: vec!["semantic".into()],
+                absent_as: Some("semantic".into()),
+            }),
+            ..SearchOptions::default()
+        },
+        ..RecallQuery::new(ScopeSet::of(&[s]), "chi psi", 10)
+    };
+    let filtered = db.recall(&q).unwrap();
+    assert!(
+        filtered.iter().any(|(n, _)| n.id == seed),
+        "seed (absent kind = semantic) survives"
+    );
+    assert!(
+        filtered.iter().all(|(n, _)| n.id != neighbor),
+        "post-fusion retain must catch graph-leg candidates"
+    );
+}
+
+/// recall validates prop_retain like search_text does — before any leg runs.
+#[test]
+fn recall_rejects_empty_prop_retain_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let q = RecallQuery {
+        options: SearchOptions {
+            prop_retain: Some(PropRetain {
+                prop: "kind".into(),
+                any_of: vec![],
+                absent_as: None,
+            }),
+            ..SearchOptions::default()
+        },
+        ..RecallQuery::new(ScopeSet::of(&[s]), "anything", 10)
+    };
+    match db.recall(&q) {
+        Err(TopoError::Rejected(_)) => {}
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}

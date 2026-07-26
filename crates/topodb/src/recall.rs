@@ -257,6 +257,7 @@ impl Db {
         // Check the CALLER's recency options before the leg call zeroes the
         // weight — see SearchOptions::validate_recency for why.
         q.options.validate_recency()?;
+        q.options.validate_prop_retain()?;
         if let Some((_, v)) = &q.vector {
             if v.is_empty() {
                 return Err(TopoError::Rejected(
@@ -363,6 +364,12 @@ impl Db {
         // filtering rarely starves k — and legitimately may).
         if let Some(labels) = &q.labels {
             out.retain(|(n, _)| labels.iter().any(|l| n.label == l.as_str()));
+        }
+        // Post-fusion prop-retain (the labels-retain slot): the text leg
+        // already filters via options, but vector/graph-leg candidates
+        // never pass through text search — this catches them.
+        if let Some(retain) = &q.options.prop_retain {
+            out.retain(|(n, _)| retain.keeps(&n.props));
         }
         // Tombstone filter: drop candidates the caller marked superseded as of
         // this query's "now". The marker is a timestamp, so an as_of/now_ms set

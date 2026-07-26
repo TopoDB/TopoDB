@@ -567,3 +567,161 @@ fn search_text_live_drops_nodes_tombstoned_by_any_listed_prop() {
         .iter()
         .all(|(n, _)| !n.props.contains_key("forgotten_at")));
 }
+
+/// SearchOptions.prop_retain: a mechanism-only string-prop allowlist.
+/// A candidate survives iff its `prop` value (missing/non-Str reads as
+/// `absent_as` when set) is in `any_of` — filtered BEFORE top-k, so a
+/// dropped hit never consumes the result window.
+#[test]
+fn search_text_prop_retain_filters_by_value_with_absent_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let mk = |content: &str, kind: Option<&str>| {
+        let id = NodeId::new();
+        let mut props = Props::new();
+        props.insert("content".into(), PropValue::Str(content.into()));
+        if let Some(k) = kind {
+            props.insert("kind".into(), PropValue::Str(k.into()));
+        }
+        (
+            id,
+            Op::CreateNode {
+                id,
+                scope: Scope::Id(s),
+                label: "Memory".into(),
+                props,
+            },
+        )
+    };
+    let (episodic, op_a) = mk("sigma tau", Some("episodic"));
+    let (procedural, op_b) = mk("sigma tau", Some("procedural"));
+    let (absent, op_c) = mk("sigma tau", None);
+    db.submit(vec![op_a, op_b, op_c]).unwrap();
+
+    let retain = |any_of: &[&str], absent_as: Option<&str>| SearchOptions {
+        prop_retain: Some(PropRetain {
+            prop: "kind".into(),
+            any_of: any_of.iter().map(|s| s.to_string()).collect(),
+            absent_as: absent_as.map(String::from),
+        }),
+        ..SearchOptions::default()
+    };
+
+    // absent_as maps the missing prop into the vocabulary: only the
+    // absent node counts as "semantic".
+    let semantic = db
+        .search_text_with(
+            &scopes,
+            "sigma",
+            10,
+            &retain(&["semantic"], Some("semantic")),
+        )
+        .unwrap();
+    assert_eq!(
+        semantic.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+        vec![absent]
+    );
+
+    // A multi-value allowlist admits each listed value.
+    let both = db
+        .search_text_with(
+            &scopes,
+            "sigma",
+            10,
+            &retain(&["episodic", "procedural"], Some("semantic")),
+        )
+        .unwrap();
+    let mut got: Vec<_> = both.iter().map(|(n, _)| n.id).collect();
+    got.sort();
+    let mut want = vec![episodic, procedural];
+    want.sort();
+    assert_eq!(got, want);
+
+    // No absent_as: a node without the prop never matches.
+    let strict = db
+        .search_text_with(&scopes, "sigma", 10, &retain(&["semantic"], None))
+        .unwrap();
+    assert!(
+        strict.is_empty(),
+        "absent prop must not match without absent_as"
+    );
+}
+
+/// prop_retain filters BEFORE top-k: with k=1 and the best BM25 hit
+/// filtered out, the surviving node still fills the window.
+#[test]
+fn search_text_prop_retain_filters_before_topk() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let mut strong = Props::new();
+    // Repeats the term so BM25 ranks this node first.
+    strong.insert(
+        "content".into(),
+        PropValue::Str("upsilon upsilon upsilon".into()),
+    );
+    strong.insert("kind".into(), PropValue::Str("episodic".into()));
+    let strong_id = NodeId::new();
+    let mut weak = Props::new();
+    weak.insert("content".into(), PropValue::Str("upsilon phi".into()));
+    let weak_id = NodeId::new();
+    db.submit(vec![
+        Op::CreateNode {
+            id: strong_id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: strong,
+        },
+        Op::CreateNode {
+            id: weak_id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: weak,
+        },
+    ])
+    .unwrap();
+
+    let options = SearchOptions {
+        prop_retain: Some(PropRetain {
+            prop: "kind".into(),
+            any_of: vec!["semantic".into()],
+            absent_as: Some("semantic".into()),
+        }),
+        ..SearchOptions::default()
+    };
+    let hits = db
+        .search_text_with(&scopes, "upsilon", 1, &options)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|(n, _)| n.id).collect::<Vec<_>>(),
+        vec![weak_id],
+        "the filtered strong hit must not consume the k=1 window"
+    );
+}
+
+/// Validation: empty prop / empty any_of are caller bugs, rejected loudly
+/// (mirrors the labels empty-allowlist rejection).
+#[test]
+fn search_text_prop_retain_rejects_empty_prop_and_empty_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    for (prop, any_of) in [("", vec!["semantic".to_string()]), ("kind", vec![])] {
+        let options = SearchOptions {
+            prop_retain: Some(PropRetain {
+                prop: prop.into(),
+                any_of,
+                absent_as: None,
+            }),
+            ..SearchOptions::default()
+        };
+        match db.search_text_with(&scopes, "anything", 10, &options) {
+            Err(TopoError::Rejected(_)) => {}
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+}
