@@ -86,6 +86,13 @@ pub fn memory_props(content: &str, extra: Option<&Value>) -> Result<Props, Strin
                 ));
             }
         }
+        if map.contains_key(crate::MEMORY_KIND_PROP) {
+            return Err(format!(
+                "props must not include {:?}: set it via remember's kind parameter \
+                 (episodic | semantic | procedural)",
+                crate::MEMORY_KIND_PROP
+            ));
+        }
     }
     let mut props = merge_required_prop(
         MEMORY_CONTENT_PROP,
@@ -316,6 +323,10 @@ pub struct RememberRequest {
     /// Extra memory metadata as a JSON object (same contract as
     /// `merge_required_prop`'s `extra`).
     pub props: Option<Value>,
+    /// Declared taxonomy kind for a NEW memory: `episodic`, `semantic`, or
+    /// `procedural`. `None` = unstamped (reads as `semantic`). Ignored on a
+    /// dedup hit — the existing node's stored kind wins.
+    pub kind: Option<String>,
 }
 
 impl RememberRequest {
@@ -337,6 +348,9 @@ impl RememberRequest {
         }
         if self.entities.iter().any(|n| n.trim().is_empty()) {
             return Err("entity names must be non-empty".into());
+        }
+        if let Some(kind) = &self.kind {
+            crate::validate_memory_kind(kind)?;
         }
         Ok(ty)
     }
@@ -376,8 +390,11 @@ pub fn plan_remember(
     let ty = req.validate().map_err(ComposeError::Invalid)?;
 
     // Validate reserved keys BEFORE the dedup check (so reserved keys are always rejected).
-    let memory_props_result =
+    let mut memory_props_result =
         memory_props(&req.content, req.props.as_ref()).map_err(ComposeError::Invalid)?;
+    if let Some(kind) = &req.kind {
+        memory_props_result.insert(crate::MEMORY_KIND_PROP.into(), PropValue::Str(kind.clone()));
+    }
 
     // Parse the supersedes list early to detect self-supersede.
     // If the dedup hit is in the supersedes list, treat it as a fresh node creation.

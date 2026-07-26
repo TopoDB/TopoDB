@@ -744,6 +744,7 @@ fn remember(
         edge_type,
         supersedes,
         props: extra,
+        kind: None,
     };
     // Collision surface: the write scope plus shared — a shared entity must
     // be found from a project-scoped write, not shadowed by a local twin.

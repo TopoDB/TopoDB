@@ -1,10 +1,10 @@
 //! plan_remember against a real (temp) engine Db. Every plan's `ops` are
 //! submitted through `db.submit` exactly as a front end would.
 
-use topodb::{Db, PropValue, Scope};
+use topodb::{Db, Op, PropValue, Scope};
 use topodb_json::{
-    content_hash, default_spec, plan_remember, scopes_to_scope_set, ComposeError, RememberRequest,
-    MEMORY_SUPERSEDED_AT_PROP,
+    content_hash, default_spec, memory_props, plan_remember, scopes_to_scope_set,
+    validate_memory_kind, ComposeError, RememberRequest, MEMORY_SUPERSEDED_AT_PROP,
 };
 
 fn fresh_db(dir: &tempfile::TempDir) -> Db {
@@ -18,6 +18,7 @@ fn req(content: &str, entities: &[&str]) -> RememberRequest {
         edge_type: None,
         supersedes: vec![],
         props: None,
+        kind: None,
     }
 }
 
@@ -242,6 +243,7 @@ fn validate_rejects_empty_entities() {
         edge_type: None,
         supersedes: vec![],
         props: None,
+        kind: None,
     };
     let err = r.validate().unwrap_err();
     assert!(err.contains("entities must contain"), "{err}");
@@ -322,6 +324,7 @@ fn validate_rejects_blank_entity_names() {
         edge_type: None,
         supersedes: vec![],
         props: None,
+        kind: None,
     };
     let err = r.validate().unwrap_err();
     assert!(err.contains("entity names must be non-empty"), "{err}");
@@ -335,6 +338,7 @@ fn validate_normalizes_default_edge_type() {
         edge_type: None,
         supersedes: vec![],
         props: None,
+        kind: None,
     };
     let ty = r.validate().unwrap();
     assert_eq!(ty, "about");
@@ -348,6 +352,7 @@ fn validate_succeeds_with_valid_entity() {
         edge_type: None,
         supersedes: vec![],
         props: None,
+        kind: None,
     };
     assert_eq!(r.validate().unwrap(), "about");
 }
@@ -596,5 +601,125 @@ fn plan_forget_rejects_empty_and_dedups_repeats() {
         forgotten,
         vec![m.to_string()],
         "repeat of the same id is one forget"
+    );
+}
+
+#[test]
+fn validate_memory_kind_accepts_the_enum_and_rejects_everything_else() {
+    for ok in ["episodic", "semantic", "procedural"] {
+        assert!(validate_memory_kind(ok).is_ok(), "{ok} must validate");
+    }
+    for bad in ["", "Episodic", "SEMANTIC", "factual", "kind"] {
+        let err = validate_memory_kind(bad).unwrap_err();
+        assert!(
+            err.contains("episodic") && err.contains(&format!("{bad:?}")),
+            "message must name the vocabulary and the bad value: {err}"
+        );
+    }
+}
+
+#[test]
+fn memory_props_rejects_kind_as_reserved() {
+    let err = memory_props(
+        "some fact",
+        Some(&serde_json::json!({ "kind": "episodic" })),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("\"kind\"") && err.contains("kind parameter"),
+        "the rejection must point at the kind parameter, got: {err}"
+    );
+}
+
+#[test]
+fn plan_remember_stamps_kind_on_new_memories_and_validates_it() {
+    // fixture: empty db + write scope, as the suite's other plan_remember
+    // tests build them.
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let scope = Scope::Shared;
+    let lookup = lookup();
+
+    let req = RememberRequest {
+        content: "vega uses grpc".into(),
+        entities: vec!["vega".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+        kind: Some("episodic".into()),
+    };
+    let plan = plan_remember(&db, scope, &lookup, 5_000, &req).unwrap();
+    let create = plan
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::CreateNode { id, props, .. } if *id == plan.memory_id => Some(props),
+            _ => None,
+        })
+        .expect("a new memory CreateNode");
+    assert_eq!(
+        create.get("kind"),
+        Some(&PropValue::Str("episodic".into())),
+        "kind must be stamped on the new memory's props"
+    );
+
+    // An invalid kind rejects before any planning.
+    let bad = RememberRequest {
+        content: "vega uses grpc".into(),
+        entities: vec!["vega".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+        kind: Some("factual".into()),
+    };
+    match plan_remember(&db, scope, &lookup, 5_000, &bad) {
+        Err(ComposeError::Invalid(m)) => assert!(m.contains("episodic"), "{m}"),
+        Err(ComposeError::Engine(_)) => panic!("expected Invalid error, got Engine error"),
+        Ok(_) => panic!("expected Invalid error, got Ok"),
+    }
+}
+
+/// Dedup ignores kind: same content with a DIFFERENT declared kind still
+/// dedups to the existing memory, and the stored kind wins (no SetNodeProps
+/// touches the existing node's kind).
+#[test]
+fn plan_remember_dedup_ignores_kind_and_stored_kind_wins() {
+    // fixture: empty db + write scope + lookup, as above.
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let scope = Scope::Shared;
+    let lookup = lookup();
+
+    let first = RememberRequest {
+        content: "lyra uses mqtt".into(),
+        entities: vec!["lyra".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+        kind: Some("procedural".into()),
+    };
+    let plan1 = plan_remember(&db, scope, &lookup, 5_000, &first).unwrap();
+    db.submit(plan1.ops).unwrap();
+
+    let second = RememberRequest {
+        content: "lyra uses mqtt".into(),
+        entities: vec!["lyra".into()],
+        edge_type: None,
+        supersedes: vec![],
+        props: None,
+        kind: Some("episodic".into()),
+    };
+    let plan2 = plan_remember(&db, scope, &lookup, 6_000, &second).unwrap();
+    assert!(
+        plan2.deduplicated,
+        "identical content must dedup regardless of kind"
+    );
+    assert_eq!(plan2.memory_id, plan1.memory_id);
+    assert!(
+        plan2.ops.iter().all(|op| !matches!(
+            op,
+            Op::SetNodeProps { id, .. } if *id == plan1.memory_id
+        )),
+        "the dedup hit's stored kind must win — no prop rewrite"
     );
 }

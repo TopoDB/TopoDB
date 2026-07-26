@@ -60,6 +60,39 @@ pub const MEMORY_FORGOTTEN_AT_PROP: &str = "forgotten_at";
 /// dedup, advisories, hygiene) filters on this same set so "live" cannot
 /// drift between surfaces.
 pub const MEMORY_TOMBSTONE_PROPS: [&str; 2] = [MEMORY_SUPERSEDED_AT_PROP, MEMORY_FORGOTTEN_AT_PROP];
+
+/// Memory taxonomy prop (`kind`), a `Str` on Memory nodes:
+/// `episodic` (a dated observation: "CI was red this morning"),
+/// `semantic` (a standing fact: "release tags are per-package"),
+/// `procedural` (a how-to: "publish crates in dependency order").
+/// ABSENT MEANS `semantic` — no migration; the read side maps a missing
+/// prop to the default before filtering. Kind never affects ranking; it
+/// exists for the lifecycle decay policy and explicit filtering.
+pub const MEMORY_KIND_PROP: &str = "kind";
+pub const MEMORY_KIND_EPISODIC: &str = "episodic";
+pub const MEMORY_KIND_SEMANTIC: &str = "semantic";
+pub const MEMORY_KIND_PROCEDURAL: &str = "procedural";
+/// The closed kind vocabulary, in canonical order.
+pub const MEMORY_KINDS: [&str; 3] = [
+    MEMORY_KIND_EPISODIC,
+    MEMORY_KIND_SEMANTIC,
+    MEMORY_KIND_PROCEDURAL,
+];
+/// What an absent `kind` prop reads as.
+pub const MEMORY_KIND_DEFAULT: &str = MEMORY_KIND_SEMANTIC;
+
+/// Enum-validates a caller-supplied memory kind. Exact-match, lowercase
+/// only — a taxonomy is a vocabulary, not a suggestion box.
+pub fn validate_memory_kind(kind: &str) -> Result<(), String> {
+    if MEMORY_KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        Err(format!(
+            "kind must be one of \"episodic\", \"semantic\", \"procedural\" — got {kind:?}"
+        ))
+    }
+}
+
 pub const ALIAS_LABEL: &str = "Alias";
 pub const ALIAS_NAME_PROP: &str = "name";
 pub const ALIAS_EDGE_TYPE: &str = "alias_of";
