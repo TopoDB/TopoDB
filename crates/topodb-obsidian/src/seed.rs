@@ -66,7 +66,7 @@ pub fn slug(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {
-            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+            if c.is_control() || "/\\:*?\"<>|[]#^".contains(c) {
                 '-'
             } else {
                 c
@@ -228,6 +228,11 @@ pub fn seed_vault(
     let mut used: BTreeMap<String, NodeId> = BTreeMap::new();
     let mut all_entities: BTreeMap<NodeId, (NodeRecord, String)> = BTreeMap::new();
 
+    // Pass 1: gather each memory's linked entities (no writes yet) so entity
+    // slugs can be reserved BEFORE memory notes claim any filenames — a stub
+    // must always keep the plain `name.md` (wikilink text and filename must
+    // agree), so a colliding memory note has to be the one pushed to a suffix.
+    let mut per_memory_entities: Vec<Vec<String>> = Vec::with_capacity(memories.len());
     for mem in memories {
         let edges = match db.edges_from(scopes, mem.id, None, None, true) {
             Ok(e) => e,
@@ -236,6 +241,7 @@ pub fn seed_vault(
                     file: mem.id.to_string(),
                     reason: e.to_string(),
                 });
+                per_memory_entities.push(Vec::new());
                 continue;
             }
         };
@@ -254,8 +260,20 @@ pub fn seed_vault(
             entity_names.push(name.clone());
             all_entities.entry(node.id).or_insert((node, name));
         }
+        per_memory_entities.push(entity_names);
+    }
 
-        let note = render_memory_note(mem, &entity_names);
+    // Pass 2: reserve every entity's slug in `used` before any memory note is
+    // named, so stubs keep their plain names on collision.
+    for (ent_id, (_, name)) in &all_entities {
+        let base = slug(name);
+        resolve_filename(base, *ent_id, &mut used);
+    }
+
+    // Pass 3: write memory notes, using whatever filename `used` yields —
+    // reserved entity slugs already occupy their plain names.
+    for (mem, entity_names) in memories.iter().zip(per_memory_entities.iter()) {
+        let note = render_memory_note(mem, entity_names);
         let base = title_or_id(mem);
         let filename = resolve_filename(base, mem.id, &mut used);
         let path = vault.join(&filename);
@@ -335,6 +353,16 @@ mod tests {
     }
 
     #[test]
+    fn slug_strips_obsidian_wikilink_and_heading_chars() {
+        let s = slug("Fact about [[Redis]] done");
+        assert!(!s.contains('['));
+        assert!(!s.contains(']'));
+        let s2 = slug("tag #topic and heading ^block");
+        assert!(!s2.contains('#'));
+        assert!(!s2.contains('^'));
+    }
+
+    #[test]
     fn slug_is_char_boundary_safe() {
         let s = slug(&"中".repeat(34)); // 102 bytes of CJK — must not panic
         assert!(!s.is_empty());
@@ -392,6 +420,53 @@ mod tests {
         assert_eq!((r3.skipped, r3.seeded), (1, 0));
         let r4 = seed_vault(&db, &lookup, vdir.path(), &[mem], true).unwrap();
         assert_eq!(r4.seeded, 1);
+    }
+
+    #[test]
+    fn stub_wins_plain_name_on_filename_collision_with_memory() {
+        let (_d, db) = db();
+        let lookup = scopes_to_scope_set(&[Scope::Shared]);
+        // Memory's derived filename ("redis.md", from its title) collides
+        // with the linked entity's own slug ("redis.md"). The stub must win
+        // the plain name so wikilink text ("[[redis]]") and filename agree;
+        // the memory note gets bumped to a suffixed name instead.
+        let out = crate::plan_note(
+            &db,
+            Scope::Shared,
+            &lookup,
+            1,
+            &input("---\ntitle: redis\n---\nFact about [[redis]].\n"),
+        )
+        .unwrap();
+        let NoteAction::Created { memory_id } = out.action else {
+            panic!()
+        };
+        db.submit(out.ops).unwrap();
+        let mem = db.node(&lookup, memory_id).unwrap();
+
+        let vdir = tempfile::tempdir().unwrap();
+        let r = seed_vault(&db, &lookup, vdir.path(), std::slice::from_ref(&mem), false).unwrap();
+        assert_eq!((r.seeded, r.stubs), (1, 1));
+
+        let names: Vec<_> = std::fs::read_dir(vdir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.iter().any(|n| n == "redis.md"), "{names:?}");
+        let stub_text = std::fs::read_to_string(vdir.path().join("redis.md")).unwrap();
+        assert!(stub_text.contains("entity: true"));
+
+        let memory_name = names
+            .iter()
+            .find(|n| *n != "redis.md")
+            .unwrap_or_else(|| panic!("expected a suffixed memory note among {names:?}"));
+        assert!(memory_name.starts_with("redis-"), "{names:?}");
+        let memory_text = std::fs::read_to_string(vdir.path().join(memory_name)).unwrap();
+        assert!(memory_text.contains(&format!("topodb-id: {memory_id}")));
+
+        // Re-seed is stable: same two files, nothing re-churned.
+        let r2 = seed_vault(&db, &lookup, vdir.path(), std::slice::from_ref(&mem), false).unwrap();
+        assert_eq!((r2.seeded + r2.stubs, r2.unchanged), (0, 2));
     }
 
     #[test]

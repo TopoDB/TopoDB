@@ -2679,3 +2679,97 @@ fn obsidian_seed_selects_writes_and_protects_edits() {
         Some(2)
     );
 }
+
+/// Regression for the seed/ingest scope asymmetry (a memory in a project
+/// scope, linked to an entity in `shared`): `obsidian-seed --scope <project>`
+/// must be able to resolve the shared entity (this failed with "unknown
+/// entity" before the fix, since seed read with the project scope alone), and
+/// the seeded vault must then re-ingest as a pure no-op — no spurious
+/// supersession from the wider [project, shared] lookup `obsidian-ingest`
+/// uses discovering an edge that seed never saw.
+#[test]
+fn obsidian_seed_resolves_shared_entity_from_a_project_scope_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let dbs = db.to_str().unwrap().to_string();
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", &dbs];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+
+    // Entity in the default `shared` scope.
+    let ce = run(&["create-entity", "--name", "redis"]);
+    assert!(
+        ce.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ce.stderr)
+    );
+
+    // Memory in a project scope, linked to the shared entity.
+    let rem = run(&[
+        "--scope",
+        &project,
+        "remember",
+        "--content",
+        "Zeta caches sessions in redis",
+        "--entity",
+        "redis",
+    ]);
+    assert!(
+        rem.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rem.stderr)
+    );
+
+    let vault = dir.path().join("wm");
+
+    // Before the fix, this failed with "unknown entity redis" because seed
+    // read only the project scope, never shared.
+    let seed = run(&[
+        "--scope",
+        &project,
+        "obsidian-seed",
+        vault.to_str().unwrap(),
+        "--entity",
+        "redis",
+    ]);
+    assert!(
+        seed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let sv: serde_json::Value = serde_json::from_slice(&seed.stdout).unwrap();
+    assert_eq!(sv["seeded"].as_u64(), Some(1));
+    assert_eq!(sv["stubs"].as_u64(), Some(1));
+
+    let names: Vec<_> = std::fs::read_dir(&vault)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(names.iter().any(|n| n == "redis.md"), "{names:?}");
+
+    // Re-ingest the untouched seeded vault: no new/superseded memories.
+    let ingest = run(&[
+        "--scope",
+        &project,
+        "obsidian-ingest",
+        vault.to_str().unwrap(),
+    ]);
+    assert!(
+        ingest.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let iv: serde_json::Value = serde_json::from_slice(&ingest.stdout).unwrap();
+    assert_eq!(
+        (
+            iv["superseded"].as_u64(),
+            iv["ingested"].as_u64(),
+            iv["errors"].as_array().unwrap().len()
+        ),
+        (Some(0), Some(0), 0),
+        "untouched seeded vault must re-ingest as a pure no-op, got {iv:?}"
+    );
+}

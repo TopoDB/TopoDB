@@ -3504,13 +3504,17 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     #[tool(
         description = "Materialize memories into an Obsidian-format vault as a working set: \
 one note per memory plus entity stubs, wikilinks intact. Select by hybrid-recall query or by \
-entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true."
+entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true. \
+Reads always include the shared scope in addition to the requested one(s), so seeded links \
+match what ingest_vault compares against on re-ingest."
     )]
     fn seed_vault(
         &self,
         Parameters(p): Parameters<SeedVaultParams>,
     ) -> Result<Json<SeedVaultResult>, ErrorData> {
-        let scopes = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let scopes = self
+            .resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?
+            .with_shared();
         let memories = match (&p.query, &p.entity) {
             (Some(q), None) => {
                 let vector = self

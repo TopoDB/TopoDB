@@ -945,10 +945,10 @@ fn obsidian_seed(
     entity: Option<String>,
     hops: u8,
     overwrite: bool,
-    write_scope: Scope,
+    scope: Scope,
     pretty: bool,
 ) -> ! {
-    let scopes = topodb_json::scope_to_scope_set(write_scope);
+    let scopes = topodb_json::scopes_to_scope_set(&[scope, Scope::Shared]);
     let memories = match (&query, &entity) {
         (Some(q), None) => topodb_obsidian::select_by_query(db, &scopes, q, k, None)
             .unwrap_or_else(|e| output::fail_engine(&e)),
