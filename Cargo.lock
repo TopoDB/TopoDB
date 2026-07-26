@@ -3256,6 +3256,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "topodb-obsidian"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "topodb",
+ "topodb-json",
+]
+
+[[package]]
 name = "topodb-py"
 version = "0.0.1"
 dependencies = [
