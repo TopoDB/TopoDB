@@ -1,8 +1,8 @@
 //! Obsidian-format vault ⇄ TopoDB transforms. Deterministic, no LLM.
 //! One note = one memory; `topodb-id` in frontmatter is the identity key.
 
-// mod wikilink; // Task 3
 mod note;
+mod wikilink;
 // mod mapping; // Task 4
 // mod vault; // Task 5
 // mod report; // Task 6
@@ -17,7 +17,7 @@ pub use note::Note;
 //     render_entity_stub, render_memory_note, seed_vault, select_by_entity, select_by_query, slug,
 // }; // Task 8-9
 // pub use vault::{stamp_id, walk_vault, write_note}; // Task 5
-// pub use wikilink::extract_wikilinks; // Task 3
+pub use wikilink::extract_wikilinks;
 
 /// Frontmatter identity key. Stamped by ingest; present on seeded notes.
 pub const TOPODB_ID_KEY: &str = "topodb-id";
