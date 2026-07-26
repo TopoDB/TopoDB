@@ -198,7 +198,9 @@ pub fn existing_memory(
 /// Ops marking `ids` superseded (stamp + close open out-edges) plus the ids
 /// actually marked. Moved from server.rs `supersede_ops`; `now_ms` is a
 /// parameter so tests are deterministic. Error strings must stay identical.
-fn plan_supersede(
+/// Public building block for layers (e.g. topodb-obsidian) that supersede
+/// without going through `plan_remember`.
+pub fn plan_supersede(
     db: &Db,
     write_scope: Scope,
     ids: &[String],
@@ -526,4 +528,27 @@ pub fn plan_remember(
         edge_ids,
         superseded,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use topodb::Op;
+
+    #[test]
+    fn plan_supersede_is_public_and_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.redb")).unwrap();
+        let id = NodeId::new();
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Shared,
+            label: MEMORY_LABEL.into(),
+            props: memory_props("old fact", None).unwrap(),
+        }])
+        .unwrap();
+        let (ops, marked) = plan_supersede(&db, Scope::Shared, &[id.to_string()], 42).unwrap();
+        assert_eq!(marked, vec![id.to_string()]);
+        assert!(!ops.is_empty());
+    }
 }
