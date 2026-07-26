@@ -31,7 +31,7 @@ pub fn note_to_input(note: &Note) -> Result<NoteInput, String> {
         match key {
             TOPODB_ID_KEY => id = Some(v.as_str().ok_or("topodb-id must be a string")?.to_string()),
             "kind" => kind = Some(v.as_str().ok_or("kind must be a string")?.to_string()),
-            ENTITY_STUB_KEY => is_entity_stub = v.as_bool().unwrap_or(false),
+            ENTITY_STUB_KEY => is_entity_stub = v.as_bool().ok_or("entity must be a boolean")?,
             RELATED_KEY => match v {
                 Yaml::String(s) => push_links(s, &mut entities, &mut seen),
                 Yaml::Sequence(seq) => {
@@ -145,6 +145,13 @@ mod tests {
     fn entity_stub_flag() {
         let i = input("---\ntopodb-id: 01BBB\nentity: true\n---\n");
         assert!(i.is_entity_stub);
+    }
+
+    #[test]
+    fn entity_stub_flag_rejects_non_bool() {
+        let n = Note::parse("---\nentity: \"yes\"\n---\nx").unwrap();
+        let err = note_to_input(&n).unwrap_err();
+        assert!(err.contains("entity must be a boolean"), "{err:?}");
     }
 
     #[test]

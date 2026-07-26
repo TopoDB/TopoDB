@@ -48,6 +48,10 @@ For each note in the vault:
 
 Every write is stamped with exactly one scope (global `--scope` on the CLI; per-call `scope` on MCP). Frontmatter id stamping rewrites the file atomically (temp + rename), preserving unknown frontmatter keys and body bytes exactly. See the spec (docs/superpowers/specs/2026-07-26-obsidian-integration-design.md) for the full ingest contract, including entity stubs and error handling.
 
+Ingest is additive only: deleting a note from the vault propagates nothing back to the graph — the memory it was seeded from lives on as-is. Retiring a memory (soft-tombstoning it as `forgotten_at`) is the `forget` verb's job, invoked separately; ingest never infers a delete from a missing file.
+
+Embeddings are applied only when the caller supplies an embed hook: the MCP server's `ingest_vault`/`seed_vault` always do (via its configured embedder), while the CLI's `obsidian-ingest`/`obsidian-seed` are text+graph only (no `embed` hook), so vector recall over CLI-ingested memories is unavailable until something else embeds them.
+
 ## Seed semantics
 
 Two selectors, both existing reads filtering liveness via the engine's tombstone set:
