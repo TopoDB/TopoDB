@@ -9,8 +9,7 @@ mod vault; // Task 5
 mod wikilink; // Task 4
               // mod seed; // Task 8-9
 
-pub use ingest::{plan_note, IngestOutcome, NoteAction}; // Task 6-7
-                                                        // pub use ingest::ingest_vault; // Task 7
+pub use ingest::{ingest_vault, plan_note, IngestOutcome, NoteAction}; // Task 6-7
 pub use mapping::{note_to_input, NoteInput}; // Task 4
 pub use note::Note;
 pub use report::{FileError, IngestReport, SeedReport}; // Task 6
