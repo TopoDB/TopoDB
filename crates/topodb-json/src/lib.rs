@@ -19,6 +19,13 @@ pub use compose::{
     PlannedEntity, RememberPlan, RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
 };
 
+mod lifecycle;
+pub use lifecycle::{
+    lifecycle_candidates, staleness, LifecycleCandidate, LifecycleParams, LIFECYCLE_DEFAULT_LIMIT,
+    LIFECYCLE_HALF_LIFE_EPISODIC_DAYS, LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS,
+    LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS,
+};
+
 mod retry;
 pub use retry::open_with_busy_retry;
 
