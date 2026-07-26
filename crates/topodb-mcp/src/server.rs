@@ -1837,6 +1837,86 @@ struct ForgetResult {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct IngestVaultParams {
+    /// Vault directory on the server's host filesystem (absolute path recommended).
+    vault: String,
+    /// Write scope: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Plan and report without writing to the db or the vault.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SeedVaultParams {
+    /// Vault directory to materialize notes into (created if missing).
+    vault: String,
+    /// Hybrid-recall selector (exactly one of query/entity).
+    #[serde(default)]
+    query: Option<String>,
+    /// Recall result count when selecting by `query`. Defaults to 12.
+    #[serde(default)]
+    k: Option<usize>,
+    /// Entity-neighborhood selector (exactly one of query/entity).
+    #[serde(default)]
+    entity: Option<String>,
+    /// Traversal radius (in hops) when selecting by `entity`. Defaults to 2.
+    #[serde(default)]
+    hops: Option<u8>,
+    /// Read scope: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default read scopes.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Multiple read scopes (mutually exclusive with `scope`).
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+    /// Overwrite existing vault files that differ from the rendered content.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct VaultFileError {
+    /// Vault-relative file path the error occurred on.
+    file: String,
+    /// Human-readable failure reason.
+    reason: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct IngestVaultResult {
+    /// Notes that created a brand-new memory.
+    ingested: usize,
+    /// Notes whose change superseded a prior memory version.
+    superseded: usize,
+    /// Notes that deduplicated to an existing identical memory.
+    deduplicated: usize,
+    /// Notes left unchanged (includes entity stubs).
+    skipped: usize,
+    /// Per-file failures; the rest of the vault still processes.
+    errors: Vec<VaultFileError>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct SeedVaultResult {
+    /// Memory notes newly written.
+    seeded: usize,
+    /// Entity stub notes newly written.
+    stubs: usize,
+    /// Files left untouched because they already matched.
+    unchanged: usize,
+    /// Files left untouched because they differ and `overwrite` was false.
+    skipped: usize,
+    /// Per-file failures; the rest of the vault still processes.
+    errors: Vec<VaultFileError>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateMemoryParams {
     /// The memory's full-text-searchable body.
     content: String,
@@ -3377,6 +3457,105 @@ impl TopoServer {
             })?;
         self.submit_write(ops)?;
         Ok(Json(ForgetResult { forgotten }))
+    }
+
+    #[tool(
+        description = "Ingest an Obsidian-format vault directory: one note = one memory, \
+wikilinks become entities, notes with a topodb-id supersede their prior version on change. \
+Stamps new ids back into note frontmatter. Deterministic; embeddings applied when available."
+    )]
+    fn ingest_vault(
+        &self,
+        Parameters(p): Parameters<IngestVaultParams>,
+    ) -> Result<Json<IngestVaultResult>, ErrorData> {
+        let scope = self.resolve_scope(p.scope.as_deref())?;
+        let mut lookup_scopes: Vec<Scope> = self.default_read_scopes.as_slice().to_vec();
+        lookup_scopes.push(scope);
+        lookup_scopes.push(Scope::Shared);
+        let lookup = convert::scopes_to_scope_set(&lookup_scopes);
+        let embedder = &self.embedder;
+        let embed = |text: &str| embedder.embed(text).map(|v| (embedder.model_name(), v));
+        let report = topodb_obsidian::ingest_vault(
+            &self.db,
+            std::path::Path::new(&p.vault),
+            scope,
+            &lookup,
+            now_ms(),
+            p.dry_run,
+            Some(&embed),
+        )
+        .map_err(|m| ErrorData::invalid_params(m, None))?;
+        Ok(Json(IngestVaultResult {
+            ingested: report.ingested,
+            superseded: report.superseded,
+            deduplicated: report.deduplicated,
+            skipped: report.skipped,
+            errors: report
+                .errors
+                .into_iter()
+                .map(|e| VaultFileError {
+                    file: e.file,
+                    reason: e.reason,
+                })
+                .collect(),
+        }))
+    }
+
+    #[tool(
+        description = "Materialize memories into an Obsidian-format vault as a working set: \
+one note per memory plus entity stubs, wikilinks intact. Select by hybrid-recall query or by \
+entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true."
+    )]
+    fn seed_vault(
+        &self,
+        Parameters(p): Parameters<SeedVaultParams>,
+    ) -> Result<Json<SeedVaultResult>, ErrorData> {
+        let scopes = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let memories = match (&p.query, &p.entity) {
+            (Some(q), None) => {
+                let vector = self
+                    .embedder
+                    .embed(q)
+                    .map(|v| (self.embedder.model_name(), v));
+                topodb_obsidian::select_by_query(&self.db, &scopes, q, p.k.unwrap_or(12), vector)
+                    .map_err(classify_topo_error)?
+            }
+            (None, Some(name)) => {
+                topodb_obsidian::select_by_entity(&self.db, &scopes, name, p.hops.unwrap_or(2))
+                    .map_err(|e| match e {
+                        convert::ComposeError::Invalid(m) => ErrorData::invalid_params(m, None),
+                        convert::ComposeError::Engine(t) => classify_topo_error(t),
+                    })?
+            }
+            _ => {
+                return Err(ErrorData::invalid_params(
+                    "exactly one of query or entity is required",
+                    None,
+                ))
+            }
+        };
+        let report = topodb_obsidian::seed_vault(
+            &self.db,
+            &scopes,
+            std::path::Path::new(&p.vault),
+            &memories,
+            p.overwrite,
+        )
+        .map_err(|m| ErrorData::invalid_params(m, None))?;
+        Ok(Json(SeedVaultResult {
+            seeded: report.seeded,
+            stubs: report.stubs,
+            unchanged: report.unchanged,
+            skipped: report.skipped,
+            errors: report
+                .errors
+                .into_iter()
+                .map(|e| VaultFileError {
+                    file: e.file,
+                    reason: e.reason,
+                })
+                .collect(),
+        }))
     }
 
     #[tool(

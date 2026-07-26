@@ -3238,6 +3238,7 @@ dependencies = [
  "tokio",
  "topodb",
  "topodb-json",
+ "topodb-obsidian",
  "ureq",
  "zip",
 ]

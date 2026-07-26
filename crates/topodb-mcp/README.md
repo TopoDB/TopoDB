@@ -42,8 +42,8 @@ The `--help`/`-h` and `--version`/`-V` flags print to stdout and exit 0.
 
 ## Tools
 
-`tools/list` reports exactly 28 tools: `db_info`, 14 read tools (`get_changes` included), and
-13 write tools.
+`tools/list` reports exactly 30 tools: `db_info`, 14 read tools (`get_changes` included), and
+15 write tools.
 
 | Tool | Params | Description |
 |---|---|---|
@@ -75,6 +75,8 @@ The `--help`/`-h` and `--version`/`-V` flags print to stdout and exit 0.
 | `close_edge` | `id` (string, required), `valid_to` (integer ms, optional — defaults to now) | Close an open edge, stamping its `valid_to` — the fact stops being "currently true" but stays in history. Find the edge id with `get_edges`; for the "X changed to Y" case prefer `link` with `supersede: true`. An explicit `valid_to` must be a plausible past-or-present ms timestamp (seconds-since-epoch and future values are rejected). Errors if the edge doesn't exist or is already closed. Returns the committed seq. |
 | `set_embedding` | `id` (string, required), `model` (string, required), `vector` (non-empty number array, required) | Attach a raw embedding vector (host-computed) to an existing node under `model`. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq. |
 | `submit_batch` | `commands` (array of command objects, required) | Submit a batch of high-level commands atomically — all commit or none. Each command's `op` matches a tool name (own field names, not always identical to that tool's param names — see the batch DSL). `#N` in an id field references the id produced by the Nth earlier command (0-indexed: `#0` is the first command). Returns the produced ids in order (`null` for commands that create nothing). |
+| `ingest_vault` | `vault`, `scope?`, `dry_run?` | Ingest an Obsidian-format vault: one note = one memory; wikilinks → entities; changed notes supersede; ids stamped back into frontmatter. |
+| `seed_vault` | `vault`, `query?`/`entity?` (exactly one), `k?`, `hops?`, `scope?`/`scopes?`, `overwrite?` | Materialize memories into an Obsidian-format vault (notes + entity stubs). Non-clobbering by default. |
 
 Every scoped read tool accepts both `scope` (one scope) and `scopes` (an array of several,
 e.g. a project scope plus `"shared"`) — a non-empty `scopes` wins over `scope`, which wins over
