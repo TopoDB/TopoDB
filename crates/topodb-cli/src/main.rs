@@ -43,7 +43,10 @@ fn main() {
         | Command::CreateEntity { scope, .. }
         | Command::Link { scope, .. }
         | Command::Remember { scope, .. }
-        | Command::Forget { scope, .. } => resolve_cmd_scope(scope.as_deref(), default_scope),
+        | Command::Forget { scope, .. }
+        | Command::ObsidianIngest { scope, .. } => {
+            resolve_cmd_scope(scope.as_deref(), default_scope)
+        }
         _ => default_scope,
     };
 
@@ -136,6 +139,9 @@ fn main() {
             cli.pretty,
         ),
         Command::Forget { ids, .. } => forget(&db, write_scope, &ids, cli.pretty),
+        Command::ObsidianIngest { vault, dry_run, .. } => {
+            obsidian_ingest(&db, &vault, write_scope, dry_run, cli.pretty)
+        }
         Command::Get { id } => get(&db, default_scope, &id, cli.pretty),
         Command::Find {
             label,
@@ -889,6 +895,27 @@ fn forget(db: &Db, scope: Scope, ids: &[String], pretty: bool) -> ! {
         output::fail_engine(&e);
     }
     output::ok(&serde_json::json!({ "forgotten": forgotten }), pretty);
+}
+
+fn obsidian_ingest(
+    db: &Db,
+    vault: &std::path::Path,
+    write_scope: Scope,
+    dry_run: bool,
+    pretty: bool,
+) -> ! {
+    let lookup = topodb_json::scopes_to_scope_set(&[write_scope, Scope::Shared]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match topodb_obsidian::ingest_vault(db, vault, write_scope, &lookup, now, dry_run, None) {
+        Ok(report) => output::ok(
+            &serde_json::to_value(&report).expect("report serializes"),
+            pretty,
+        ),
+        Err(m) => output::fail("rejected", &m, 2),
+    }
 }
 
 fn set_props(db: &Db, id: &str, props: &str, pretty: bool) -> ! {

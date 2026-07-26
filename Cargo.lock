@@ -3207,6 +3207,7 @@ dependencies = [
  "tempfile",
  "topodb",
  "topodb-json",
+ "topodb-obsidian",
 ]
 
 [[package]]

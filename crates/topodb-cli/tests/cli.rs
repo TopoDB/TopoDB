@@ -2544,3 +2544,57 @@ fn lifecycle_candidates_ranks_deterministically_and_validates() {
         );
     }
 }
+
+#[test]
+fn obsidian_ingest_creates_supersedes_and_stamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let vault = dir.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    std::fs::write(
+        vault.join("fact.md"),
+        "---\nstatus: open\n---\nDelta uses [[redb]].\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    // Missing dir → rejected/2.
+    let bad = run(&["obsidian-ingest", dir.path().join("nope").to_str().unwrap()]);
+    assert_eq!(bad.status.code(), Some(2));
+
+    // Dry run reports without writing.
+    let dry = run(&["obsidian-ingest", vault.to_str().unwrap(), "--dry-run"]);
+    let v: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(v["ingested"], 1);
+    assert!(!std::fs::read_to_string(vault.join("fact.md"))
+        .unwrap()
+        .contains("topodb-id"));
+
+    // Real run stamps and stores; rerun is a skip.
+    let r = run(&["obsidian-ingest", vault.to_str().unwrap()]);
+    assert!(
+        r.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(
+        (
+            v["ingested"].as_u64(),
+            v["errors"].as_array().unwrap().len()
+        ),
+        (Some(1), 0)
+    );
+    assert!(std::fs::read_to_string(vault.join("fact.md"))
+        .unwrap()
+        .contains("topodb-id:"));
+    let r2 = run(&["obsidian-ingest", vault.to_str().unwrap()]);
+    let v2: serde_json::Value = serde_json::from_slice(&r2.stdout).unwrap();
+    assert_eq!(v2["skipped"], 1);
+    // And the memory is searchable.
+    let s = run(&["search", "Delta"]);
+    assert!(String::from_utf8_lossy(&s.stdout).contains("Delta uses"));
+}
