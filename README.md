@@ -97,7 +97,7 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 - Access stats (recall-driven counters); change feed (`subscribe` / `ops_since`) + op-log compaction
 - Versioned on-disk format ([FORMAT.md](FORMAT.md))
 
-**Memory & recall over MCP — `topodb-mcp`** (30 tools; [full table](crates/topodb-mcp/README.md))
+**Memory & recall over MCP — `topodb-mcp`** (31 tools; [full table](crates/topodb-mcp/README.md))
 
 - Hybrid recall — BM25 + vector + graph, RRF-fused, recency-weighted
 - Memory hygiene — write-time dedup + supersession, banded/contradiction-aware near-duplicate detection, `consolidate_memories`, orphan + stale scans, `memory_health`, `suggest_links`
@@ -146,7 +146,7 @@ single-process access only).
 
 ### topodb-mcp
 
-A standalone binary: point it at a `.redb` file and it serves **30 MCP tools** over stdio
+A standalone binary: point it at a `.redb` file and it serves **31 MCP tools** over stdio
 JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
 
 - **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`
