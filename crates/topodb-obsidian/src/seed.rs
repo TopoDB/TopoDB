@@ -4,11 +4,62 @@
 use crate::{Note, RELATED_KEY, TITLE_PROP, TOPODB_ID_KEY};
 use serde_yaml::{Mapping, Value as Yaml};
 use std::collections::BTreeMap;
-use topodb::{Db, NodeId, NodeRecord, PropValue, ScopeSet};
+use topodb::{Db, Direction, NodeId, NodeRecord, PropValue, RecallQuery, ScopeSet, TraversalQuery};
 use topodb_json::{
-    ALIAS_EDGE_TYPE, ALIAS_NAME_PROP, ENTITY_LABEL, ENTITY_NAME_PROP, MEMORY_CONTENT_HASH_PROP,
-    MEMORY_CONTENT_PROP, MEMORY_FORGOTTEN_AT_PROP, MEMORY_SUPERSEDED_AT_PROP,
+    find_existing_entity, ComposeError, ALIAS_EDGE_TYPE, ALIAS_NAME_PROP, ENTITY_LABEL,
+    ENTITY_NAME_PROP, MEMORY_CONTENT_HASH_PROP, MEMORY_CONTENT_PROP, MEMORY_FORGOTTEN_AT_PROP,
+    MEMORY_LABEL, MEMORY_SUPERSEDED_AT_PROP, MEMORY_TOMBSTONE_PROPS,
 };
+
+/// Select live memories by BM25/vector recall (tombstoned memories excluded).
+pub fn select_by_query(
+    db: &Db,
+    scopes: &ScopeSet,
+    query: &str,
+    k: usize,
+    vector: Option<(String, Vec<f32>)>,
+) -> Result<Vec<NodeRecord>, topodb::TopoError> {
+    let q = RecallQuery {
+        vector,
+        labels: Some(vec![MEMORY_LABEL.to_string()]),
+        tombstone_props: MEMORY_TOMBSTONE_PROPS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        ..RecallQuery::new(scopes.clone(), query, k)
+    };
+    Ok(db.recall(&q)?.into_iter().map(|(n, _)| n).collect())
+}
+
+/// Select live memories within `hops` of a named entity (alias-normalized).
+/// Errors if the entity is unknown.
+pub fn select_by_entity(
+    db: &Db,
+    scopes: &ScopeSet,
+    entity: &str,
+    hops: u8,
+) -> Result<Vec<NodeRecord>, ComposeError> {
+    let anchor = find_existing_entity(db, scopes, entity)?
+        .ok_or_else(|| ComposeError::Invalid(format!("unknown entity {entity:?}")))?;
+    let sg = db.traverse(&TraversalQuery {
+        scopes: scopes.clone(),
+        seeds: vec![anchor.id],
+        max_hops: hops,
+        edge_types: None,
+        direction: Direction::Both,
+        as_of: None,
+    })?;
+    Ok(sg
+        .nodes
+        .into_iter()
+        .filter(|n| n.label.as_str() == MEMORY_LABEL)
+        .filter(|n| {
+            MEMORY_TOMBSTONE_PROPS
+                .iter()
+                .all(|p| !n.props.contains_key(*p))
+        })
+        .collect())
+}
 
 /// Filesystem-safe slug: unsafe chars → '-', trim, drop trailing dots, cap 100 chars.
 pub fn slug(name: &str) -> String {
@@ -341,5 +392,63 @@ mod tests {
         assert_eq!((r3.skipped, r3.seeded), (1, 0));
         let r4 = seed_vault(&db, &lookup, vdir.path(), &[mem], true).unwrap();
         assert_eq!(r4.seeded, 1);
+    }
+
+    #[test]
+    fn select_by_query_finds_live_memories_only() {
+        let (_d, db) = db();
+        let lookup = scopes_to_scope_set(&[Scope::Shared]);
+        for txt in ["kafka handles the event stream", "postgres stores billing"] {
+            let o = crate::plan_note(
+                &db,
+                Scope::Shared,
+                &lookup,
+                1,
+                &input(&format!("{txt} [[infra]]\n")),
+            )
+            .unwrap();
+            db.submit(o.ops).unwrap();
+        }
+        let hits = select_by_query(&db, &lookup, "event stream", 5, None).unwrap();
+        assert!(hits.iter().all(|n| n.label.as_str() == "Memory"));
+        assert!(hits.iter().any(|n| matches!(n.props.get("content"),
+            Some(topodb::PropValue::Str(s)) if s.contains("kafka"))));
+
+        // Tombstoned memories are excluded from BOTH selectors.
+        let kafka = hits
+            .iter()
+            .find(|n| {
+                matches!(n.props.get("content"),
+                Some(topodb::PropValue::Str(s)) if s.contains("kafka"))
+            })
+            .unwrap();
+        let (ops, _) =
+            topodb_json::plan_forget(&db, Scope::Shared, &[kafka.id.to_string()], 9).unwrap();
+        db.submit(ops).unwrap();
+        let hits2 = select_by_query(&db, &lookup, "event stream", 5, None).unwrap();
+        assert!(hits2.iter().all(|n| n.id != kafka.id));
+        let by_ent = select_by_entity(&db, &lookup, "infra", 2).unwrap();
+        assert!(by_ent.iter().all(|n| n.id != kafka.id));
+    }
+
+    #[test]
+    fn select_by_entity_traverses_and_rejects_unknown() {
+        let (_d, db) = db();
+        let lookup = scopes_to_scope_set(&[Scope::Shared]);
+        let o = crate::plan_note(
+            &db,
+            Scope::Shared,
+            &lookup,
+            1,
+            &input("Zeta fact about [[Widget]].\n"),
+        )
+        .unwrap();
+        db.submit(o.ops).unwrap();
+        let hits = select_by_entity(&db, &lookup, "widget", 2).unwrap(); // alias-normalized name
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(
+            select_by_entity(&db, &lookup, "nope", 2),
+            Err(topodb_json::ComposeError::Invalid(_))
+        ));
     }
 }
