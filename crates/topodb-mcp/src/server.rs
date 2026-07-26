@@ -1386,6 +1386,19 @@ fn default_labels() -> Vec<String> {
     vec!["Memory".to_string(), "Entity".to_string()]
 }
 
+fn default_lifecycle_limit() -> usize {
+    convert::LIFECYCLE_DEFAULT_LIMIT
+}
+fn default_half_life_episodic_days() -> f64 {
+    convert::LIFECYCLE_HALF_LIFE_EPISODIC_DAYS
+}
+fn default_half_life_semantic_days() -> f64 {
+    convert::LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS
+}
+fn default_half_life_procedural_days() -> f64 {
+    convert::LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchMemoriesParams {
@@ -1648,6 +1661,50 @@ struct AccessStatsResult {
     /// most recent such read (0 if the node has never been counted).
     #[serde(skip_serializing_if = "Option::is_none")]
     last_accessed_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LifecycleCandidatesParams {
+    /// Top-N candidates to report, by descending staleness.
+    #[serde(default = "default_lifecycle_limit")]
+    #[schemars(range(min = 1))]
+    limit: usize,
+    /// Staleness half-life for episodic memories, in days (> 0).
+    #[serde(default = "default_half_life_episodic_days")]
+    #[schemars(range(min = 0.001))]
+    half_life_episodic_days: f64,
+    /// Staleness half-life for semantic memories (and memories with no
+    /// kind), in days (> 0).
+    #[serde(default = "default_half_life_semantic_days")]
+    #[schemars(range(min = 0.001))]
+    half_life_semantic_days: f64,
+    /// Staleness half-life for procedural memories, in days (> 0).
+    #[serde(default = "default_half_life_procedural_days")]
+    #[schemars(range(min = 0.001))]
+    half_life_procedural_days: f64,
+    /// Pin the sweep's "now" (Unix ms) for reproducible runs; omitted =
+    /// wall clock.
+    #[serde(default)]
+    now_ms: Option<i64>,
+    /// Scope to scan: `"shared"` or a scope ULID. Defaults to the server's
+    /// configured default scope.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Scan several scopes at once (takes precedence over `scope`); must
+    /// not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct LifecycleCandidatesResult {
+    /// Decay candidates, stalest first, each with full evidence:
+    /// {id, content, kind, created_at, last_accessed_at, access_count,
+    /// staleness}.
+    #[schemars(with = "Vec<Value>")]
+    candidates: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3173,6 +3230,33 @@ impl TopoServer {
                 last_accessed_at: None,
             },
         }))
+    }
+
+    #[tool(
+        description = "Surface decay candidates: live memories ranked by kind-aware staleness ((age/half_life)/ln(e+access_count); age since last access, falling back to creation; half-life defaults episodic 14d / semantic 120d / procedural 365d, absent kind counts as semantic). Read-only, deterministic under now_ms, and UNBUMPED — running the sweep does not perturb the access signal it reads. This tool only PROPOSES: nothing is stamped or deleted. YOU review each candidate's evidence and act via forget or consolidate_memories — never forget from staleness alone. For near-duplicates use find_duplicate_memories; this sweep does not detect them."
+    )]
+    fn lifecycle_candidates(
+        &self,
+        Parameters(p): Parameters<LifecycleCandidatesParams>,
+    ) -> Result<Json<LifecycleCandidatesResult>, ErrorData> {
+        let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        let params = convert::LifecycleParams {
+            limit: p.limit,
+            half_life_episodic_ms: (p.half_life_episodic_days * 86_400_000.0) as i64,
+            half_life_semantic_ms: (p.half_life_semantic_days * 86_400_000.0) as i64,
+            half_life_procedural_ms: (p.half_life_procedural_days * 86_400_000.0) as i64,
+        };
+        let now = p.now_ms.unwrap_or_else(now_ms);
+        let candidates = convert::lifecycle_candidates(&self.db, &scope_set, &params, now)
+            .map_err(|e| match e {
+                convert::ComposeError::Invalid(m) => ErrorData::invalid_params(m, None),
+                convert::ComposeError::Engine(t) => classify_topo_error(t),
+            })?;
+        let candidates = candidates
+            .iter()
+            .map(|c| serde_json::to_value(c).expect("LifecycleCandidate serializes infallibly"))
+            .collect();
+        Ok(Json(LifecycleCandidatesResult { candidates }))
     }
 
     #[tool(
