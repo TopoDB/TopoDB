@@ -45,8 +45,8 @@ fn end_to_end_scenario_over_stdio() {
     let tools = server.tools_list(DEFAULT_TIMEOUT);
     assert_eq!(
         tools.len(),
-        28,
-        "expected exactly 28 tools (db_info + 14 read + 13 write), got: {tools:#?}"
+        29,
+        "expected exactly 29 tools (db_info + 15 read + 13 write), got: {tools:#?}"
     );
     for name in [
         "db_info",
@@ -61,6 +61,7 @@ fn end_to_end_scenario_over_stdio() {
         "traverse",
         "suggest_links",
         "access_stats",
+        "lifecycle_candidates",
         "get_changes",
         "get_edges",
         "create_memory",
