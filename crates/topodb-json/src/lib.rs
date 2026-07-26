@@ -21,9 +21,9 @@ pub use compose::{
 
 mod lifecycle;
 pub use lifecycle::{
-    lifecycle_candidates, staleness, LifecycleCandidate, LifecycleParams, LIFECYCLE_DEFAULT_LIMIT,
-    LIFECYCLE_HALF_LIFE_EPISODIC_DAYS, LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS,
-    LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS,
+    lifecycle_candidates, plan_purge, staleness, LifecycleCandidate, LifecycleParams,
+    LIFECYCLE_DEFAULT_LIMIT, LIFECYCLE_HALF_LIFE_EPISODIC_DAYS,
+    LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS, LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS,
 };
 
 mod retry;

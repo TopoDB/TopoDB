@@ -8,7 +8,7 @@ use crate::{
     ComposeError, MEMORY_CONTENT_PROP, MEMORY_KINDS, MEMORY_KIND_DEFAULT, MEMORY_KIND_EPISODIC,
     MEMORY_KIND_PROCEDURAL, MEMORY_KIND_PROP, MEMORY_LABEL, MEMORY_TOMBSTONE_PROPS,
 };
-use topodb::{Db, PropValue, ScopeSet};
+use topodb::{Db, NodeId, Op, PropValue, ScopeSet};
 
 /// How many candidates a sweep reports by default.
 pub const LIFECYCLE_DEFAULT_LIMIT: usize = 20;
@@ -144,4 +144,37 @@ pub fn lifecycle_candidates(
     });
     out.truncate(params.limit);
     Ok(out)
+}
+
+/// Phase E: plan the destructive purge. Selects every Memory node in
+/// `scopes` whose ANY tombstone prop holds an `Int` strictly older than
+/// `tombstoned_before_ms` and returns one `Op::RemoveNode` per hit plus
+/// the ascending-sorted id list (same order). The caller decides whether
+/// to submit — the CLI's dry-run prints this plan without ever writing.
+/// Non-`Int` tombstone values are not marks (the engine's liveness rule);
+/// live nodes are never selected. Purge is deliberately CLI-only and
+/// never part of the lifecycle graph: reclamation is an operator action.
+pub fn plan_purge(
+    db: &Db,
+    scopes: &ScopeSet,
+    tombstoned_before_ms: i64,
+) -> Result<(Vec<Op>, Vec<String>), ComposeError> {
+    if tombstoned_before_ms <= 0 {
+        return Err(ComposeError::Invalid(
+            "tombstoned-before must be a positive unix-ms timestamp".into(),
+        ));
+    }
+    let mut doomed: Vec<NodeId> = Vec::new();
+    for node in db.nodes_by_label_unbumped(scopes, MEMORY_LABEL) {
+        let qualifies = MEMORY_TOMBSTONE_PROPS.iter().any(
+            |p| matches!(node.props.get(*p), Some(PropValue::Int(t)) if *t < tombstoned_before_ms),
+        );
+        if qualifies {
+            doomed.push(node.id);
+        }
+    }
+    doomed.sort();
+    let ids = doomed.iter().map(|id| id.to_string()).collect();
+    let ops = doomed.into_iter().map(|id| Op::RemoveNode { id }).collect();
+    Ok((ops, ids))
 }
