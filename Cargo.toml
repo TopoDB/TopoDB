@@ -8,6 +8,7 @@ members = [
     "crates/topodb-sgh",
     "crates/topodb-py",
     "crates/topodb-node",
+    "crates/topodb-obsidian",
 ]
 
 # The profile that 'dist' will build with
