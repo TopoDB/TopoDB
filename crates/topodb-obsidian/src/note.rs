@@ -19,33 +19,38 @@ impl Note {
                 body: text.to_string(),
             });
         };
-        let mut close: Option<usize> = None;
-
-        // Check for closing delimiter at the start of rest (empty frontmatter)
+        // Closing delimiter at the very start of rest (empty frontmatter),
+        // e.g. "---\n---\nbody\n". Handled fully inline and returned early so
+        // it never aliases an index produced by the match_indices loop below.
         if rest.len() >= 3 && &rest[..3] == "---" {
             let after = &rest[3..];
             if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
-                close = Some(0); // Special marker: close at position 0 means start of rest
+                let mut body = after;
+                if let Some(b) = body
+                    .strip_prefix("\r\n")
+                    .or_else(|| body.strip_prefix('\n'))
+                {
+                    body = b;
+                }
+                return Ok(Note {
+                    frontmatter: Mapping::new(),
+                    body: body.to_string(),
+                });
             }
         }
 
-        if close.is_none() {
-            for (i, _) in rest.match_indices("\n---") {
-                let after = &rest[i + 4..];
-                if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
-                    close = Some(i);
-                    break;
-                }
+        let mut close: Option<usize> = None;
+        for (i, _) in rest.match_indices("\n---") {
+            let after = &rest[i + 4..];
+            if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
+                close = Some(i);
+                break;
             }
         }
 
         let close_pos = close.ok_or("unterminated frontmatter (no closing ---)")?;
-        let (yaml, mut body) = if close_pos == 0 {
-            // Closing --- at start of rest: empty frontmatter
-            ("", &rest[3..])
-        } else {
-            (&rest[..close_pos + 1], &rest[close_pos + 4..])
-        };
+        let yaml = &rest[..close_pos + 1];
+        let mut body = &rest[close_pos + 4..];
 
         if let Some(b) = body
             .strip_prefix("\r\n")
@@ -129,6 +134,17 @@ mod tests {
         assert!(n.frontmatter.is_empty());
         assert_eq!(n.body, "body\n");
         let crlf = Note::parse("---\r\n---\r\nbody\n").unwrap();
+        assert!(crlf.frontmatter.is_empty());
+        assert_eq!(crlf.body, "body\n");
+    }
+
+    #[test]
+    fn blank_line_frontmatter_does_not_corrupt_body() {
+        let n = Note::parse("---\n\n---\nbody\n").unwrap();
+        assert!(n.frontmatter.is_empty());
+        assert_eq!(n.body, "body\n");
+
+        let crlf = Note::parse("---\r\n\r\n---\r\nbody\n").unwrap();
         assert!(crlf.frontmatter.is_empty());
         assert_eq!(crlf.body, "body\n");
     }
