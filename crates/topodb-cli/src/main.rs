@@ -142,6 +142,24 @@ fn main() {
         Command::ObsidianIngest { vault, dry_run, .. } => {
             obsidian_ingest(&db, &vault, write_scope, dry_run, cli.pretty)
         }
+        Command::ObsidianSeed {
+            vault,
+            query,
+            k,
+            entity,
+            hops,
+            overwrite,
+        } => obsidian_seed(
+            &db,
+            &vault,
+            query,
+            k,
+            entity,
+            hops,
+            overwrite,
+            default_scope,
+            cli.pretty,
+        ),
         Command::Get { id } => get(&db, default_scope, &id, cli.pretty),
         Command::Find {
             label,
@@ -910,6 +928,42 @@ fn obsidian_ingest(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     match topodb_obsidian::ingest_vault(db, vault, write_scope, &lookup, now, dry_run, None) {
+        Ok(report) => output::ok(
+            &serde_json::to_value(&report).expect("report serializes"),
+            pretty,
+        ),
+        Err(m) => output::fail("rejected", &m, 2),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn obsidian_seed(
+    db: &Db,
+    vault: &std::path::Path,
+    query: Option<String>,
+    k: usize,
+    entity: Option<String>,
+    hops: u8,
+    overwrite: bool,
+    write_scope: Scope,
+    pretty: bool,
+) -> ! {
+    let scopes = topodb_json::scope_to_scope_set(write_scope);
+    let memories = match (&query, &entity) {
+        (Some(q), None) => topodb_obsidian::select_by_query(db, &scopes, q, k, None)
+            .unwrap_or_else(|e| output::fail_engine(&e)),
+        (None, Some(name)) => match topodb_obsidian::select_by_entity(db, &scopes, name, hops) {
+            Ok(m) => m,
+            Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
+            Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
+        },
+        _ => output::fail(
+            "rejected",
+            "exactly one of --query or --entity is required",
+            2,
+        ),
+    };
+    match topodb_obsidian::seed_vault(db, &scopes, vault, &memories, overwrite) {
         Ok(report) => output::ok(
             &serde_json::to_value(&report).expect("report serializes"),
             pretty,
