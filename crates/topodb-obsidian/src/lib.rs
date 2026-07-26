@@ -3,8 +3,8 @@
 
 mod mapping;
 mod note;
+mod vault; // Task 5
 mod wikilink; // Task 4
-              // mod vault; // Task 5
               // mod report; // Task 6
               // mod ingest; // Task 6-7
               // mod seed; // Task 8-9
@@ -16,7 +16,7 @@ pub use note::Note;
 // pub use seed::{
 //     render_entity_stub, render_memory_note, seed_vault, select_by_entity, select_by_query, slug,
 // }; // Task 8-9
-// pub use vault::{stamp_id, walk_vault, write_note}; // Task 5
+pub use vault::{stamp_id, walk_vault, write_note}; // Task 5
 pub use wikilink::extract_wikilinks;
 
 /// Frontmatter identity key. Stamped by ingest; present on seeded notes.
