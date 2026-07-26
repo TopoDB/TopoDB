@@ -18,6 +18,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`SearchOptions.prop_retain`** — a mechanism-only string-prop allowlist (`PropRetain { prop, any_of, absent_as }`): a candidate survives iff its `prop` value (a missing/non-`Str` value reads as `absent_as` when set) is in `any_of`. Filtered before top-k in every text-search path, never access-bumped when dropped, and re-applied post-fusion in `recall` so vector/graph-leg candidates cannot leak past it. The engine names no prop and no vocabulary; empty `prop`/`any_of` are rejected.
 - **`RecallQuery.tombstone_props` / `Db::search_text_live` takes a prop SET** — tombstone filtering generalizes from one prop (`tombstone_prop: Option<String>`) to any number (`tombstone_props: Vec<String>` / `&[&str]`): a candidate is dropped when ANY listed prop holds an `Int` timestamp `<=` the query's effective now. Per-prop semantics unchanged (future marks kept, non-`Int` values ignored, filtered before top-k, never access-bumped). **Breaking for struct-literal construction** of `RecallQuery` and for `search_text_live` callers — pass `vec![prop]` / `&[prop]` for the old behavior.
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
 - **`Db::search_vector_unbumped`** — cosine vector search with the same population, order, and scores as `search_vector`, but WITHOUT bumping access counters. For maintenance and advisory reads (near-duplicate checks) that must not spend the recency signal they exist to protect — the same rationale as `search_text_unbumped`. One shared implementation with the bumping variant.
@@ -326,6 +327,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **Memory `kind` taxonomy vocabulary** — `MEMORY_KIND_PROP` (`"kind"`), the closed enum `MEMORY_KINDS` (`episodic | semantic | procedural`), `MEMORY_KIND_DEFAULT` (`semantic` — what an absent prop reads as; no migration needed), and `validate_memory_kind`. `RememberRequest.kind` stamps NEW memories only (dedup ignores kind; the hit's stored kind wins); `kind` joins the reserved props rail with a message pointing at the parameter.
 - **`MEMORY_FORGOTTEN_AT_PROP` + `MEMORY_TOMBSTONE_PROPS`** — the second tombstone and the canonical liveness set every surface filters on. `plan_forget(db, write_scope, ids, now_ms)` — strict shared ops builder for the `forget` verb (stamp + close open edges; ANY invalid id rejects the whole call, unlike `plan_supersede`'s skip-if-retired). `memory_props` now also rejects `forgotten_at` as reserved; `existing_memory` excludes forgotten nodes from dedup.
 
 #### Changed
@@ -452,6 +454,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`remember.kind` + `search_memories.kinds`** — the kind taxonomy over MCP: `kind` enum-validates and stamps new memories (dedup ignores it; the stored kind wins), `kinds` filters recall post-fusion with absent-as-`semantic` (entity hits count as `semantic` — combine with `labels: ["Memory"]` to filter to memories only). Invalid or empty values are `invalid_params`.
 - **`forget` tool** — soft-retire memories (`ids`, optional `scope`): stamps `forgotten_at` + closes open edges atomically via the same shared planner as the CLI. Strict targets: any invalid id rejects the whole call. Distinct from `remember.supersedes` (replacement) — forget is "never needs to come back".
 - **Liveness is now the shared tombstone set** — `search`, the dedup path, the near-duplicate advisory, and the hygiene scans all treat `forgotten_at` exactly like `superseded_at`.
 - **`get_edges` — `direction` parameter** (enum: `"out"`/`"in"`/`"both"`, default `"out"`). For `"out"` (default), lists the node's outgoing edges as before. For `"in"`, the anchor shifts to the target and `to_id` filters the far source end (incoming edges, mirrored view). For `"both"`, returns an id-deduped union of incoming and outgoing edges.
@@ -931,6 +934,8 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`remember --kind <episodic|semantic|procedural>`** — classifies a NEW memory; enum-validated (exit 2 otherwise); ignored on a dedup hit (the stored kind wins). Omitted = reads as `semantic`.
+- **`search --kinds <kind>[,<kind>...]`** — only return hits of these kinds, on BOTH the default and `--include-superseded` paths; a node without a `kind` prop (including entities) counts as `semantic`. Filtered before top-k, unbumped.
 - **`forget <id>...`** — soft-retire memories: stamps `forgotten_at` and closes their open edges atomically. Recall and default `search` stop returning them; history stays reachable (`search --include-superseded`, temporal reads). Every id must be a live Memory in the write scope — unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call (exit 2). Output: `{"forgotten": [ids]}`.
 - **`get-edges` — `--direction out|in|both` flag** (default `out`). For `out` (default), lists the node's outgoing edges as before. For `in`, the anchor shifts to the target and `--to` filters the far source end (incoming edges, mirrored view). For `both`, returns an id-deduped union of incoming and outgoing edges.
 
