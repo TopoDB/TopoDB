@@ -73,9 +73,8 @@ pub(crate) const B: f32 = 0.75;
 /// equals one of `any_of`. Applied BEFORE top-k truncation (a filtered hit
 /// never consumes the result window) and never access-bumped on a dropped
 /// node. The engine names no prop and no vocabulary — the host owns both
-/// (e.g. the policy layer's Memory `kind` taxonomy, where the host passes
-/// `absent_as: Some("semantic")` to make an unstamped node match its
-/// default kind).
+/// (e.g. a host-defined category prop, where the host passes the category's
+/// default as `absent_as` so an unstamped node matches it).
 #[derive(Debug, Clone)]
 pub struct PropRetain {
     /// The `Str` prop to test.
