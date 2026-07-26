@@ -2878,6 +2878,7 @@ impl TopoServer {
             recency_half_life_ms: (p.recency_half_life_days * 86_400_000.0) as i64,
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
+            prop_retain: None,
         };
 
         // Process label_weights: convert from JSON map to Vec<(String, f32)>.
