@@ -240,6 +240,10 @@ fn main() {
             now_ms,
             cli.pretty,
         ),
+        Command::Purge {
+            tombstoned_before,
+            yes,
+        } => purge(&db, default_scope, tombstoned_before, yes, cli.pretty),
         Command::Changes { since } => changes(&db, since, cli.pretty),
         Command::Compact { keep_from } => compact(&db, keep_from, cli.pretty),
         Command::SetProps { id, props } => set_props(&db, &id, &props, cli.pretty),
@@ -626,6 +630,38 @@ fn lifecycle_candidates(
         Err(e) => output::fail("internal", &e.to_string(), 1),
     };
     output::ok(&value, pretty);
+}
+
+/// Phase E purge: plan via the shared topodb_json builder, then either
+/// report (dry-run, the default — no write path is even reachable) or
+/// submit the whole RemoveNode batch atomically. An empty batch under
+/// --yes skips the submit and reports seq: null.
+fn purge(db: &Db, scope: Scope, tombstoned_before: i64, yes: bool, pretty: bool) -> ! {
+    let scopes = topodb_json::scope_to_scope_set(scope);
+    let (ops, ids) = match topodb_json::plan_purge(db, &scopes, tombstoned_before) {
+        Ok(plan) => plan,
+        Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
+        Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
+    };
+    let count = ids.len();
+    if !yes {
+        output::ok(
+            &serde_json::json!({ "dry_run": true, "count": count, "ids": ids }),
+            pretty,
+        );
+    }
+    let seq = if ops.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match db.submit(ops) {
+            Ok(applied) => serde_json::json!(applied.last_seq),
+            Err(e) => output::fail_engine(&e),
+        }
+    };
+    output::ok(
+        &serde_json::json!({ "dry_run": false, "count": count, "ids": ids, "seq": seq }),
+        pretty,
+    );
 }
 
 fn changes(db: &Db, since: u64, pretty: bool) -> ! {
