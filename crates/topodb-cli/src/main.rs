@@ -200,6 +200,22 @@ fn main() {
             cli.pretty,
         ),
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
+        Command::LifecycleCandidates {
+            limit,
+            half_life_episodic_days,
+            half_life_semantic_days,
+            half_life_procedural_days,
+            now_ms,
+        } => lifecycle_candidates(
+            &db,
+            default_scope,
+            limit,
+            half_life_episodic_days,
+            half_life_semantic_days,
+            half_life_procedural_days,
+            now_ms,
+            cli.pretty,
+        ),
         Command::Changes { since } => changes(&db, since, cli.pretty),
         Command::Compact { keep_from } => compact(&db, keep_from, cli.pretty),
         Command::SetProps { id, props } => set_props(&db, &id, &props, cli.pretty),
@@ -544,6 +560,46 @@ fn stats(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
         }),
         Ok(None) => serde_json::json!({ "found": false }),
         Err(e) => output::fail_engine(&e),
+    };
+    output::ok(&value, pretty);
+}
+
+/// Phase C decay sweep: delegate to the shared
+/// `topodb_json::lifecycle_candidates` (read-only, unbumped) and print
+/// the evidence array. Day flags convert to ms here — the shared layer
+/// speaks ms.
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_candidates(
+    db: &Db,
+    scope: Scope,
+    limit: usize,
+    half_life_episodic_days: f64,
+    half_life_semantic_days: f64,
+    half_life_procedural_days: f64,
+    now_ms: Option<i64>,
+    pretty: bool,
+) -> ! {
+    let scopes = topodb_json::scope_to_scope_set(scope);
+    let params = topodb_json::LifecycleParams {
+        limit,
+        half_life_episodic_ms: (half_life_episodic_days * 86_400_000.0) as i64,
+        half_life_semantic_ms: (half_life_semantic_days * 86_400_000.0) as i64,
+        half_life_procedural_ms: (half_life_procedural_days * 86_400_000.0) as i64,
+    };
+    let now = now_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    });
+    let candidates = match topodb_json::lifecycle_candidates(db, &scopes, &params, now) {
+        Ok(c) => c,
+        Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
+        Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
+    };
+    let value = match serde_json::to_value(&candidates) {
+        Ok(v) => v,
+        Err(e) => output::fail("internal", &e.to_string(), 1),
     };
     output::ok(&value, pretty);
 }

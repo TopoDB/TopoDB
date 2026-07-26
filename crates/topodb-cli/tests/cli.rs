@@ -2454,3 +2454,93 @@ fn kind_taxonomy_stamps_filters_and_validates() {
         );
     }
 }
+
+/// Phase C sweep on the CLI: kind-aware staleness ranking under an
+/// injected --now-ms (deterministic), tombstone exclusion, limit, and
+/// param validation. The sweep only proposes — nothing in the db changes.
+#[test]
+fn lifecycle_candidates_ranks_deterministically_and_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let remember = |content: &str, kind: Option<&str>| -> String {
+        let mut args = vec!["remember", "--content", content, "--entity", "topic"];
+        if let Some(k) = kind {
+            args.extend_from_slice(&["--kind", k]);
+        }
+        let v: serde_json::Value = serde_json::from_slice(&run(&args).stdout).unwrap();
+        v["memory_id"].as_str().unwrap().to_string()
+    };
+    let ep = remember("ci was red this morning", Some("episodic"));
+    let se = remember("release tags are per package", None);
+    let pr = remember("publish crates in dependency order", Some("procedural"));
+    let dead = remember("stale duplicate", None);
+    assert!(run(&["forget", &dead]).status.success());
+
+    // Sweep from 28 days after mint: episodic (14d) > semantic (120d) >
+    // procedural (365d) at equal age; the forgotten memory never appears.
+    let ulid_ms = |id: &str| {
+        // ULID timestamp: first 10 chars, Crockford base32.
+        let alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        id.chars()
+            .take(10)
+            .fold(0i64, |acc, c| acc * 32 + alphabet.find(c).unwrap() as i64)
+    };
+    let now = ulid_ms(&ep) + 28 * 86_400_000;
+    let now_s = now.to_string();
+    let out = run(&["lifecycle-candidates", "--now-ms", &now_s]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![ep.as_str(), se.as_str(), pr.as_str()]);
+    assert_eq!(v[0]["kind"], "episodic");
+    assert!(v[0]["staleness"].as_f64().unwrap() > v[1]["staleness"].as_f64().unwrap());
+    assert!(v[0]["content"].as_str().unwrap().contains("ci was red"));
+    assert!(v[0]["created_at"].is_number() && v[0]["access_count"].is_number());
+
+    // Determinism: identical call, identical output bytes.
+    let again = run(&["lifecycle-candidates", "--now-ms", &now_s]);
+    assert_eq!(out.stdout, again.stdout);
+
+    // Limit truncates after ranking.
+    let top1: serde_json::Value = serde_json::from_slice(
+        &run(&["lifecycle-candidates", "--now-ms", &now_s, "--limit", "1"]).stdout,
+    )
+    .unwrap();
+    assert_eq!(top1.as_array().unwrap().len(), 1);
+    assert_eq!(top1[0]["id"].as_str().unwrap(), ep.as_str());
+
+    // Validation: exit 2 with the shared messages.
+    for (args, needle) in [
+        (vec!["lifecycle-candidates", "--limit", "0"], "limit"),
+        (
+            vec!["lifecycle-candidates", "--half-life-episodic-days", "0"],
+            "half-lives must be positive",
+        ),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains(needle),
+            "{needle:?} missing for {args:?}: {all}"
+        );
+    }
+}

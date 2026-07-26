@@ -256,6 +256,27 @@ pub enum Command {
         /// Node id (ULID).
         id: String,
     },
+    /// Surface decay candidates: live memories ranked by kind-aware
+    /// staleness ((age/half_life)/ln(e+access_count); age since last
+    /// access, falling back to creation). Read-only and unbumped — the
+    /// sweep PROPOSES, it never stamps; act on its output with `forget`.
+    /// Half-life defaults: episodic 14d, semantic 120d, procedural 365d
+    /// (absent/unknown kind counts as semantic).
+    LifecycleCandidates {
+        /// Top-N candidates to report.
+        #[arg(long, default_value_t = topodb_json::LIFECYCLE_DEFAULT_LIMIT)]
+        limit: usize,
+        #[arg(long = "half-life-episodic-days", default_value_t = topodb_json::LIFECYCLE_HALF_LIFE_EPISODIC_DAYS)]
+        half_life_episodic_days: f64,
+        #[arg(long = "half-life-semantic-days", default_value_t = topodb_json::LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS)]
+        half_life_semantic_days: f64,
+        #[arg(long = "half-life-procedural-days", default_value_t = topodb_json::LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS)]
+        half_life_procedural_days: f64,
+        /// Pin the sweep's "now" (Unix ms) for reproducible runs; omitted =
+        /// wall clock.
+        #[arg(long = "now-ms")]
+        now_ms: Option<i64>,
+    },
     /// Replay the op log from a sequence number (inclusive). Unscoped
     /// host-level primitive — spans every scope. `Compacted` (the requested
     /// range is below the retained floor) is a rejected/exit-2 condition:
