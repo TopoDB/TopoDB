@@ -19,17 +19,34 @@ impl Note {
                 body: text.to_string(),
             });
         };
-        let mut close = None;
-        for (i, _) in rest.match_indices("\n---") {
-            let after = &rest[i + 4..];
+        let mut close: Option<usize> = None;
+
+        // Check for closing delimiter at the start of rest (empty frontmatter)
+        if rest.len() >= 3 && &rest[..3] == "---" {
+            let after = &rest[3..];
             if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
-                close = Some(i);
-                break;
+                close = Some(0); // Special marker: close at position 0 means start of rest
             }
         }
-        let i = close.ok_or("unterminated frontmatter (no closing ---)")?;
-        let yaml = &rest[..i + 1];
-        let mut body = &rest[i + 4..];
+
+        if close.is_none() {
+            for (i, _) in rest.match_indices("\n---") {
+                let after = &rest[i + 4..];
+                if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
+                    close = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let close_pos = close.ok_or("unterminated frontmatter (no closing ---)")?;
+        let (yaml, mut body) = if close_pos == 0 {
+            // Closing --- at start of rest: empty frontmatter
+            ("", &rest[3..])
+        } else {
+            (&rest[..close_pos + 1], &rest[close_pos + 4..])
+        };
+
         if let Some(b) = body
             .strip_prefix("\r\n")
             .or_else(|| body.strip_prefix('\n'))
@@ -104,6 +121,16 @@ mod tests {
         let again = Note::parse(&n.serialize()).unwrap();
         assert_eq!(again.id().as_deref(), Some("01XYZ"));
         assert_eq!(again.body, "x\n");
+    }
+
+    #[test]
+    fn empty_frontmatter_parses_as_empty_mapping() {
+        let n = Note::parse("---\n---\nbody\n").unwrap();
+        assert!(n.frontmatter.is_empty());
+        assert_eq!(n.body, "body\n");
+        let crlf = Note::parse("---\r\n---\r\nbody\n").unwrap();
+        assert!(crlf.frontmatter.is_empty());
+        assert_eq!(crlf.body, "body\n");
     }
 
     #[test]
