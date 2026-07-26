@@ -122,6 +122,21 @@ case "$out" in
   *) echo "FAIL - still errors with build hint when nothing is found"; echo "       got: $out"; fails=$((fails + 1)) ;;
 esac
 
+# 13. SGH_MEMORY_DB derives from SGH_DB by suffixing -memory before .redb.
+actual="$(SGH_BIN="$fake" SGH_DB=/tmp/sgh-test-proj.redb bash -c "source '$LIB' >/dev/null 2>&1 && printf '%s' \"\$SGH_MEMORY_DB\"")"
+check "SGH_MEMORY_DB derives from SGH_DB" "/tmp/sgh-test-proj-memory.redb" "$actual"
+
+# 14. An explicit SGH_MEMORY_DB override is honored verbatim (and SGH_MCP,
+# when composed, points at the override — the pairing must not drift).
+actual="$(SGH_BIN="$fake" SGH_MEMORY_DB=/tmp/elsewhere.redb bash -c "source '$LIB' >/dev/null 2>&1 && printf '%s' \"\$SGH_MEMORY_DB\"")"
+check "explicit SGH_MEMORY_DB is honored" "/tmp/elsewhere.redb" "$actual"
+
+# 15. An explicit SGH_TOPODB override is honored verbatim.
+fake_cli="$(mktemp -d)/topodb"
+touch "$fake_cli" && chmod +x "$fake_cli"
+actual="$(SGH_BIN="$fake" SGH_TOPODB="$fake_cli" bash -c "source '$LIB' >/dev/null 2>&1 && printf '%s' \"\$SGH_TOPODB\"")"
+check "explicit SGH_TOPODB is honored" "$fake_cli" "$actual"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; fi
 exit "$fails"

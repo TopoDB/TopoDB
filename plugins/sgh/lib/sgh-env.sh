@@ -61,12 +61,23 @@ fi
 mkdir -p "$(dirname "$SGH_DB")"
 export SGH_DB
 
+# --- agent memory database ---------------------------------------------------
+# The per-project memory db the graphs read and write: agent nodes through
+# mcp__topodb (composed into $SGH_MCP below), command nodes through the
+# topodb CLI ($SGH_TOPODB below). NOT $SGH_DB — that is the sgh run store.
+# Deriving it from SGH_DB keeps the pairing stable under an SGH_DB override.
+if [ -z "${SGH_MEMORY_DB:-}" ]; then
+  SGH_MEMORY_DB="${SGH_DB%.redb}-memory.redb"
+fi
+export SGH_MEMORY_DB
+
 # --- agent MCP server -------------------------------------------------------
 # Composes the value for `sgh run --agent-mcp`: an absolute topodb-mcp binary
 # plus a per-project agent-memory database. That db is NOT $SGH_DB — SGH_DB is
 # the sgh run store; this is the memory db the graph's agent nodes read and
-# write through mcp__topodb. Deriving it from SGH_DB ("<same path>-memory")
-# keeps the pairing stable under an SGH_DB override too.
+# write through mcp__topodb. The path lives in $SGH_MEMORY_DB (derived from
+# SGH_DB as "<same path>-memory") to keep the pairing stable under an SGH_DB
+# override too.
 # Resolution mirrors $SGH_BIN: explicit $SGH_MCP override wins, then the
 # in-repo release build, then PATH, then cargo's bin dir. Unlike SGH_BIN a
 # miss is NOT fatal: MCP is per-node opt-in, and a graph with no opted-in
@@ -92,11 +103,38 @@ if [ -z "${SGH_MCP:-}" ]; then
     # --scope shared --embeddings off mirrors the proven live-e2e invocation;
     # embeddings stay off because the server is a per-run helper — model
     # warmup on every sgh run would be all cost, no recall benefit.
-    SGH_MCP="$_sgh_mcp_bin --db ${SGH_DB%.redb}-memory.redb --scope shared --embeddings off"
+    SGH_MCP="$_sgh_mcp_bin --db $SGH_MEMORY_DB --scope shared --embeddings off"
   else
     echo "sgh: topodb-mcp not found; SGH_MCP left unset (only graphs whose agent nodes declare tools: [topodb] need it)" >&2
   fi
 fi
 if [ -n "${SGH_MCP:-}" ]; then
   export SGH_MCP
+fi
+
+# --- topodb CLI --------------------------------------------------------------
+# Command nodes (the lifecycle graph's sweep/verify) shell out to the topodb
+# CLI against $SGH_MEMORY_DB. Resolution mirrors $SGH_MCP: explicit override,
+# in-repo release build, PATH, cargo's bin dir. Like $SGH_MCP a miss is NOT
+# fatal — only graphs whose command nodes run "$SGH_TOPODB" need it.
+if [ -z "${SGH_TOPODB:-}" ]; then
+  _sgh_cli_root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  _sgh_cli_root="$(cd "$_sgh_cli_root/../.." 2>/dev/null && pwd || printf '%s' "$PWD")"
+  _sgh_cli_bin="$_sgh_cli_root/target/release/topodb"
+  _sgh_cli_cargo="${CARGO_HOME:-$HOME/.cargo}/bin/topodb"
+  if [ -x "$_sgh_cli_bin" ]; then
+    SGH_TOPODB="$_sgh_cli_bin"
+  elif command -v topodb >/dev/null 2>&1; then
+    SGH_TOPODB="$(command -v topodb)"
+  elif [ -x "$_sgh_cli_cargo" ]; then
+    SGH_TOPODB="$_sgh_cli_cargo"
+  else
+    SGH_TOPODB=""
+  fi
+  if [ -z "$SGH_TOPODB" ]; then
+    echo "sgh: topodb CLI not found; SGH_TOPODB left unset (only graphs whose command nodes run \"\$SGH_TOPODB\" need it — build with: cargo build --release -p topodb-cli)" >&2
+  fi
+fi
+if [ -n "${SGH_TOPODB:-}" ]; then
+  export SGH_TOPODB
 fi
