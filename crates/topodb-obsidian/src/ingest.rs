@@ -219,6 +219,124 @@ fn skip(action: NoteAction) -> IngestOutcome {
     }
 }
 
+/// Optional embedding hook: text → (model_name, vector). MCP passes its
+/// embedder; the CLI passes None. Engine stays policy-free.
+pub type EmbedFn<'a> = &'a dyn Fn(&str) -> Option<(String, Vec<f32>)>;
+
+pub fn ingest_vault(
+    db: &Db,
+    vault: &std::path::Path,
+    write_scope: Scope,
+    lookup: &ScopeSet,
+    now_ms: i64,
+    dry_run: bool,
+    embed: Option<EmbedFn>,
+) -> Result<crate::IngestReport, String> {
+    let mut report = crate::IngestReport::default();
+    for path in crate::walk_vault(vault)? {
+        let rel = path
+            .strip_prefix(vault)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let fail = |reason: String, report: &mut crate::IngestReport| {
+            report.errors.push(crate::FileError {
+                file: rel.clone(),
+                reason,
+            });
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                fail(e.to_string(), &mut report);
+                continue;
+            }
+        };
+        let mut note = match crate::Note::parse(&text) {
+            Ok(n) => n,
+            Err(e) => {
+                fail(e, &mut report);
+                continue;
+            }
+        };
+        let input = match crate::note_to_input(&note) {
+            Ok(i) => i,
+            Err(e) => {
+                fail(e, &mut report);
+                continue;
+            }
+        };
+        let outcome = match plan_note(db, write_scope, lookup, now_ms, &input) {
+            Ok(o) => o,
+            Err(ComposeError::Invalid(m)) => {
+                fail(m, &mut report);
+                continue;
+            }
+            Err(ComposeError::Engine(e)) => {
+                fail(e.to_string(), &mut report);
+                continue;
+            }
+        };
+        let new_head = match &outcome.action {
+            NoteAction::Created { memory_id } => {
+                report.ingested += 1;
+                Some(*memory_id)
+            }
+            NoteAction::Superseded { memory_id, .. } => {
+                report.superseded += 1;
+                Some(*memory_id)
+            }
+            NoteAction::Deduplicated { memory_id } => {
+                report.deduplicated += 1;
+                Some(*memory_id)
+            }
+            NoteAction::SkippedUnchanged | NoteAction::SkippedEntityStub => {
+                report.skipped += 1;
+                None
+            }
+        };
+        if dry_run {
+            continue;
+        }
+        let mut ops = outcome.ops;
+        if let Some(embed) = embed {
+            if let (Some(content), Some(head)) = (&outcome.new_memory, new_head) {
+                if let Some((model, vector)) = embed(content) {
+                    ops.push(Op::SetEmbedding {
+                        id: head,
+                        model,
+                        vector,
+                    });
+                }
+            }
+            for (id, name) in &outcome.new_entities {
+                if let Some((model, vector)) = embed(name) {
+                    ops.push(Op::SetEmbedding {
+                        id: *id,
+                        model,
+                        vector,
+                    });
+                }
+            }
+        }
+        if !ops.is_empty() {
+            if let Err(e) = db.submit(ops) {
+                fail(e.to_string(), &mut report);
+                continue;
+            }
+        }
+        if let Some(head) = new_head {
+            let stamped = note.id().as_deref() == Some(head.to_string().as_str());
+            if !stamped {
+                if let Err(e) = crate::stamp_id(&path, &mut note, &head.to_string()) {
+                    fail(format!("db updated but id stamp failed: {e}"), &mut report);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +454,60 @@ mod tests {
             &format!("---\ntopodb-id: {}\n---\nedited\n", widget.id),
         );
         assert!(matches!(ent.action, NoteAction::SkippedEntityStub));
+    }
+
+    #[test]
+    fn ingest_vault_processes_stamps_and_reports() {
+        let (_d, db) = db();
+        let vdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vdir.path().join("a.md"),
+            "---\nkind: semantic\n---\nAlpha uses [[redb]].\n",
+        )
+        .unwrap();
+        std::fs::write(vdir.path().join("b.md"), "Plain fact.\n").unwrap();
+        std::fs::write(vdir.path().join("bad.md"), "---\n: :\n---\nx\n").unwrap();
+        let lookup = scopes_to_scope_set(&[Scope::Shared]);
+
+        // Dry run: plans but writes nothing, stamps nothing.
+        let dry = ingest_vault(&db, vdir.path(), Scope::Shared, &lookup, 5, true, None).unwrap();
+        assert_eq!((dry.ingested, dry.errors.len()), (2, 1));
+        assert!(!std::fs::read_to_string(vdir.path().join("a.md"))
+            .unwrap()
+            .contains("topodb-id"));
+
+        // Real run: ids stamped, db populated.
+        let r = ingest_vault(&db, vdir.path(), Scope::Shared, &lookup, 5, false, None).unwrap();
+        assert_eq!(
+            (r.ingested, r.superseded, r.skipped, r.errors.len()),
+            (2, 0, 0, 1)
+        );
+        assert!(std::fs::read_to_string(vdir.path().join("a.md"))
+            .unwrap()
+            .contains("topodb-id:"));
+
+        // Second run: everything unchanged.
+        let r2 = ingest_vault(&db, vdir.path(), Scope::Shared, &lookup, 6, false, None).unwrap();
+        assert_eq!((r2.ingested, r2.skipped, r2.errors.len()), (0, 2, 1));
+
+        // Edit one file → supersession, id re-stamped to the new head.
+        let a = std::fs::read_to_string(vdir.path().join("a.md")).unwrap();
+        std::fs::write(
+            vdir.path().join("a.md"),
+            a.replace("Alpha uses", "Alpha now uses"),
+        )
+        .unwrap();
+        let old_id_line = a
+            .lines()
+            .find(|l| l.starts_with("topodb-id"))
+            .unwrap()
+            .to_string();
+        let r3 = ingest_vault(&db, vdir.path(), Scope::Shared, &lookup, 7, false, None).unwrap();
+        assert_eq!((r3.superseded, r3.skipped), (1, 1));
+        let a2 = std::fs::read_to_string(vdir.path().join("a.md")).unwrap();
+        assert!(
+            !a2.contains(&old_id_line),
+            "id must advance to the new head"
+        );
     }
 }
