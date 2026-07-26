@@ -973,6 +973,85 @@ fn recall_prop_retain_drops_graph_leg_candidates_too() {
     );
 }
 
+/// RecallQuery: options.prop_retain also drops candidates that arrive via
+/// the VECTOR leg — hand-built embeddings, zero token overlap with the
+/// query, so the candidate never passes through the text leg's in-loop
+/// filter and only the post-fusion retain can catch it.
+#[test]
+fn recall_prop_retain_drops_vector_leg_candidates_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let lexical = NodeId::new();
+    let mut lex_props = Props::new();
+    lex_props.insert("content".into(), PropValue::Str("kappa lambda".into()));
+    // Vector-leg-only candidate: content shares no token with the query,
+    // kind is filtered out — reachable only through its embedding.
+    let vec_only = NodeId::new();
+    let mut v_props = Props::new();
+    v_props.insert("content".into(), PropValue::Str("unrelated words".into()));
+    v_props.insert("kind".into(), PropValue::Str("episodic".into()));
+    db.submit(vec![
+        Op::CreateNode {
+            id: lexical,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: lex_props,
+        },
+        Op::CreateNode {
+            id: vec_only,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: v_props,
+        },
+        Op::SetEmbedding {
+            id: vec_only,
+            model: "m".into(),
+            vector: vec![0.95, 0.05],
+        },
+    ])
+    .unwrap();
+
+    // Without the retain, the vector leg surfaces the candidate.
+    let mut plain = RecallQuery::new(ScopeSet::of(&[s]), "kappa", 10);
+    plain.vector = Some(("m".into(), vec![1.0, 0.0]));
+    let hits = db.recall(&plain).unwrap();
+    assert!(
+        hits.iter().any(|(n, _)| n.id == vec_only),
+        "precondition: the vector leg must surface the zero-token-overlap candidate"
+    );
+
+    // With it, the episodic candidate is dropped post-fusion.
+    let q = RecallQuery {
+        vector: Some(("m".into(), vec![1.0, 0.0])),
+        options: SearchOptions {
+            prop_retain: Some(PropRetain {
+                prop: "kind".into(),
+                any_of: vec!["semantic".into()],
+                absent_as: Some("semantic".into()),
+            }),
+            ..SearchOptions::default()
+        },
+        ..RecallQuery::new(ScopeSet::of(&[s]), "kappa", 10)
+    };
+    let filtered = db.recall(&q).unwrap();
+    assert!(
+        filtered.iter().any(|(n, _)| n.id == lexical),
+        "lexical hit (absent kind = semantic) survives"
+    );
+    assert!(
+        filtered.iter().all(|(n, _)| n.id != vec_only),
+        "post-fusion retain must catch vector-leg candidates"
+    );
+}
+
 /// recall validates prop_retain like search_text does — before any leg runs.
 #[test]
 fn recall_rejects_empty_prop_retain_allowlist() {
