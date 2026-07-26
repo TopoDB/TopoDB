@@ -3182,6 +3182,7 @@ impl TopoServer {
             edge_type: p.edge_type.clone(),
             supersedes: p.supersedes.clone().unwrap_or_default(),
             props: p.props.clone(),
+            kind: None,
         };
         req.validate()
             .map_err(|e| ErrorData::invalid_params(e, None))?;
