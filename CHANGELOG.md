@@ -328,6 +328,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 #### Added
 
 - **`lifecycle_candidates` + `staleness`** — the Phase C decay sweep: rank live memories by kind-aware staleness (`(age/half_life)/ln(e+access_count)`, age since last access falling back to ULID mint time), top-N (default 20) with full evidence `{id, content, kind, created_at, last_accessed_at, access_count, staleness}`. Deterministic under an injected `now_ms`, read-only, unbumped (built on `nodes_by_label_unbumped` + `access_stats`). Half-life defaults: episodic 14d, semantic 120d, procedural 365d (`LIFECYCLE_HALF_LIFE_*_DAYS`); absent/unknown kind uses the semantic half-life.
+- **`plan_supersede` is now public** — layered callers (e.g., obsidian vault ingest) can compose supersession ops alongside remember, directly instead of via the batch DSL.
 - **Memory `kind` taxonomy vocabulary** — `MEMORY_KIND_PROP` (`"kind"`), the closed enum `MEMORY_KINDS` (`episodic | semantic | procedural`), `MEMORY_KIND_DEFAULT` (`semantic` — what an absent prop reads as; no migration needed), and `validate_memory_kind`. `RememberRequest.kind` stamps NEW memories only (dedup ignores kind; the hit's stored kind wins); `kind` joins the reserved props rail with a message pointing at the parameter.
 - **`MEMORY_FORGOTTEN_AT_PROP` + `MEMORY_TOMBSTONE_PROPS`** — the second tombstone and the canonical liveness set every surface filters on. `plan_forget(db, write_scope, ids, now_ms)` — strict shared ops builder for the `forget` verb (stamp + close open edges; ANY invalid id rejects the whole call, unlike `plan_supersede`'s skip-if-retired). `memory_props` now also rejects `forgotten_at` as reserved; `existing_memory` excludes forgotten nodes from dedup.
 
@@ -449,6 +450,16 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ---
 
+## `topodb-obsidian`
+
+### Unreleased
+
+#### Added
+
+- **`topodb-obsidian`** — new crate: Obsidian-format vault ingest/seed (note⇄memory mapping, wikilinks→entities, supersession on edit, fixpoint-tested round-trip).
+
+---
+
 ## `topodb-mcp`
 
 ### Unreleased
@@ -460,6 +471,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **`forget` tool** — soft-retire memories (`ids`, optional `scope`): stamps `forgotten_at` + closes open edges atomically via the same shared planner as the CLI. Strict targets: any invalid id rejects the whole call. Distinct from `remember.supersedes` (replacement) — forget is "never needs to come back".
 - **Liveness is now the shared tombstone set** — `search`, the dedup path, the near-duplicate advisory, and the hygiene scans all treat `forgotten_at` exactly like `superseded_at`.
 - **`get_edges` — `direction` parameter** (enum: `"out"`/`"in"`/`"both"`, default `"out"`). For `"out"` (default), lists the node's outgoing edges as before. For `"in"`, the anchor shifts to the target and `to_id` filters the far source end (incoming edges, mirrored view). For `"both"`, returns an id-deduped union of incoming and outgoing edges.
+- **`ingest_vault` / `seed_vault`** — vault bridge tools; tool count 28 → 30.
 
 #### Fixed
 
@@ -912,6 +924,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 - **`/sgh:lifecycle` + the shipped lifecycle graph** (`graphs/lifecycle.yaml`) — the F6 Phase D reference loop: a deterministic `lifecycle-candidates` sweep (command node, no model call), a judge agent that reviews decay candidates plus `find_duplicate_memories` pairs and applies its verdicts via `mcp__topodb` (`forget`, consolidations first), and a verify command node that re-reads the db and fails the run if any claimed action is not reflected — self-reports cannot fake it. Two-step gate mirrors `/sgh:run`; requires `topodb`, `topodb-mcp` and `jq`.
 - **`sgh-env.sh`: `SGH_MEMORY_DB` + `SGH_TOPODB`** — the per-project memory-db path is now exported once (and reused inside `SGH_MCP`), and the topodb CLI resolves with the established override → in-repo release → PATH → cargo-bin order (non-fatal on miss, like `SGH_MCP`).
+- **`/topodb:vault-seed` / `/topodb:vault-ingest`** — working-memory vault commands.
 - **Hooks: session-start memory injection + observational episode capture.** SessionStart injects
   up to 8 recent, access-ranked project memories (hard char cap, 2.5s deadline, main sessions
   only, `startup`/`clear` sources only). PostToolUse records what each retrieval tool returned
@@ -943,6 +956,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 - **`search --kinds <kind>[,<kind>...]`** — only return hits of these kinds, on BOTH the default and `--include-superseded` paths; a node without a `kind` prop (including entities) counts as `semantic`. Filtered before top-k, unbumped.
 - **`forget <id>...`** — soft-retire memories: stamps `forgotten_at` and closes their open edges atomically. Recall and default `search` stop returning them; history stays reachable (`search --include-superseded`, temporal reads). Every id must be a live Memory in the write scope — unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call (exit 2). Output: `{"forgotten": [ids]}`.
 - **`get-edges` — `--direction out|in|both` flag** (default `out`). For `out` (default), lists the node's outgoing edges as before. For `in`, the anchor shifts to the target and `--to` filters the far source end (incoming edges, mirrored view). For `both`, returns an id-deduped union of incoming and outgoing edges.
+- **`obsidian-ingest` / `obsidian-seed`** — vault bridge subcommands.
 
 #### Changed
 
