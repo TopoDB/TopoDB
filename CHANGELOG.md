@@ -331,6 +331,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **`plan_supersede` is now public** — layered callers (e.g., obsidian vault ingest) can compose supersession ops alongside remember, directly instead of via the batch DSL.
 - **Memory `kind` taxonomy vocabulary** — `MEMORY_KIND_PROP` (`"kind"`), the closed enum `MEMORY_KINDS` (`episodic | semantic | procedural`), `MEMORY_KIND_DEFAULT` (`semantic` — what an absent prop reads as; no migration needed), and `validate_memory_kind`. `RememberRequest.kind` stamps NEW memories only (dedup ignores kind; the hit's stored kind wins); `kind` joins the reserved props rail with a message pointing at the parameter.
 - **`MEMORY_FORGOTTEN_AT_PROP` + `MEMORY_TOMBSTONE_PROPS`** — the second tombstone and the canonical liveness set every surface filters on. `plan_forget(db, write_scope, ids, now_ms)` — strict shared ops builder for the `forget` verb (stamp + close open edges; ANY invalid id rejects the whole call, unlike `plan_supersede`'s skip-if-retired). `memory_props` now also rejects `forgotten_at` as reserved; `existing_memory` excludes forgotten nodes from dedup.
+- **`plan_purge`** — the Phase E reclamation planner: selects Memory nodes whose any tombstone (`superseded_at`/`forgotten_at`) is an `Int` strictly older than the cutoff and returns `RemoveNode` ops + the ascending id list. Planning is separate from submitting so callers can dry-run; boundary values survive, non-`Int` marks and live nodes are never selected.
 
 #### Changed
 
@@ -957,6 +958,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 - **`forget <id>...`** — soft-retire memories: stamps `forgotten_at` and closes their open edges atomically. Recall and default `search` stop returning them; history stays reachable (`search --include-superseded`, temporal reads). Every id must be a live Memory in the write scope — unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call (exit 2). Output: `{"forgotten": [ids]}`.
 - **`get-edges` — `--direction out|in|both` flag** (default `out`). For `out` (default), lists the node's outgoing edges as before. For `in`, the anchor shifts to the target and `--to` filters the far source end (incoming edges, mirrored view). For `both`, returns an id-deduped union of incoming and outgoing edges.
 - **`obsidian-ingest` / `obsidian-seed`** — vault bridge subcommands.
+- **`purge`** — destructive space reclamation, completing F6: `--tombstoned-before <unix-ms>` hard-deletes long-tombstoned memories (engine remove-node, edges cascade). Dry-run by default (count + ids, nothing written); only `--yes` submits, atomically. Purged history is gone — `as_of` queries stop seeing those nodes; that is the point. CLI-only, and never part of the `/sgh:lifecycle` graph.
 
 #### Changed
 
