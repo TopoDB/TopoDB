@@ -97,18 +97,19 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 - Access stats (recall-driven counters); change feed (`subscribe` / `ops_since`) + op-log compaction
 - Versioned on-disk format ([FORMAT.md](FORMAT.md))
 
-**Memory & recall over MCP — `topodb-mcp`** (27 tools; [full table](crates/topodb-mcp/README.md))
+**Memory & recall over MCP — `topodb-mcp`** (30 tools; [full table](crates/topodb-mcp/README.md))
 
 - Hybrid recall — BM25 + vector + graph, RRF-fused, recency-weighted
 - Memory hygiene — write-time dedup + supersession, banded/contradiction-aware near-duplicate detection, `consolidate_memories`, orphan + stale scans, `memory_health`, `suggest_links`
 - Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup and search
 - Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime)
 - Multi-scope reads — read across a scope *set*
+- Obsidian vault bridge (`ingest_vault` / `seed_vault`) — vault as working memory, graph as LTM
 
 **CLI & distribution — `topodb-cli`, `@topodb/pi`, plugin**
 
-- All 17 engine operations, JSON in/out, exit-code contract (incl. `set-props` / `remove-node` / bulk submit)
-- One-command Pi install (`@topodb/pi`); Claude Code plugin (managed server + session-start recall/hygiene injection)
+- All 17 engine operations plus `remember`, `forget`, `obsidian-ingest`, `obsidian-seed`; JSON in/out, exit-code contract (incl. `set-props` / `remove-node` / bulk submit)
+- One-command Pi install (`@topodb/pi`); Claude Code plugin (managed server + session-start recall/hygiene injection); Obsidian vault bridge (`obsidian-ingest` / `obsidian-seed`) — vault as working memory, graph as LTM
 
 **Planned:** multi-scope reads over the CLI · API stabilization (0.1) · reproducible benchmarks
 
@@ -122,13 +123,14 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 | [`topodb-json`](crates/topodb-json) | [![crates.io](https://img.shields.io/crates/v/topodb-json.svg)](https://crates.io/crates/topodb-json) | The shared JSON↔engine conversion layer used by `topodb-mcp` and `topodb-cli`. Not a library you typically depend on directly. |
 | [`topodb-mcp`](crates/topodb-mcp) | [![crates.io](https://img.shields.io/crates/v/topodb-mcp.svg)](https://crates.io/crates/topodb-mcp) | An MCP (Model Context Protocol) server exposing a `topodb` database over stdio, for coding agents and other MCP clients that want scoped recall/write tools without embedding Rust. |
 | [`topodb-cli`](crates/topodb-cli) | [![crates.io](https://img.shields.io/crates/v/topodb-cli.svg)](https://crates.io/crates/topodb-cli) | A direct-embedded `topodb` command-line binary — JSON in, JSON out, predictable exit codes — for scripting and ad hoc inspection of a database file without a server or an MCP client. |
+| [`topodb-obsidian`](crates/topodb-obsidian) | [![crates.io](https://img.shields.io/crates/v/topodb-obsidian.svg)](https://crates.io/crates/topodb-obsidian) | Deterministic Obsidian-vault ⇄ graph transforms (ingest/seed) shared by the CLI and MCP server. |
 
 ### topodb-cli
 
 `topodb-cli` installs a binary named **`topodb`**: point it at a `.redb` file and it gives you
 all 17 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
 `search`, `traverse`, `stats`, `changes`, `compact`, `set-props`, `remove-node`, `close-edge`,
-`set-embedding`, `search-vector`, `submit`) as one-shot, script-friendly subcommands — compact
+`set-embedding`, `search-vector`, `submit`), plus `remember` / `forget` (memory write), and `obsidian-ingest` / `obsidian-seed` (vault bridge) as one-shot, script-friendly subcommands — compact
 JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can branch
 on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
 `create-memory`, `create-entity`, and `link` each also take their own per-command `--scope`,
@@ -144,13 +146,14 @@ single-process access only).
 
 ### topodb-mcp
 
-A standalone binary: point it at a `.redb` file and it serves **27 MCP tools** over stdio
+A standalone binary: point it at a `.redb` file and it serves **30 MCP tools** over stdio
 JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
 
 - **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`
 - **Memory hygiene** — `find_duplicate_memories` (vector-mode: banded + contradiction-aware; text-mode fallback when embedder unavailable), `find_orphan_memories`, `find_stale_memories`, `memory_health`
 - **Write** — `remember`, `create_memory`, `consolidate_memories`, `create_entity`, `add_alias`, `add_synonym`, `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`
 - **Admin** — `db_info`; `get_changes` (the one unscoped read — replays the op log across every scope, so it's off unless you pass `--allow-unscoped-changes`)
+- **Obsidian vault bridge** — `ingest_vault`, `seed_vault`
 
 **Scoping.** Reads filter by a *set* of scopes (`--read-scopes`, or a per-call `scopes` array);
 a write is stamped with exactly *one* scope (`--scope`, or a per-call `scope`) — `link` included,
