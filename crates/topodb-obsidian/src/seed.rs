@@ -12,7 +12,7 @@ use topodb_json::{
 
 /// Filesystem-safe slug: unsafe chars → '-', trim, drop trailing dots, cap 100 chars.
 pub fn slug(name: &str) -> String {
-    let mut s: String = name
+    let s: String = name
         .chars()
         .map(|c| {
             if c.is_control() || "/\\:*?\"<>|".contains(c) {
@@ -21,8 +21,8 @@ pub fn slug(name: &str) -> String {
                 c
             }
         })
+        .take(100)
         .collect();
-    s.truncate(100);
     let s = s.trim().trim_end_matches('.').to_string();
     if s.is_empty() {
         "untitled".into()
@@ -281,6 +281,14 @@ mod tests {
         assert_eq!(slug("auth: the/plan?"), "auth- the-plan-");
         assert_eq!(slug(""), "untitled");
         assert_eq!(slug(&"x".repeat(300)).len(), 100);
+    }
+
+    #[test]
+    fn slug_is_char_boundary_safe() {
+        let s = slug(&"中".repeat(34)); // 102 bytes of CJK — must not panic
+        assert!(!s.is_empty());
+        assert!(s.chars().count() <= 100);
+        assert_eq!(slug(&"é".repeat(200)).chars().count(), 100);
     }
 
     #[test]
