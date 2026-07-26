@@ -2773,3 +2773,85 @@ fn obsidian_seed_resolves_shared_entity_from_a_project_scope_and_round_trips() {
         "untouched seeded vault must re-ingest as a pure no-op, got {iv:?}"
     );
 }
+
+/// Phase E purge on the CLI: dry-run by default (reports, writes nothing),
+/// --yes hard-deletes exactly the strictly-older tombstoned memories, and
+/// non-tombstoned memories are never touched. History note made real:
+/// after purge, `get` stops finding the node entirely.
+#[test]
+fn purge_dry_runs_by_default_and_deletes_with_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let json = |out: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let remember = |content: &str| -> String {
+        let out = run(&["remember", "--content", content, "--entity", "topic"]);
+        json(&out)["memory_id"].as_str().unwrap().to_string()
+    };
+
+    let doomed = remember("tombstoned long ago");
+    let keeper = remember("still live");
+    assert!(run(&["forget", &doomed]).status.success());
+
+    // A cutoff far in the future makes `doomed`'s fresh tombstone "old".
+    let future = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000)
+        .to_string();
+
+    // Dry-run: reports the plan, writes nothing.
+    let dry = run(&["purge", "--tombstoned-before", &future]);
+    assert!(
+        dry.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let v = json(&dry);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["ids"][0].as_str().unwrap(), doomed.as_str());
+    let still = json(&run(&["get", &doomed]));
+    assert_eq!(still["found"], true, "dry-run must not delete");
+
+    // --yes: the tombstoned memory is hard-deleted; the live one survives.
+    let purged = run(&["purge", "--tombstoned-before", &future, "--yes"]);
+    assert!(purged.status.success());
+    let v = json(&purged);
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(v["count"], 1);
+    assert!(v["seq"].is_number());
+    assert_eq!(
+        json(&run(&["get", &doomed]))["found"],
+        false,
+        "purged history is gone"
+    );
+    assert_eq!(
+        json(&run(&["get", &keeper]))["found"],
+        true,
+        "non-tombstoned never touched"
+    );
+
+    // Nothing left: an empty purge with --yes reports zero without a write.
+    let empty = run(&["purge", "--tombstoned-before", &future, "--yes"]);
+    let v = json(&empty);
+    assert_eq!(v["count"], 0);
+    assert!(v["seq"].is_null(), "empty batch skips the submit");
+
+    // Validation: exit 2 with the shared message.
+    let bad = run(&["purge", "--tombstoned-before", "0"]);
+    assert_eq!(bad.status.code(), Some(2));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(all.contains("tombstoned-before"), "{all}");
+}

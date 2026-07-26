@@ -277,6 +277,20 @@ pub enum Command {
         #[arg(long = "now-ms")]
         now_ms: Option<i64>,
     },
+    /// DESTRUCTIVE space reclamation: hard-delete every Memory whose
+    /// superseded_at or forgotten_at tombstone is strictly older than the
+    /// cutoff (engine remove-node; incident edges cascade away). Dry-run
+    /// by default — prints count + ids and writes NOTHING until --yes.
+    /// Purged history is gone: as_of queries stop seeing those nodes.
+    /// Deliberately CLI-only and never part of the sgh lifecycle graph.
+    Purge {
+        /// Unix-ms cutoff: purge tombstones strictly older than this.
+        #[arg(long = "tombstoned-before")]
+        tombstoned_before: i64,
+        /// Actually delete. Without it, purge is a dry-run report.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Replay the op log from a sequence number (inclusive). Unscoped
     /// host-level primitive — spans every scope. `Compacted` (the requested
     /// range is below the retained floor) is a rejected/exit-2 condition:
