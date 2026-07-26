@@ -15,8 +15,8 @@ pub use batch::resolve_batch;
 mod compose;
 pub use compose::{
     content_hash, entity_dedup_key, existing_memory, find_existing_entity, memory_props,
-    normalize_content, plan_forget, plan_remember, resolve_entities_by_name, ComposeError,
-    PlannedEntity, RememberPlan, RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
+    normalize_content, plan_forget, plan_remember, plan_supersede, resolve_entities_by_name,
+    ComposeError, PlannedEntity, RememberPlan, RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
 };
 
 mod lifecycle;
