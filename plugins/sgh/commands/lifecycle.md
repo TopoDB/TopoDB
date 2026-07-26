@@ -34,6 +34,10 @@ if [ -z "${SGH_TOPODB:-}" ]; then
   echo "Build it first:  cargo build --release -p topodb-cli" >&2
   exit 1
 fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "lifecycle: jq is required by the verify step — install jq first." >&2
+  exit 1
+fi
 GRAPH="${CLAUDE_PLUGIN_ROOT}/graphs/lifecycle.yaml"
 "$SGH_BIN" --db "$SGH_DB" validate "$GRAPH" --agent-mcp "$SGH_MCP"
 ```

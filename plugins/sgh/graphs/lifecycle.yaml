@@ -22,6 +22,9 @@ nodes:
 
   - id: judge
     kind: agent
+    # retries re-judge the frozen sweep input; re-acting on an already-retired
+    # id is rejected by the engine, so a partial first attempt can
+    # block-and-rerun but never double-applies
     needs: [sweep]
     tools: [topodb]
     prompt: |
@@ -95,10 +98,15 @@ nodes:
     needs: [sweep, judge]
     run: |
       set -eu
+      # derived from verdicts, never from self-reported acted_ids — a judge
+      # that acts-but-underreports (or fabricates) must not pass
       command -v jq >/dev/null 2>&1 || { echo "verify: jq is required" >&2; exit 4; }
-      acted=$(printf '%s' "$SGH_INPUT_JUDGE" | jq -r '.acted_ids[]')
+      acted=$(printf '%s' "$SGH_INPUT_JUDGE" | jq -r \
+        '([.decay[]|select(.verdict=="forget").id] + [.duplicates[]|select(.verdict=="consolidate").drop_id]) | unique | .[]')
       still_live=""
       for id in $acted; do
+        # found:false counts as retired — safe only because nothing in this
+        # graph hard-deletes (purge is out of scope)
         if "$SGH_TOPODB" --db "$SGH_MEMORY_DB" get "$id" \
           | jq -e '.found and (.node.props.forgotten_at == null) and (.node.props.superseded_at == null)' >/dev/null; then
           echo "verify: acted id still live: $id" >&2
@@ -110,8 +118,9 @@ nodes:
       printf '%s' "$SGH_INPUT_JUDGE" | jq \
         --argjson before "$(printf '%s' "$SGH_INPUT_SWEEP" | jq 'length')" \
         --argjson after "$(printf '%s' "$after" | jq 'length')" \
-        '{before_candidates: $before, after_candidates: $after,
-          acted: (.acted_ids | length), decay: .decay, duplicates: .duplicates}'
+        '([.decay[]|select(.verdict=="forget").id] + [.duplicates[]|select(.verdict=="consolidate").drop_id] | unique) as $acted
+         | {before_candidates: $before, after_candidates: $after,
+            acted: ($acted | length), decay: .decay, duplicates: .duplicates}'
     output:
       schema:
         type: object
