@@ -278,24 +278,18 @@ pub fn ingest_vault(
             }
         };
         let new_head = match &outcome.action {
-            NoteAction::Created { memory_id } => {
-                report.ingested += 1;
-                Some(*memory_id)
-            }
-            NoteAction::Superseded { memory_id, .. } => {
-                report.superseded += 1;
-                Some(*memory_id)
-            }
-            NoteAction::Deduplicated { memory_id } => {
-                report.deduplicated += 1;
-                Some(*memory_id)
-            }
-            NoteAction::SkippedUnchanged | NoteAction::SkippedEntityStub => {
-                report.skipped += 1;
-                None
-            }
+            NoteAction::Created { memory_id } => Some(*memory_id),
+            NoteAction::Superseded { memory_id, .. } => Some(*memory_id),
+            NoteAction::Deduplicated { memory_id } => Some(*memory_id),
+            NoteAction::SkippedUnchanged | NoteAction::SkippedEntityStub => None,
         };
         if dry_run {
+            match &outcome.action {
+                NoteAction::Created { .. } => report.ingested += 1,
+                NoteAction::Superseded { .. } => report.superseded += 1,
+                NoteAction::Deduplicated { .. } => report.deduplicated += 1,
+                NoteAction::SkippedUnchanged | NoteAction::SkippedEntityStub => report.skipped += 1,
+            }
             continue;
         }
         let mut ops = outcome.ops;
@@ -324,6 +318,12 @@ pub fn ingest_vault(
                 fail(e.to_string(), &mut report);
                 continue;
             }
+        }
+        match &outcome.action {
+            NoteAction::Created { .. } => report.ingested += 1,
+            NoteAction::Superseded { .. } => report.superseded += 1,
+            NoteAction::Deduplicated { .. } => report.deduplicated += 1,
+            NoteAction::SkippedUnchanged | NoteAction::SkippedEntityStub => report.skipped += 1,
         }
         if let Some(head) = new_head {
             let stamped = note.id().as_deref() == Some(head.to_string().as_str());
@@ -509,5 +509,28 @@ mod tests {
             !a2.contains(&old_id_line),
             "id must advance to the new head"
         );
+    }
+
+    #[test]
+    fn dedup_hit_stamps_existing_memory_id() {
+        let (_d, db) = db();
+        let lookup = scopes_to_scope_set(&[Scope::Shared]);
+        let vdir = tempfile::tempdir().unwrap();
+        std::fs::write(vdir.path().join("first.md"), "Same fact text.\n").unwrap();
+        let r1 = ingest_vault(&db, vdir.path(), Scope::Shared, &lookup, 1, false, None).unwrap();
+        assert_eq!(r1.ingested, 1);
+        let first =
+            crate::Note::parse(&std::fs::read_to_string(vdir.path().join("first.md")).unwrap())
+                .unwrap();
+        let id = first.id().unwrap();
+
+        // A second, id-less note with identical content dedups AND gets the same id stamped.
+        std::fs::write(vdir.path().join("second.md"), "Same fact text.\n").unwrap();
+        let r2 = ingest_vault(&db, vdir.path(), Scope::Shared, &lookup, 2, false, None).unwrap();
+        assert_eq!((r2.deduplicated, r2.ingested), (1, 0));
+        let second =
+            crate::Note::parse(&std::fs::read_to_string(vdir.path().join("second.md")).unwrap())
+                .unwrap();
+        assert_eq!(second.id().unwrap(), id);
     }
 }
