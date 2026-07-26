@@ -141,7 +141,8 @@ fn lifecycle_graph_actions_match_verdicts_live() {
 
     let agent = ClaudeCodeRunner::new(
         Some("haiku".to_string()),
-        vec![topodb.to_string_lossy().into_owned(), "jq".to_string()],
+        // no bash grants — production parity: /sgh:lifecycle passes no --agent-bash
+        vec![],
         Some(McpWiring {
             config_path: config.to_string_lossy().into_owned(),
         }),

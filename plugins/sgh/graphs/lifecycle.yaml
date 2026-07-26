@@ -44,10 +44,17 @@ nodes:
          which id survives (keep) and which is retired (drop). Consolidate
          only true duplicates or redundant restatements; keep-both when the
          two say different things.
-      4. Apply your own verdicts, in this order:
+      4. Apply your own verdicts by calling the tools — writing the JSON
+         report is NOT applying; every acted id must have a successful
+         tool_result before you reply. In this order:
          a. every consolidate verdict: one consolidate_memories call per
-            pair (keep = the survivor id, drop = the retired id);
-         b. every forget verdict: one forget call listing all forget ids.
+            pair, with params {keep: <survivor id>, drop: <retired id>};
+         b. every forget verdict: one forget call with params
+            {ids: [<every forget id>]}.
+         These tools may need a schema lookup before first use (e.g.
+         ToolSearch for mcp__topodb__forget and
+         mcp__topodb__consolidate_memories) — do that rather than assuming
+         they are unavailable. Never use Bash for any part of this task.
          Never forget an id a consolidation already retired, and never act
          on an id you decided to keep.
       5. Reply with ONLY the required JSON object. acted_ids lists every id
