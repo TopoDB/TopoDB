@@ -50,6 +50,7 @@ All 19 subcommands, in scaffold + write + read order:
 | `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
 | `get-edges <from>` | positional source node id (or target when `--direction in`), `--direction out\|in\|both` (default `out`; for `in`, the anchor shifts to the target and `--to` filters the far source end), `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
+| `lifecycle-candidates` | `--limit <N>`, `--half-life-episodic-days <F>`, `--half-life-semantic-days <F>`, `--half-life-procedural-days <F>`, `--now-ms <MS>` | JSON array of `{id, content, kind, created_at, last_accessed_at, access_count, staleness}` |
 | `changes` | `--since <seq>` (required) | `[ {"seq": u64, "op": <op-json>}, ... ]` |
 | `compact` | `--keep-from <seq>` (required) | `{"oldest": <seq>}` |
 | `set-props <id>` | positional node id, `--props <json-object>` (required; a `null` value removes that key) | `{"seq": <seq>}` |
@@ -91,6 +92,11 @@ Notes on individual commands:
   (standing fact), `procedural` (how-to). An unstamped memory reads as `semantic`, so existing
   dbs need no migration. `remember --kind` stamps new memories (dedup ignores it — the stored
   kind wins); `search --kinds` filters by it. Kind never affects ranking.
+- **`lifecycle-candidates`**: surfaces decay candidates — live memories ranked by kind-aware
+  staleness (`(age/half_life)/ln(e+access_count)`; half-life defaults 14d/120d/365d for
+  episodic/semantic/procedural, absent kind counts as semantic). Deterministic under `--now-ms`,
+  read-only, and unbumped (the sweep never perturbs the access signal it reads). It only
+  PROPOSES: review the evidence and retire memories explicitly with `forget`.
 - **`find`**: `--value` is parsed as a JSON scalar first (`42` → `Int`, `true` → `Bool`, `"ada"`
   → `Str`); if it doesn't parse as JSON at all, the raw string is taken as `Str` — so
   `--value ada` and `--value '"ada"'` are equivalent. A float value is never equality-indexable

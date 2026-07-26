@@ -327,6 +327,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`lifecycle_candidates` + `staleness`** — the Phase C decay sweep: rank live memories by kind-aware staleness (`(age/half_life)/ln(e+access_count)`, age since last access falling back to ULID mint time), top-N (default 20) with full evidence `{id, content, kind, created_at, last_accessed_at, access_count, staleness}`. Deterministic under an injected `now_ms`, read-only, unbumped (built on `nodes_by_label_unbumped` + `access_stats`). Half-life defaults: episodic 14d, semantic 120d, procedural 365d (`LIFECYCLE_HALF_LIFE_*_DAYS`); absent/unknown kind uses the semantic half-life.
 - **Memory `kind` taxonomy vocabulary** — `MEMORY_KIND_PROP` (`"kind"`), the closed enum `MEMORY_KINDS` (`episodic | semantic | procedural`), `MEMORY_KIND_DEFAULT` (`semantic` — what an absent prop reads as; no migration needed), and `validate_memory_kind`. `RememberRequest.kind` stamps NEW memories only (dedup ignores kind; the hit's stored kind wins); `kind` joins the reserved props rail with a message pointing at the parameter.
 - **`MEMORY_FORGOTTEN_AT_PROP` + `MEMORY_TOMBSTONE_PROPS`** — the second tombstone and the canonical liveness set every surface filters on. `plan_forget(db, write_scope, ids, now_ms)` — strict shared ops builder for the `forget` verb (stamp + close open edges; ANY invalid id rejects the whole call, unlike `plan_supersede`'s skip-if-retired). `memory_props` now also rejects `forgotten_at` as reserved; `existing_memory` excludes forgotten nodes from dedup.
 
@@ -454,6 +455,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`lifecycle_candidates` tool** (29 tools) — the decay sweep over MCP: same shared builder and semantics as the CLI subcommand (deterministic `now_ms`, tunable half-life days, unbumped, read-only). The description carries the lifecycle doctrine: the sweep proposes; the agent reviews each candidate's evidence and acts via `forget`/`consolidate_memories`.
 - **`remember.kind` + `search_memories.kinds`** — the kind taxonomy over MCP: `kind` enum-validates and stamps new memories (dedup ignores it; the stored kind wins), `kinds` filters recall post-fusion with absent-as-`semantic` (entity hits count as `semantic` — combine with `labels: ["Memory"]` to filter to memories only). Invalid or empty values are `invalid_params`.
 - **`forget` tool** — soft-retire memories (`ids`, optional `scope`): stamps `forgotten_at` + closes open edges atomically via the same shared planner as the CLI. Strict targets: any invalid id rejects the whole call. Distinct from `remember.supersedes` (replacement) — forget is "never needs to come back".
 - **Liveness is now the shared tombstone set** — `search`, the dedup path, the near-duplicate advisory, and the hygiene scans all treat `forgotten_at` exactly like `superseded_at`.
@@ -934,6 +936,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`lifecycle-candidates`** — the decay sweep as a subcommand: `--limit` (default 20), per-kind `--half-life-*-days` flags, `--now-ms` for reproducible runs. Prints the ranked evidence array; read-only and unbumped. The sweep proposes — act on it with `forget`.
 - **`remember --kind <episodic|semantic|procedural>`** — classifies a NEW memory; enum-validated (exit 2 otherwise); ignored on a dedup hit (the stored kind wins). Omitted = reads as `semantic`.
 - **`search --kinds <kind>[,<kind>...]`** — only return hits of these kinds, on BOTH the default and `--include-superseded` paths; a node without a `kind` prop (including entities) counts as `semantic`. Filtered before top-k, unbumped.
 - **`forget <id>...`** — soft-retire memories: stamps `forgotten_at` and closes their open edges atomically. Recall and default `search` stop returning them; history stays reachable (`search --include-superseded`, temporal reads). Every id must be a live Memory in the write scope — unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call (exit 2). Output: `{"forgotten": [ids]}`.
