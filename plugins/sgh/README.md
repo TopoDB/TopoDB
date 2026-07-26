@@ -62,6 +62,19 @@ npm packaging with prebuilt platform binaries is deliberately deferred.
   deliberate: accepting a path as a command argument would be a shell-
   injection vector, so the path is fixed instead.
 
+- `/sgh:lifecycle` — Runs the shipped memory-lifecycle graph (`graphs/lifecycle.yaml`) against
+  this project's memory db (`$SGH_MEMORY_DB`): a read-only decay sweep
+  proposes candidates, a judge agent (armed with `mcp__topodb`) decides
+  keep/forget and duplicate consolidation and applies its own verdicts, and
+  a verify step re-reads the database — the run fails if any claimed action
+  is not actually reflected. Same two-step gate as `/sgh:run`: every command
+  is shown before anything executes. Nothing is hard-deleted; forget and
+  consolidation stamp soft tombstones (`forgotten_at`/`superseded_at`) that
+  `--include-superseded` and `as_of` queries can still reach.
+
+  Requires the `topodb` CLI and `topodb-mcp` binaries (build with
+  `cargo build --release -p topodb-cli -p topodb-mcp`) and `jq`.
+
 ## The approval gate
 
 `/sgh:run` runs `sgh validate` first — read-only — which prints every

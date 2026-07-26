@@ -910,6 +910,8 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`/sgh:lifecycle` + the shipped lifecycle graph** (`graphs/lifecycle.yaml`) — the F6 Phase D reference loop: a deterministic `lifecycle-candidates` sweep (command node, no model call), a judge agent that reviews decay candidates plus `find_duplicate_memories` pairs and applies its verdicts via `mcp__topodb` (`forget`, consolidations first), and a verify command node that re-reads the db and fails the run if any claimed action is not reflected — self-reports cannot fake it. Two-step gate mirrors `/sgh:run`; requires `topodb`, `topodb-mcp` and `jq`.
+- **`sgh-env.sh`: `SGH_MEMORY_DB` + `SGH_TOPODB`** — the per-project memory-db path is now exported once (and reused inside `SGH_MCP`), and the topodb CLI resolves with the established override → in-repo release → PATH → cargo-bin order (non-fatal on miss, like `SGH_MCP`).
 - **Hooks: session-start memory injection + observational episode capture.** SessionStart injects
   up to 8 recent, access-ranked project memories (hard char cap, 2.5s deadline, main sessions
   only, `startup`/`clear` sources only). PostToolUse records what each retrieval tool returned
