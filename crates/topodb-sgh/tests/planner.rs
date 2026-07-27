@@ -209,3 +209,77 @@ fn unparseable_yaml_is_retried_like_any_other_rejection() {
     assert!(p.plan(&req()).is_ok());
     assert_eq!(backend.prompts().len(), 2);
 }
+
+/// ApiBackend is a PlanBackend: BoundedPlanner drives it exactly like any
+/// other backend, proving plan-over-HTTP shares the bounded retry loop.
+#[cfg(feature = "http")]
+mod api_backend_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use topodb_sgh::planner::api::ApiBackend;
+    use topodb_sgh::provider::{
+        ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, HttpTransport,
+        ProviderError, StopReason,
+    };
+
+    /// A ChatProvider that always returns one scripted text reply, recording
+    /// every turn it was asked to build a payload for. A local miniature of
+    /// tests/http_runner.rs's ScriptedProvider.
+    struct ScriptedProvider {
+        text: String,
+        seen: Mutex<Vec<ChatTurn>>,
+    }
+
+    impl ScriptedProvider {
+        fn returning_text(text: &str) -> Self {
+            ScriptedProvider {
+                text: text.to_string(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChatProvider for ScriptedProvider {
+        fn request(&self, turn: &ChatTurn) -> Result<HttpPayload, ProviderError> {
+            self.seen.lock().unwrap().push(turn.clone());
+            Ok(HttpPayload {
+                url: "http://scripted".into(),
+                headers: vec![],
+                body: vec![],
+            })
+        }
+
+        fn parse(&self, _status: u16, _body: &[u8]) -> Result<ChatResponse, ProviderError> {
+            Ok(ChatResponse {
+                parts: vec![ContentPart::Text {
+                    text: self.text.clone(),
+                }],
+                stop: StopReason::EndTurn,
+            })
+        }
+    }
+
+    /// A transport that always answers 200 with an empty body — pairs with
+    /// ScriptedProvider, whose `parse` ignores the body entirely.
+    struct OkTransport;
+
+    impl HttpTransport for OkTransport {
+        fn post(
+            &self,
+            _payload: &HttpPayload,
+            _timeout: Duration,
+        ) -> Result<(u16, Vec<u8>), std::io::Error> {
+            Ok((200, Vec::new()))
+        }
+    }
+
+    #[test]
+    fn api_backend_plugs_into_bounded_planner() {
+        let provider = ScriptedProvider::returning_text(VALID);
+        let backend = ApiBackend::with_transport(Box::new(provider), Box::new(OkTransport), None);
+        let planner = BoundedPlanner::with_backend(Box::new(backend), 1);
+        let g = planner.plan(&req()).unwrap();
+        assert_eq!(g.version, 1);
+    }
+}

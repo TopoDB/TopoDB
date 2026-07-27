@@ -1,3 +1,5 @@
+#[cfg(feature = "http")]
+pub mod api;
 #[cfg(feature = "claude-code")]
 pub mod claude;
 pub mod mock;
