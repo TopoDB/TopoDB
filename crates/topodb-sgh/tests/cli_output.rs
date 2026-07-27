@@ -102,3 +102,30 @@ fn run_help_lists_the_hardening_flags() {
         assert!(help.contains(flag), "missing {flag} in run --help");
     }
 }
+
+#[test]
+fn resume_help_exists_with_approve_gate() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sgh"))
+        .args(["resume", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--approve-gate"));
+    assert!(!help.contains("--replan"), "resume must not offer replan");
+}
+
+#[test]
+fn resume_unknown_run_exits_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sgh"))
+        .args([
+            "--db",
+            dir.path().join("x.redb").to_str().unwrap(),
+            "resume",
+            "01NOPE",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+}
