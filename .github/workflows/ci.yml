@@ -18,6 +18,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: sgh library without default features
+        run: cargo check -p topodb-sgh --no-default-features --features anthropic,openai --all-targets
+      - name: sgh all features
+        run: cargo test -p topodb-sgh --all-features
       - run: cargo bench --no-run
         if: matrix.os == 'ubuntu-latest'
   node-test:
