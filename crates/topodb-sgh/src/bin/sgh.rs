@@ -1,10 +1,11 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use topodb::Db;
 use topodb_sgh::executor::{Executor, RunReport};
 #[cfg(feature = "claude-code")]
-use topodb_sgh::planner::claude::claude_planner;
+use topodb_sgh::planner::claude::claude_planner_with_timeout;
 use topodb_sgh::planner::{PlanRequest, Planner};
 use topodb_sgh::replan::{collect_failure_context, propose_revision, FailureContext};
 #[cfg(feature = "claude-code")]
@@ -142,6 +143,12 @@ enum Cmd {
         /// Seconds a single command node may run before it is killed.
         #[arg(long, default_value_t = 120)]
         command_timeout: u64,
+        /// Seconds a single agent-node model call (the whole node, not one
+        /// HTTP request) may run before it is treated as failed. Applies to
+        /// both the claude-code runner (subprocess deadline) and the HTTP
+        /// runners (whole tool-loop deadline).
+        #[arg(long, default_value_t = 600)]
+        agent_timeout: u64,
         /// On a halted run, ask the planner for a revised graph.
         #[arg(long)]
         replan: bool,
@@ -172,6 +179,10 @@ enum Cmd {
         /// How many times the planner may retry an invalid graph.
         #[arg(long, default_value_t = 3)]
         max_attempts: u32,
+        /// Seconds a single planner call may run before it is treated as
+        /// failed.
+        #[arg(long, default_value_t = 600)]
+        agent_timeout: u64,
     },
 }
 
@@ -426,7 +437,7 @@ enum BuiltRunner {
     #[cfg(feature = "claude-code")]
     Claude(ClaudeCodeRunner),
     #[cfg(feature = "http")]
-    Http(topodb_sgh::runner::http::HttpChatRunner),
+    Http(Box<topodb_sgh::runner::http::HttpChatRunner>),
 }
 
 impl BuiltRunner {
@@ -435,7 +446,7 @@ impl BuiltRunner {
             #[cfg(feature = "claude-code")]
             BuiltRunner::Claude(r) => r,
             #[cfg(feature = "http")]
-            BuiltRunner::Http(r) => r,
+            BuiltRunner::Http(r) => r.as_ref(),
             // With neither feature compiled, `BuiltRunner` has no variants
             // and no value of it can ever exist — every provider is
             // rejected at the flag-rail stage before construction. `&T` is
@@ -509,12 +520,13 @@ fn build_replan_planner(
     provider: Provider,
     model: Option<String>,
     base_url: Option<String>,
+    agent_timeout: Duration,
 ) -> topodb_sgh::planner::BoundedPlanner {
     match provider {
         Provider::ClaudeCode => {
             #[cfg(feature = "claude-code")]
             {
-                claude_planner(model, 3)
+                claude_planner_with_timeout(model, 3, agent_timeout)
             }
             #[cfg(not(feature = "claude-code"))]
             {
@@ -527,7 +539,8 @@ fn build_replan_planner(
             #[cfg(feature = "http")]
             {
                 let provider_client = build_http_provider(provider, model.clone(), base_url);
-                let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model);
+                let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model)
+                    .with_timeout(agent_timeout);
                 topodb_sgh::planner::BoundedPlanner::with_backend(Box::new(backend), 3)
             }
             #[cfg(not(feature = "http"))]
@@ -587,6 +600,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_bash,
             agent_mcp,
             command_timeout,
+            agent_timeout,
             replan,
             max_replans,
             provider,
@@ -601,6 +615,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 agent_bash,
                 agent_mcp,
                 command_timeout,
+                agent_timeout,
                 replan,
                 max_replans,
                 provider,
@@ -618,7 +633,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider,
             base_url,
             max_attempts,
-        } => plan_cmd(goal, out, context, model, provider, base_url, max_attempts)?,
+            agent_timeout,
+        } => plan_cmd(
+            goal,
+            out,
+            context,
+            model,
+            provider,
+            base_url,
+            max_attempts,
+            agent_timeout,
+        )?,
     }
 
     Ok(())
@@ -643,11 +668,13 @@ fn run_cmd(
     agent_bash: Vec<String>,
     agent_mcp: Option<String>,
     command_timeout: u64,
+    agent_timeout: u64,
     replan: bool,
     max_replans: u32,
     provider: Provider,
     base_url: Option<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    let agent_timeout = Duration::from_secs(agent_timeout);
     // `--yes-including-revisions` implies `--yes` for anything else
     // in this command that reads `yes` (there is nothing else today,
     // but keeping the invariant explicit here means a future reader
@@ -721,11 +748,10 @@ fn run_cmd(
             }),
             None => None,
         };
-        Some(BuiltRunner::Claude(ClaudeCodeRunner::new(
-            model.clone(),
-            agent_bash.clone(),
-            mcp_wiring,
-        )))
+        Some(BuiltRunner::Claude(
+            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
+                .with_deadline(agent_timeout),
+        ))
     } else {
         None
     };
@@ -855,13 +881,13 @@ fn run_cmd(
                 let provider_client = pending_http_provider
                     .take()
                     .expect("pending_http_provider is Some whenever provider != ClaudeCode");
-                runner = Some(BuiltRunner::Http(
-                    topodb_sgh::runner::http::HttpChatRunner::new(
-                        provider_client,
-                        model.clone(),
-                        bridge,
-                    ),
-                ));
+                let mut http_runner = topodb_sgh::runner::http::HttpChatRunner::new(
+                    provider_client,
+                    model.clone(),
+                    bridge,
+                );
+                http_runner.node_deadline = agent_timeout;
+                runner = Some(BuiltRunner::Http(Box::new(http_runner)));
             }
         }
         let runner_ref = runner
@@ -948,7 +974,8 @@ fn run_cmd(
         // The planner mirrors whatever `--provider` executed the run: a
         // claude-code run replans with `claude_planner`, an HTTP-provider
         // run replans with a fresh `ApiBackend` over the same provider.
-        let planner = build_replan_planner(provider, model.clone(), base_url.clone());
+        let planner =
+            build_replan_planner(provider, model.clone(), base_url.clone(), agent_timeout);
         let revised = match propose_revision(&planner, &current, &ctx) {
             Ok(g) => g,
             Err(e) => {
@@ -1004,7 +1031,9 @@ fn plan_cmd(
     provider: Provider,
     base_url: Option<String>,
     max_attempts: u32,
+    agent_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_timeout = Duration::from_secs(agent_timeout);
     // Flag rails before anything else, same as `run`.
     validate_provider_flags(provider, &base_url, false);
     #[cfg(not(feature = "claude-code"))]
@@ -1018,7 +1047,7 @@ fn plan_cmd(
             Provider::ClaudeCode => {
                 #[cfg(feature = "claude-code")]
                 {
-                    claude_planner(model, max_attempts)
+                    claude_planner_with_timeout(model, max_attempts, agent_timeout)
                 }
                 #[cfg(not(feature = "claude-code"))]
                 {
@@ -1029,7 +1058,8 @@ fn plan_cmd(
                 #[cfg(feature = "http")]
                 {
                     let provider_client = build_http_provider(provider, model.clone(), base_url);
-                    let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model);
+                    let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model)
+                        .with_timeout(agent_timeout);
                     topodb_sgh::planner::BoundedPlanner::with_backend(
                         Box::new(backend),
                         max_attempts,
