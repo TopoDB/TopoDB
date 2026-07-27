@@ -115,41 +115,29 @@ impl McpBridge {
         let response = self.read_response(self.next_id)?;
         self.next_id += 1;
 
-        // Extract result
-        if let Some(result) = response.get("result") {
-            let is_error = result
-                .get("isError")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+        let result = Self::expect_result(&response)?;
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-            let mut text_parts = Vec::new();
-            if let Some(content_array) = result.get("content").and_then(|v| v.as_array()) {
-                for item in content_array {
-                    if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            text_parts.push(text.to_string());
-                        }
+        let mut text_parts = Vec::new();
+        if let Some(content_array) = result.get("content").and_then(|v| v.as_array()) {
+            for item in content_array {
+                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        text_parts.push(text.to_string());
                     }
                 }
             }
+        }
 
-            let text = text_parts.join("\n");
+        let text = text_parts.join("\n");
 
-            if is_error {
-                Err(BridgeError::Tool(text))
-            } else {
-                Ok(text)
-            }
-        } else if let Some(error) = response.get("error") {
-            let message = error
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            Err(BridgeError::Malformed(message.to_string()))
+        if is_error {
+            Err(BridgeError::Tool(text))
         } else {
-            Err(BridgeError::Malformed(
-                "response has no result or error field".to_string(),
-            ))
+            Ok(text)
         }
     }
 
@@ -169,9 +157,10 @@ impl McpBridge {
         });
 
         self.send_request(&request)?;
-        let _response = self.read_response(self.next_id)?;
+        let response = self.read_response(self.next_id)?;
         self.next_id += 1;
 
+        let _ = Self::expect_result(&response)?;
         Ok(())
     }
 
@@ -187,43 +176,31 @@ impl McpBridge {
         let response = self.read_response(self.next_id)?;
         self.next_id += 1;
 
-        // Extract tools from result
-        if let Some(result) = response.get("result") {
-            if let Some(tools_array) = result.get("tools").and_then(|v| v.as_array()) {
-                for tool_obj in tools_array {
-                    if let Some(name) = tool_obj.get("name").and_then(|v| v.as_str()) {
-                        let description = tool_obj
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+        let result = Self::expect_result(&response)?;
+        if let Some(tools_array) = result.get("tools").and_then(|v| v.as_array()) {
+            for tool_obj in tools_array {
+                if let Some(name) = tool_obj.get("name").and_then(|v| v.as_str()) {
+                    let description = tool_obj
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
 
-                        let input_schema = tool_obj.get("inputSchema").cloned().unwrap_or(json!({}));
+                    let input_schema = tool_obj.get("inputSchema").cloned().unwrap_or(json!({}));
 
-                        self.tools.push(ToolDef {
-                            name: format!("{}{}", TOOL_NAMESPACE, name),
-                            description,
-                            input_schema,
-                        });
-                    } else {
-                        return Err(BridgeError::Malformed("tool missing name".to_string()));
-                    }
+                    self.tools.push(ToolDef {
+                        name: format!("{}{}", TOOL_NAMESPACE, name),
+                        description,
+                        input_schema,
+                    });
+                } else {
+                    return Err(BridgeError::Malformed("tool missing name".to_string()));
                 }
-                Ok(())
-            } else {
-                Err(BridgeError::Malformed(
-                    "tools result missing tools array".to_string(),
-                ))
             }
-        } else if let Some(error) = response.get("error") {
-            let message = error
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            Err(BridgeError::Malformed(message.to_string()))
+            Ok(())
         } else {
             Err(BridgeError::Malformed(
-                "response has no result or error field".to_string(),
+                "tools result missing tools array".to_string(),
             ))
         }
     }
@@ -235,6 +212,22 @@ impl McpBridge {
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
         Ok(())
+    }
+
+    fn expect_result(response: &Value) -> Result<Value, BridgeError> {
+        if let Some(result) = response.get("result") {
+            Ok(result.clone())
+        } else if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            Err(BridgeError::Malformed(message.to_string()))
+        } else {
+            Err(BridgeError::Malformed(
+                "response has no result or error field".to_string(),
+            ))
+        }
     }
 
     fn read_response(&mut self, awaited_id: u64) -> Result<Value, BridgeError> {

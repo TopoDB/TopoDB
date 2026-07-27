@@ -70,3 +70,22 @@ fn dead_server_is_server_gone() {
         other => panic!("expected ServerGone/Io, got {other:?}"),
     }
 }
+
+#[test]
+fn initialize_error_response_is_malformed() {
+    // Fake replies to initialize with a JSON-RPC error object.
+    let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32600,"message":"unsupported protocol"}}' ;;
+  esac
+done
+"#;
+    let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+    match McpBridge::spawn(&argv) {
+        Err(BridgeError::Malformed(msg)) => assert!(msg.contains("unsupported protocol"), "got: {msg}"),
+        other => panic!("expected Malformed, got {other:?}"),
+    }
+}
