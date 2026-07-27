@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use topodb::Db;
 use topodb_sgh::executor::{ClockFn, Executor, RunReport};
 #[cfg(feature = "claude-code")]
 use topodb_sgh::planner::claude::claude_planner_with_timeout_and_cancel;
@@ -189,6 +188,46 @@ enum Cmd {
         #[arg(long, default_value_t = 600)]
         agent_timeout: u64,
     },
+    /// Resume a persisted run: re-execute what is not yet succeeded, spending
+    /// only the budget the original graph declared and has not yet consumed.
+    Resume {
+        run_id: String,
+        /// Approve a gate node by id (repeatable) so its dependents may
+        /// proceed. Every id must name a `kind: gate` node in the recovered
+        /// graph.
+        #[arg(long = "approve-gate")]
+        approve_gate: Vec<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Which backend executes agent nodes. Defaults to the local `claude`
+        /// CLI (requires the claude-code feature).
+        #[arg(long, value_enum, default_value = "claude-code")]
+        provider: Provider,
+        /// Base URL override, valid only with --provider openai.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Skip the approval prompt for the recovered graph.
+        #[arg(long)]
+        yes: bool,
+        /// Grant agent nodes permission to run shell commands starting with this
+        /// prefix (repeatable). Additive on top of Read/Write/Edit.
+        #[arg(long = "agent-bash")]
+        agent_bash: Vec<String>,
+        /// Supply agent nodes with the TopoDB MCP server: the full server
+        /// command (binary + args).
+        #[arg(long = "agent-mcp")]
+        agent_mcp: Option<String>,
+        /// Seconds a single command node may run before it is killed.
+        #[arg(long, default_value_t = 120)]
+        command_timeout: u64,
+        /// Seconds a single agent-node model call may run before it is
+        /// treated as failed.
+        #[arg(long, default_value_t = 600)]
+        agent_timeout: u64,
+        /// Maximum number of ready nodes executed concurrently.
+        #[arg(long, default_value_t = 4)]
+        max_inflight: usize,
+    },
 }
 
 /// Every command node's id and full `run:` string, in declaration order.
@@ -330,6 +369,72 @@ fn one_line(s: &str) -> String {
     }
     let head: String = flat.chars().take(200).collect();
     format!("{head}…")
+}
+
+/// Sidecar event directory for a given db file: a sibling directory named
+/// `<file-name>.events` (e.g. `sgh.redb` -> `sgh.redb.events/`). Each run's
+/// JSONL event file lives at `events_dir(db_path).join("<run_id>.jsonl")`.
+/// A resumed run reopens (and appends to) the same file — see `JsonlSink::
+/// create`, which always opens in append mode.
+fn events_dir(db_path: &std::path::Path) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir_name = format!("{file_name}.events");
+    match db_path.parent() {
+        Some(parent) => parent.join(dir_name),
+        None => PathBuf::from(dir_name),
+    }
+}
+
+/// Open the event JSONL file for `run_id` under `db_path`'s sidecar events
+/// dir. On failure (rare: disk full, permissions), warn to stderr and return
+/// `None` — an unwritable event log must never fail the run it observes.
+fn open_event_sink(
+    db_path: &std::path::Path,
+    run_id: &str,
+) -> Option<topodb_sgh::events::JsonlSink> {
+    let path = events_dir(db_path).join(format!("{run_id}.jsonl"));
+    match topodb_sgh::events::JsonlSink::create(&path) {
+        Ok(sink) => Some(sink),
+        Err(e) => {
+            eprintln!(
+                "warning: could not open event log at {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Map a `Db::open` failure to the CLI's Busy-specific message, or pass any
+/// other error through as its default `Display`. `Db::open` returns
+/// `TopoError` directly (not boxed), so this matches it without any
+/// downcasting. Used by both `run_cmd` and `resume_cmd`.
+fn open_db_or_exit(db_path: &std::path::Path) -> topodb::Db {
+    match topodb::Db::open(db_path) {
+        Ok(db) => db,
+        Err(topodb::TopoError::Busy) => {
+            eprintln!(
+                "error: database is held by another process (a run in progress?) — try 'sgh show <run-id>' for live status"
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Map an `Outcome` to the run status stored on the shared-scope index.
+fn status_for_outcome(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Completed => topodb_sgh::store::RUN_STATUS_COMPLETE,
+        Outcome::HaltedAtCheckpoint => topodb_sgh::store::RUN_STATUS_CHECKPOINT,
+        Outcome::Blocked => topodb_sgh::store::RUN_STATUS_BLOCKED,
+    }
 }
 
 /// Current wall clock, in epoch milliseconds, for `Executor::with_clock`.
@@ -669,6 +774,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_attempts,
             agent_timeout,
         )?,
+        Cmd::Resume {
+            run_id,
+            approve_gate,
+            model,
+            provider,
+            base_url,
+            yes,
+            agent_bash,
+            agent_mcp,
+            command_timeout,
+            agent_timeout,
+            max_inflight,
+        } => {
+            let code = resume_cmd(
+                &cli.db,
+                run_id,
+                approve_gate,
+                model,
+                yes,
+                agent_bash,
+                agent_mcp,
+                command_timeout,
+                agent_timeout,
+                provider,
+                base_url,
+                max_inflight,
+            )?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
 
     Ok(())
@@ -788,7 +924,7 @@ fn run_cmd(
     #[cfg(not(feature = "claude-code"))]
     let mut runner: Option<BuiltRunner> = None;
 
-    let db = Db::open(db_path)?;
+    let db = open_db_or_exit(db_path);
     let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout))
         .with_cancel(cancel.clone());
 
@@ -931,11 +1067,15 @@ fn run_cmd(
         let now = now_ms();
         let store = RunStore::create(&db, &run_id, &current, now)?;
         let clock: ClockFn = Arc::new(now_ms);
+        let sink = open_event_sink(db_path, &run_id);
         let mut ex = Executor::new(store, current.clone(), runner_ref)
             .with_command_runner(&command_runner)
             .with_cancel(cancel.clone())
             .with_max_inflight(max_inflight)
             .with_clock(clock);
+        if let Some(sink) = &sink {
+            ex = ex.with_events(sink).with_run_id(run_id.clone());
+        }
         let report = ex.run(now)?;
 
         println!("\nrun {run_id}");
@@ -968,10 +1108,14 @@ fn run_cmd(
         // cancelled run must not spawn a planner subprocess.
         if cancel.is_cancelled() {
             eprintln!("run cancelled");
+            ex.store_ref()
+                .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms())?;
             return Ok(1);
         }
 
         if report.blocked.is_empty() {
+            ex.store_ref()
+                .set_status(status_for_outcome(&Outcome::Completed), now_ms())?;
             return Ok(0);
         }
 
@@ -980,8 +1124,11 @@ fn run_cmd(
         // `all_blocked_are_gates`), so this has to happen before
         // `next_step` would otherwise increment `replans_used`.
         let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
+        let outcome = outcome_of(&report, &ctx);
+        ex.store_ref()
+            .set_status(status_for_outcome(&outcome), now_ms())?;
 
-        match outcome_of(&report, &ctx) {
+        match outcome {
             Outcome::Completed => {
                 unreachable!("report.blocked was already checked non-empty above")
             }
@@ -1068,6 +1215,315 @@ fn run_cmd(
         println!("proposed revision:\n{revised_yaml}");
         // Loop back: the revision re-enters the gate exactly like the
         // original graph. It is never executed without approval.
+    }
+}
+
+/// The `resume` subcommand's body: reopen a persisted run via
+/// `RunStore::open`, approve any gates named by `--approve-gate`, and
+/// re-execute whatever is not yet succeeded — spending only the budget the
+/// original graph declared and has not yet consumed (see `execute_node`'s
+/// resume-awareness). There is no replan here: a resumed run either
+/// finishes or blocks again; the operator resumes again (with different
+/// gates approved) or falls back to `sgh run --replan` on a fresh graph.
+///
+/// Mirrors `run_cmd`'s flag rails, gate preview/prompt, and runner/bridge
+/// construction (cross-referenced below at each divergence) rather than
+/// sharing code with it, because `run_cmd`'s body is a `loop` built around
+/// the replan cycle and extracting a shared helper would have required
+/// restructuring that loop, which the task explicitly avoided.
+#[allow(clippy::too_many_arguments)]
+fn resume_cmd(
+    db_path: &std::path::Path,
+    run_id: String,
+    approve_gate: Vec<String>,
+    model: Option<String>,
+    yes: bool,
+    agent_bash: Vec<String>,
+    agent_mcp: Option<String>,
+    command_timeout: u64,
+    agent_timeout: u64,
+    provider: Provider,
+    base_url: Option<String>,
+    max_inflight: usize,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let agent_timeout = Duration::from_secs(agent_timeout);
+    let cancel = topodb_sgh::runner::cancel::CancelToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())?;
+
+    // Same flag rails as `run_cmd` (see there for rationale): these must run
+    // before any file or db IO.
+    let agent_bash: Vec<String> = agent_bash
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .collect();
+    for grant in &agent_bash {
+        if let Err(e) = topodb_sgh::runner::rails::validate_bash_grant(grant) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+    validate_provider_flags(provider, &base_url, !agent_bash.is_empty());
+    #[cfg(not(feature = "claude-code"))]
+    if provider == Provider::ClaudeCode {
+        eprintln!("error: this sgh was built without the claude-code feature");
+        std::process::exit(2);
+    }
+
+    let mcp_argv = match agent_mcp.as_deref() {
+        Some(cmd) => match topodb_sgh::runner::rails::validate_mcp_server_command(cmd) {
+            Ok(argv) => Some(argv),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
+    #[cfg(feature = "claude-code")]
+    let mut runner: Option<BuiltRunner> = if provider == Provider::ClaudeCode {
+        let mcp_wiring = match &mcp_argv {
+            Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
+                config_path: write_mcp_config(argv)?.to_string_lossy().into_owned(),
+            }),
+            None => None,
+        };
+        Some(BuiltRunner::Claude(
+            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
+                .with_deadline(agent_timeout)
+                .with_cancel(cancel.clone()),
+        ))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "claude-code"))]
+    let mut runner: Option<BuiltRunner> = None;
+
+    let db = open_db_or_exit(db_path);
+
+    let mut pending_http_provider: Option<Box<dyn topodb_sgh::provider::ChatProvider>> =
+        match provider {
+            Provider::ClaudeCode => None,
+            Provider::Anthropic | Provider::Openai => Some(build_http_provider(
+                provider,
+                model.clone(),
+                base_url.clone(),
+            )),
+        };
+
+    let (store, current) = match RunStore::open(&db, &run_id) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Every `--approve-gate` id must name a `kind: gate` node in the
+    // recovered graph — approving a non-gate id (or one absent from the
+    // graph entirely) is a rail violation, caught before the gate preview
+    // below rather than silently doing nothing at run time.
+    for gate in &approve_gate {
+        match current.graph.node(gate) {
+            Some(n) if n.kind == NodeKind::Gate => {}
+            Some(_) => {
+                eprintln!("error: node {gate:?} is not a gate node");
+                std::process::exit(2);
+            }
+            None => {
+                eprintln!("error: no node {gate:?} in the recovered graph");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let bound = worst_case(&current);
+    println!("Goal: {}", current.graph.goal);
+    println!("Nodes: {}", current.graph.nodes.len());
+    println!("Bound: {bound}");
+
+    let commands = command_preview(&current);
+    if !commands.is_empty() {
+        println!("\nCommands that will execute in a shell:");
+        for line in &commands {
+            println!("  {line}");
+        }
+    }
+
+    let grants = grants_preview(&agent_bash);
+    if !grants.is_empty() {
+        println!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
+        for grant in &grants {
+            println!("  {grant}:*");
+        }
+    }
+
+    print_unconstrained(&current);
+
+    if !approve_gate.is_empty() {
+        println!("\nGates approved on resume: {}", approve_gate.join(", "));
+    }
+
+    if let Some(err) = mcp_pairing_error(&current, agent_mcp.as_deref()) {
+        eprintln!("error: {err}");
+        return Ok(2);
+    }
+
+    if let Some(cmd) = &agent_mcp {
+        println!();
+        let lines = match provider {
+            Provider::ClaudeCode => {
+                #[cfg(feature = "claude-code")]
+                {
+                    mcp_gate_lines(&current, cmd)
+                }
+                #[cfg(not(feature = "claude-code"))]
+                {
+                    unreachable!(
+                        "claude-code provider without the feature already \
+                         exited at the flag-rail stage"
+                    )
+                }
+            }
+            Provider::Anthropic | Provider::Openai => http_mcp_gate_lines(&current, cmd),
+        };
+        for line in lines {
+            println!("{line}");
+        }
+    }
+
+    // Same gate semantics as `run_cmd`: a resumed run is a new process, so
+    // the operator re-approves the shell strings that will execute — `--yes`
+    // skips as usual. There is no revision concept on resume (no replan), so
+    // `is_revision` is always false and `yes_including_revisions` is always
+    // false.
+    if needs_prompt(false, yes, false) {
+        println!("\nProceed? [y/N]");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("aborted");
+            return Ok(0);
+        }
+    }
+
+    // HTTP providers only: build the runner now, post-approval — see
+    // `run_cmd`'s matching block for why (no MCP bridge subprocess for a
+    // run the operator rejects).
+    if runner.is_none() {
+        #[cfg(feature = "http")]
+        {
+            let bridge = if !mcp_nodes(&current).is_empty() {
+                let argv = mcp_argv
+                    .as_ref()
+                    .expect("mcp_pairing_error enforces this pairing");
+                match topodb_sgh::mcp_bridge::McpBridge::spawn(argv) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(2);
+                    }
+                }
+            } else {
+                None
+            };
+            let provider_client = pending_http_provider
+                .take()
+                .expect("pending_http_provider is Some whenever provider != ClaudeCode");
+            let mut http_runner = topodb_sgh::runner::http::HttpChatRunner::new(
+                provider_client,
+                model.clone(),
+                bridge,
+            );
+            http_runner.node_deadline = agent_timeout;
+            http_runner.cancel = Some(cancel.clone());
+            runner = Some(BuiltRunner::Http(Box::new(http_runner)));
+        }
+    }
+    let runner_ref = runner
+        .as_ref()
+        .expect("built either eagerly (claude-code) or just above (http)")
+        .as_agent_runner();
+
+    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout))
+        .with_cancel(cancel.clone());
+
+    // Record an "approve" attempt for each approved gate BEFORE the run:
+    // `execute_node` checks a gate's attempt history at execution time (see
+    // its resume-awareness comment), so these must land before `ex.run()`.
+    let now = now_ms();
+    for gate in &approve_gate {
+        store.record_attempt(gate, "approve", "", now)?;
+    }
+
+    // The event file is the SAME file the original run wrote (append mode —
+    // see `JsonlSink::create`): a resumed run continues that run's event
+    // stream rather than starting a new one.
+    let sink = open_event_sink(db_path, &run_id);
+    let clock: ClockFn = Arc::new(now_ms);
+    let mut ex = Executor::new(store, current.clone(), runner_ref)
+        .with_command_runner(&command_runner)
+        .with_cancel(cancel.clone())
+        .with_max_inflight(max_inflight)
+        .with_clock(clock);
+    if let Some(sink) = &sink {
+        ex = ex.with_events(sink).with_run_id(run_id.clone());
+    }
+    let report = ex.run(now)?;
+
+    println!("\nrun {run_id}");
+    println!("  succeeded: {:?}", report.succeeded);
+    println!("  blocked:   {:?}", report.blocked);
+    println!("  skipped:   {:?}", report.skipped);
+    for id in &report.blocked {
+        if let Some(reason) = report.blocked_reasons.get(id) {
+            println!("    {id}: {}", one_line(reason));
+        }
+    }
+    println!(
+        "  model calls: {} (bound was {})",
+        report.model_calls, bound.agent_calls
+    );
+    println!(
+        "  command runs: {} (bound was {})",
+        report.command_runs, bound.command_runs
+    );
+
+    if cancel.is_cancelled() {
+        eprintln!("run cancelled");
+        ex.store_ref()
+            .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms())?;
+        return Ok(1);
+    }
+
+    if report.blocked.is_empty() {
+        ex.store_ref()
+            .set_status(status_for_outcome(&Outcome::Completed), now_ms())?;
+        return Ok(0);
+    }
+
+    let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
+    let outcome = outcome_of(&report, &ctx);
+    ex.store_ref()
+        .set_status(status_for_outcome(&outcome), now_ms())?;
+
+    match outcome {
+        Outcome::Completed => {
+            unreachable!("report.blocked was already checked non-empty above")
+        }
+        Outcome::HaltedAtCheckpoint => {
+            println!(
+                "\nrun halted at an intentional checkpoint, not a failure: {:?}",
+                ctx.gated
+            );
+            println!("no replan on resume — approve the remaining gate(s) and resume again.");
+            Ok(exit_code(&Outcome::HaltedAtCheckpoint))
+        }
+        Outcome::Blocked => {
+            eprintln!("\nrun blocked by a failure: {:?}", ctx.blocked);
+            Ok(1)
+        }
     }
 }
 
