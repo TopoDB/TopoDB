@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use super::cancel::CancelToken;
 use super::proc::{run_with_deadline, ProcEnd};
 use super::{NodeOutcome, RunnerError};
 
@@ -57,11 +58,20 @@ pub fn env_var_name(dep_id: &str) -> String {
 /// killed; a backgrounded descendant there can still outlive the timeout.
 pub struct ShellCommandRunner {
     timeout: Duration,
+    cancel: Option<CancelToken>,
 }
 
 impl ShellCommandRunner {
     pub fn new(timeout: Duration) -> Self {
-        ShellCommandRunner { timeout }
+        ShellCommandRunner {
+            timeout,
+            cancel: None,
+        }
+    }
+
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 }
 
@@ -80,7 +90,13 @@ impl CommandRunner for ShellCommandRunner {
         // Spawn, drain, poll, and (on timeout) group-kill are all handled by
         // the shared engine — see `runner::proc` for the drain-thread and
         // grace-period rationale.
-        let (out, end) = run_with_deadline(&mut cmd, self.timeout, None)?;
+        let (out, end) = run_with_deadline(&mut cmd, self.timeout, self.cancel.as_ref())?;
+
+        if end == ProcEnd::Cancelled {
+            return Ok(NodeOutcome::Failed {
+                error: "cancelled".into(),
+            });
+        }
 
         if end == ProcEnd::DeadlineKilled {
             return Ok(NodeOutcome::Failed {
