@@ -516,6 +516,7 @@ fn a_cancelled_run_starts_no_nodes() {
 /// and records a "cancelled" attempt instead of burning the retry budget.
 #[test]
 fn cancellation_mid_ladder_blocks_with_cancelled_attempt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use topodb_sgh::runner::cancel::CancelToken;
 
     let g = Graph::from_yaml(
@@ -535,6 +536,7 @@ fn cancellation_mid_ladder_blocks_with_cancelled_attempt() {
 
     struct CancellingRunner {
         token: CancelToken,
+        calls: AtomicUsize,
     }
 
     impl topodb_sgh::runner::AgentRunner for CancellingRunner {
@@ -542,6 +544,7 @@ fn cancellation_mid_ladder_blocks_with_cancelled_attempt() {
             &self,
             _req: &topodb_sgh::runner::NodeRequest,
         ) -> Result<topodb_sgh::runner::NodeOutcome, topodb_sgh::runner::RunnerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             self.token.cancel();
             Ok(topodb_sgh::runner::NodeOutcome::Failed {
                 error: "fail".into(),
@@ -551,6 +554,7 @@ fn cancellation_mid_ladder_blocks_with_cancelled_attempt() {
 
     let runner = CancellingRunner {
         token: token_for_runner.clone(),
+        calls: AtomicUsize::new(0),
     };
 
     let mut ex = Executor::new(store, v, &runner).with_cancel(token);
@@ -573,6 +577,12 @@ fn cancellation_mid_ladder_blocks_with_cancelled_attempt() {
             .iter()
             .any(|(rung, error)| rung == "cancelled" && error == "cancelled"),
         "should have a 'cancelled' attempt with error 'cancelled', got: {attempts:?}"
+    );
+
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        1,
+        "cancellation must prevent the retry from executing"
     );
 }
 
