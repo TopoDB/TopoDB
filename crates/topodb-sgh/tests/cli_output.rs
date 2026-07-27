@@ -129,3 +129,59 @@ fn resume_unknown_run_exits_2() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
 }
+
+#[test]
+fn show_requires_run_id_or_list() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sgh"))
+        .args(["show"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn show_missing_event_log_names_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sgh"))
+        .args([
+            "--db",
+            dir.path().join("x.redb").to_str().unwrap(),
+            "show",
+            "01RUN",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("01RUN"));
+}
+
+#[test]
+fn show_pretty_prints_a_canned_event_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("x.redb");
+    let events_dir = dir.path().join("x.redb.events");
+    std::fs::create_dir_all(&events_dir).unwrap();
+
+    // Write a canned event file with three lines matching the Envelope shape
+    let event_file = events_dir.join("01RUN.jsonl");
+    let events = r#"{"v":1,"ts":1000,"event":"run_started","run_id":"01RUN","goal":"test goal","agent_calls_bound":100,"command_runs_bound":10}
+{"v":1,"ts":1100,"event":"node_started","node_id":"a"}
+{"v":1,"ts":1200,"event":"node_succeeded","node_id":"a"}"#;
+    std::fs::write(&event_file, events).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sgh"))
+        .args(["--db", db_path.to_str().unwrap(), "show", "01RUN"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("run_started"), "stdout: {stdout}");
+    assert!(stdout.contains("node_started"), "stdout: {stdout}");
+    assert!(stdout.contains("node_succeeded"), "stdout: {stdout}");
+}
