@@ -183,8 +183,39 @@ Runs are recorded in a per-project database under
 default is `./sgh.redb` in the working directory; the plugin never uses that.
 Override with `SGH_DB`.
 
+## Runs are durable
+
+Every run gets a stable wall-clock timestamp the moment `sgh` starts. Runs are
+findable after completion, crash, or interruption:
+
+- `sgh show --list` enumerates all runs in the database, with their status
+  (running, checkpoint, blocked, complete, failed) and wall-clock start time.
+- `sgh show <id>` reads and prints the run's final state and event log.
+- `sgh show <id> --follow` streams events as they arrive, even while the
+  database is locked by a running process. This is the replay of a run already
+  in progress, not a live co-execution — events are buffered to an external
+  events directory (`<db>.events/`) and streamed from there.
+
+**Important:** The events directory is a disposable projection. The database is
+the source of truth. Deleting `<db>.events/` loses the stream, but the run
+state and bound proof persist in the database and survive a full node restart.
+
+Interrupted or crashed runs are resumable:
+
+- `sgh resume <id>` continues a run from where it left off, skipping all
+  completed nodes. The budget (agent-call cap) carries over from the original
+  run's bound, so total calls across both processes stay within the worst-case
+  limit.
+- `sgh resume <id> --approve-gate <node>` approves a node that was halted at
+  an approval gate (status "checkpoint") and resumes from there. Exit code 3's
+  second half: the node passes the gate and execution resumes normally,
+  exiting 0 when complete.
+
+The database path override (`SGH_DB`) works unchanged for all of these.
+
 ## Not included yet
 
-- `/sgh:show` — needs an IPC layer, because redb takes an exclusive
-  cross-process lock and `show` cannot read the database while a run holds it.
+- `/sgh:show` — the CLI side is unblocked, but the plugin command itself is
+  follow-up. You can inspect runs with `sgh show <id>` / `sgh show --list`
+  directly from a terminal.
 - Pi packaging (`npm/topodb-sgh-pi`).
