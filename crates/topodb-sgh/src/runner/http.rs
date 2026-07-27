@@ -11,7 +11,7 @@ use crate::provider::{
 };
 use crate::schema::TOPODB_TOOL;
 
-use super::{common, AgentRunner, NodeOutcome, NodeRequest, RunnerError};
+use super::{cancel::CancelToken, common, AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
 /// Safely elide a response body to ~200 chars for an error message,
 /// preserving UTF-8 boundaries.
@@ -120,6 +120,9 @@ pub struct HttpChatRunner {
     /// sends around them. Phase 3's events make a stuck bridge call
     /// observable from the outside even though this field cannot kill it.
     pub node_deadline: Duration,
+    /// Cooperative cancellation token. When set and cancelled, the runner
+    /// aborts inflight work and returns a failed outcome.
+    pub cancel: Option<CancelToken>,
 }
 
 impl HttpChatRunner {
@@ -148,6 +151,7 @@ impl HttpChatRunner {
             max_transport_retries: 3,
             backoff_base: Duration::from_secs(1),
             node_deadline: Duration::from_secs(600),
+            cancel: None,
         }
     }
 
@@ -196,6 +200,13 @@ impl AgentRunner for HttpChatRunner {
         // path can start new work once the whole-node budget is spent.
         macro_rules! remaining_or_fail {
             () => {{
+                if let Some(token) = &self.cancel {
+                    if token.is_cancelled() {
+                        return Ok(NodeOutcome::Failed {
+                            error: "cancelled".into(),
+                        });
+                    }
+                }
                 let remaining = deadline_at.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Ok(NodeOutcome::Failed {

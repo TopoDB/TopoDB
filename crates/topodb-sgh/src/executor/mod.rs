@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::recovery::{contract_preserved, NoopRepairer, Repairer, Rung};
+use crate::runner::cancel::CancelToken;
 use crate::runner::command::{CommandRequest, CommandRunner};
 use crate::runner::{AgentRunner, NodeOutcome, NodeRequest};
 use crate::schema::validate::Validated;
@@ -48,6 +49,7 @@ pub struct Executor<'r> {
     /// error is still in hand. Read into `RunReport` by `report()`. Gate
     /// blocks add no entry — they are checkpoints, not failures.
     blocked_reasons: BTreeMap<String, String>,
+    cancel_token: Option<CancelToken>,
 }
 
 impl<'r> Executor<'r> {
@@ -62,6 +64,7 @@ impl<'r> Executor<'r> {
             model_calls: 0,
             command_runs: 0,
             blocked_reasons: BTreeMap::new(),
+            cancel_token: None,
         }
     }
 
@@ -79,6 +82,12 @@ impl<'r> Executor<'r> {
     /// execute shell steps by accident.
     pub fn with_command_runner(mut self, command_runner: &'r dyn CommandRunner) -> Self {
         self.command_runner = Some(command_runner);
+        self
+    }
+
+    /// Wire in a cancellation token. Allows cooperative cancellation of the run.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel_token = Some(token);
         self
     }
 
@@ -157,6 +166,15 @@ impl<'r> Executor<'r> {
                 continue;
             }
 
+            // Check for cancellation before starting the node
+            if let Some(token) = &self.cancel_token {
+                if token.is_cancelled() {
+                    let t = self.tick();
+                    self.store.set_state(&id, NodeState::Skipped, t)?;
+                    continue;
+                }
+            }
+
             let t = self.tick();
             self.store.set_state(&id, NodeState::Ready, t)?;
 
@@ -205,6 +223,19 @@ impl<'r> Executor<'r> {
         let mut repairs_left = repair_budget;
 
         loop {
+            // Check for cancellation at the top of each ladder iteration
+            if let Some(token) = &self.cancel_token {
+                if token.is_cancelled() {
+                    let t = self.tick();
+                    self.store.record_attempt(id, "cancelled", "cancelled", t)?;
+                    self.blocked_reasons
+                        .insert(id.to_string(), "cancelled".to_string());
+                    let t = self.tick();
+                    self.store.set_state(id, NodeState::Blocked, t)?;
+                    return Ok(());
+                }
+            }
+
             let t = self.tick();
             self.store.set_state(id, NodeState::Running, t)?;
 
