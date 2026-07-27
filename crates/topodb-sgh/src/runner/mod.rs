@@ -1,6 +1,7 @@
 pub mod cancel;
 #[cfg(feature = "claude-code")]
 pub mod claude;
+pub mod cli;
 pub mod command;
 pub mod common;
 #[cfg(feature = "http")]

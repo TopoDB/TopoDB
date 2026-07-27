@@ -1,5 +1,8 @@
-use std::process::Command;
+use std::process::ExitStatus;
+use std::time::Duration;
 
+use super::cancel::CancelToken;
+use super::cli::{CliCodec, CliPrintRunner};
 use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
 use super::common::elide;
@@ -147,24 +150,17 @@ pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
     }
 }
 
-pub struct ClaudeCodeRunner {
-    model: Option<String>,
-    bash_grants: Vec<String>,
-    mcp: Option<McpWiring>,
+/// The claude CLI as a [`CliCodec`]: builds `claude -p` argv and interprets
+/// the captured output. Spawn, deadline, and cancellation are owned by
+/// [`CliPrintRunner`] via the shared proc engine.
+pub struct ClaudeCodeCli {
+    pub model: Option<String>,
+    pub bash_grants: Vec<String>,
+    pub mcp: Option<McpWiring>,
 }
 
-impl ClaudeCodeRunner {
-    pub fn new(model: Option<String>, bash_grants: Vec<String>, mcp: Option<McpWiring>) -> Self {
-        ClaudeCodeRunner {
-            model,
-            bash_grants,
-            mcp,
-        }
-    }
-}
-
-impl AgentRunner for ClaudeCodeRunner {
-    fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
+impl CliCodec for ClaudeCodeCli {
+    fn argv(&self, req: &NodeRequest) -> Vec<String> {
         // Without a tool grant, an agent node runs under the default
         // permission mode, where there is no one to approve a Write. The tool
         // call is blocked, the agent explains that it was blocked, and
@@ -194,30 +190,69 @@ impl AgentRunner for ClaudeCodeRunner {
         } else {
             None
         };
-        let argv = build_argv(
+        build_argv(
             build_prompt(req),
             self.model.clone(),
             &self.bash_grants,
             node_mcp,
-        );
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
+        )
+    }
 
-        let out = cmd.output()?;
-
+    fn interpret(
+        &self,
+        req: &NodeRequest,
+        exit: ExitStatus,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<NodeOutcome, RunnerError> {
         // Check the exit status before decoding stdout. A failing
         // invocation's stdout is not a promise of valid UTF-8 (partial
         // writes, binary diagnostics, etc.), and decoding it first would
         // turn a diagnosable failure (exit status + stderr) into a
         // confusing `RunnerError::Utf8` that discards both.
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if !exit.success() {
+            let stderr = String::from_utf8_lossy(stderr).to_string();
             return Ok(NodeOutcome::Failed {
-                error: format!("claude exited with {}: {}", out.status, stderr.trim()),
+                error: format!("claude exited with {}: {}", exit, stderr.trim()),
             });
         }
 
-        let stdout = String::from_utf8(out.stdout).map_err(|_| RunnerError::Utf8)?;
+        let stdout = String::from_utf8(stdout.to_vec()).map_err(|_| RunnerError::Utf8)?;
         Ok(interpret_result(&stdout, req.output_schema.is_some()))
+    }
+}
+
+pub struct ClaudeCodeRunner {
+    inner: CliPrintRunner,
+}
+
+impl ClaudeCodeRunner {
+    pub fn new(model: Option<String>, bash_grants: Vec<String>, mcp: Option<McpWiring>) -> Self {
+        let codec = ClaudeCodeCli {
+            model,
+            bash_grants,
+            mcp,
+        };
+        ClaudeCodeRunner {
+            inner: CliPrintRunner::new(Box::new(codec)),
+        }
+    }
+
+    pub fn with_deadline(self, d: Duration) -> Self {
+        ClaudeCodeRunner {
+            inner: self.inner.with_deadline(d),
+        }
+    }
+
+    pub fn with_cancel(self, t: CancelToken) -> Self {
+        ClaudeCodeRunner {
+            inner: self.inner.with_cancel(t),
+        }
+    }
+}
+
+impl AgentRunner for ClaudeCodeRunner {
+    fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
+        self.inner.run(req)
     }
 }
