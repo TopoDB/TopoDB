@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use crate::events::{EventSink, RunEvent};
 use crate::recovery::{contract_preserved, NoopRepairer, Repairer, Rung};
 use crate::runner::cancel::CancelToken;
 use crate::runner::command::{CommandRequest, CommandRunner};
 use crate::runner::{AgentRunner, NodeOutcome, NodeRequest};
+use crate::schema::bound::worst_case;
 use crate::schema::validate::Validated;
 use crate::schema::NodeKind;
 use crate::store::run::{NodeState, RunStore};
@@ -68,6 +70,17 @@ struct Shared<'r> {
     /// claim so an internal engine failure stops the scheduler from
     /// claiming further work even without cooperative cancellation wired in.
     aborted: AtomicBool,
+    /// Best-effort sidecar event sink (see `crate::events`). `None` is the
+    /// default and must cost nothing beyond the `Option` check at each
+    /// emission point — no allocation, no formatting, happens before the
+    /// `if let Some(sink)` short-circuits.
+    events: Option<&'r dyn EventSink>,
+    /// Caller-supplied run id, threaded into `RunEvent::RunStarted`. Empty
+    /// by default: the executor itself has no notion of a run id (the store
+    /// is opened by the caller under one), so library users who never call
+    /// `with_run_id` just get `""` in the emitted event rather than a
+    /// required-but-unused constructor argument.
+    run_id: String,
 }
 
 /// A wall-clock source, injected via `Executor::with_clock`. Returns epoch
@@ -96,6 +109,8 @@ impl<'r> Executor<'r> {
                 cancel: None,
                 max_inflight: 1,
                 aborted: AtomicBool::new(false),
+                events: None,
+                run_id: String::new(),
             },
         }
     }
@@ -131,6 +146,24 @@ impl<'r> Executor<'r> {
     /// never touch this knob.
     pub fn with_max_inflight(mut self, n: usize) -> Self {
         self.shared.max_inflight = n.max(1);
+        self
+    }
+
+    /// Wire in a sidecar event sink (see `crate::events`). Without one,
+    /// every emission point is a single `Option` check and nothing else
+    /// happens — no allocation, no serialization, no lock contention.
+    pub fn with_events(mut self, sink: &'r dyn EventSink) -> Self {
+        self.shared.events = Some(sink);
+        self
+    }
+
+    /// The run id to report in `RunEvent::RunStarted`. The executor has no
+    /// intrinsic notion of a run id (the store already knows which run it
+    /// is; the executor doesn't need to) — this exists purely so the
+    /// emitted event carries the same id the CLI's caller used to open the
+    /// store. Defaults to `""` for library callers who don't care.
+    pub fn with_run_id(mut self, run_id: String) -> Self {
+        self.shared.run_id = run_id;
         self
     }
 
@@ -211,6 +244,19 @@ impl<'r> Executor<'r> {
 
         self.shared.clock.store(start_ms, Ordering::SeqCst);
 
+        if let Some(sink) = self.shared.events {
+            let bound = worst_case(&self.shared.graph);
+            sink.emit(
+                self.shared.clock.load(Ordering::SeqCst),
+                &RunEvent::RunStarted {
+                    run_id: self.shared.run_id.clone(),
+                    goal: self.shared.graph.graph.goal.clone(),
+                    agent_calls_bound: bound.agent_calls,
+                    command_runs_bound: bound.command_runs,
+                },
+            );
+        }
+
         if self.shared.max_inflight == 1 {
             // Topological order makes a single forward pass sufficient:
             // every dependency is resolved (or has failed and been
@@ -250,6 +296,14 @@ impl<'r> Executor<'r> {
                 if any_dep_unfinished {
                     let t = tick(&self.shared);
                     self.shared.store.set_state(&id, NodeState::Skipped, t)?;
+                    if let Some(sink) = self.shared.events {
+                        sink.emit(
+                            t,
+                            &RunEvent::NodeSkipped {
+                                node_id: id.clone(),
+                            },
+                        );
+                    }
                     continue;
                 }
 
@@ -258,6 +312,14 @@ impl<'r> Executor<'r> {
                     if token.is_cancelled() {
                         let t = tick(&self.shared);
                         self.shared.store.set_state(&id, NodeState::Skipped, t)?;
+                        if let Some(sink) = self.shared.events {
+                            sink.emit(
+                                t,
+                                &RunEvent::NodeSkipped {
+                                    node_id: id.clone(),
+                                },
+                            );
+                        }
                         continue;
                     }
                 }
@@ -271,7 +333,22 @@ impl<'r> Executor<'r> {
             run_parallel(&self.shared)?;
         }
 
-        self.report()
+        let report = self.report()?;
+
+        if let Some(sink) = self.shared.events {
+            sink.emit(
+                self.shared.clock.load(Ordering::SeqCst),
+                &RunEvent::RunFinished {
+                    succeeded: report.succeeded.clone(),
+                    blocked: report.blocked.clone(),
+                    skipped: report.skipped.clone(),
+                    model_calls: report.model_calls,
+                    command_runs: report.command_runs,
+                },
+            );
+        }
+
+        Ok(report)
     }
 
     fn report(&self) -> Result<RunReport, SghError> {
@@ -307,6 +384,11 @@ impl<'r> Executor<'r> {
 /// land atomically at the same wall-clock instant, and rejecting an equal
 /// timestamp there would turn a real atomic swap into an artificially
 /// ordered pair.
+/// Zero-cost when no sink is wired: every call site is `if let Some(sink) =
+/// shared.events { sink.emit(t, &RunEvent::Foo{..}) }`, so with no sink the
+/// `RunEvent` (which may own `String`s built from a `.clone()`) is never
+/// constructed at all — the `Option` check short-circuits before any of
+/// that work happens, not after.
 fn tick(shared: &Shared) -> i64 {
     match &shared.wall_clock {
         None => shared.clock.fetch_add(1, Ordering::SeqCst) + 1,
@@ -379,6 +461,14 @@ fn run_parallel(shared: &Shared) -> Result<(), SghError> {
                     if !started.contains(id) {
                         let t = tick(shared);
                         shared.store.set_state(id, NodeState::Skipped, t)?;
+                        if let Some(sink) = shared.events {
+                            sink.emit(
+                                t,
+                                &RunEvent::NodeSkipped {
+                                    node_id: id.clone(),
+                                },
+                            );
+                        }
                         started.insert(id.clone());
                     }
                 }
@@ -420,6 +510,14 @@ fn run_parallel(shared: &Shared) -> Result<(), SghError> {
                 if any_dead {
                     let t = tick(shared);
                     shared.store.set_state(id, NodeState::Skipped, t)?;
+                    if let Some(sink) = shared.events {
+                        sink.emit(
+                            t,
+                            &RunEvent::NodeSkipped {
+                                node_id: id.clone(),
+                            },
+                        );
+                    }
                     started.insert(id.clone());
                     continue;
                 }
@@ -495,7 +593,30 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
         let t = tick(shared);
         if approved {
             shared.store.set_state(id, NodeState::Succeeded, t)?;
+            if let Some(sink) = shared.events {
+                sink.emit(
+                    t,
+                    &RunEvent::NodeSucceeded {
+                        node_id: id.to_string(),
+                    },
+                );
+            }
         } else {
+            if let Some(sink) = shared.events {
+                sink.emit(
+                    t,
+                    &RunEvent::GateReached {
+                        node_id: id.to_string(),
+                    },
+                );
+                sink.emit(
+                    t,
+                    &RunEvent::NodeBlocked {
+                        node_id: id.to_string(),
+                        reason: None,
+                    },
+                );
+            }
             shared.store.set_state(id, NodeState::Blocked, t)?;
         }
         return Ok(());
@@ -538,6 +659,10 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
     let mut retries_left = original.budget.retries.saturating_sub(prior_retries);
     let mut repairs_left = repair_budget.saturating_sub(prior_repairs);
 
+    // `NodeStarted` is emitted once per node execution — the first ladder
+    // iteration only, not on every retry re-entry into the loop.
+    let mut first_iteration = true;
+
     loop {
         // Check for cancellation at the top of each ladder iteration
         if let Some(token) = &shared.cancel {
@@ -546,6 +671,16 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
                 shared
                     .store
                     .record_attempt(id, "cancelled", "cancelled", t)?;
+                if let Some(sink) = shared.events {
+                    sink.emit(
+                        t,
+                        &RunEvent::AttemptFinished {
+                            node_id: id.to_string(),
+                            rung: "cancelled".to_string(),
+                            error: "cancelled".to_string(),
+                        },
+                    );
+                }
                 shared
                     .blocked_reasons
                     .lock()
@@ -553,12 +688,32 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
                     .insert(id.to_string(), "cancelled".to_string());
                 let t = tick(shared);
                 shared.store.set_state(id, NodeState::Blocked, t)?;
+                if let Some(sink) = shared.events {
+                    sink.emit(
+                        t,
+                        &RunEvent::NodeBlocked {
+                            node_id: id.to_string(),
+                            reason: Some("cancelled".to_string()),
+                        },
+                    );
+                }
                 return Ok(());
             }
         }
 
         let t = tick(shared);
         shared.store.set_state(id, NodeState::Running, t)?;
+        if first_iteration {
+            first_iteration = false;
+            if let Some(sink) = shared.events {
+                sink.emit(
+                    t,
+                    &RunEvent::NodeStarted {
+                        node_id: id.to_string(),
+                    },
+                );
+            }
+        }
 
         let outcome = if node.kind == NodeKind::Command {
             let creq = CommandRequest {
@@ -609,6 +764,14 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
                     shared.store.record_output(id, &output, t)?;
                     let t = tick(shared);
                     shared.store.set_state(id, NodeState::Succeeded, t)?;
+                    if let Some(sink) = shared.events {
+                        sink.emit(
+                            t,
+                            &RunEvent::NodeSucceeded {
+                                node_id: id.to_string(),
+                            },
+                        );
+                    }
                     return Ok(());
                 }
                 Err(reason) => reason,
@@ -639,6 +802,16 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
 
         let t = tick(shared);
         shared.store.record_attempt(id, rung.as_str(), &error, t)?;
+        if let Some(sink) = shared.events {
+            sink.emit(
+                t,
+                &RunEvent::AttemptFinished {
+                    node_id: id.to_string(),
+                    rung: rung.as_str().to_string(),
+                    error: error.clone(),
+                },
+            );
+        }
 
         match rung {
             Rung::Retry => {
@@ -689,6 +862,15 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
                             .unwrap()
                             .insert(id.to_string(), error.clone());
                         shared.store.set_state(id, NodeState::Blocked, t)?;
+                        if let Some(sink) = shared.events {
+                            sink.emit(
+                                t,
+                                &RunEvent::NodeBlocked {
+                                    node_id: id.to_string(),
+                                    reason: Some(error.clone()),
+                                },
+                            );
+                        }
                         return Ok(());
                     }
                 }
@@ -701,6 +883,15 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
                     .unwrap()
                     .insert(id.to_string(), error.clone());
                 shared.store.set_state(id, NodeState::Blocked, t)?;
+                if let Some(sink) = shared.events {
+                    sink.emit(
+                        t,
+                        &RunEvent::NodeBlocked {
+                            node_id: id.to_string(),
+                            reason: Some(error.clone()),
+                        },
+                    );
+                }
                 return Ok(());
             }
         }
