@@ -2,7 +2,7 @@ use topodb::{Db, PropValue, Scope, ScopeSet};
 use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::Graph;
 use topodb_sgh::store::run::{NodeState, RunStore};
-use topodb_sgh::store::EDGE_REVISION_OF;
+use topodb_sgh::store::{EDGE_PRODUCED, EDGE_REVISION_OF};
 
 fn store(db: &Db) -> RunStore {
     let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
@@ -63,6 +63,61 @@ fn record_output_supersedes_prior_output() {
     assert_eq!(
         s.output("survey").unwrap().as_deref(),
         Some(r#"{"sites":["a"]}"#)
+    );
+}
+
+/// A node's output write is atomic: output node + superseding PRODUCED edge
+/// carry the same timestamp (one batch — no crash window between them).
+///
+/// `ChangeEvent` (see `crates/topodb/src/db.rs`) carries only `seq` + `op` —
+/// no explicit batch/group id — so there is no `ops_since`-based same-batch
+/// proof available; this uses the timestamp form the brief allows as
+/// fallback: the closed (superseded) edge's `valid_to` and the freshly
+/// opened edge's `valid_from` must be identical, which is only possible if
+/// both writes (and the output node's creation) landed in the same
+/// `submit_at` call.
+#[test]
+fn record_output_is_single_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    s.record_output("survey", "{}", 200).unwrap();
+    assert_eq!(s.output("survey").unwrap().as_deref(), Some("{}"));
+
+    s.record_output("survey", "{\"v\":2}", 201).unwrap();
+    assert_eq!(
+        s.output("survey").unwrap().as_deref(),
+        Some("{\"v\":2}"),
+        "second output visible"
+    );
+
+    // Inspect the PRODUCED edges directly via the debug dump (there is no
+    // public unfiltered-by-as_of read, and this run only ever writes PRODUCED
+    // edges for "survey"'s output): the first must be closed at 201 (the
+    // second call's timestamp) and the second must open at 201 — both writes
+    // for the second call share one batch.
+    let all: Vec<_> = db
+        .debug_dump_edges()
+        .into_iter()
+        .filter(|e| e.ty.as_str() == EDGE_PRODUCED)
+        .collect();
+    assert_eq!(all.len(), 2, "both output edges survive as history");
+
+    let closed: Vec<_> = all.iter().filter(|e| e.valid_to.is_some()).collect();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0].valid_to,
+        Some(201),
+        "prior PRODUCED edge closed at the second record_output's timestamp"
+    );
+
+    let open: Vec<_> = all.iter().filter(|e| e.valid_to.is_none()).collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].valid_from, 201,
+        "new PRODUCED edge opens at the same timestamp — same batch as the close \
+         and the output node's own creation"
     );
 }
 

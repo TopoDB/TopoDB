@@ -4,7 +4,7 @@ use topodb::{
     Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
 };
 
-use super::supersede::link_superseding;
+use super::supersede::{link_superseding, link_superseding_with};
 use super::{
     SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED,
     EDGE_REVISION_OF, LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_REVISION, LABEL_RUN,
@@ -258,27 +258,35 @@ impl RunStore {
     }
 
     /// Outputs are a mutable current value, same as node state: a fresh
-    /// `SghOutput` node is created on every call, then linked with
-    /// `link_superseding` as `node -[EDGE_PRODUCED]-> output` so the prior
+    /// `SghOutput` node is minted and linked with `link_superseding_with` as
+    /// `node -[EDGE_PRODUCED]-> output` in a SINGLE batch, so the prior
     /// output edge for this node (if any) is closed rather than left open
-    /// alongside the new one. The edge direction matters here — supersession
-    /// is keyed on `(from, ty)`, so it must key on the stable node id, not on
-    /// the freshly-created output id (which would never match a prior edge).
+    /// alongside the new one, and the output node's creation can never be
+    /// left orphaned by a crash between two separate `submit_at` calls (see
+    /// `link_superseding_with`'s doc comment). The edge direction matters
+    /// here — supersession is keyed on `(from, ty)`, so it must key on the
+    /// stable node id, not on the freshly-created output id (which would
+    /// never match a prior edge).
     pub fn record_output(&self, node_id: &str, json: &str, now_ms: i64) -> Result<(), SghError> {
         let node = self.nodes[node_id];
         let id = NodeId::new();
         let mut props = Props::new();
         props.insert("content".into(), PropValue::Str(json.to_string()));
-        self.db.submit_at(
-            vec![Op::CreateNode {
-                id,
-                scope: self.scope,
-                label: LABEL_OUTPUT.into(),
-                props,
-            }],
+        let prelude = vec![Op::CreateNode {
+            id,
+            scope: self.scope,
+            label: LABEL_OUTPUT.into(),
+            props,
+        }];
+        link_superseding_with(
+            &self.db,
+            self.scope,
+            node,
+            id,
+            EDGE_PRODUCED,
             now_ms,
+            prelude,
         )?;
-        link_superseding(&self.db, self.scope, node, id, EDGE_PRODUCED, now_ms)?;
         Ok(())
     }
 
@@ -395,23 +403,21 @@ impl RunStore {
         props.insert("reason".into(), PropValue::Str(reason.to_string()));
         props.insert("at".into(), PropValue::DateTime(now_ms));
 
-        self.db.submit_at(
-            vec![Op::CreateNode {
-                id,
-                scope: self.scope,
-                label: LABEL_REVISION.into(),
-                props,
-            }],
-            now_ms,
-        )?;
+        let prelude = vec![Op::CreateNode {
+            id,
+            scope: self.scope,
+            label: LABEL_REVISION.into(),
+            props,
+        }];
 
-        link_superseding(
+        link_superseding_with(
             &self.db,
             self.scope,
             self.run_node,
             id,
             EDGE_REVISION_OF,
             now_ms,
+            prelude,
         )?;
         Ok(())
     }

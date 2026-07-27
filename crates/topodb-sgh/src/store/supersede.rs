@@ -43,6 +43,32 @@ pub fn link_superseding(
     ty: &str,
     now_ms: i64,
 ) -> Result<EdgeId, SghError> {
+    link_superseding_with(db, scope, from, to, ty, now_ms, Vec::new())
+}
+
+/// Like [`link_superseding`], but atomically includes `prelude_ops` (e.g. the
+/// `CreateNode` for a fresh output) in the SAME `submit_at` batch as the
+/// close+create edge ops. This closes the crash window a caller would
+/// otherwise have between writing a prelude node and writing the edge that
+/// points at it: with two separate `submit_at`s, a crash between them leaves
+/// an orphan node with no edge (or an edge that never got created) behind.
+///
+/// On contention (`Rejected`), the close-set is re-read from a fresh
+/// `traverse` and the WHOLE batch — prelude included — is resubmitted. This
+/// is safe because a rejected batch applies nothing (group-atomic): if the
+/// previous attempt's `CreateNode { id, .. }` was in a rejected batch, that id
+/// was never actually created, so re-submitting the identical `CreateNode`
+/// with the same id on the next attempt cannot double-create anything: either
+/// the whole batch (including the recreate) lands, or none of it does.
+pub fn link_superseding_with(
+    db: &Db,
+    scope: Scope,
+    from: NodeId,
+    to: NodeId,
+    ty: &str,
+    now_ms: i64,
+    prelude_ops: Vec<Op>,
+) -> Result<EdgeId, SghError> {
     let scopes = match scope {
         // Shared-scope edges are deliberately excluded here: an Id-scoped
         // supersession only ever creates and reads edges within that one
@@ -62,16 +88,28 @@ pub fn link_superseding(
     // subsequent write race-free (a node could vanish between this check and
     // the `submit_at` below) — it only removes the common, permanent,
     // never-a-race case up front.
-    for node in [from, to] {
-        if db.node(&scopes, node).is_none() {
-            return Err(SghError::MissingEndpoint { node });
-        }
+    //
+    // `to` is checked only when `prelude_ops` is empty: when it is
+    // non-empty, `to` is by convention the very node `prelude_ops` is about
+    // to mint (see `record_output`/`record_revision`), so it does not exist
+    // yet and a pre-check would always — wrongly — reject. `from` has no
+    // such caller convention (it is always a pre-existing, stable node id
+    // such as a run or graph node), so it stays unconditional.
+    if db.node(&scopes, from).is_none() {
+        return Err(SghError::MissingEndpoint { node: from });
+    }
+    if prelude_ops.is_empty() && db.node(&scopes, to).is_none() {
+        return Err(SghError::MissingEndpoint { node: to });
     }
 
     for _ in 0..MAX_ATTEMPTS {
         // `Db` has no `edges_from`; `traverse` (1 hop, `Direction::Out`, a
         // type filter, `as_of: Some(now_ms)`) is the public read primitive
-        // that answers "what is open out of `from` via `ty` right now".
+        // that answers "what is open out of `from` via `ty` right now". This
+        // read is repeated fresh on every attempt (not cached across
+        // retries): a lost race means some other writer changed the open set
+        // since our last read, so the close-set for the resubmitted batch
+        // must be recomputed, not reused.
         let sg = db.traverse(&TraversalQuery {
             scopes: scopes.clone(),
             seeds: vec![from],
@@ -86,18 +124,25 @@ pub fn link_superseding(
         // from` by construction of the traversal itself.
         let open: Vec<_> = sg.edges;
 
-        // Already correct: nothing to do.
+        // Already correct: nothing to do. Only reachable when `prelude_ops`
+        // is empty — every `prelude_ops`-bearing caller mints `to` fresh
+        // per call (see `record_output`/`record_revision`), so no prior edge
+        // can already point at it; the debug_assert documents that invariant
+        // without paying a runtime cost in the (only) case where it matters.
         if let Some(existing) = open.iter().find(|e| e.to == to) {
+            debug_assert!(
+                prelude_ops.is_empty(),
+                "prelude_ops caller must mint `to` fresh per call; an existing edge to it \
+                 would mean the prelude's CreateNode is redundant or `to` was reused"
+            );
             return Ok(existing.id);
         }
 
-        let mut ops: Vec<Op> = open
-            .iter()
-            .map(|e| Op::CloseEdge {
-                id: e.id,
-                valid_to: Some(now_ms),
-            })
-            .collect();
+        let mut ops: Vec<Op> = prelude_ops.clone();
+        ops.extend(open.iter().map(|e| Op::CloseEdge {
+            id: e.id,
+            valid_to: Some(now_ms),
+        }));
 
         let new_id = EdgeId::new();
         ops.push(Op::CreateEdge {
