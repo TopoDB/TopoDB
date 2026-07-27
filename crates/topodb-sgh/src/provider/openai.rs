@@ -3,7 +3,9 @@
 //! This module is a pure request/response mapper for OpenAI-compatible endpoints.
 //! It handles both the official OpenAI API and any server implementing the same wire format.
 
-use super::{ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, ProviderError, Role, StopReason};
+use super::{
+    ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, ProviderError, Role, StopReason,
+};
 use serde_json::{json, Value};
 
 /// Safely elide a response body to ~200 chars, preserving UTF-8 boundaries.
@@ -49,10 +51,10 @@ impl OpenAiProvider {
             .unwrap_or_else(|| default_base.to_string());
 
         // Check key requirement: required when base_url is None or equals default
-        if api_key.is_none() || api_key.as_ref().map(|k| k.is_empty()).unwrap_or(false) {
-            if resolved_base == default_base {
-                return Err(ProviderError::Config("OPENAI_API_KEY".to_string()));
-            }
+        if (api_key.is_none() || api_key.as_ref().map(|k| k.is_empty()).unwrap_or(false))
+            && resolved_base == default_base
+        {
+            return Err(ProviderError::Config("OPENAI_API_KEY".to_string()));
         }
 
         Ok(Self {
@@ -70,7 +72,9 @@ impl OpenAiProvider {
         model: Option<String>,
         base_url: Option<String>,
     ) -> Result<Self, ProviderError> {
-        let api_key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
         Self::new(api_key, model, base_url)
     }
 }
@@ -277,7 +281,9 @@ impl ChatProvider for OpenAiProvider {
             .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
-            .ok_or_else(|| ProviderError::Malformed("missing choices array or empty".to_string()))?;
+            .ok_or_else(|| {
+                ProviderError::Malformed("missing choices array or empty".to_string())
+            })?;
 
         // Extract message
         let message = choice
@@ -305,7 +311,9 @@ impl ChatProvider for OpenAiProvider {
             if !content.is_null() {
                 if let Some(text) = content.as_str() {
                     if !text.is_empty() {
-                        parts.push(ContentPart::Text { text: text.to_string() });
+                        parts.push(ContentPart::Text {
+                            text: text.to_string(),
+                        });
                     }
                 }
             }
@@ -318,32 +326,37 @@ impl ChatProvider for OpenAiProvider {
                     let id = call
                         .get("id")
                         .and_then(|i| i.as_str())
-                        .ok_or_else(|| ProviderError::Malformed("tool_call missing id".to_string()))?
+                        .ok_or_else(|| {
+                            ProviderError::Malformed("tool_call missing id".to_string())
+                        })?
                         .to_string();
 
-                    let function = call
-                        .get("function")
-                        .ok_or_else(|| ProviderError::Malformed("tool_call missing function".to_string()))?;
+                    let function = call.get("function").ok_or_else(|| {
+                        ProviderError::Malformed("tool_call missing function".to_string())
+                    })?;
 
                     let name = function
                         .get("name")
                         .and_then(|n| n.as_str())
-                        .ok_or_else(|| ProviderError::Malformed("function missing name".to_string()))?
+                        .ok_or_else(|| {
+                            ProviderError::Malformed("function missing name".to_string())
+                        })?
                         .to_string();
 
                     let arguments_str = function
                         .get("arguments")
                         .and_then(|a| a.as_str())
-                        .ok_or_else(|| ProviderError::Malformed(format!("tool_call {} arguments missing", id)))?;
+                        .ok_or_else(|| {
+                            ProviderError::Malformed(format!("tool_call {} arguments missing", id))
+                        })?;
 
                     // Parse the JSON string to a Value
-                    let input: Value = serde_json::from_str(arguments_str)
-                        .map_err(|_| {
-                            ProviderError::Malformed(format!(
-                                "tool_call {} arguments not valid JSON",
-                                id
-                            ))
-                        })?;
+                    let input: Value = serde_json::from_str(arguments_str).map_err(|_| {
+                        ProviderError::Malformed(format!(
+                            "tool_call {} arguments not valid JSON",
+                            id
+                        ))
+                    })?;
 
                     parts.push(ContentPart::ToolUse { id, name, input });
                 }

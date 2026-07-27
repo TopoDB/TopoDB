@@ -11,7 +11,10 @@ fn turn_with(parts: Vec<ContentPart>, tools: Vec<ToolDef>, schema: Option<Value>
     ChatTurn {
         model: None,
         system: Some("sys".into()),
-        messages: vec![ChatMessage { role: Role::User, parts }],
+        messages: vec![ChatMessage {
+            role: Role::User,
+            parts,
+        }],
         tools,
         output_schema: schema,
         max_tokens: 8192,
@@ -21,14 +24,26 @@ fn turn_with(parts: Vec<ContentPart>, tools: Vec<ToolDef>, schema: Option<Value>
 #[test]
 fn request_maps_text_tools_and_schema() {
     let turn = turn_with(
-        vec![ContentPart::Text { text: "do it".into() }],
-        vec![ToolDef { name: "topodb__search".into(), description: "d".into(), input_schema: json!({"type":"object"}) }],
+        vec![ContentPart::Text {
+            text: "do it".into(),
+        }],
+        vec![ToolDef {
+            name: "topodb__search".into(),
+            description: "d".into(),
+            input_schema: json!({"type":"object"}),
+        }],
         Some(json!({"type":"object","required":["n"]})),
     );
     let p = provider().request(&turn).unwrap();
     assert_eq!(p.url, "https://api.anthropic.com/v1/messages");
-    assert!(p.headers.iter().any(|(k, v)| k == "x-api-key" && v == "k-test"));
-    assert!(p.headers.iter().any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+    assert!(p
+        .headers
+        .iter()
+        .any(|(k, v)| k == "x-api-key" && v == "k-test"));
+    assert!(p
+        .headers
+        .iter()
+        .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
     let body: Value = serde_json::from_slice(&p.body).unwrap();
     assert_eq!(body["model"], "claude-haiku-4-5");
     assert_eq!(body["system"], "sys");
@@ -41,7 +56,11 @@ fn request_maps_text_tools_and_schema() {
 #[test]
 fn request_maps_tool_result_roundtrip_message() {
     let turn = turn_with(
-        vec![ContentPart::ToolResult { tool_use_id: "tu1".into(), content: "found 3".into(), is_error: false }],
+        vec![ContentPart::ToolResult {
+            tool_use_id: "tu1".into(),
+            content: "found 3".into(),
+            is_error: false,
+        }],
         vec![],
         None,
     );
@@ -57,7 +76,12 @@ fn parse_end_turn_text() {
     let body = json!({"content": [{"type":"text","text":"{\"n\":1}"}], "stop_reason":"end_turn"});
     let r = provider().parse(200, body.to_string().as_bytes()).unwrap();
     assert_eq!(r.stop, StopReason::EndTurn);
-    assert_eq!(r.parts, vec![ContentPart::Text { text: "{\"n\":1}".into() }]);
+    assert_eq!(
+        r.parts,
+        vec![ContentPart::Text {
+            text: "{\"n\":1}".into()
+        }]
+    );
 }
 
 #[test]
@@ -78,7 +102,9 @@ fn parse_tool_use() {
 #[test]
 fn parse_api_error_is_malformed_with_message() {
     let body = json!({"type":"error","error":{"type":"invalid_request_error","message":"bad key"}});
-    let err = provider().parse(401, body.to_string().as_bytes()).unwrap_err();
+    let err = provider()
+        .parse(401, body.to_string().as_bytes())
+        .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("401") && msg.contains("bad key"), "got: {msg}");
 }

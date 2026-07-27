@@ -1,10 +1,17 @@
 //! Anthropic Messages API codec (structured-outputs-capable).
 //!
 //! This module is a pure request/response mapper for the Anthropic Messages API.
-//! Structured output (output_format + beta header) shape is verified live during Task 10's e2e tests;
-//! if the API rejects it, the e2e task fixes this codec, not the schema itself.
+//! The structured-output request shape (`output_format` plus the
+//! `anthropic-beta: structured-outputs-2025-11-13` header) is pinned by this
+//! module's fixture tests, but it has NOT yet been verified against the live
+//! API — Task 10's e2e run was reshaped and its schema-bearing case was
+//! dropped before that verification happened. The first live run that
+//! exercises a schema-bearing request should confirm this shape (and drop
+//! the beta header if the feature has since reached general availability).
 
-use super::{ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, ProviderError, Role, StopReason};
+use super::{
+    ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, ProviderError, Role, StopReason,
+};
 use serde_json::{json, Value};
 
 /// Safely elide a response body to ~200 chars, preserving UTF-8 boundaries.
@@ -208,17 +215,20 @@ impl ChatProvider for AnthropicProvider {
         let parts = content_array
             .iter()
             .map(|item| {
-                let content_type = item
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| ProviderError::Malformed("content item missing type".to_string()))?;
+                let content_type = item.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
+                    ProviderError::Malformed("content item missing type".to_string())
+                })?;
 
                 match content_type {
                     "text" => {
                         let text = item
                             .get("text")
                             .and_then(|t| t.as_str())
-                            .ok_or_else(|| ProviderError::Malformed("text block missing text field".to_string()))?
+                            .ok_or_else(|| {
+                                ProviderError::Malformed(
+                                    "text block missing text field".to_string(),
+                                )
+                            })?
                             .to_string();
                         Ok(ContentPart::Text { text })
                     }
@@ -226,16 +236,22 @@ impl ChatProvider for AnthropicProvider {
                         let id = item
                             .get("id")
                             .and_then(|i| i.as_str())
-                            .ok_or_else(|| ProviderError::Malformed("tool_use missing id".to_string()))?
+                            .ok_or_else(|| {
+                                ProviderError::Malformed("tool_use missing id".to_string())
+                            })?
                             .to_string();
                         let name = item
                             .get("name")
                             .and_then(|n| n.as_str())
-                            .ok_or_else(|| ProviderError::Malformed("tool_use missing name".to_string()))?
+                            .ok_or_else(|| {
+                                ProviderError::Malformed("tool_use missing name".to_string())
+                            })?
                             .to_string();
                         let input = item
                             .get("input")
-                            .ok_or_else(|| ProviderError::Malformed("tool_use missing input".to_string()))?
+                            .ok_or_else(|| {
+                                ProviderError::Malformed("tool_use missing input".to_string())
+                            })?
                             .clone();
                         Ok(ContentPart::ToolUse { id, name, input })
                     }

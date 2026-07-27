@@ -99,10 +99,13 @@ impl ChatProvider for ScriptedProvider {
     }
 }
 
+/// Scripted (status, body) pairs consumed in order by `ScriptedTransport`.
+type ScriptedResponses = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
+
 /// Returns scripted (status, body) pairs in order; records call count.
 #[derive(Clone)]
 struct ScriptedTransport {
-    responses: Arc<Mutex<Vec<(u16, Vec<u8>)>>>,
+    responses: ScriptedResponses,
     calls: Arc<Mutex<u32>>,
 }
 
@@ -149,7 +152,9 @@ fn base_req(output_schema: Option<serde_json::Value>, tools: Vec<String>) -> Nod
 
 fn end_turn(text: &str) -> ChatResponse {
     ChatResponse {
-        parts: vec![ContentPart::Text { text: text.to_string() }],
+        parts: vec![ContentPart::Text {
+            text: text.to_string(),
+        }],
         stop: StopReason::EndTurn,
     }
 }
@@ -175,7 +180,9 @@ fn succeeds_on_end_turn_text() {
     let outcome = runner.run(&req).unwrap();
     assert_eq!(
         outcome,
-        NodeOutcome::Succeeded { output: "{\"n\":1}".into() }
+        NodeOutcome::Succeeded {
+            output: "{\"n\":1}".into()
+        }
     );
 }
 
@@ -190,7 +197,9 @@ fn schema_native_omits_prompt_schema_section() {
     let outcome = runner.run(&req).unwrap();
     assert_eq!(
         outcome,
-        NodeOutcome::Succeeded { output: "{\"n\":1}".into() }
+        NodeOutcome::Succeeded {
+            output: "{\"n\":1}".into()
+        }
     );
 
     let recorded = inspect.recorded.lock().unwrap();
@@ -222,7 +231,9 @@ fn schema_fallback_extracts_json() {
     let outcome = runner.run(&req).unwrap();
     assert_eq!(
         outcome,
-        NodeOutcome::Succeeded { output: "{\"n\":1}".into() }
+        NodeOutcome::Succeeded {
+            output: "{\"n\":1}".into()
+        }
     );
 
     let recorded = inspect.recorded.lock().unwrap();
@@ -262,15 +273,22 @@ fn tool_loop_executes_bridge_and_feeds_result() {
     let runner = runner_with(provider, transport, Some(bridge));
     let req = base_req(None, vec!["topodb".into()]);
     let outcome = runner.run(&req).unwrap();
-    assert_eq!(outcome, NodeOutcome::Succeeded { output: "done".into() });
+    assert_eq!(
+        outcome,
+        NodeOutcome::Succeeded {
+            output: "done".into()
+        }
+    );
 
     let recorded = inspect.recorded.lock().unwrap();
     assert_eq!(recorded.len(), 2);
     let second_turn_has_result = recorded[1].messages.iter().any(|m| {
         m.parts.iter().any(|p| match p {
-            ContentPart::ToolResult { content, tool_use_id, is_error } => {
-                content == "found 2 results" && tool_use_id == "t1" && !is_error
-            }
+            ContentPart::ToolResult {
+                content,
+                tool_use_id,
+                is_error,
+            } => content == "found 2 results" && tool_use_id == "t1" && !is_error,
             _ => false,
         })
     });
@@ -295,7 +313,12 @@ fn out_of_surface_tool_is_denied() {
     let runner = runner_with(provider, transport, Some(bridge));
     let req = base_req(None, vec!["topodb".into()]);
     let outcome = runner.run(&req).unwrap();
-    assert_eq!(outcome, NodeOutcome::Denied { tool: "Bash".into() });
+    assert_eq!(
+        outcome,
+        NodeOutcome::Denied {
+            tool: "Bash".into()
+        }
+    );
 }
 
 #[test]
@@ -307,7 +330,12 @@ fn node_without_optin_gets_no_tools() {
     let runner = runner_with(provider, transport, Some(bridge));
     let req = base_req(None, vec![]);
     let outcome = runner.run(&req).unwrap();
-    assert_eq!(outcome, NodeOutcome::Succeeded { output: "ok".into() });
+    assert_eq!(
+        outcome,
+        NodeOutcome::Succeeded {
+            output: "ok".into()
+        }
+    );
 
     let recorded = inspect.recorded.lock().unwrap();
     assert_eq!(recorded.len(), 1);
@@ -388,7 +416,9 @@ fn transport_4xx_no_retry() {
 #[test]
 fn max_tokens_stop_fails() {
     let provider = ScriptedProvider::new(vec![ChatResponse {
-        parts: vec![ContentPart::Text { text: "partial".into() }],
+        parts: vec![ContentPart::Text {
+            text: "partial".into(),
+        }],
         stop: StopReason::MaxTokens,
     }]);
     let transport = ScriptedTransport::new(vec![200]);
@@ -396,7 +426,9 @@ fn max_tokens_stop_fails() {
     let req = base_req(None, vec![]);
     let outcome = runner.run(&req).unwrap();
     match outcome {
-        NodeOutcome::Failed { error } => assert!(error.contains("max_tokens"), "error was: {error}"),
+        NodeOutcome::Failed { error } => {
+            assert!(error.contains("max_tokens"), "error was: {error}")
+        }
         other => panic!("expected Failed, got {other:?}"),
     }
 }

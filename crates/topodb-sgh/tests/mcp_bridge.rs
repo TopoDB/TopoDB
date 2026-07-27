@@ -52,7 +52,9 @@ fn call_strips_namespace_and_returns_text() {
 #[test]
 fn tool_error_content_becomes_tool_err() {
     let mut bridge = McpBridge::spawn(&fake_server()).unwrap();
-    let err = bridge.call("topodb__search", &json!({"q": "boom"})).unwrap_err();
+    let err = bridge
+        .call("topodb__search", &json!({"q": "boom"}))
+        .unwrap_err();
     match err {
         BridgeError::Tool(msg) => assert_eq!(msg, "it broke"),
         other => panic!("expected Tool error, got {other:?}"),
@@ -85,7 +87,9 @@ done
 "#;
     let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
     match McpBridge::spawn(&argv) {
-        Err(BridgeError::Malformed(msg)) => assert!(msg.contains("unsupported protocol"), "got: {msg}"),
+        Err(BridgeError::Malformed(msg)) => {
+            assert!(msg.contains("unsupported protocol"), "got: {msg}")
+        }
         other => panic!("expected Malformed, got {other:?}"),
     }
 }

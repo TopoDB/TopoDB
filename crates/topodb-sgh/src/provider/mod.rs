@@ -29,9 +29,19 @@ pub struct ToolDef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContentPart {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
-    ToolResult { tool_use_id: String, content: String, is_error: bool },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,8 +110,11 @@ pub trait ChatProvider: Send + Sync {
 pub trait HttpTransport: Send + Sync {
     /// POST the payload; return (status, body). `Err` is transport-level
     /// (DNS, connect, timeout) — HTTP error statuses are Ok((status, body)).
-    fn post(&self, payload: &HttpPayload, timeout: std::time::Duration)
-        -> Result<(u16, Vec<u8>), std::io::Error>;
+    fn post(
+        &self,
+        payload: &HttpPayload,
+        timeout: std::time::Duration,
+    ) -> Result<(u16, Vec<u8>), std::io::Error>;
 }
 
 #[cfg(feature = "http")]
@@ -133,9 +146,7 @@ impl HttpTransport for UreqTransport {
                 resp.into_reader().read_to_end(&mut buf)?;
                 Ok((code, buf))
             }
-            Err(ureq::Error::Transport(t)) => {
-                Err(std::io::Error::new(std::io::ErrorKind::Other, t.to_string()))
-            }
+            Err(ureq::Error::Transport(t)) => Err(std::io::Error::other(t.to_string())),
         }
     }
 }

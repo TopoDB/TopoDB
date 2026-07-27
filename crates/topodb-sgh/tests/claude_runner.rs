@@ -91,10 +91,9 @@ fn a_denied_tool_is_a_failure_even_though_claude_reports_success() {
 #[test]
 fn a_denial_failure_names_the_tool_that_was_blocked() {
     match interpret_result(denied_write(), false) {
-        NodeOutcome::Denied { tool } => assert_eq!(
-            tool, "Write",
-            "the tool field must name the denied tool"
-        ),
+        NodeOutcome::Denied { tool } => {
+            assert_eq!(tool, "Write", "the tool field must name the denied tool")
+        }
         other => panic!("expected Denied, got {other:?}"),
     }
 }

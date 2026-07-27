@@ -11,7 +11,10 @@ fn turn_with(parts: Vec<ContentPart>, tools: Vec<ToolDef>, schema: Option<Value>
     ChatTurn {
         model: None,
         system: Some("sys".into()),
-        messages: vec![ChatMessage { role: Role::User, parts }],
+        messages: vec![ChatMessage {
+            role: Role::User,
+            parts,
+        }],
         tools,
         output_schema: schema,
         max_tokens: 8192,
@@ -21,13 +24,22 @@ fn turn_with(parts: Vec<ContentPart>, tools: Vec<ToolDef>, schema: Option<Value>
 #[test]
 fn request_maps_messages_tools_and_response_format() {
     let turn = turn_with(
-        vec![ContentPart::Text { text: "do it".into() }],
-        vec![ToolDef { name: "topodb__search".into(), description: "d".into(), input_schema: json!({"type":"object"}) }],
+        vec![ContentPart::Text {
+            text: "do it".into(),
+        }],
+        vec![ToolDef {
+            name: "topodb__search".into(),
+            description: "d".into(),
+            input_schema: json!({"type":"object"}),
+        }],
         Some(json!({"type":"object","required":["n"]})),
     );
     let p = provider().request(&turn).unwrap();
     assert_eq!(p.url, "https://api.openai.com/v1/chat/completions");
-    assert!(p.headers.iter().any(|(k, v)| k == "authorization" && v == "Bearer k-test"));
+    assert!(p
+        .headers
+        .iter()
+        .any(|(k, v)| k == "authorization" && v == "Bearer k-test"));
     let body: Value = serde_json::from_slice(&p.body).unwrap();
     assert_eq!(body["model"], "gpt-x");
     assert_eq!(body["messages"][0]["role"], "system");
@@ -36,13 +48,20 @@ fn request_maps_messages_tools_and_response_format() {
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["tools"][0]["function"]["name"], "topodb__search");
     assert_eq!(body["response_format"]["type"], "json_schema");
-    assert_eq!(body["response_format"]["json_schema"]["schema"]["required"][0], "n");
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"]["required"][0],
+        "n"
+    );
 }
 
 #[test]
 fn request_maps_tool_result_to_tool_role_message() {
     let turn = turn_with(
-        vec![ContentPart::ToolResult { tool_use_id: "tu1".into(), content: "found 3".into(), is_error: false }],
+        vec![ContentPart::ToolResult {
+            tool_use_id: "tu1".into(),
+            content: "found 3".into(),
+            is_error: false,
+        }],
         vec![],
         None,
     );
@@ -57,8 +76,19 @@ fn request_maps_tool_result_to_tool_role_message() {
 
 #[test]
 fn request_allows_keyless_local_base_url() {
-    let p = OpenAiProvider::new(None, Some("m".into()), Some("http://localhost:11434/v1".into())).unwrap();
-    let payload = p.request(&turn_with(vec![ContentPart::Text { text: "x".into() }], vec![], None)).unwrap();
+    let p = OpenAiProvider::new(
+        None,
+        Some("m".into()),
+        Some("http://localhost:11434/v1".into()),
+    )
+    .unwrap();
+    let payload = p
+        .request(&turn_with(
+            vec![ContentPart::Text { text: "x".into() }],
+            vec![],
+            None,
+        ))
+        .unwrap();
     assert_eq!(payload.url, "http://localhost:11434/v1/chat/completions");
     assert!(!payload.headers.iter().any(|(k, _)| k == "authorization"));
 }
@@ -74,7 +104,12 @@ fn parse_stop_with_content() {
     let body = json!({"choices":[{"message":{"content":"{\"n\":1}"},"finish_reason":"stop"}]});
     let r = provider().parse(200, body.to_string().as_bytes()).unwrap();
     assert_eq!(r.stop, StopReason::EndTurn);
-    assert_eq!(r.parts, vec![ContentPart::Text { text: "{\"n\":1}".into() }]);
+    assert_eq!(
+        r.parts,
+        vec![ContentPart::Text {
+            text: "{\"n\":1}".into()
+        }]
+    );
 }
 
 #[test]
@@ -104,9 +139,14 @@ fn parse_length_is_max_tokens() {
 #[test]
 fn parse_api_error_carries_status_and_message() {
     let body = json!({"error":{"message":"invalid api key","type":"invalid_request_error"}});
-    let err = provider().parse(401, body.to_string().as_bytes()).unwrap_err();
+    let err = provider()
+        .parse(401, body.to_string().as_bytes())
+        .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("401") && msg.contains("invalid api key"), "got: {msg}");
+    assert!(
+        msg.contains("401") && msg.contains("invalid api key"),
+        "got: {msg}"
+    );
 }
 
 #[test]
@@ -115,11 +155,42 @@ fn request_preserves_interleaved_tool_message_order() {
         model: None,
         system: None,
         messages: vec![
-            ChatMessage { role: Role::User, parts: vec![ContentPart::Text { text: "q".into() }] },
-            ChatMessage { role: Role::Assistant, parts: vec![ContentPart::ToolUse { id: "a".into(), name: "t".into(), input: json!({}) }] },
-            ChatMessage { role: Role::User, parts: vec![ContentPart::ToolResult { tool_use_id: "a".into(), content: "ra".into(), is_error: false }] },
-            ChatMessage { role: Role::Assistant, parts: vec![ContentPart::ToolUse { id: "b".into(), name: "t".into(), input: json!({}) }] },
-            ChatMessage { role: Role::User, parts: vec![ContentPart::ToolResult { tool_use_id: "b".into(), content: "rb".into(), is_error: false }] },
+            ChatMessage {
+                role: Role::User,
+                parts: vec![ContentPart::Text { text: "q".into() }],
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                parts: vec![ContentPart::ToolUse {
+                    id: "a".into(),
+                    name: "t".into(),
+                    input: json!({}),
+                }],
+            },
+            ChatMessage {
+                role: Role::User,
+                parts: vec![ContentPart::ToolResult {
+                    tool_use_id: "a".into(),
+                    content: "ra".into(),
+                    is_error: false,
+                }],
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                parts: vec![ContentPart::ToolUse {
+                    id: "b".into(),
+                    name: "t".into(),
+                    input: json!({}),
+                }],
+            },
+            ChatMessage {
+                role: Role::User,
+                parts: vec![ContentPart::ToolResult {
+                    tool_use_id: "b".into(),
+                    content: "rb".into(),
+                    is_error: false,
+                }],
+            },
         ],
         tools: vec![],
         output_schema: None,
@@ -127,9 +198,16 @@ fn request_preserves_interleaved_tool_message_order() {
     };
     let p = provider().request(&turn).unwrap();
     let body: Value = serde_json::from_slice(&p.body).unwrap();
-    let roles: Vec<&str> = body["messages"].as_array().unwrap().iter()
-        .map(|m| m["role"].as_str().unwrap()).collect();
-    assert_eq!(roles, vec!["user", "assistant", "tool", "assistant", "tool"]);
+    let roles: Vec<&str> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool", "assistant", "tool"]
+    );
     assert_eq!(body["messages"][2]["tool_call_id"], "a");
     assert_eq!(body["messages"][4]["tool_call_id"], "b");
 }
