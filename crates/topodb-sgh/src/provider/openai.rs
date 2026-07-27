@@ -85,7 +85,7 @@ impl ChatProvider for OpenAiProvider {
             .ok_or_else(|| ProviderError::Config("no model specified".to_string()))?
             .clone();
 
-        // Build messages array
+        // Build messages array - single pass preserving conversation order
         let mut messages = Vec::new();
 
         // Add system message if present
@@ -96,7 +96,7 @@ impl ChatProvider for OpenAiProvider {
             }));
         }
 
-        // Add other messages
+        // Single pass through messages preserving conversation order
         for msg in &turn.messages {
             match msg.role {
                 Role::User => {
@@ -115,6 +115,22 @@ impl ChatProvider for OpenAiProvider {
                             "role": "user",
                             "content": text_parts.join("\n\n")
                         }));
+                    }
+
+                    // Handle tool result parts - emit as tool messages at this position
+                    for part in &msg.parts {
+                        if let ContentPart::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error: _,
+                        } = part
+                        {
+                            messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": content
+                            }));
+                        }
                     }
                 }
                 Role::Assistant => {
@@ -169,24 +185,6 @@ impl ChatProvider for OpenAiProvider {
                     }
 
                     messages.push(assistant_msg);
-                }
-            }
-        }
-
-        // Handle ToolResult parts - each one becomes its own tool message
-        for msg in &turn.messages {
-            for part in &msg.parts {
-                if let ContentPart::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error: _,
-                } = part
-                {
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": content
-                    }));
                 }
             }
         }
@@ -336,7 +334,7 @@ impl ChatProvider for OpenAiProvider {
                     let arguments_str = function
                         .get("arguments")
                         .and_then(|a| a.as_str())
-                        .ok_or_else(|| ProviderError::Malformed("function missing arguments".to_string()))?;
+                        .ok_or_else(|| ProviderError::Malformed(format!("tool_call {} arguments missing", id)))?;
 
                     // Parse the JSON string to a Value
                     let input: Value = serde_json::from_str(arguments_str)
