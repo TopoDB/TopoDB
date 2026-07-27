@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 
 use crate::recovery::{contract_preserved, NoopRepairer, Repairer, Rung};
@@ -57,6 +58,12 @@ struct Shared<'r> {
     /// blocks add no entry — they are checkpoints, not failures.
     blocked_reasons: Mutex<BTreeMap<String, String>>,
     cancel: Option<CancelToken>,
+    max_inflight: usize,
+    /// Set when a worker returns `Err(SghError)` in parallel mode and no
+    /// `CancelToken` was supplied. Checked alongside `cancel` before every
+    /// claim so an internal engine failure stops the scheduler from
+    /// claiming further work even without cooperative cancellation wired in.
+    aborted: AtomicBool,
 }
 
 pub struct Executor<'r> {
@@ -77,6 +84,8 @@ impl<'r> Executor<'r> {
                 command_runs: AtomicU64::new(0),
                 blocked_reasons: Mutex::new(BTreeMap::new()),
                 cancel: None,
+                max_inflight: 1,
+                aborted: AtomicBool::new(false),
             },
         }
     }
@@ -101,6 +110,17 @@ impl<'r> Executor<'r> {
     /// Wire in a cancellation token. Allows cooperative cancellation of the run.
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
         self.shared.cancel = Some(token);
+        self
+    }
+
+    /// How many nodes may run concurrently. Clamped to at least 1 — a
+    /// caller passing 0 gets the sequential default rather than a run that
+    /// can never claim anything. `n == 1` (the default) takes the exact
+    /// sequential loop from Task 5, unchanged, so every prior guarantee
+    /// (bit-identical schedules included) keeps holding for callers who
+    /// never touch this knob.
+    pub fn with_max_inflight(mut self, n: usize) -> Self {
+        self.shared.max_inflight = n.max(1);
         self
     }
 
@@ -146,47 +166,55 @@ impl<'r> Executor<'r> {
 
         self.shared.clock.store(start_ms, Ordering::SeqCst);
 
-        // Topological order makes a single forward pass sufficient: every
-        // dependency is resolved (or has failed and been skipped) before its
-        // dependents are considered.
-        let order = self.shared.graph.topo_order.clone();
-        for id in order {
-            let deps = self
-                .shared
-                .graph
-                .graph
-                .node(&id)
-                .expect("node exists")
-                .needs
-                .clone();
+        if self.shared.max_inflight == 1 {
+            // Topological order makes a single forward pass sufficient:
+            // every dependency is resolved (or has failed and been
+            // skipped) before its dependents are considered. This is the
+            // exact Task 5 loop, untouched — kept as its own code path
+            // (rather than routed through the scheduler with n=1) so its
+            // behavior, including bit-identical schedules, can never be
+            // perturbed by scheduler changes.
+            let order = self.shared.graph.topo_order.clone();
+            for id in order {
+                let deps = self
+                    .shared
+                    .graph
+                    .graph
+                    .node(&id)
+                    .expect("node exists")
+                    .needs
+                    .clone();
 
-            let mut any_dep_unfinished = false;
-            for d in &deps {
-                if self.shared.store.state(d)? != NodeState::Succeeded {
-                    any_dep_unfinished = true;
-                    break;
+                let mut any_dep_unfinished = false;
+                for d in &deps {
+                    if self.shared.store.state(d)? != NodeState::Succeeded {
+                        any_dep_unfinished = true;
+                        break;
+                    }
                 }
-            }
 
-            if any_dep_unfinished {
-                let t = tick(&self.shared);
-                self.shared.store.set_state(&id, NodeState::Skipped, t)?;
-                continue;
-            }
-
-            // Check for cancellation before starting the node
-            if let Some(token) = &self.shared.cancel {
-                if token.is_cancelled() {
+                if any_dep_unfinished {
                     let t = tick(&self.shared);
                     self.shared.store.set_state(&id, NodeState::Skipped, t)?;
                     continue;
                 }
+
+                // Check for cancellation before starting the node
+                if let Some(token) = &self.shared.cancel {
+                    if token.is_cancelled() {
+                        let t = tick(&self.shared);
+                        self.shared.store.set_state(&id, NodeState::Skipped, t)?;
+                        continue;
+                    }
+                }
+
+                let t = tick(&self.shared);
+                self.shared.store.set_state(&id, NodeState::Ready, t)?;
+
+                execute_node(&self.shared, &id)?;
             }
-
-            let t = tick(&self.shared);
-            self.shared.store.set_state(&id, NodeState::Ready, t)?;
-
-            execute_node(&self.shared, &id)?;
+        } else {
+            run_parallel(&self.shared)?;
         }
 
         self.report()
@@ -217,6 +245,148 @@ impl<'r> Executor<'r> {
 /// same sequence as the previous `self.clock += 1; self.clock`.
 fn tick(shared: &Shared) -> i64 {
     shared.clock.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// The ready-set scheduler for `max_inflight > 1`: workers borrow `&Shared`
+/// inside `std::thread::scope` (no `Arc`, no clone — `RunStore` isn't
+/// `Clone` and doesn't need to be, since the scope guarantees every spawned
+/// thread joins before this function returns). A node is *ready* once every
+/// dependency's state is `Succeeded` and it hasn't been started; a node with
+/// a dependency that reached a terminal-but-not-`Succeeded` state can never
+/// become ready and is marked `Skipped` immediately — the same store write
+/// the sequential loop makes, just discovered dynamically instead of in one
+/// forward pass. Ready nodes are claimed in `topo_order` order, at most
+/// `max_inflight` at a time; the scheduler blocks on the results channel
+/// whenever it's saturated or has nothing left to claim but work is still
+/// inflight, so there is no busy-spin.
+fn run_parallel(shared: &Shared) -> Result<(), SghError> {
+    let order = shared.graph.topo_order.clone();
+    let cap = shared.max_inflight;
+
+    let deps_of: HashMap<&str, &[String]> = order
+        .iter()
+        .map(|id| {
+            let node = shared.graph.graph.node(id).expect("node exists");
+            (id.as_str(), node.needs.as_slice())
+        })
+        .collect();
+
+    let mut started: HashSet<String> = HashSet::new();
+    let mut first_error: Option<SghError> = None;
+
+    std::thread::scope(|scope| -> Result<(), SghError> {
+        let (tx, rx) = mpsc::channel::<(String, Result<(), SghError>)>();
+        let mut inflight: usize = 0;
+
+        loop {
+            if started.len() == order.len() && inflight == 0 {
+                break;
+            }
+
+            let cancelled = shared
+                .cancel
+                .as_ref()
+                .map(|t| t.is_cancelled())
+                .unwrap_or(false)
+                || shared.aborted.load(Ordering::SeqCst);
+
+            if cancelled {
+                // Drain every already-inflight worker first, so a genuine
+                // engine error surfaces deterministically as the returned
+                // error rather than being silently dropped by the implicit
+                // scope join.
+                while inflight > 0 {
+                    let (_, res) = rx.recv().expect("a worker is inflight");
+                    inflight -= 1;
+                    if let Err(e) = res {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+                for id in &order {
+                    if !started.contains(id) {
+                        let t = tick(shared);
+                        shared.store.set_state(id, NodeState::Skipped, t)?;
+                        started.insert(id.clone());
+                    }
+                }
+                break;
+            }
+
+            // Claim pass: walk topo_order, skipping already-started nodes,
+            // marking never-ready nodes Skipped, and spawning workers for
+            // whatever is ready, up to the cap.
+            for id in &order {
+                if inflight >= cap {
+                    break;
+                }
+                if started.contains(id) {
+                    continue;
+                }
+
+                let mut any_unfinished = false;
+                let mut any_dead = false;
+                for d in deps_of[id.as_str()] {
+                    let st = shared.store.state(d)?;
+                    if st != NodeState::Succeeded {
+                        any_unfinished = true;
+                        if st.is_terminal() {
+                            any_dead = true;
+                        }
+                    }
+                }
+
+                if any_dead {
+                    let t = tick(shared);
+                    shared.store.set_state(id, NodeState::Skipped, t)?;
+                    started.insert(id.clone());
+                    continue;
+                }
+                if any_unfinished {
+                    continue;
+                }
+
+                let t = tick(shared);
+                shared.store.set_state(id, NodeState::Ready, t)?;
+                started.insert(id.clone());
+                inflight += 1;
+
+                let tx = tx.clone();
+                let id_owned = id.clone();
+                scope.spawn(move || {
+                    let res = execute_node(shared, &id_owned);
+                    let _ = tx.send((id_owned, res));
+                });
+            }
+
+            if started.len() == order.len() && inflight == 0 {
+                break;
+            }
+
+            if inflight > 0 {
+                let (_, res) = rx.recv().expect("a worker is inflight");
+                inflight -= 1;
+                if let Err(e) = res {
+                    if let Some(token) = &shared.cancel {
+                        token.cancel();
+                    } else {
+                        shared.aborted.store(true, Ordering::SeqCst);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
