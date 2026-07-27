@@ -40,6 +40,18 @@ multi-minute compile is a bad surprise.
 
 npm packaging with prebuilt platform binaries is deliberately deferred.
 
+## Providers
+
+The `sgh` CLI's `run` and `plan` subcommands take `--provider
+claude-code|anthropic|openai` (default `claude-code`); `openai` also accepts
+`--base-url` to point at any OpenAI-compatible local endpoint (vLLM, Ollama,
+etc). `anthropic` and `openai` talk to the provider's HTTP API directly and
+read their key from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. `--agent-bash` is
+claude-code-only — the HTTP providers execute no shell of their own, so a
+bash grant has nothing to attach to. **The plugin itself is unaffected**: its
+slash commands always drive the local `claude` CLI (`--provider claude-code`,
+the default), unchanged by this flag existing.
+
 ## Commands
 
 - `/sgh:plan <goal>` — compile a goal into `.sgh/graph.yaml` and print its
@@ -122,6 +134,12 @@ Agent node with MCP (TopoDB memory tools):
 
 ```sh
 sgh run graph.yaml --agent-mcp '/abs/topodb-mcp --db /Users/you/.topodb/agent.redb --scope shared --embeddings off'
+```
+
+Agent nodes over an HTTP provider instead of claude-code:
+
+```sh
+sgh run graph.yaml --provider anthropic --agent-mcp '/abs/topodb-mcp --db /Users/you/.topodb/agent.redb --scope shared --embeddings off'
 ```
 
 `--yes-including-revisions` is not used anywhere in this plugin, and `--replan`

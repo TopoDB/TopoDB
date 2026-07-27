@@ -501,6 +501,48 @@ fn build_http_provider(
     }
 }
 
+/// Build the planner used for a `--replan` revision. `ClaudeCode` reuses the
+/// existing `claude_planner`; the HTTP providers build a fresh
+/// `ApiBackend` — fresh because the runner's own provider client
+/// (`pending_http_provider`) was already consumed building the executor's
+/// `AgentRunner`, so planning needs its own client, not a shared one.
+/// `from_env` is cheap (env vars only, no IO), so building it again here
+/// costs nothing.
+fn build_replan_planner(
+    provider: Provider,
+    model: Option<String>,
+    base_url: Option<String>,
+) -> topodb_sgh::planner::BoundedPlanner {
+    match provider {
+        Provider::ClaudeCode => {
+            #[cfg(feature = "claude-code")]
+            {
+                claude_planner(model, 3)
+            }
+            #[cfg(not(feature = "claude-code"))]
+            {
+                unreachable!(
+                    "claude-code provider without the feature already rejected at the flag-rail stage"
+                )
+            }
+        }
+        Provider::Anthropic | Provider::Openai => {
+            #[cfg(feature = "http")]
+            {
+                let provider_client = build_http_provider(provider, model.clone(), base_url);
+                let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model);
+                topodb_sgh::planner::BoundedPlanner::with_backend(Box::new(backend), 3)
+            }
+            #[cfg(not(feature = "http"))]
+            {
+                unreachable!(
+                    "http provider without the feature already rejected building the runner's own provider client above"
+                )
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -643,12 +685,9 @@ fn run_cmd(
         eprintln!("error: this sgh was built without the claude-code feature");
         std::process::exit(2);
     }
-    if replan && provider != Provider::ClaudeCode {
-        eprintln!(
-            "error: --replan with --provider {provider} arrives with ApiBackend (next task)"
-        );
-        std::process::exit(2);
-    }
+    // No provider-specific replan rail here: an HTTP provider missing its
+    // compiled feature is already caught below when the provider client is
+    // built (`build_http_provider`), whether or not `--replan` is set.
 
     let src = std::fs::read_to_string(&graph)?;
     let g = Graph::from_yaml(&src)?;
@@ -909,17 +948,10 @@ fn run_cmd(
         }
         println!("{}", replan_banner(replans_used, max_replans));
 
-        // Reached only when `replan` is true, which the flag rail
-        // above already tied to `provider == ClaudeCode` — and that,
-        // in turn, was already rejected at the rail stage when the
-        // claude-code feature isn't compiled in. So the claude
-        // planner is always what's wanted here in this task; HTTP
-        // providers' replan support (ApiBackend) is the next task.
-        #[cfg(feature = "claude-code")]
-        let planner = claude_planner(model.clone(), 3);
-        #[cfg(not(feature = "claude-code"))]
-        let planner: topodb_sgh::planner::BoundedPlanner =
-            unreachable!("replan with a non-claude-code provider already rejected above");
+        // The planner mirrors whatever `--provider` executed the run: a
+        // claude-code run replans with `claude_planner`, an HTTP-provider
+        // run replans with a fresh `ApiBackend` over the same provider.
+        let planner = build_replan_planner(provider, model.clone(), base_url.clone());
         let revised = match propose_revision(&planner, &current, &ctx) {
             Ok(g) => g,
             Err(e) => {
@@ -978,28 +1010,47 @@ fn plan_cmd(
 ) -> Result<(), Box<dyn std::error::Error>> {
             // Flag rails before anything else, same as `run`.
             validate_provider_flags(provider, &base_url, false);
-            // This task keeps `plan` claude-only; Task 10's ApiBackend
-            // wires anthropic/openai in here. `claude-code` without the
-            // feature is covered by this same check (the feature-check
-            // branch below only fires once provider == ClaudeCode, so a
-            // provider value that already failed this arrives with
-            // ApiBackend regardless of whether claude-code is compiled).
-            if provider != Provider::ClaudeCode {
-                eprintln!(
-                    "error: --provider {provider} for plan arrives with ApiBackend (next task)"
-                );
-                std::process::exit(2);
-            }
-
             #[cfg(not(feature = "claude-code"))]
-            {
+            if provider == Provider::ClaudeCode {
                 eprintln!("error: this sgh was built without the claude-code feature");
                 std::process::exit(2);
             }
 
-            #[cfg(feature = "claude-code")]
             {
-                let planner = claude_planner(model, max_attempts);
+                let planner: topodb_sgh::planner::BoundedPlanner = match provider {
+                    Provider::ClaudeCode => {
+                        #[cfg(feature = "claude-code")]
+                        {
+                            claude_planner(model, max_attempts)
+                        }
+                        #[cfg(not(feature = "claude-code"))]
+                        {
+                            unreachable!(
+                                "claude-code provider without the feature already rejected above"
+                            )
+                        }
+                    }
+                    Provider::Anthropic | Provider::Openai => {
+                        #[cfg(feature = "http")]
+                        {
+                            let provider_client =
+                                build_http_provider(provider, model.clone(), base_url);
+                            let backend = topodb_sgh::planner::api::ApiBackend::new(
+                                provider_client,
+                                model,
+                            );
+                            topodb_sgh::planner::BoundedPlanner::with_backend(
+                                Box::new(backend),
+                                max_attempts,
+                            )
+                        }
+                        #[cfg(not(feature = "http"))]
+                        {
+                            eprintln!("error: this sgh was built without the http feature");
+                            std::process::exit(2);
+                        }
+                    }
+                };
                 let graph = match planner.plan(&PlanRequest { goal, context }) {
                     Ok(g) => g,
                     Err(e) => {

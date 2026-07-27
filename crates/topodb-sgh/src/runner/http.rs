@@ -6,12 +6,91 @@ use std::time::Duration;
 
 use crate::mcp_bridge::{BridgeError, McpBridge};
 use crate::provider::{
-    ChatMessage, ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpTransport, Role,
-    StopReason, ToolDef, UreqTransport,
+    ChatMessage, ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, HttpTransport,
+    Role, StopReason, ToolDef, UreqTransport,
 };
 use crate::schema::TOPODB_TOOL;
 
 use super::{common, AgentRunner, NodeOutcome, NodeRequest, RunnerError};
+
+/// Safely elide a response body to ~200 chars for an error message,
+/// preserving UTF-8 boundaries.
+fn elide_body(body: &[u8]) -> String {
+    let s = String::from_utf8_lossy(body);
+    if s.chars().count() > 200 {
+        s.chars().take(200).collect()
+    } else {
+        s.into_owned()
+    }
+}
+
+/// Send one HTTP payload, retrying transport `Err(io)` and 429/5xx statuses
+/// up to `1 + retries` total attempts with capped exponential backoff
+/// (`backoff_base * 2^attempt`, capped at 30s; a zero `backoff_base` sleeps
+/// not at all — tests use this to run instantly).
+///
+/// Non-retryable statuses (2xx, or 4xx other than 429) return immediately
+/// as `Ok((status, body))` — the caller (a `ChatProvider::parse`) decides
+/// whether that status is itself an error. Only retry exhaustion and
+/// transport-level IO errors are surfaced here as `Err(String)`.
+///
+/// Shared by `HttpChatRunner` (runner/http.rs) and `ApiBackend`
+/// (planner/api.rs) so both providers' bounded retry policy stays identical
+/// by construction rather than by two hand-kept copies.
+pub(crate) fn send_with_retries(
+    transport: &dyn HttpTransport,
+    payload: &HttpPayload,
+    timeout: Duration,
+    retries: u32,
+    backoff_base: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    let attempts = 1 + retries;
+    let mut last_err = String::new();
+
+    for attempt in 0..attempts {
+        match transport.post(payload, timeout) {
+            Ok((status, body)) => {
+                if status == 429 || (500..600).contains(&status) {
+                    last_err = format!("status {status}: {}", elide_body(&body));
+                    if attempt + 1 < attempts {
+                        sleep_backoff(attempt, backoff_base);
+                        continue;
+                    }
+                    return Err(format!(
+                        "provider transport failed after {attempts} attempts: {last_err}"
+                    ));
+                }
+                return Ok((status, body));
+            }
+            Err(io_err) => {
+                last_err = io_err.to_string();
+                if attempt + 1 < attempts {
+                    sleep_backoff(attempt, backoff_base);
+                    continue;
+                }
+                return Err(format!(
+                    "provider transport failed after {attempts} attempts: {last_err}"
+                ));
+            }
+        }
+    }
+
+    // Unreachable when attempts >= 1 (retries is u32, so attempts >= 1
+    // always), kept for exhaustiveness.
+    Err(format!(
+        "provider transport failed after {attempts} attempts: {last_err}"
+    ))
+}
+
+fn sleep_backoff(attempt: u32, backoff_base: Duration) {
+    if backoff_base.is_zero() {
+        return;
+    }
+    let mult = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    let sleep = backoff_base.saturating_mul(mult);
+    let cap = Duration::from_secs(30);
+    std::thread::sleep(sleep.min(cap));
+}
 
 pub struct HttpChatRunner {
     provider: Box<dyn ChatProvider>,
@@ -62,8 +141,9 @@ impl HttpChatRunner {
 
     /// Send one turn, retrying transport `Err(io)` and 429/5xx statuses up to
     /// `1 + max_transport_retries` total attempts with capped exponential
-    /// backoff. Non-retryable statuses (4xx other than 429) fail on the
-    /// first attempt. Every failure path returns the provider's parse error
+    /// backoff (delegated to the free function `send_with_retries`, shared
+    /// with `ApiBackend` so both providers' retry policy is identical by
+    /// construction). Every failure path returns the provider's parse error
     /// text (built by calling `provider.parse` on the final response) rather
     /// than a raw status code, so the caller doesn't need its own mapping.
     ///
@@ -76,59 +156,18 @@ impl HttpChatRunner {
             Err(e) => return Err(e.to_string()),
         };
 
-        let attempts = 1 + self.max_transport_retries;
-        let mut last_err = String::new();
+        let (status, body) = send_with_retries(
+            self.transport.as_ref(),
+            &payload,
+            self.request_timeout,
+            self.max_transport_retries,
+            self.backoff_base,
+        )?;
 
-        for attempt in 0..attempts {
-            match self.transport.post(&payload, self.request_timeout) {
-                Ok((status, body)) => {
-                    if status == 429 || (500..600).contains(&status) {
-                        last_err = match self.provider.parse(status, &body) {
-                            Ok(_) => format!("status {status}"),
-                            Err(e) => e.to_string(),
-                        };
-                        if attempt + 1 < attempts {
-                            self.sleep_backoff(attempt);
-                            continue;
-                        }
-                        return Err(format!(
-                            "provider transport failed after {attempts} attempts: {last_err}"
-                        ));
-                    }
-                    // 2xx or a non-retryable status: parse and return either way.
-                    return match self.provider.parse(status, &body) {
-                        Ok(resp) => Ok(resp),
-                        Err(e) => Err(e.to_string()),
-                    };
-                }
-                Err(io_err) => {
-                    last_err = io_err.to_string();
-                    if attempt + 1 < attempts {
-                        self.sleep_backoff(attempt);
-                        continue;
-                    }
-                    return Err(format!(
-                        "provider transport failed after {attempts} attempts: {last_err}"
-                    ));
-                }
-            }
+        match self.provider.parse(status, &body) {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(e.to_string()),
         }
-
-        // Unreachable when attempts >= 1 (max_transport_retries is u32, so
-        // attempts >= 1 always), kept for exhaustiveness.
-        Err(format!(
-            "provider transport failed after {attempts} attempts: {last_err}"
-        ))
-    }
-
-    fn sleep_backoff(&self, attempt: u32) {
-        if self.backoff_base.is_zero() {
-            return;
-        }
-        let mult = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
-        let sleep = self.backoff_base.saturating_mul(mult);
-        let cap = Duration::from_secs(30);
-        std::thread::sleep(sleep.min(cap));
     }
 }
 
