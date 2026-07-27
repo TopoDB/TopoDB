@@ -1,3 +1,5 @@
+#![cfg(feature = "claude-code")]
+
 //! Live proof of the whole Phase D loop: real `claude` (haiku) as the judge,
 //! real topodb-mcp for its tools, real CLI sweeps — asserting DB STATE is
 //! CONSISTENT WITH THE VERDICTS, not merely that the run reported success.

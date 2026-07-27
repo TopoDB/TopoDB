@@ -1,3 +1,5 @@
+#![cfg(all(feature = "cli", feature = "claude-code"))]
+
 //! Process-level pins on `sgh validate`'s output contract: failures must not
 //! trail a success line. The rail/pairing checks run BEFORE "valid: N
 //! node(s)" prints, so a caller (human or script) reading top-down never sees

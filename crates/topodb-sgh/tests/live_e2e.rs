@@ -1,3 +1,5 @@
+#![cfg(feature = "claude-code")]
+
 //! The crate's only live-model test. Everything else is mocked; this one
 //! spawns the real `claude` CLI with the real `topodb-mcp` server and proves
 //! the MCP wiring end-to-end by asserting on DB STATE, not agent self-report.

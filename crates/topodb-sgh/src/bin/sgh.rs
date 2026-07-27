@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use topodb::Db;
 use topodb_sgh::executor::{Executor, RunReport};
-use topodb_sgh::planner::claude::ClaudePlanner;
+use topodb_sgh::planner::claude::claude_planner;
 use topodb_sgh::planner::{PlanRequest, Planner};
 use topodb_sgh::replan::{collect_failure_context, propose_revision, FailureContext};
 use topodb_sgh::runner::claude::ClaudeCodeRunner;
@@ -581,7 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("{}", replan_banner(replans_used, max_replans));
 
-                let planner = ClaudePlanner::new(model.clone(), 3);
+                let planner = claude_planner(model.clone(), 3);
                 let revised = match propose_revision(&planner, &current, &ctx) {
                     Ok(g) => g,
                     Err(e) => {
@@ -630,7 +630,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             max_attempts,
         } => {
-            let planner = ClaudePlanner::new(model, max_attempts);
+            let planner = claude_planner(model, max_attempts);
             let graph = match planner.plan(&PlanRequest { goal, context }) {
                 Ok(g) => g,
                 Err(e) => {

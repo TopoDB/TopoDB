@@ -1,3 +1,5 @@
+#![cfg(feature = "claude-code")]
+
 use std::collections::BTreeMap;
 
 use topodb_sgh::runner::claude::{

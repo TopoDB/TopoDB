@@ -116,7 +116,7 @@ fn mock_planner_surfaces_scripted_failures() {
 }
 
 use std::sync::Mutex;
-use topodb_sgh::planner::claude::{ClaudePlanner, PlanBackend};
+use topodb_sgh::planner::{BoundedPlanner, PlanBackend};
 
 /// A backend that returns scripted completions and records the prompts it saw.
 struct ScriptedBackend {
@@ -153,7 +153,7 @@ const DANGLING: &str = "version: 1\ngoal: g\nnodes:\n  - {id: a, kind: agent, pr
 #[test]
 fn a_valid_first_attempt_costs_exactly_one_backend_call() {
     let backend = ScriptedBackend::new(vec![VALID]);
-    let p = ClaudePlanner::with_backend(Box::new(backend), 3);
+    let p = BoundedPlanner::with_backend(Box::new(backend), 3);
     let g = p.plan(&req()).expect("plans");
     assert_eq!(g.nodes.len(), 1);
 }
@@ -161,7 +161,7 @@ fn a_valid_first_attempt_costs_exactly_one_backend_call() {
 #[test]
 fn an_invalid_attempt_is_retried_with_the_errors_fed_back() {
     let backend = std::sync::Arc::new(ScriptedBackend::new(vec![DANGLING, VALID]));
-    let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
+    let p = BoundedPlanner::with_backend(Box::new(backend.clone()), 3);
 
     let g = p.plan(&req()).expect("recovers on the second attempt");
     assert_eq!(g.nodes[0].id, "a");
@@ -180,7 +180,7 @@ fn the_retry_loop_is_bounded_and_reports_exhaustion() {
     let backend = std::sync::Arc::new(ScriptedBackend::new(vec![
         DANGLING, DANGLING, DANGLING, DANGLING,
     ]));
-    let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
+    let p = BoundedPlanner::with_backend(Box::new(backend.clone()), 3);
 
     match p.plan(&req()) {
         Err(PlannerError::Exhausted { attempts, errors }) => {
@@ -205,7 +205,7 @@ fn unparseable_yaml_is_retried_like_any_other_rejection() {
         "this is not yaml: [unclosed",
         VALID,
     ]));
-    let p = ClaudePlanner::with_backend(Box::new(backend.clone()), 3);
+    let p = BoundedPlanner::with_backend(Box::new(backend.clone()), 3);
     assert!(p.plan(&req()).is_ok());
     assert_eq!(backend.prompts().len(), 2);
 }
