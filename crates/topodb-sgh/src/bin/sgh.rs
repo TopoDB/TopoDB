@@ -971,16 +971,8 @@ fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
 
                 // CREATED_MS: raw epoch-ms integer (no date-formatting dependency in crate;
                 // consumers can pipe to their own formatter if needed)
-                let created_ms = rec
-                    .props
-                    .get("created_ms")
-                    .and_then(|pv| {
-                        if let PropValue::Int(i) = pv {
-                            Some(i.to_string())
-                        } else {
-                            None
-                        }
-                    })
+                let created_ms = prop_ms(&rec.props, "created_at")
+                    .map(|ms| ms.to_string())
                     .unwrap_or_else(|| "(unknown)".to_string());
 
                 let goal = rec
@@ -1046,6 +1038,15 @@ fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
     }
 
     Ok(())
+}
+
+/// Extract milliseconds from a property, accepting both DateTime and Int variants.
+fn prop_ms(props: &topodb::Props, key: &str) -> Option<i64> {
+    props.get(key).and_then(|pv| match pv {
+        PropValue::DateTime(ms) => Some(*ms),
+        PropValue::Int(i) => Some(*i),
+        _ => None,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2391,5 +2392,32 @@ mod tests {
             lines[2],
             "  tools: mcp__topodb -> no node opts in (flag is inert for this graph)"
         );
+    }
+
+    #[test]
+    fn prop_ms_extracts_datetime() {
+        let mut props = topodb::Props::new();
+        props.insert("ts".into(), PropValue::DateTime(1000));
+        assert_eq!(prop_ms(&props, "ts"), Some(1000));
+    }
+
+    #[test]
+    fn prop_ms_extracts_int() {
+        let mut props = topodb::Props::new();
+        props.insert("ts".into(), PropValue::Int(2000));
+        assert_eq!(prop_ms(&props, "ts"), Some(2000));
+    }
+
+    #[test]
+    fn prop_ms_returns_none_for_missing() {
+        let props = topodb::Props::new();
+        assert_eq!(prop_ms(&props, "ts"), None);
+    }
+
+    #[test]
+    fn prop_ms_returns_none_for_wrong_type() {
+        let mut props = topodb::Props::new();
+        props.insert("ts".into(), PropValue::Str("not a number".into()));
+        assert_eq!(prop_ms(&props, "ts"), None);
     }
 }
