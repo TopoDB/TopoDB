@@ -2,72 +2,16 @@ use std::process::Command;
 
 use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
+pub use super::common::{build_prompt, extract_json};
+pub use super::rails::{validate_bash_grant, validate_mcp_server_command};
+use super::common::elide;
+
 /// Run-level MCP wiring for opted-in agent nodes: the path of the generated
 /// mcp-config file naming the `topodb` stdio server. Presence of a value
 /// means the RUN supplies the capability; whether a given node sees it is
 /// the node's own `tools` opt-in (checked by the caller of [`build_argv`]).
 pub struct McpWiring {
     pub config_path: String,
-}
-
-/// Shared character/shell rail behind [`validate_bash_grant`] and
-/// [`validate_mcp_server_command`]. `what` names the value in error messages
-/// ("bash grant prefix" / "agent-mcp server command"). A rail, not a security
-/// boundary — see the callers' doc comments.
-fn validate_rail(what: &str, value: &str) -> Result<(), String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{what} is empty or whitespace-only"));
-    }
-    for ch in &[';', '|', '&', '<', '>', '`', '$', ',', '(', ')', ':'] {
-        if trimmed.contains(*ch) {
-            return Err(format!(
-                "{what} '{value}' contains forbidden character '{ch}'"
-            ));
-        }
-    }
-    let forbidden_shells = ["sh", "bash", "zsh", "dash", "ksh", "fish", "env"];
-    for token in trimmed.split_whitespace() {
-        let base_cmd = token
-            .split('/')
-            .next_back()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if forbidden_shells.contains(&base_cmd.as_str()) {
-            return Err(format!(
-                "{what} '{value}' contains a shell or generic launcher ({base_cmd}), not a binary"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validate a bash grant prefix.
-///
-/// This is a rail to catch obviously problematic prefixes — not a security boundary.
-/// Rejects:
-/// - Empty or whitespace-only strings
-/// - Every whitespace-separated token's basename (after `/`) if it matches
-///   a shell command (case-insensitive) in {sh, bash, zsh, dash, ksh, fish, env}
-/// - Any of the characters `;`, `|`, `&`, `<`, `>`, `` ` ``, `$`, `,`, `(`, `)`, `:`
-///
-/// Error message names the prefix and explains why it was rejected.
-pub fn validate_bash_grant(prefix: &str) -> Result<(), String> {
-    validate_rail("bash grant prefix", prefix)
-}
-
-/// Validate and split an `--agent-mcp` server command into argv.
-///
-/// Same rail as bash grants (empty / metacharacters / shell basenames
-/// rejected — including `:`, which also rules out Windows drive paths; the
-/// bash-grant rail shares that limitation). The value is whitespace-split
-/// with NO shell involved — the same no-shell doctrine as the plugin's goal
-/// handling — so paths with spaces are unsupported, exactly as they are for
-/// bash grants. First token is the server binary; prefer an absolute path
-/// (same textual-honesty lesson as bash grants).
-pub fn validate_mcp_server_command(cmd: &str) -> Result<Vec<String>, String> {
-    validate_rail("agent-mcp server command", cmd)?;
-    Ok(cmd.split_whitespace().map(String::from).collect())
 }
 
 /// Build the command-line arguments for invoking `claude -p`.
@@ -125,39 +69,6 @@ pub fn build_argv(
     }
 
     argv
-}
-
-/// Assembles the prompt for a node. Kept separate from process spawning so it
-/// is unit-testable without invoking a model.
-pub fn build_prompt(req: &NodeRequest) -> String {
-    let mut p = String::new();
-    p.push_str(&req.prompt);
-
-    if !req.inputs.is_empty() {
-        p.push_str("\n\n## Inputs\n\n");
-        p.push_str(
-            "These are the complete outputs of this step's declared dependencies. \
-             They are the only context from the run available to you.\n\n",
-        );
-        for (id, json) in &req.inputs {
-            p.push_str(&format!("### {id}\n\n```json\n{json}\n```\n\n"));
-        }
-    }
-
-    if let Some(schema) = &req.output_schema {
-        p.push_str("\n\n## Required output\n\n");
-        p.push_str(
-            "Reply with bare JSON matching this schema and nothing else — no prose, \
-             no code fences. Output that does not match is treated as a failure. \
-             Even if you find the work already done and change nothing, still reply \
-             with JSON reflecting the current state (e.g. counts of what already \
-             exists) — never an explanation instead of the JSON.\n\n",
-        );
-        p.push_str(&serde_json::to_string_pretty(schema).unwrap_or_default());
-        p.push('\n');
-    }
-
-    p
 }
 
 /// Decide what a completed `claude -p` invocation actually accomplished.
@@ -239,62 +150,6 @@ pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
             error: format!("claude returned no `result` field: {}", elide(stdout)),
         },
     }
-}
-
-/// Pull a JSON object or array out of a model reply, tolerating the two most
-/// common ways the model wraps it despite being told not to: a ```json …```
-/// (or bare ```` ``` ````) fence, and one or more sentences of prose around
-/// the object. Returns the JSON substring only if it actually parses; a stray
-/// unbalanced brace in prose yields `None`, not a false positive. A reply that
-/// is already bare JSON is returned unchanged.
-pub fn extract_json(reply: &str) -> Option<String> {
-    let s = reply.trim();
-
-    // Whole reply already parses — the common, well-behaved case.
-    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
-        return Some(s.to_string());
-    }
-
-    // A fenced block: ```json\n…\n``` or ```\n…\n```. Take the fence body.
-    if let Some(after) = s.strip_prefix("```") {
-        // Drop an optional language tag on the first line (e.g. `json`).
-        let body = match after.find('\n') {
-            Some(nl) => &after[nl + 1..],
-            None => after,
-        };
-        let body = body.strip_suffix("```").unwrap_or(body).trim();
-        if serde_json::from_str::<serde_json::Value>(body).is_ok() {
-            return Some(body.to_string());
-        }
-    }
-
-    // Prose around an object/array: scan for the first opening bracket and
-    // find the balanced close by trying successive candidates. Cheap because
-    // agent replies are short; correctness comes from requiring a real parse.
-    let bytes = s.as_bytes();
-    let open = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
-    let close_char = if bytes[open] == b'{' { b'}' } else { b']' };
-    // Search from the last matching close back toward `open` so the widest
-    // balanced span is tried first.
-    let mut end = s.len();
-    while let Some(rel) = s[open..end].rfind(close_char as char) {
-        let candidate = &s[open..open + rel + 1];
-        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-            return Some(candidate.to_string());
-        }
-        end = open + rel; // try a shorter span
-    }
-    None
-}
-
-/// Keep a diagnostic short enough to read in a run report.
-fn elide(s: &str) -> String {
-    let s = s.trim();
-    if s.chars().count() <= 200 {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(200).collect();
-    format!("{head}…")
 }
 
 pub struct ClaudeCodeRunner {
