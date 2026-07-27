@@ -969,6 +969,8 @@ fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
                     })
                     .unwrap_or_else(|| "(no status)".to_string());
 
+                // CREATED_MS: raw epoch-ms integer (no date-formatting dependency in crate;
+                // consumers can pipe to their own formatter if needed)
                 let created_ms = rec
                     .props
                     .get("created_ms")

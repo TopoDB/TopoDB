@@ -162,9 +162,10 @@ fn show_pretty_prints_a_canned_event_file() {
     let events_dir = dir.path().join("x.redb.events");
     std::fs::create_dir_all(&events_dir).unwrap();
 
-    // Write a canned event file with three lines matching the Envelope shape
+    // Write a canned event file with three valid lines + one garbage line (forward-compat test)
     let event_file = events_dir.join("01RUN.jsonl");
     let events = r#"{"v":1,"ts":1000,"event":"run_started","run_id":"01RUN","goal":"test goal","agent_calls_bound":100,"command_runs_bound":10}
+not json at all {
 {"v":1,"ts":1100,"event":"node_started","node_id":"a"}
 {"v":1,"ts":1200,"event":"node_succeeded","node_id":"a"}"#;
     std::fs::write(&event_file, events).unwrap();
@@ -181,7 +182,30 @@ fn show_pretty_prints_a_canned_event_file() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Check exit code 0 and presence of all events
     assert!(stdout.contains("run_started"), "stdout: {stdout}");
     assert!(stdout.contains("node_started"), "stdout: {stdout}");
     assert!(stdout.contains("node_succeeded"), "stdout: {stdout}");
+
+    // Forward-compat: unparseable line printed raw with ? prefix
+    assert!(stdout.contains("? not json at all {"), "stdout: {stdout}");
+
+    // Verify ordering via byte offsets
+    let run_started_pos = stdout
+        .find("run_started")
+        .expect("run_started not found in output");
+    let node_started_pos = stdout
+        .find("node_started")
+        .expect("node_started not found in output");
+    let node_succeeded_pos = stdout
+        .find("node_succeeded")
+        .expect("node_succeeded not found in output");
+    assert!(
+        run_started_pos < node_started_pos && node_started_pos < node_succeeded_pos,
+        "events not in order: run_started={}, node_started={}, node_succeeded={}",
+        run_started_pos,
+        node_started_pos,
+        node_succeeded_pos
+    );
 }
