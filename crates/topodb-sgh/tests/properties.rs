@@ -327,8 +327,7 @@ proptest! {
 #[test]
 fn planner_retry_loop_is_bounded() {
     use std::sync::Mutex;
-    use topodb_sgh::planner::claude::{ClaudePlanner, PlanBackend};
-    use topodb_sgh::planner::{PlanRequest, Planner, PlannerError};
+    use topodb_sgh::planner::{BoundedPlanner, PlanBackend, PlanRequest, Planner, PlannerError};
 
     struct AlwaysInvalid {
         calls: Mutex<u32>,
@@ -344,7 +343,7 @@ fn planner_retry_loop_is_bounded() {
         let backend = std::sync::Arc::new(AlwaysInvalid {
             calls: Mutex::new(0),
         });
-        let p = ClaudePlanner::with_backend(Box::new(backend.clone()), max);
+        let p = BoundedPlanner::with_backend(Box::new(backend.clone()), max);
         let err = p
             .plan(&PlanRequest {
                 goal: "g".into(),

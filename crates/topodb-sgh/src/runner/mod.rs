@@ -1,3 +1,4 @@
+#[cfg(feature = "claude-code")]
 pub mod claude;
 pub mod command;
 pub mod common;
