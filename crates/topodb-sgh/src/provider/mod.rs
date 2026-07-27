@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // added in Tasks 5/6
-// #[cfg(feature = "anthropic")]
-// pub mod anthropic;
+#[cfg(feature = "anthropic")]
+pub mod anthropic;
 // #[cfg(feature = "openai")]
 // pub mod openai;
 
