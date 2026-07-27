@@ -116,14 +116,7 @@ pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
         .unwrap_or_default();
 
     if !denied.is_empty() {
-        return NodeOutcome::Failed {
-            error: format!(
-                "claude was denied {} — the node cannot have done its work. \
-                 Grant the tool in ClaudeCodeRunner, or move the work to a \
-                 `command` node whose `run:` string passes through the approval gate.",
-                denied.join(", ")
-            ),
-        };
+        return NodeOutcome::Denied { tool: denied.join(", ") };
     }
 
     if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {

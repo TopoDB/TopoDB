@@ -472,3 +472,27 @@ fn a_retry_of_a_schema_node_feeds_back_the_error_and_demands_json() {
         "the retry must feed back what went wrong, got: {retry}"
     );
 }
+
+/// A Denied outcome climbs the ladder exactly like Failed, and the blocked
+/// reason names the tool without any provider branding.
+#[test]
+fn denied_outcome_blocks_with_debranded_reason() {
+    let graph = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n  - id: a\n    kind: agent\n    prompt: p\n    budget: {retries: 0, repairs: 0}\n",
+    )
+    .unwrap();
+    let v = validate(&graph).unwrap();
+    let runner = MockRunner::new().script("a", vec![NodeOutcome::Denied { tool: "Write".into() }]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+    let mut ex = Executor::new(store, v, &runner);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(report.blocked, vec!["a".to_string()]);
+    let reason = &report.blocked_reasons["a"];
+    assert!(reason.contains("provider denied tool Write"), "got: {reason}");
+    assert!(!reason.to_lowercase().contains("claude"), "got: {reason}");
+}

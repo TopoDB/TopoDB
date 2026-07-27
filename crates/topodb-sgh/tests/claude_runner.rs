@@ -78,21 +78,42 @@ fn denied_write() -> &'static str {
 #[test]
 fn a_denied_tool_is_a_failure_even_though_claude_reports_success() {
     match interpret_result(denied_write(), false) {
-        NodeOutcome::Failed { .. } => {}
+        NodeOutcome::Denied { .. } => {}
         NodeOutcome::Succeeded { output } => {
             panic!("a node whose Write was denied did no work, got success: {output}")
         }
+        other => panic!("expected Denied, got {other:?}"),
     }
 }
 
 #[test]
 fn a_denial_failure_names_the_tool_that_was_blocked() {
     match interpret_result(denied_write(), false) {
-        NodeOutcome::Failed { error } => assert!(
-            error.contains("Write"),
-            "the error must name the denied tool so the cause is diagnosable, got: {error}"
+        NodeOutcome::Denied { tool } => assert_eq!(
+            tool, "Write",
+            "the tool field must name the denied tool"
         ),
-        other => panic!("expected failure, got {other:?}"),
+        other => panic!("expected Denied, got {other:?}"),
+    }
+}
+
+#[test]
+fn multiple_denied_tools_are_comma_joined() {
+    let multi_denial_json = r#"{
+        "subtype": "success",
+        "is_error": false,
+        "result": "Multiple tools were blocked.",
+        "permission_denials": [
+            {"tool_name": "Write", "tool_use_id": "toolu_01", "tool_input": {"file_path": "/tmp/x"}},
+            {"tool_name": "Bash", "tool_use_id": "toolu_02", "tool_input": {"command": "rm -rf /"}}
+        ]
+    }"#;
+    match interpret_result(multi_denial_json, false) {
+        NodeOutcome::Denied { tool } => assert_eq!(
+            tool, "Write, Bash",
+            "multiple denied tools must be comma-joined in input order"
+        ),
+        other => panic!("expected Denied, got {other:?}"),
     }
 }
 
