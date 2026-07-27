@@ -108,3 +108,28 @@ fn parse_api_error_carries_status_and_message() {
     let msg = err.to_string();
     assert!(msg.contains("401") && msg.contains("invalid api key"), "got: {msg}");
 }
+
+#[test]
+fn request_preserves_interleaved_tool_message_order() {
+    let turn = ChatTurn {
+        model: None,
+        system: None,
+        messages: vec![
+            ChatMessage { role: Role::User, parts: vec![ContentPart::Text { text: "q".into() }] },
+            ChatMessage { role: Role::Assistant, parts: vec![ContentPart::ToolUse { id: "a".into(), name: "t".into(), input: json!({}) }] },
+            ChatMessage { role: Role::User, parts: vec![ContentPart::ToolResult { tool_use_id: "a".into(), content: "ra".into(), is_error: false }] },
+            ChatMessage { role: Role::Assistant, parts: vec![ContentPart::ToolUse { id: "b".into(), name: "t".into(), input: json!({}) }] },
+            ChatMessage { role: Role::User, parts: vec![ContentPart::ToolResult { tool_use_id: "b".into(), content: "rb".into(), is_error: false }] },
+        ],
+        tools: vec![],
+        output_schema: None,
+        max_tokens: 8192,
+    };
+    let p = provider().request(&turn).unwrap();
+    let body: Value = serde_json::from_slice(&p.body).unwrap();
+    let roles: Vec<&str> = body["messages"].as_array().unwrap().iter()
+        .map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool", "assistant", "tool"]);
+    assert_eq!(body["messages"][2]["tool_call_id"], "a");
+    assert_eq!(body["messages"][4]["tool_call_id"], "b");
+}
