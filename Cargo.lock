@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "topodb"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-cli"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "clap",
  "serde_json",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-json"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3222,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-mcp"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "fastembed",
  "flate2",
