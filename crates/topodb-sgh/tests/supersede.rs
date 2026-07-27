@@ -1,7 +1,7 @@
 use topodb::{
     Db, Direction, EdgeRecord, NodeId, Op, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
 };
-use topodb_sgh::store::supersede::link_superseding;
+use topodb_sgh::store::supersede::{link_superseding, link_superseding_with};
 use topodb_sgh::store::SghError;
 
 fn node(db: &Db, scope: Scope, label: &str, t: i64) -> NodeId {
@@ -156,4 +156,57 @@ fn nonexistent_source_fails_fast_with_missing_endpoint_not_contended() {
         SghError::MissingEndpoint { node } => assert_eq!(node, ghost),
         other => panic!("expected MissingEndpoint {{ node: ghost }}, got {other:?}"),
     }
+}
+
+/// The composed variant lands prelude node + superseding edge in ONE batch:
+/// after the call, the node exists AND the old edge is closed AND the new
+/// edge is open — and the op log shows them at the same timestamp.
+#[test]
+fn link_superseding_with_prelude_is_single_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let sid = ScopeId::new();
+    let scope = Scope::Id(sid);
+    let scopes = ScopeSet::of(&[sid]);
+
+    let from = node(&db, scope, "SghNode", 1);
+    let to1 = node(&db, scope, "SghState", 2);
+
+    link_superseding(&db, scope, from, to1, "T", 10).unwrap();
+
+    // to2 is minted here — NOT created yet — and only comes into existence
+    // via the prelude op inside link_superseding_with's single batch.
+    let to2 = NodeId::new();
+    link_superseding_with(
+        &db,
+        scope,
+        from,
+        to2,
+        "T",
+        50,
+        vec![Op::CreateNode {
+            id: to2,
+            scope,
+            label: "L".into(),
+            props: Props::new(),
+        }],
+    )
+    .unwrap();
+
+    assert!(db.node(&scopes, to2).is_some(), "prelude CreateNode landed");
+
+    let open = open_edges(&db, &scopes, from, "T", 50);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].to, to2);
+
+    let all = all_edges(&db, from, "T");
+    assert_eq!(all.len(), 2, "history preserved");
+    let closed = all.iter().find(|e| e.to == to1).unwrap();
+    assert_eq!(
+        closed.valid_to,
+        Some(50),
+        "old edge closed at the same timestamp the new one opens — same batch"
+    );
+    let opened = all.iter().find(|e| e.to == to2).unwrap();
+    assert_eq!(opened.valid_from, 50);
 }
