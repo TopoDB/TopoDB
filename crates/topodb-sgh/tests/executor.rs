@@ -4,7 +4,7 @@ use topodb_sgh::runner::mock::MockRunner;
 use topodb_sgh::runner::NodeOutcome;
 use topodb_sgh::schema::validate::{validate, Validated};
 use topodb_sgh::schema::Graph;
-use topodb_sgh::store::run::RunStore;
+use topodb_sgh::store::run::{NodeState, RunStore};
 use topodb_sgh::store::SghError;
 
 fn diamond() -> Validated {
@@ -616,4 +616,44 @@ fn denied_outcome_blocks_with_debranded_reason() {
         "got: {reason}"
     );
     assert!(!reason.to_lowercase().contains("claude"), "got: {reason}");
+}
+
+/// With an injected wall clock, store timestamps are real epoch ms and
+/// non-decreasing even when the clock stalls (monotone clamp).
+#[test]
+fn injected_clock_stamps_states_with_wall_time() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    let graph = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n  - id: a\n    kind: agent\n    prompt: p\n    budget: {retries: 0, repairs: 0}\n",
+    )
+    .unwrap();
+    let v = validate(&graph).unwrap();
+    let runner = MockRunner::new();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "wall", &v, 1_000_000).unwrap();
+
+    // A fake clock that returns 1_000_000 forever (stalled clock).
+    static NOW: AtomicI64 = AtomicI64::new(1_000_000);
+    let clock: topodb_sgh::executor::ClockFn = Arc::new(|| NOW.load(Ordering::SeqCst));
+
+    let mut ex = Executor::new(store, v, &runner).with_clock(clock);
+    let report = ex.run(1_000_000).unwrap();
+
+    assert_eq!(report.succeeded, vec!["a".to_string()]);
+
+    // Before the run's own start time, the node had no state yet.
+    assert_eq!(ex.store_ref().state_at("a", 999_999).unwrap(), None);
+
+    // At the "latest" sentinel, the node is Succeeded — every transition
+    // landed at or after 1_000_000 despite the stalled clock: the
+    // monotone clamp held, with no panic and no store rejection from
+    // descending or repeated timestamps.
+    assert_eq!(
+        ex.store_ref().state_at("a", i64::MAX - 1).unwrap(),
+        Some(NodeState::Succeeded)
+    );
 }
