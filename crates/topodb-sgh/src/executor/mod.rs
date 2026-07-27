@@ -145,6 +145,11 @@ impl<'r> Executor<'r> {
     /// determinism, and library users get deterministic replay for free;
     /// the CLI always injects the wall clock, so production behavior
     /// matches the spec's intent. Treat this as chosen, not missed.
+    ///
+    /// The same non-decreasing-timestamp invariant documented on `run`'s
+    /// `start_ms` applies to an injected clock across a resumed run: it must
+    /// never report a value lower than what the prior run of this store
+    /// already wrote, or writes race the run's own history (see `run`).
     pub fn with_clock(mut self, clock: ClockFn) -> Self {
         self.shared.wall_clock = Some(clock);
         self
@@ -166,6 +171,20 @@ impl<'r> Executor<'r> {
         self.shared.clock.load(Ordering::SeqCst)
     }
 
+    /// `start_ms`: the clock value the run's timeline begins at. Must be
+    /// non-decreasing across a run's lifetime: when resuming a run (a store
+    /// obtained via `RunStore::open` rather than fresh from `RunStore::
+    /// create`), `start_ms` MUST be greater than or equal to every timestamp
+    /// this run has already written. Passing a too-low `start_ms` makes this
+    /// call's superseding writes race the run's own prior history and
+    /// surfaces as an opaque `SghError::Contended` once the write's internal
+    /// retry budget is exhausted — the real cause is the caller's clock, not
+    /// genuine concurrent contention. The CLI always passes wall-clock
+    /// milliseconds, which satisfies this automatically (real time never
+    /// runs backwards); a library caller using the default logical clock
+    /// (no `with_clock`) instead must carry the prior run's high-water mark
+    /// forward itself, e.g. resuming with a `start_ms` comfortably above the
+    /// original run's tick range.
     pub fn run(&mut self, start_ms: i64) -> Result<RunReport, SghError> {
         // Command nodes have a shell path only when a CommandRunner is
         // configured. Without one, dispatching a command node through
