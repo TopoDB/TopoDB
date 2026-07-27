@@ -171,6 +171,105 @@ proptest! {
         );
     }
 
+    /// Same as `run_terminates_within_the_computed_bound` above, but with
+    /// `.with_max_inflight(4)`: the parallel scheduler must honor the same
+    /// termination and bound guarantees as the sequential loop.
+    #[test]
+    fn parallel_run_terminates_within_the_computed_bound(g in dag(), mask in failure_mask()) {
+        let v = validate(&g).expect("generated graphs are valid by construction");
+        let bound = worst_case(&v);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.redb")).unwrap();
+        let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+        let mut runner = MockRunner::new();
+        let mut commands = MockCommandRunner::new();
+        for (i, node) in v.graph.nodes.iter().enumerate() {
+            if mask[i % mask.len()] {
+                match node.kind {
+                    NodeKind::Command => {
+                        commands = commands.script(
+                            &node.id,
+                            vec![NodeOutcome::Failed { error: "injected".into() }],
+                        );
+                    }
+                    _ => {
+                        runner = runner.script(
+                            &node.id,
+                            vec![NodeOutcome::Failed { error: "injected".into() }],
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut ex = Executor::new(store, v.clone(), &runner)
+            .with_repairer(&PromptOnlyRepairer)
+            .with_command_runner(&commands)
+            .with_max_inflight(4);
+        let report = ex.run(10).unwrap();
+
+        let total = report.succeeded.len() + report.blocked.len() + report.skipped.len();
+        prop_assert_eq!(total, v.graph.nodes.len(), "every node reached a terminal state");
+
+        prop_assert!(
+            report.model_calls <= bound.agent_calls,
+            "run made {} model calls, bound promised at most {}",
+            report.model_calls,
+            bound.agent_calls
+        );
+    }
+
+    /// Same as `no_node_runs_before_its_dependencies_succeed` above, but with
+    /// `.with_max_inflight(4)`: soundness must hold under concurrent
+    /// scheduling, not just the sequential loop.
+    #[test]
+    fn parallel_no_node_runs_before_its_dependencies_succeed(g in dag(), mask in failure_mask()) {
+        let v = validate(&g).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.redb")).unwrap();
+        let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+        let mut runner = MockRunner::new();
+        let mut commands = MockCommandRunner::new();
+        for (i, node) in v.graph.nodes.iter().enumerate() {
+            if mask[i % mask.len()] {
+                match node.kind {
+                    NodeKind::Command => {
+                        commands =
+                            commands.script(&node.id, vec![NodeOutcome::Failed { error: "x".into() }]);
+                    }
+                    _ => {
+                        runner =
+                            runner.script(&node.id, vec![NodeOutcome::Failed { error: "x".into() }]);
+                    }
+                }
+            }
+        }
+
+        let mut ex = Executor::new(store, v.clone(), &runner)
+            .with_command_runner(&commands)
+            .with_max_inflight(4);
+        let report = ex.run(10).unwrap();
+
+        let ran: std::collections::HashSet<&String> =
+            report.succeeded.iter().chain(report.blocked.iter()).collect();
+
+        for node in &v.graph.nodes {
+            if ran.contains(&node.id) {
+                for dep in &node.needs {
+                    prop_assert!(
+                        report.succeeded.contains(dep),
+                        "node {} ran but dependency {} did not succeed",
+                        node.id,
+                        dep
+                    );
+                }
+            }
+        }
+    }
+
     /// SOUNDNESS: a node only ever runs once all its dependencies succeeded.
     /// Contrapositive: any node that ran and has a dependency that did not
     /// succeed is a violation.
