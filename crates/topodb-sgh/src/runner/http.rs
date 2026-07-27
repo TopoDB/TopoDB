@@ -2,7 +2,7 @@
 //! structured-output fallback, transport retries, and denial mapping —
 //! a ChatProvider is only a wire-format codec.
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::mcp_bridge::{BridgeError, McpBridge};
 use crate::provider::{
@@ -109,6 +109,17 @@ pub struct HttpChatRunner {
     /// (attempt n sleeps `backoff_base * 2^n`, capped at 30s).
     /// Default 1s; tests set Duration::ZERO.
     pub backoff_base: Duration,
+    /// Whole-node wall-clock budget (default 600s). Checked before every
+    /// transport send and every bridge call; the per-request timeout used
+    /// for a send is `remaining.min(request_timeout)`, so a large
+    /// `request_timeout` never lets one send outlive the node deadline.
+    ///
+    /// Limitation: a hung bridge call still hangs regardless of this
+    /// deadline — MCP bridge calls read from a pipe with no timeout of
+    /// their own, so this field cannot bound them, only the transport
+    /// sends around them. Phase 3's events make a stuck bridge call
+    /// observable from the outside even though this field cannot kill it.
+    pub node_deadline: Duration,
 }
 
 impl HttpChatRunner {
@@ -136,6 +147,7 @@ impl HttpChatRunner {
             request_timeout: Duration::from_secs(600),
             max_transport_retries: 3,
             backoff_base: Duration::from_secs(1),
+            node_deadline: Duration::from_secs(600),
         }
     }
 
@@ -150,7 +162,11 @@ impl HttpChatRunner {
     /// Simplification (Phase 1): the transport does not surface response
     /// headers, so a numeric `retry-after` cannot be honored even though the
     /// spec allows it — we always use the computed exponential backoff.
-    fn send_with_retries(&self, turn: &ChatTurn) -> Result<ChatResponse, String> {
+    fn send_with_retries(
+        &self,
+        turn: &ChatTurn,
+        timeout: Duration,
+    ) -> Result<ChatResponse, String> {
         let payload = match self.provider.request(turn) {
             Ok(p) => p,
             Err(e) => return Err(e.to_string()),
@@ -159,7 +175,7 @@ impl HttpChatRunner {
         let (status, body) = send_with_retries(
             self.transport.as_ref(),
             &payload,
-            self.request_timeout,
+            timeout,
             self.max_transport_retries,
             self.backoff_base,
         )?;
@@ -173,6 +189,23 @@ impl HttpChatRunner {
 
 impl AgentRunner for HttpChatRunner {
     fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
+        let deadline_at = Instant::now() + self.node_deadline;
+        // Returns `Some(remaining)` while there's still budget, or emits the
+        // Failed outcome and returns None once the deadline has passed.
+        // Called before every transport send and every bridge call so no
+        // path can start new work once the whole-node budget is spent.
+        macro_rules! remaining_or_fail {
+            () => {{
+                let remaining = deadline_at.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(NodeOutcome::Failed {
+                        error: format!("deadline exceeded after {}s", self.node_deadline.as_secs()),
+                    });
+                }
+                remaining
+            }};
+        }
+
         // Clause 1: tool surface.
         let wants_topodb = req.tools.iter().any(|t| t == TOPODB_TOOL);
         let tools: Vec<ToolDef> = if wants_topodb {
@@ -182,14 +215,17 @@ impl AgentRunner for HttpChatRunner {
                         error: "node declares tools: [topodb] but the run supplied no --agent-mcp server".to_string(),
                     });
                 }
-                Some(bridge) => match bridge.lock() {
-                    Ok(guard) => guard.tools().to_vec(),
-                    Err(_) => {
-                        return Ok(NodeOutcome::Failed {
-                            error: "mcp bridge mutex was poisoned".to_string(),
-                        });
+                Some(bridge) => {
+                    remaining_or_fail!();
+                    match bridge.lock() {
+                        Ok(guard) => guard.tools().to_vec(),
+                        Err(_) => {
+                            return Ok(NodeOutcome::Failed {
+                                error: "mcp bridge mutex was poisoned".to_string(),
+                            });
+                        }
                     }
-                },
+                }
             }
         } else {
             Vec::new()
@@ -225,7 +261,9 @@ impl AgentRunner for HttpChatRunner {
                 max_tokens: self.max_tokens,
             };
 
-            let response = match self.send_with_retries(&turn) {
+            let remaining = remaining_or_fail!();
+            let timeout = remaining.min(self.request_timeout);
+            let response = match self.send_with_retries(&turn, timeout) {
                 Ok(r) => r,
                 Err(e) => return Ok(NodeOutcome::Failed { error: e }),
             };
@@ -256,6 +294,7 @@ impl AgentRunner for HttpChatRunner {
 
                 let mut result_parts = Vec::with_capacity(tool_uses.len());
                 for (id, name, input) in &tool_uses {
+                    remaining_or_fail!();
                     let bridge = self
                         .bridge
                         .as_ref()

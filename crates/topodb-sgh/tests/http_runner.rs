@@ -414,6 +414,76 @@ fn transport_4xx_no_retry() {
 }
 
 #[test]
+fn node_deadline_zero_fails_before_any_transport_call() {
+    let provider = ScriptedProvider::new(vec![]);
+    let transport = ScriptedTransport::new(vec![]);
+    let inspect = transport.clone();
+    let mut runner = runner_with(provider, transport, None);
+    runner.node_deadline = Duration::ZERO;
+    let req = base_req(None, vec![]);
+    let outcome = runner.run(&req).unwrap();
+    match outcome {
+        NodeOutcome::Failed { error } => {
+            assert_eq!(error, "deadline exceeded after 0s");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(inspect.calls(), 0);
+}
+
+/// Records the `timeout` arg every `post` call receives; always answers a
+/// scripted 200 with an empty body.
+#[derive(Clone)]
+struct SlowTransport {
+    seen_timeouts: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl SlowTransport {
+    fn new() -> Self {
+        SlowTransport {
+            seen_timeouts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl HttpTransport for SlowTransport {
+    fn post(
+        &self,
+        _payload: &HttpPayload,
+        timeout: Duration,
+    ) -> Result<(u16, Vec<u8>), std::io::Error> {
+        self.seen_timeouts.lock().unwrap().push(timeout);
+        Ok((200, Vec::new()))
+    }
+}
+
+#[test]
+fn per_request_timeout_is_capped_by_remaining_deadline() {
+    let provider = ScriptedProvider::new(vec![end_turn("ok")]);
+    let transport = SlowTransport::new();
+    let inspect = transport.seen_timeouts.clone();
+    let mut r = HttpChatRunner::with_transport(Box::new(provider), Box::new(transport), None, None);
+    r.request_timeout = Duration::from_secs(600);
+    r.node_deadline = Duration::from_secs(5);
+    r.backoff_base = Duration::ZERO;
+    let req = base_req(None, vec![]);
+    let outcome = r.run(&req).unwrap();
+    assert_eq!(
+        outcome,
+        NodeOutcome::Succeeded {
+            output: "ok".into()
+        }
+    );
+    let seen = inspect.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0] <= Duration::from_secs(5),
+        "timeout was {:?}",
+        seen[0]
+    );
+}
+
+#[test]
 fn max_tokens_stop_fails() {
     let provider = ScriptedProvider::new(vec![ChatResponse {
         parts: vec![ContentPart::Text {
