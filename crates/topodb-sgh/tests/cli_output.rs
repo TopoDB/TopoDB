@@ -56,3 +56,37 @@ fn validate_clean_graph_still_prints_the_success_line() {
     );
     assert!(stdout.contains("valid: 1 node(s)"), "stdout: {stdout}");
 }
+
+#[test]
+fn base_url_requires_openai_provider() {
+    let out = bin()
+        .args([
+            "run",
+            "graph.yaml",
+            "--provider",
+            "anthropic",
+            "--base-url",
+            "http://x",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--base-url applies only"));
+}
+
+#[test]
+fn agent_bash_requires_claude_code_provider() {
+    let out = bin()
+        .args([
+            "run",
+            "graph.yaml",
+            "--provider",
+            "openai",
+            "--agent-bash",
+            "topodb",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--agent-bash applies only"));
+}
