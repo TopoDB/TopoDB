@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.12 — 2026-07-27
 
 #### Added
 
@@ -323,7 +323,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
-### Unreleased
+### 0.0.9 — 2026-07-27
 
 #### Added
 
@@ -453,7 +453,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-obsidian`
 
-### Unreleased
+### 0.0.1 — 2026-07-27
 
 #### Added
 
@@ -463,7 +463,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
-### Unreleased
+### 0.0.14 — 2026-07-27
 
 #### Added
 
@@ -484,6 +484,16 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 - **Text near-duplicate scoring** — switched from Jaccard (`|A∩B|/|A∪B|`) to token containment (`|A∩B|/min(|A|,|B|)`), floor 0.7 (was 0.6). The field test's canonical contradiction pair (similarity ≈0.833) is now correctly caught as band `"likely"`. In text mode (`find_duplicate_memories`, `memory_health` when embedder is not Ready), text-mode `similarity` field is now a containment score (not cosine, not Jaccard).
 - **`consolidate_memories` now requires both `keep` and `drop` to be live under the full tombstone set** — a `forgotten` id is now rejected the same way an already-superseded one is (previously only `superseded_at` was checked). The rejection message changed from `"... is already superseded"` to `"... is already superseded or forgotten"` — a note for anyone string-matching on it.
+
+#### Release checklist
+
+- **Bump the Claude Code plugin's server pin** (`plugins/claude-code/server-args.js`'s
+  `SERVER_VERSION`, currently still `"0.0.13"`) to this version once it is published to npm —
+  pin + the e2e devDependency move in the same commit, per the release rule; see
+  `plugins/claude-code/README.md`'s "Server version" section for why the pin can't move early.
+- **First crates.io publishes this release:** `topodb-obsidian 0.0.1` (must land BEFORE
+  `topodb-cli`/`topodb-mcp`, which depend on it) and `topodb-sgh 0.0.1`. Full publish order:
+  topodb → topodb-json → topodb-obsidian → topodb-cli → topodb-mcp → topodb-sgh.
 
 ### 0.0.13 — 2026-07-23
 
@@ -886,7 +896,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## `topodb-sgh`
 
-### Unreleased
+### 0.0.1 — 2026-07-27
 
 #### Added
 
@@ -908,18 +918,7 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## Claude Code plugin
 
-### 0.1.1 — 2026-07-23
-
-#### Changed
-
-- **Server pin bumped to topodb-mcp 0.0.13** (`SERVER_VERSION` + the e2e devDependency, in the
-  same commit per the release rule). Brings the plugin's server current with today's release:
-  `as_of` temporal reads on traverse/get_edges, Entity down-weighting in `search_memories`
-  (`label_weights`), superseded-content re-remember semantics, reserved memory prop keys, and
-  text-fallback hygiene with `method`/`degraded` reporting. `SKILL.md` now teaches
-  `remember`'s `supersedes` and `as_of` history reads.
-
-### Unreleased
+### 0.1.2 — 2026-07-27
 
 #### Added
 
@@ -944,11 +943,22 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   risks the memory injection; a server without `memory_health` yields no nudge. Requires the
   0.0.12 pin. (#26)
 
+### 0.1.1 — 2026-07-23
+
+#### Changed
+
+- **Server pin bumped to topodb-mcp 0.0.13** (`SERVER_VERSION` + the e2e devDependency, in the
+  same commit per the release rule). Brings the plugin's server current with today's release:
+  `as_of` temporal reads on traverse/get_edges, Entity down-weighting in `search_memories`
+  (`label_weights`), superseded-content re-remember semantics, reserved memory prop keys, and
+  text-fallback hygiene with `method`/`degraded` reporting. `SKILL.md` now teaches
+  `remember`'s `supersedes` and `as_of` history reads.
+
 ---
 
 ## `topodb-cli`
 
-### Unreleased
+### 0.0.9 — 2026-07-27
 
 #### Added
 
