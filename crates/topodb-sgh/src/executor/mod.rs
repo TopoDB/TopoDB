@@ -202,6 +202,15 @@ impl<'r> Executor<'r> {
             // perturbed by scheduler changes.
             let order = self.shared.graph.topo_order.clone();
             for id in order {
+                // Resume-awareness: a node already `Succeeded` (from a prior
+                // run of this same store) is done — no Ready write, no
+                // execution. This read is unconditional, so a fresh run
+                // (every node `Pending`) costs one extra read per node and
+                // behaves identically to before.
+                if self.shared.store.state(&id)? == NodeState::Succeeded {
+                    continue;
+                }
+
                 let deps = self
                     .shared
                     .graph
@@ -368,6 +377,15 @@ fn run_parallel(shared: &Shared) -> Result<(), SghError> {
                     continue;
                 }
 
+                // Resume-awareness: a node already `Succeeded` (from a prior
+                // run of this same store) is completed from the start — no
+                // Ready write, no worker spawned. Dependents still see it as
+                // finished via the ordinary dep-state checks below.
+                if shared.store.state(id)? == NodeState::Succeeded {
+                    started.insert(id.clone());
+                    continue;
+                }
+
                 let mut any_unfinished = false;
                 let mut any_dead = false;
                 for d in deps_of[id.as_str()] {
@@ -447,11 +465,20 @@ fn run_parallel(shared: &Shared) -> Result<(), SghError> {
 fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
     let original = shared.graph.graph.node(id).expect("node exists").clone();
 
-    // Gate nodes halt the run for human approval; there is no
-    // interactive surface yet, so a gate simply blocks.
+    // Gate nodes halt the run for human approval; there is no interactive
+    // surface yet, so a gate blocks — unless a resumed run's history
+    // already carries an "approve" attempt (recorded out-of-band, e.g. by
+    // a CLI approval command), in which case the gate passes straight
+    // through: tick, `Succeeded`, no output, no blocked_reasons entry.
     if original.kind == NodeKind::Gate {
+        let prior = shared.store.attempts(id)?;
+        let approved = prior.iter().any(|(rung, _)| rung == "approve");
         let t = tick(shared);
-        shared.store.set_state(id, NodeState::Blocked, t)?;
+        if approved {
+            shared.store.set_state(id, NodeState::Succeeded, t)?;
+        } else {
+            shared.store.set_state(id, NodeState::Blocked, t)?;
+        }
         return Ok(());
     }
 
@@ -479,8 +506,18 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
     // `original` stays untouched so every repair is checked against the
     // node's true, frozen contract, not against the last revision.
     let mut node = original.clone();
-    let mut retries_left = original.budget.retries;
-    let mut repairs_left = repair_budget;
+
+    // Resume-awareness: budget consumed in a prior run of this node counts
+    // against this run's budget too, so total spend across resumes never
+    // exceeds the original bound. Counted by exact rung string — "block",
+    // "cancelled", and "approve" never consumed budget and still don't.
+    // `saturating_sub` means a store somehow carrying more recorded attempts
+    // than the budget allows just yields 0 remaining rather than panicking.
+    let prior = shared.store.attempts(id)?;
+    let prior_retries = prior.iter().filter(|(rung, _)| rung == "retry").count() as u32;
+    let prior_repairs = prior.iter().filter(|(rung, _)| rung == "repair").count() as u32;
+    let mut retries_left = original.budget.retries.saturating_sub(prior_retries);
+    let mut repairs_left = repair_budget.saturating_sub(prior_repairs);
 
     loop {
         // Check for cancellation at the top of each ladder iteration
