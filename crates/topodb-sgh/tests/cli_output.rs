@@ -90,3 +90,15 @@ fn agent_bash_requires_claude_code_provider() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--agent-bash applies only"));
 }
+
+#[test]
+fn run_help_lists_the_hardening_flags() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_sgh"))
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    for flag in ["--agent-timeout", "--max-inflight"] {
+        assert!(help.contains(flag), "missing {flag} in run --help");
+    }
+}

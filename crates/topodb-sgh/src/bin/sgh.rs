@@ -155,6 +155,10 @@ enum Cmd {
         /// How many revisions may be proposed before giving up.
         #[arg(long, default_value_t = 1)]
         max_replans: u32,
+        /// Maximum number of ready nodes executed concurrently. 1 forces
+        /// strictly sequential execution.
+        #[arg(long, default_value_t = 4)]
+        max_inflight: usize,
     },
     /// Compile a goal into a graph.yaml and print its worst-case bound.
     Plan {
@@ -605,6 +609,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_replans,
             provider,
             base_url,
+            max_inflight,
         } => {
             let code = run_cmd(
                 &cli.db,
@@ -620,6 +625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_replans,
                 provider,
                 base_url,
+                max_inflight,
             )?;
             if code != 0 {
                 std::process::exit(code);
@@ -673,8 +679,12 @@ fn run_cmd(
     max_replans: u32,
     provider: Provider,
     base_url: Option<String>,
+    max_inflight: usize,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let agent_timeout = Duration::from_secs(agent_timeout);
+    let cancel = topodb_sgh::runner::cancel::CancelToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())?;
     // `--yes-including-revisions` implies `--yes` for anything else
     // in this command that reads `yes` (there is nothing else today,
     // but keeping the invariant explicit here means a future reader
@@ -750,7 +760,8 @@ fn run_cmd(
         };
         Some(BuiltRunner::Claude(
             ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
-                .with_deadline(agent_timeout),
+                .with_deadline(agent_timeout)
+                .with_cancel(cancel.clone()),
         ))
     } else {
         None
@@ -887,6 +898,7 @@ fn run_cmd(
                     bridge,
                 );
                 http_runner.node_deadline = agent_timeout;
+                http_runner.cancel = Some(cancel.clone());
                 runner = Some(BuiltRunner::Http(Box::new(http_runner)));
             }
         }
@@ -898,8 +910,10 @@ fn run_cmd(
         let run_id = ulid::Ulid::new().to_string();
         let now = 1;
         let store = RunStore::create(&db, &run_id, &current, now)?;
-        let mut ex =
-            Executor::new(store, current.clone(), runner_ref).with_command_runner(&command_runner);
+        let mut ex = Executor::new(store, current.clone(), runner_ref)
+            .with_command_runner(&command_runner)
+            .with_cancel(cancel.clone())
+            .with_max_inflight(max_inflight);
         let report = ex.run(now + 1)?;
 
         println!("\nrun {run_id}");
