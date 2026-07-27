@@ -2,6 +2,8 @@
 pub mod claude;
 pub mod command;
 pub mod common;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod mock;
 pub mod rails;
 
