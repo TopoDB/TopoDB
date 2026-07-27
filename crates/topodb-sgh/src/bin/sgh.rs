@@ -353,7 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match validate(&g) {
                 Ok(v) => {
                     if let Some(cmd) = &agent_mcp {
-                        if let Err(e) = topodb_sgh::runner::claude::validate_mcp_server_command(cmd)
+                        if let Err(e) = topodb_sgh::runner::rails::validate_mcp_server_command(cmd)
                         {
                             eprintln!("error: {e}");
                             std::process::exit(2);
@@ -408,7 +408,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Validate bash grants before anything runs.
             for grant in &agent_bash {
-                if let Err(e) = topodb_sgh::runner::claude::validate_bash_grant(grant) {
+                if let Err(e) = topodb_sgh::runner::rails::validate_bash_grant(grant) {
                     eprintln!("error: {e}");
                     std::process::exit(2);
                 }
@@ -427,7 +427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let mcp_argv = match agent_mcp.as_deref() {
-                Some(cmd) => match topodb_sgh::runner::claude::validate_mcp_server_command(cmd) {
+                Some(cmd) => match topodb_sgh::runner::rails::validate_mcp_server_command(cmd) {
                     Ok(argv) => Some(argv),
                     Err(e) => {
                         eprintln!("error: {e}");

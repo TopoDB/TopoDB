@@ -1,6 +1,8 @@
 pub mod claude;
 pub mod command;
+pub mod common;
 pub mod mock;
+pub mod rails;
 
 use std::collections::BTreeMap;
 
