@@ -61,6 +61,24 @@ command-node checks at a different db. This doesn't bite under
 `claude-code`, since claude spawns the MCP server per node invocation rather
 than once for the whole run.
 
+### Hardening flags
+
+`run` (and, for `--agent-timeout`, `plan` too) take a few flags that bound
+how long and how wide a run is allowed to get:
+
+- `--agent-timeout <secs>` (default `600`) — the whole-node deadline for a
+  single agent call, for every provider: the claude-code subprocess and both
+  HTTP runners' tool loop alike. A node that blows through it is treated as
+  failed, not left running.
+- `--max-inflight <n>` (default `4`, only on `run`) — how many ready nodes the
+  executor will run concurrently. `1` forces strictly sequential execution,
+  which is useful when you want deterministic ordering or your provider rate-
+  limits concurrent calls.
+- **Ctrl-C** — a `sgh run` in progress cancels gracefully on the first
+  interrupt: inflight children are killed as a process group, the run is
+  marked blocked, and the process exits `1`. It does not delete anything —
+  the run's state is left in the db for a future replan or resume.
+
 ## Commands
 
 - `/sgh:plan <goal>` — compile a goal into `.sgh/graph.yaml` and print its
