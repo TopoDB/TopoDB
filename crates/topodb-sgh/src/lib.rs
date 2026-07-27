@@ -6,6 +6,7 @@
 //! transition in TopoDB (`store`).
 pub mod executor;
 pub mod planner;
+pub mod provider;
 pub mod recovery;
 pub mod replan;
 pub mod runner;
