@@ -262,6 +262,10 @@ impl<'r> Executor<'r> {
                     Err(reason) => reason,
                 },
                 NodeOutcome::Failed { error } => error,
+                NodeOutcome::Denied { tool } => format!(
+                    "provider denied tool {tool} — the node cannot have done its work \
+                     under this provider's granted surface"
+                ),
             };
 
             let t = self.tick();
