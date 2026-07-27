@@ -5,6 +5,7 @@
 //! provider backends (`runner`, `provider`), and persist every state
 //! transition in TopoDB (`store`).
 pub mod executor;
+pub mod mcp_bridge;
 pub mod planner;
 pub mod provider;
 pub mod recovery;
