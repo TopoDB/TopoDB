@@ -89,3 +89,13 @@ fn from_env_missing_key_is_config_error() {
     let err = AnthropicProvider::from_env(None).unwrap_err();
     assert!(err.to_string().contains("ANTHROPIC_API_KEY"));
 }
+
+#[test]
+fn parse_error_without_message_elides_body_utf8_safely() {
+    let body = r#"{"foo":"bär"}"#.as_bytes(); // JSON, no error.message
+    let err = provider().parse(500, body).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("500"), "got: {msg}");
+    assert!(msg.contains("bär"), "got: {msg}");
+    assert!(!msg.contains('\u{FFFD}'), "no mojibake: {msg}");
+}
