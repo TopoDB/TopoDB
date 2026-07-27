@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::recovery::{contract_preserved, NoopRepairer, Repairer, Rung};
 use crate::runner::cancel::CancelToken;
@@ -36,35 +38,46 @@ pub struct RunReport {
 /// recovery ladder (retry, then repair, then block) in `execute_node`;
 /// REPLAN (regenerating graph structure) is out of scope — the ladder
 /// stops at `Blocked`.
-pub struct Executor<'r> {
+/// Everything `execute_node` needs, shareable across worker threads. Holds
+/// the executor's state behind interior mutability (atomics for counters
+/// and the clock, a mutex for the reasons map) so a future concurrent
+/// executor can share one `Shared` across threads without each node needing
+/// `&mut`.
+struct Shared<'r> {
     store: RunStore,
     graph: Validated,
     runner: &'r dyn AgentRunner,
     repairer: &'r dyn Repairer,
     command_runner: Option<&'r dyn CommandRunner>,
-    clock: i64,
-    model_calls: u64,
-    command_runs: u64,
+    clock: AtomicI64,
+    model_calls: AtomicU64,
+    command_runs: AtomicU64,
     /// Why each failed node blocked, captured at the block point where the
     /// error is still in hand. Read into `RunReport` by `report()`. Gate
     /// blocks add no entry — they are checkpoints, not failures.
-    blocked_reasons: BTreeMap<String, String>,
-    cancel_token: Option<CancelToken>,
+    blocked_reasons: Mutex<BTreeMap<String, String>>,
+    cancel: Option<CancelToken>,
+}
+
+pub struct Executor<'r> {
+    shared: Shared<'r>,
 }
 
 impl<'r> Executor<'r> {
     pub fn new(store: RunStore, graph: Validated, runner: &'r dyn AgentRunner) -> Self {
         Executor {
-            store,
-            graph,
-            runner,
-            repairer: &NoopRepairer,
-            command_runner: None,
-            clock: 0,
-            model_calls: 0,
-            command_runs: 0,
-            blocked_reasons: BTreeMap::new(),
-            cancel_token: None,
+            shared: Shared {
+                store,
+                graph,
+                runner,
+                repairer: &NoopRepairer,
+                command_runner: None,
+                clock: AtomicI64::new(0),
+                model_calls: AtomicU64::new(0),
+                command_runs: AtomicU64::new(0),
+                blocked_reasons: Mutex::new(BTreeMap::new()),
+                cancel: None,
+            },
         }
     }
 
@@ -73,7 +86,7 @@ impl<'r> Executor<'r> {
     /// contract-preserving revision is never available and the ladder
     /// falls straight from RETRY to BLOCK.
     pub fn with_repairer(mut self, repairer: &'r dyn Repairer) -> Self {
-        self.repairer = repairer;
+        self.shared.repairer = repairer;
         self
     }
 
@@ -81,19 +94,19 @@ impl<'r> Executor<'r> {
     /// graph containing a command node — the library must not be able to
     /// execute shell steps by accident.
     pub fn with_command_runner(mut self, command_runner: &'r dyn CommandRunner) -> Self {
-        self.command_runner = Some(command_runner);
+        self.shared.command_runner = Some(command_runner);
         self
     }
 
     /// Wire in a cancellation token. Allows cooperative cancellation of the run.
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
-        self.cancel_token = Some(token);
+        self.shared.cancel = Some(token);
         self
     }
 
     /// Read-only access to the run store, for inspection and tests.
     pub fn store_ref(&self) -> &RunStore {
-        &self.store
+        &self.shared.store
     }
 
     /// The executor's current logical clock value, i.e. the timestamp of the
@@ -104,14 +117,7 @@ impl<'r> Executor<'r> {
     /// increasing and any `as_of` reconstruction faithful to what actually
     /// happened when.
     pub fn clock(&self) -> i64 {
-        self.clock
-    }
-
-    /// Every write advances a logical clock rather than reading wall time, so
-    /// a run's timeline is reproducible.
-    fn tick(&mut self) -> i64 {
-        self.clock += 1;
-        self.clock
+        self.shared.clock.load(Ordering::SeqCst)
     }
 
     pub fn run(&mut self, start_ms: i64) -> Result<RunReport, SghError> {
@@ -123,8 +129,9 @@ impl<'r> Executor<'r> {
         // caller to remember `.with_command_runner(..)` — otherwise any
         // other library caller could drive the executor straight past its
         // own published bound without deliberately supplying a runner.
-        if self.command_runner.is_none() {
+        if self.shared.command_runner.is_none() {
             let offenders: Vec<String> = self
+                .shared
                 .graph
                 .graph
                 .nodes
@@ -137,14 +144,15 @@ impl<'r> Executor<'r> {
             }
         }
 
-        self.clock = start_ms;
+        self.shared.clock.store(start_ms, Ordering::SeqCst);
 
         // Topological order makes a single forward pass sufficient: every
         // dependency is resolved (or has failed and been skipped) before its
         // dependents are considered.
-        let order = self.graph.topo_order.clone();
+        let order = self.shared.graph.topo_order.clone();
         for id in order {
             let deps = self
+                .shared
                 .graph
                 .graph
                 .node(&id)
@@ -154,239 +162,45 @@ impl<'r> Executor<'r> {
 
             let mut any_dep_unfinished = false;
             for d in &deps {
-                if self.store.state(d)? != NodeState::Succeeded {
+                if self.shared.store.state(d)? != NodeState::Succeeded {
                     any_dep_unfinished = true;
                     break;
                 }
             }
 
             if any_dep_unfinished {
-                let t = self.tick();
-                self.store.set_state(&id, NodeState::Skipped, t)?;
+                let t = tick(&self.shared);
+                self.shared.store.set_state(&id, NodeState::Skipped, t)?;
                 continue;
             }
 
             // Check for cancellation before starting the node
-            if let Some(token) = &self.cancel_token {
+            if let Some(token) = &self.shared.cancel {
                 if token.is_cancelled() {
-                    let t = self.tick();
-                    self.store.set_state(&id, NodeState::Skipped, t)?;
+                    let t = tick(&self.shared);
+                    self.shared.store.set_state(&id, NodeState::Skipped, t)?;
                     continue;
                 }
             }
 
-            let t = self.tick();
-            self.store.set_state(&id, NodeState::Ready, t)?;
+            let t = tick(&self.shared);
+            self.shared.store.set_state(&id, NodeState::Ready, t)?;
 
-            self.execute_node(&id)?;
+            execute_node(&self.shared, &id)?;
         }
 
         self.report()
     }
 
-    fn execute_node(&mut self, id: &str) -> Result<(), SghError> {
-        let original = self.graph.graph.node(id).expect("node exists").clone();
-
-        // Gate nodes halt the run for human approval; there is no
-        // interactive surface yet, so a gate simply blocks.
-        if original.kind == NodeKind::Gate {
-            let t = self.tick();
-            self.store.set_state(id, NodeState::Blocked, t)?;
-            return Ok(());
-        }
-
-        // Bounded context: inputs are exactly the outputs of this node's
-        // declared dependencies. Nothing else in the run is reachable from
-        // here, and this map is the only channel through which a node sees
-        // prior work.
-        let mut inputs = BTreeMap::new();
-        for dep in &original.needs {
-            if let Some(out) = self.store.output(dep)? {
-                inputs.insert(dep.clone(), out);
-            }
-        }
-
-        // Commands are retry-only: there is no model to consult for a shell
-        // invocation, so their repair budget is ignored. Task 3's cost model
-        // (`bound.rs`) has no repair term for commands for the same reason.
-        let repair_budget = match original.kind {
-            NodeKind::Agent => original.budget.repairs,
-            _ => 0,
-        };
-
-        // `node` is the revisable working copy the ladder operates on; only
-        // its prompt ever changes (via a contract-preserving repair).
-        // `original` stays untouched so every repair is checked against the
-        // node's true, frozen contract, not against the last revision.
-        let mut node = original.clone();
-        let mut retries_left = original.budget.retries;
-        let mut repairs_left = repair_budget;
-
-        loop {
-            // Check for cancellation at the top of each ladder iteration
-            if let Some(token) = &self.cancel_token {
-                if token.is_cancelled() {
-                    let t = self.tick();
-                    self.store.record_attempt(id, "cancelled", "cancelled", t)?;
-                    self.blocked_reasons
-                        .insert(id.to_string(), "cancelled".to_string());
-                    let t = self.tick();
-                    self.store.set_state(id, NodeState::Blocked, t)?;
-                    return Ok(());
-                }
-            }
-
-            let t = self.tick();
-            self.store.set_state(id, NodeState::Running, t)?;
-
-            let outcome = if node.kind == NodeKind::Command {
-                let creq = CommandRequest {
-                    node_id: id.to_string(),
-                    run: node.run.clone().expect("validated: command nodes have run"),
-                    inputs: inputs.clone(),
-                    // Mirrors the agent branch. The runner uses this only to
-                    // decide whether to pass stdout through verbatim (schema
-                    // declared) or wrap it as {"stdout":..,"exit_code":..}.
-                    // Validation itself still happens in `validate_output`.
-                    output_schema: node.output.as_ref().map(|o| o.schema.clone()),
-                };
-                self.command_runs += 1;
-                let runner = self
-                    .command_runner
-                    .expect("checked in run(): command nodes imply a command runner");
-                match runner.run(&creq) {
-                    Ok(o) => o,
-                    Err(e) => NodeOutcome::Failed {
-                        error: e.to_string(),
-                    },
-                }
-            } else {
-                let req = NodeRequest {
-                    node_id: id.to_string(),
-                    prompt: node.prompt.clone().or(node.run.clone()).unwrap_or_default(),
-                    inputs: inputs.clone(),
-                    output_schema: node.output.as_ref().map(|o| o.schema.clone()),
-                    tools: node.tools.clone(),
-                };
-
-                if node.kind == NodeKind::Agent {
-                    self.model_calls += 1;
-                }
-
-                match self.runner.run(&req) {
-                    Ok(o) => o,
-                    Err(e) => NodeOutcome::Failed {
-                        error: e.to_string(),
-                    },
-                }
-            };
-
-            let error = match outcome {
-                NodeOutcome::Succeeded { output } => match validate_output(&node, &output) {
-                    Ok(()) => {
-                        let t = self.tick();
-                        self.store.record_output(id, &output, t)?;
-                        let t = self.tick();
-                        self.store.set_state(id, NodeState::Succeeded, t)?;
-                        return Ok(());
-                    }
-                    Err(reason) => reason,
-                },
-                NodeOutcome::Failed { error } => error,
-                NodeOutcome::Denied { tool } => format!(
-                    "provider denied tool {tool} — the node cannot have done its work \
-                     under this provider's granted surface"
-                ),
-            };
-
-            let t = self.tick();
-            self.store.set_state(id, NodeState::Failed, t)?;
-
-            // Strict ascent: retries, then repairs, then block. No
-            // classifier decides which rung a failure "deserves" — that
-            // would be a heuristic governing autonomous work, exactly the
-            // implicit control flow this project exists to remove.
-            let rung = if retries_left > 0 {
-                retries_left -= 1;
-                Rung::Retry
-            } else if repairs_left > 0 {
-                repairs_left -= 1;
-                Rung::Repair
-            } else {
-                Rung::Block
-            };
-
-            let t = self.tick();
-            self.store.record_attempt(id, rung.as_str(), &error, t)?;
-
-            match rung {
-                Rung::Retry => {
-                    // A bare retry re-runs the identical prompt, so a model
-                    // that replied with prose (failing a schema node's output
-                    // check) tends to reply with the same prose again — an
-                    // idempotent re-run against a finished workspace could
-                    // block forever this way. Feed the failure back and, for a
-                    // schema node, demand JSON. This spends no extra model call
-                    // (the retry is already budgeted and bounded); it only
-                    // changes what the next attempt is told. The downstream
-                    // command node still verifies the claim, so coaxing a
-                    // parseable reply cannot mask unfinished work.
-                    if node.kind == NodeKind::Agent {
-                        let base = original.prompt.as_deref().unwrap_or_default();
-                        node.prompt = Some(retry_prompt(base, &error, original.output.is_some()));
-                    }
-                    let t = self.tick();
-                    self.store.set_state(id, NodeState::Recovering, t)?;
-                }
-                Rung::Repair => {
-                    // The bound (`bound.rs`) budgets `2*repairs` model calls
-                    // per agent node: one call to consult the recovery
-                    // model, then one re-execution of the node. Only the
-                    // re-execution was counted before this fix (at the top
-                    // of the loop); count the consultation itself here so
-                    // `RunReport.model_calls` and `Bound.agent_calls` meter
-                    // the same thing. Repair budget is always 0 for
-                    // non-agent nodes, so this rung is unreachable for them
-                    // and the guard is just documentation-by-code.
-                    if node.kind == NodeKind::Agent {
-                        self.model_calls += 1;
-                    }
-                    match self.repairer.repair(&node, &error) {
-                        // A repair that breaks the contract is not a repair
-                        // — refuse it and block rather than let the graph
-                        // silently mutate.
-                        Some(revised) if contract_preserved(&original, &revised) => {
-                            node = revised;
-                            let t = self.tick();
-                            self.store.set_state(id, NodeState::Recovering, t)?;
-                        }
-                        _ => {
-                            let t = self.tick();
-                            self.blocked_reasons.insert(id.to_string(), error.clone());
-                            self.store.set_state(id, NodeState::Blocked, t)?;
-                            return Ok(());
-                        }
-                    }
-                }
-                Rung::Block => {
-                    let t = self.tick();
-                    self.blocked_reasons.insert(id.to_string(), error.clone());
-                    self.store.set_state(id, NodeState::Blocked, t)?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
     fn report(&self) -> Result<RunReport, SghError> {
         let mut r = RunReport {
-            model_calls: self.model_calls,
-            command_runs: self.command_runs,
-            blocked_reasons: self.blocked_reasons.clone(),
+            model_calls: self.shared.model_calls.load(Ordering::SeqCst),
+            command_runs: self.shared.command_runs.load(Ordering::SeqCst),
+            blocked_reasons: self.shared.blocked_reasons.lock().unwrap().clone(),
             ..Default::default()
         };
-        for id in &self.graph.topo_order {
-            match self.store.state(id)? {
+        for id in &self.shared.graph.topo_order {
+            match self.shared.store.state(id)? {
                 NodeState::Succeeded => r.succeeded.push(id.clone()),
                 NodeState::Blocked => r.blocked.push(id.clone()),
                 NodeState::Skipped => r.skipped.push(id.clone()),
@@ -394,6 +208,221 @@ impl<'r> Executor<'r> {
             }
         }
         Ok(r)
+    }
+}
+
+/// Every write advances a logical clock rather than reading wall time, so a
+/// run's timeline is reproducible. `fetch_add` preserves both uniqueness and
+/// monotonicity; in today's single-threaded caller this produces the exact
+/// same sequence as the previous `self.clock += 1; self.clock`.
+fn tick(shared: &Shared) -> i64 {
+    shared.clock.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
+    let original = shared.graph.graph.node(id).expect("node exists").clone();
+
+    // Gate nodes halt the run for human approval; there is no
+    // interactive surface yet, so a gate simply blocks.
+    if original.kind == NodeKind::Gate {
+        let t = tick(shared);
+        shared.store.set_state(id, NodeState::Blocked, t)?;
+        return Ok(());
+    }
+
+    // Bounded context: inputs are exactly the outputs of this node's
+    // declared dependencies. Nothing else in the run is reachable from
+    // here, and this map is the only channel through which a node sees
+    // prior work.
+    let mut inputs = BTreeMap::new();
+    for dep in &original.needs {
+        if let Some(out) = shared.store.output(dep)? {
+            inputs.insert(dep.clone(), out);
+        }
+    }
+
+    // Commands are retry-only: there is no model to consult for a shell
+    // invocation, so their repair budget is ignored. Task 3's cost model
+    // (`bound.rs`) has no repair term for commands for the same reason.
+    let repair_budget = match original.kind {
+        NodeKind::Agent => original.budget.repairs,
+        _ => 0,
+    };
+
+    // `node` is the revisable working copy the ladder operates on; only
+    // its prompt ever changes (via a contract-preserving repair).
+    // `original` stays untouched so every repair is checked against the
+    // node's true, frozen contract, not against the last revision.
+    let mut node = original.clone();
+    let mut retries_left = original.budget.retries;
+    let mut repairs_left = repair_budget;
+
+    loop {
+        // Check for cancellation at the top of each ladder iteration
+        if let Some(token) = &shared.cancel {
+            if token.is_cancelled() {
+                let t = tick(shared);
+                shared
+                    .store
+                    .record_attempt(id, "cancelled", "cancelled", t)?;
+                shared
+                    .blocked_reasons
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), "cancelled".to_string());
+                let t = tick(shared);
+                shared.store.set_state(id, NodeState::Blocked, t)?;
+                return Ok(());
+            }
+        }
+
+        let t = tick(shared);
+        shared.store.set_state(id, NodeState::Running, t)?;
+
+        let outcome = if node.kind == NodeKind::Command {
+            let creq = CommandRequest {
+                node_id: id.to_string(),
+                run: node.run.clone().expect("validated: command nodes have run"),
+                inputs: inputs.clone(),
+                // Mirrors the agent branch. The runner uses this only to
+                // decide whether to pass stdout through verbatim (schema
+                // declared) or wrap it as {"stdout":..,"exit_code":..}.
+                // Validation itself still happens in `validate_output`.
+                output_schema: node.output.as_ref().map(|o| o.schema.clone()),
+            };
+            shared.command_runs.fetch_add(1, Ordering::SeqCst);
+            let runner = shared
+                .command_runner
+                .expect("checked in run(): command nodes imply a command runner");
+            match runner.run(&creq) {
+                Ok(o) => o,
+                Err(e) => NodeOutcome::Failed {
+                    error: e.to_string(),
+                },
+            }
+        } else {
+            let req = NodeRequest {
+                node_id: id.to_string(),
+                prompt: node.prompt.clone().or(node.run.clone()).unwrap_or_default(),
+                inputs: inputs.clone(),
+                output_schema: node.output.as_ref().map(|o| o.schema.clone()),
+                tools: node.tools.clone(),
+            };
+
+            if node.kind == NodeKind::Agent {
+                shared.model_calls.fetch_add(1, Ordering::SeqCst);
+            }
+
+            match shared.runner.run(&req) {
+                Ok(o) => o,
+                Err(e) => NodeOutcome::Failed {
+                    error: e.to_string(),
+                },
+            }
+        };
+
+        let error = match outcome {
+            NodeOutcome::Succeeded { output } => match validate_output(&node, &output) {
+                Ok(()) => {
+                    let t = tick(shared);
+                    shared.store.record_output(id, &output, t)?;
+                    let t = tick(shared);
+                    shared.store.set_state(id, NodeState::Succeeded, t)?;
+                    return Ok(());
+                }
+                Err(reason) => reason,
+            },
+            NodeOutcome::Failed { error } => error,
+            NodeOutcome::Denied { tool } => format!(
+                "provider denied tool {tool} — the node cannot have done its work \
+                 under this provider's granted surface"
+            ),
+        };
+
+        let t = tick(shared);
+        shared.store.set_state(id, NodeState::Failed, t)?;
+
+        // Strict ascent: retries, then repairs, then block. No
+        // classifier decides which rung a failure "deserves" — that
+        // would be a heuristic governing autonomous work, exactly the
+        // implicit control flow this project exists to remove.
+        let rung = if retries_left > 0 {
+            retries_left -= 1;
+            Rung::Retry
+        } else if repairs_left > 0 {
+            repairs_left -= 1;
+            Rung::Repair
+        } else {
+            Rung::Block
+        };
+
+        let t = tick(shared);
+        shared.store.record_attempt(id, rung.as_str(), &error, t)?;
+
+        match rung {
+            Rung::Retry => {
+                // A bare retry re-runs the identical prompt, so a model
+                // that replied with prose (failing a schema node's output
+                // check) tends to reply with the same prose again — an
+                // idempotent re-run against a finished workspace could
+                // block forever this way. Feed the failure back and, for a
+                // schema node, demand JSON. This spends no extra model call
+                // (the retry is already budgeted and bounded); it only
+                // changes what the next attempt is told. The downstream
+                // command node still verifies the claim, so coaxing a
+                // parseable reply cannot mask unfinished work.
+                if node.kind == NodeKind::Agent {
+                    let base = original.prompt.as_deref().unwrap_or_default();
+                    node.prompt = Some(retry_prompt(base, &error, original.output.is_some()));
+                }
+                let t = tick(shared);
+                shared.store.set_state(id, NodeState::Recovering, t)?;
+            }
+            Rung::Repair => {
+                // The bound (`bound.rs`) budgets `2*repairs` model calls
+                // per agent node: one call to consult the recovery
+                // model, then one re-execution of the node. Only the
+                // re-execution was counted before this fix (at the top
+                // of the loop); count the consultation itself here so
+                // `RunReport.model_calls` and `Bound.agent_calls` meter
+                // the same thing. Repair budget is always 0 for
+                // non-agent nodes, so this rung is unreachable for them
+                // and the guard is just documentation-by-code.
+                if node.kind == NodeKind::Agent {
+                    shared.model_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                match shared.repairer.repair(&node, &error) {
+                    // A repair that breaks the contract is not a repair
+                    // — refuse it and block rather than let the graph
+                    // silently mutate.
+                    Some(revised) if contract_preserved(&original, &revised) => {
+                        node = revised;
+                        let t = tick(shared);
+                        shared.store.set_state(id, NodeState::Recovering, t)?;
+                    }
+                    _ => {
+                        let t = tick(shared);
+                        shared
+                            .blocked_reasons
+                            .lock()
+                            .unwrap()
+                            .insert(id.to_string(), error.clone());
+                        shared.store.set_state(id, NodeState::Blocked, t)?;
+                        return Ok(());
+                    }
+                }
+            }
+            Rung::Block => {
+                let t = tick(shared);
+                shared
+                    .blocked_reasons
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_string(), error.clone());
+                shared.store.set_state(id, NodeState::Blocked, t)?;
+                return Ok(());
+            }
+        }
     }
 }
 
