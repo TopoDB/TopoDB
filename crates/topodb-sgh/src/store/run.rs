@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use topodb::{
     Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
@@ -8,7 +8,7 @@ use super::supersede::{link_superseding, link_superseding_with};
 use super::{
     SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED,
     EDGE_REVISION_OF, LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_REVISION, LABEL_RUN,
-    LABEL_STATE,
+    LABEL_RUN_INDEX, LABEL_STATE, RUN_STATUS_RUNNING,
 };
 use crate::schema::validate::Validated;
 
@@ -77,7 +77,9 @@ pub struct RunStore {
     db: Db,
     scope: Scope,
     scopes: ScopeSet,
+    run_id: String,
     run_node: NodeId,
+    index_node: NodeId,
     /// graph node id -> engine node id
     nodes: HashMap<String, NodeId>,
     /// state name -> engine node id
@@ -91,15 +93,37 @@ impl RunStore {
         let scopes = ScopeSet::of(&[sid]);
 
         let run_node = NodeId::new();
+        let graph_yaml = serde_yaml::to_string(&v.graph)?;
         let mut props = Props::new();
         props.insert("run_id".into(), PropValue::Str(run_id.to_string()));
         props.insert("goal".into(), PropValue::Str(v.graph.goal.clone()));
+        props.insert("graph_yaml".into(), PropValue::Str(graph_yaml));
         let mut ops = vec![Op::CreateNode {
             id: run_node,
             scope,
             label: LABEL_RUN.into(),
             props,
         }];
+
+        // The shared-scope index: a standalone record (no edges to the run's
+        // own scope — see `LABEL_RUN_INDEX`'s doc comment) joined to this run
+        // purely by the `run_id`/`scope_id` props a reader can look up.
+        let index_node = NodeId::new();
+        let mut index_props = Props::new();
+        index_props.insert("run_id".into(), PropValue::Str(run_id.to_string()));
+        index_props.insert("scope_id".into(), PropValue::Str(sid.to_string()));
+        index_props.insert("goal".into(), PropValue::Str(v.graph.goal.clone()));
+        index_props.insert("created_at".into(), PropValue::DateTime(now_ms));
+        index_props.insert(
+            "status".into(),
+            PropValue::Str(RUN_STATUS_RUNNING.to_string()),
+        );
+        ops.push(Op::CreateNode {
+            id: index_node,
+            scope: Scope::Shared,
+            label: LABEL_RUN_INDEX.into(),
+            props: index_props,
+        });
 
         // One state node per variant, per run.
         let mut states = HashMap::new();
@@ -143,7 +167,9 @@ impl RunStore {
             db: db.clone(),
             scope,
             scopes,
+            run_id: run_id.to_string(),
             run_node,
+            index_node,
             nodes,
             states,
         };
@@ -189,6 +215,45 @@ impl RunStore {
 
     pub fn run_node(&self) -> NodeId {
         self.run_node
+    }
+
+    /// Update the shared-scope index's status prop. LWW (`Op::SetNodeProps`),
+    /// not supersession — the index carries current status only, and every
+    /// run's own state history already lives on the run's HAS_STATE edges.
+    pub fn set_status(&self, status: &str, now_ms: i64) -> Result<(), SghError> {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "status".to_string(),
+            Some(PropValue::Str(status.to_string())),
+        );
+        self.db.submit_at(
+            vec![Op::SetNodeProps {
+                id: self.index_node,
+                props,
+            }],
+            now_ms,
+        )?;
+        Ok(())
+    }
+
+    /// The stored graph yaml, written once at `create` time. Missing (or
+    /// non-string) means the run node is corrupt — `create` always writes
+    /// this prop, so its absence is not a normal "not found" case.
+    pub fn graph_yaml(&self) -> Result<String, SghError> {
+        let rec =
+            self.db
+                .node(&self.scopes, self.run_node)
+                .ok_or_else(|| SghError::CorruptRun {
+                    run_id: self.run_id.clone(),
+                    reason: "run node missing".to_string(),
+                })?;
+        match rec.props.get("graph_yaml") {
+            Some(PropValue::Str(s)) => Ok(s.clone()),
+            _ => Err(SghError::CorruptRun {
+                run_id: self.run_id.clone(),
+                reason: "graph_yaml prop missing or not a string".to_string(),
+            }),
+        }
     }
 
     pub fn set_state(&self, node_id: &str, state: NodeState, now_ms: i64) -> Result<(), SghError> {

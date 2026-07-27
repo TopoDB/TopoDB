@@ -1,8 +1,8 @@
-use topodb::{Db, PropValue, Scope, ScopeSet};
+use topodb::{Db, PropValue, Scope, ScopeId, ScopeSet};
 use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::Graph;
 use topodb_sgh::store::run::{NodeState, RunStore};
-use topodb_sgh::store::{EDGE_PRODUCED, EDGE_REVISION_OF};
+use topodb_sgh::store::{EDGE_PRODUCED, EDGE_REVISION_OF, LABEL_NODE, LABEL_RUN, LABEL_RUN_INDEX};
 
 fn store(db: &Db) -> RunStore {
     let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
@@ -260,4 +260,104 @@ fn revisions_round_trip_and_supersede() {
         "superseded revision's payload is still readable, not wiped"
     );
     assert_eq!(superseded_reason, "survey blocked");
+}
+
+#[test]
+fn create_writes_a_shared_scope_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    let shared = ScopeSet::default().with_shared();
+    let recs = db.nodes_by_label(&shared, LABEL_RUN_INDEX);
+    assert_eq!(recs.len(), 1, "exactly one shared-scope index node");
+    let rec = &recs[0];
+
+    match rec.props.get("run_id") {
+        Some(PropValue::Str(s)) => assert_eq!(s, "run-1"),
+        other => panic!("expected run_id str prop, got {other:?}"),
+    }
+    match rec.props.get("status") {
+        Some(PropValue::Str(s)) => assert_eq!(s, "running"),
+        other => panic!("expected status str prop, got {other:?}"),
+    }
+    match rec.props.get("goal") {
+        Some(PropValue::Str(g)) => assert_eq!(g, "port the search analyzer"),
+        other => panic!("expected goal str prop, got {other:?}"),
+    }
+    match rec.props.get("created_at") {
+        Some(PropValue::DateTime(t)) => assert_eq!(*t, 100),
+        other => panic!("expected created_at datetime prop, got {other:?}"),
+    }
+
+    let scope_id = match s.scope() {
+        Scope::Id(id) => id,
+        Scope::Shared => panic!("run scope must be Scope::Id"),
+    };
+    match rec.props.get("scope_id") {
+        Some(PropValue::Str(sid)) => {
+            let parsed: ScopeId = sid.parse().expect("scope_id parses back to a ScopeId");
+            assert_eq!(
+                parsed, scope_id,
+                "scope_id round-trips to the store's scope"
+            );
+        }
+        other => panic!("expected scope_id str prop, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_status_rewrites_the_index_prop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    s.set_status("complete", 200).unwrap();
+
+    let shared = ScopeSet::default().with_shared();
+    let recs = db.nodes_by_label(&shared, LABEL_RUN_INDEX);
+    assert_eq!(recs.len(), 1);
+    let rec = &recs[0];
+
+    match rec.props.get("status") {
+        Some(PropValue::Str(status)) => assert_eq!(status, "complete"),
+        other => panic!("expected status str prop, got {other:?}"),
+    }
+    match rec.props.get("created_at") {
+        Some(PropValue::DateTime(t)) => assert_eq!(*t, 100, "created_at must not change"),
+        other => panic!("expected created_at datetime prop, got {other:?}"),
+    }
+}
+
+#[test]
+fn graph_yaml_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    let yaml = s.graph_yaml().unwrap();
+    let g = Graph::from_yaml(&yaml).unwrap();
+    let v = validate(&g).unwrap();
+
+    let orig = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let orig_v = validate(&orig).unwrap();
+
+    assert_eq!(v.topo_order, orig_v.topo_order);
+}
+
+#[test]
+fn index_is_the_only_shared_scope_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let _s = store(&db);
+
+    let shared = ScopeSet::default().with_shared();
+    assert!(
+        db.nodes_by_label(&shared, LABEL_RUN).is_empty(),
+        "SghRun nodes must stay in the run scope"
+    );
+    assert!(
+        db.nodes_by_label(&shared, LABEL_NODE).is_empty(),
+        "SghNode nodes must stay in the run scope"
+    );
 }
