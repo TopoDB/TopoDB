@@ -1,4 +1,3 @@
-use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -400,13 +399,38 @@ fn events_dir(db_path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Rejects a run id that could escape `events_dir` via path components —
+/// `/`, `\`, or `..` — before it is ever joined into a path. Every run id
+/// this crate creates itself is a ULID (`[0-9A-Z]{26}`, no separators), so
+/// this only ever fires on a run id that arrived from the outside: a CLI
+/// argument to `sgh show <run_id>` or `sgh resume <run_id>`.
+fn invalid_run_id(run_id: &str) -> bool {
+    run_id.contains('/') || run_id.contains('\\') || run_id.contains("..")
+}
+
 /// Open the event JSONL file for `run_id` under `db_path`'s sidecar events
 /// dir. On failure (rare: disk full, permissions), warn to stderr and return
 /// `None` — an unwritable event log must never fail the run it observes.
+///
+/// `run_id` is checked against `invalid_run_id` before the path join below
+/// even though every caller in this binary passes either a freshly minted
+/// ULID (`run_cmd`) or a `run_id` `show`/`resume` already validated on the
+/// way in — kept here too as a non-bypassable last line, since this
+/// function is the one place that actually performs the join.
+///
+/// Single-writer safety of the event file depends on `Db::open`'s exclusive
+/// lock having already been taken by the time this is called — the lock is
+/// what rules out a second `sgh run`/`resume` process appending to the same
+/// run's `.jsonl` concurrently. Both call sites (`run_cmd`, `resume_cmd`)
+/// open the db before calling this; do not reorder this to run first.
 fn open_event_sink(
     db_path: &std::path::Path,
     run_id: &str,
 ) -> Option<topodb_sgh::events::JsonlSink> {
+    if invalid_run_id(run_id) {
+        eprintln!("error: invalid run id {run_id:?}");
+        std::process::exit(2);
+    }
     let path = events_dir(db_path).join(format!("{run_id}.jsonl"));
     match topodb_sgh::events::JsonlSink::create(&path) {
         Ok(sink) => Some(sink),
@@ -733,6 +757,10 @@ fn show_event_log(
     run_id: &str,
     follow: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if invalid_run_id(run_id) {
+        eprintln!("error: invalid run id {run_id:?}");
+        std::process::exit(2);
+    }
     let event_file = events_dir(db_path).join(format!("{run_id}.jsonl"));
 
     if !event_file.exists() {
@@ -741,59 +769,92 @@ fn show_event_log(
     }
 
     let file = std::fs::File::open(&event_file)?;
-    let reader = std::io::BufReader::new(file);
-
-    // Read all current lines
+    let mut reader = std::io::BufReader::new(file);
     let mut first_ts: Option<i64> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        print_event_line(&line, &mut first_ts)?;
-    }
 
-    // If following, poll for new lines
+    // Catch-up, then (if `--follow`) tail: ONE file handle and reader for
+    // both phases. The previous implementation read to EOF, then opened a
+    // *second* `File` and seeked it to `End` — any line appended in the
+    // window between those two calls was never read by either handle and
+    // vanished from the output. Keeping the same reader across both phases
+    // (`read_complete_lines` just keeps calling `read_line` on it) means
+    // there is no window: whatever wasn't there for catch-up is still
+    // sitting at the reader's current position for the tail loop to pick
+    // up next.
+    //
+    // `emit_trailing_partial: !follow` on this catch-up call: a one-shot
+    // `show` (no `--follow`) has no writer to wait on, so a final line with
+    // no trailing newline (a file that just doesn't end in one, or a run
+    // that died mid-write) is still the caller's whole answer and gets
+    // printed as-is — exactly like the old `.lines()`-based catch-up did.
+    // Under `--follow`, that same trailing partial is deliberately withheld
+    // (`false` below and in the tail loop) since a writer may still be
+    // mid-line; withholding it is what fixes the truncated-mid-write case.
+    read_complete_lines(&mut reader, !follow, &mut |line| {
+        print_event_line(line, &mut first_ts)
+    })?;
+
     if follow {
-        use std::io::{Seek, SeekFrom};
         use std::thread;
         use std::time::Duration as StdDuration;
 
-        let mut file = std::fs::File::open(&event_file)?;
-        file.seek(SeekFrom::End(0))?;
-        let mut reader = std::io::BufReader::new(file);
-
         loop {
-            // Try to read a new line
-            let mut line = String::new();
-            use std::io::BufRead;
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF: sleep and retry
-                    thread::sleep(StdDuration::from_millis(250));
-                    continue;
-                }
-                Ok(_) => {
-                    if !line.is_empty() && line != "\n" {
-                        print_event_line(&line, &mut first_ts)?;
-                    }
-                }
-                Err(_) => {
-                    // Try to re-open the file (it may have been rotated or moved)
-                    thread::sleep(StdDuration::from_millis(250));
-                    if event_file.exists() {
-                        match std::fs::File::open(&event_file) {
-                            Ok(f) => {
-                                file = f;
-                                file.seek(SeekFrom::End(0))?;
-                                reader = std::io::BufReader::new(file);
-                            }
-                            Err(_) => {
-                                // File still doesn't exist or can't be opened; keep trying
-                            }
-                        }
-                    }
-                }
-            }
+            // On a read error, deliberately do NOT reopen the file or seek
+            // anywhere — `read_complete_lines` already rewinds past any
+            // partial (not yet newline-terminated) line it read before the
+            // error, so the reader's position stays exactly where the next
+            // complete line will start. Reopening+seek-to-`End` (the old
+            // behavior) is exactly the pattern that drops lines: anything
+            // written between the error and the reopen would be skipped.
+            let _ = read_complete_lines(&mut reader, false, &mut |line| {
+                print_event_line(line, &mut first_ts)
+            });
+            thread::sleep(StdDuration::from_millis(250));
         }
     }
 
+    Ok(())
+}
+
+/// Reads every complete (newline-terminated) line currently available from
+/// `reader`, calling `on_line` with each one (newline stripped). A line read
+/// at EOF without a trailing `\n` — the writer flushed a partial write, or
+/// (during `--follow`) simply hasn't finished the line yet — is normally put
+/// back: `BufReader::read_line` already consumed those bytes out of its
+/// internal buffer, so without the seek-back they would vanish rather than
+/// being re-read (and printed, once complete) on a later call. This is also
+/// what makes a single reader safe to reuse across the catch-up and follow
+/// phases in `show_event_log`.
+///
+/// `emit_trailing_partial`: when true, a trailing unterminated line is
+/// emitted immediately instead of being held back — the right behavior for
+/// a one-shot (non-`--follow`) read, where there is no later call that would
+/// ever pick it up otherwise. `--follow` always passes `false`.
+fn read_complete_lines(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    emit_trailing_partial: bool,
+    on_line: &mut impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    loop {
+        let pos_before = reader.stream_position()?;
+        let mut buf = String::new();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break; // EOF, nothing pending
+        }
+        if buf.ends_with('\n') {
+            let line = buf.trim_end_matches(['\n', '\r']);
+            on_line(line)?;
+        } else if emit_trailing_partial {
+            on_line(&buf)?;
+            break;
+        } else {
+            // Partial line: rewind to before it was read and stop for now.
+            reader.seek(SeekFrom::Start(pos_before))?;
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -941,8 +1002,12 @@ fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
             let mut run_records: Vec<_> = runs.into_iter().collect();
             run_records.sort_by_key(|a| a.id);
 
-            // Header
-            println!("RUN_ID          STATUS      CREATED_MS  GOAL");
+            // Header. Run ids are ULIDs (26 chars) — a 15-wide column
+            // truncated the header's alignment against every real row.
+            println!(
+                "{:<26} {:<11} {:<11} GOAL",
+                "RUN_ID", "STATUS", "CREATED_MS"
+            );
 
             for rec in run_records {
                 let run_id = rec
@@ -995,7 +1060,7 @@ fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>
                 };
 
                 println!(
-                    "{:<15} {:<11} {:<11} {}",
+                    "{:<26} {:<11} {:<11} {}",
                     run_id, status, created_ms, goal_short
                 );
             }
@@ -1451,7 +1516,23 @@ fn run_cmd(
         if let Some(sink) = &sink {
             ex = ex.with_events(sink).with_run_id(run_id.clone());
         }
-        let report = ex.run(now)?;
+        // On `Err`, best-effort mark the run BLOCKED before propagating —
+        // otherwise an executor-internal failure (as opposed to a node
+        // blocking, which the normal path below already marks) leaves the
+        // shared-scope index reading "running" forever, and `sgh show
+        // --list` shows a run as perpetually in flight when it has in fact
+        // stopped. `ex` is still alive here (the executor owns the store,
+        // not the reverse), so `ex.store_ref()` is available in the `Err`
+        // arm even though `?` would otherwise propagate immediately.
+        let report = match ex.run(now) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = ex
+                    .store_ref()
+                    .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms());
+                return Err(e.into());
+            }
+        };
 
         println!("\nrun {run_id}");
         println!("  succeeded: {:?}", report.succeeded);
@@ -1827,7 +1908,22 @@ fn resume_cmd(
     // Record an "approve" attempt for each approved gate BEFORE the run:
     // `execute_node` checks a gate's attempt history at execution time (see
     // its resume-awareness comment), so these must land before `ex.run()`.
-    let now = now_ms();
+    // Floor against the store's own high-water mark, not just wall time: an
+    // NTP correction or a VM snapshot restore between the original run and
+    // this resume can hand this process a wall clock that reads behind the
+    // run's own recorded history, and every superseding write from then on
+    // would race that history until `SghError::Contended`'s retry budget
+    // runs out — a clock problem surfacing as an opaque concurrency error.
+    // `+1` keeps this resume's writes strictly after the recorded mark
+    // rather than merely equal to it.
+    let now = std::cmp::max(now_ms(), store.high_water_ms() + 1);
+    // Gate approvals are recorded here, before `ex.run()` is even
+    // constructed, and are durable regardless of what happens to the run
+    // itself: if this process is killed or the executor errors out before
+    // `run()` returns, the "approve" attempts already written stand. This is
+    // deliberate — an approval is an audited fact about what the operator
+    // authorized, not a provisional part of this resume attempt, so an
+    // aborted resume must not un-approve anything.
     for gate in &approve_gate {
         store.record_attempt(gate, "approve", "", now)?;
     }
@@ -1845,7 +1941,17 @@ fn resume_cmd(
     if let Some(sink) = &sink {
         ex = ex.with_events(sink).with_run_id(run_id.clone());
     }
-    let report = ex.run(now)?;
+    // Same best-effort BLOCKED-on-error handling as `run_cmd` — see there
+    // for rationale.
+    let report = match ex.run(now) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ex
+                .store_ref()
+                .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms());
+            return Err(e.into());
+        }
+    };
 
     println!("\nrun {run_id}");
     println!("  succeeded: {:?}", report.succeeded);

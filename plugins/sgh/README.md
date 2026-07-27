@@ -189,8 +189,8 @@ Every run gets a stable wall-clock timestamp the moment `sgh` starts. Runs are
 findable after completion, crash, or interruption:
 
 - `sgh show --list` enumerates all runs in the database, with their status
-  (running, checkpoint, blocked, complete, failed) and wall-clock start time.
-- `sgh show <id>` reads and prints the run's final state and event log.
+  (running, checkpoint, blocked, complete) and wall-clock start time.
+- `sgh show <id>` reads and prints the run's event log.
 - `sgh show <id> --follow` streams events as they arrive, even while the
   database is locked by a running process. This is the replay of a run already
   in progress, not a live co-execution — events are buffered to an external
@@ -209,7 +209,10 @@ Interrupted or crashed runs are resumable:
 - `sgh resume <id> --approve-gate <node>` approves a node that was halted at
   an approval gate (status "checkpoint") and resumes from there. Exit code 3's
   second half: the node passes the gate and execution resumes normally,
-  exiting 0 when complete.
+  exiting 0 when complete. The approval itself is recorded before the resumed
+  run executes anything and is durable: if the resume is killed or errors out
+  partway through, the gate stays approved — approval is an audited fact
+  about what you authorized, not something an aborted resume can undo.
 
 The database path override (`SGH_DB`) works unchanged for all of these.
 
