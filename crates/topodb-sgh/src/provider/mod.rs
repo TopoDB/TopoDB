@@ -9,8 +9,8 @@ use serde_json::Value;
 // added in Tasks 5/6
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
-// #[cfg(feature = "openai")]
-// pub mod openai;
+#[cfg(feature = "openai")]
+pub mod openai;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
