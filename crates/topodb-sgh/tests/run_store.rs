@@ -333,6 +333,28 @@ fn set_status_rewrites_the_index_prop() {
     }
 }
 
+/// See `RunStore::set_status`'s doc comment: `high_water_ms` is the
+/// cross-process defense against a resuming process whose wall clock reads
+/// behind this run's own history (NTP correction, VM snapshot restore).
+/// `create` stamps it at creation time and `set_status` re-stamps it on
+/// every status change; both must be visible after a fresh `RunStore::open`
+/// — the mark has to survive being read back in a new process, since that's
+/// the only place it's ever consulted (`resume_cmd`).
+#[test]
+fn high_water_ms_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let _s = store(&db); // created at now_ms=100, see `store()` above
+
+    let (reopened, _v) = RunStore::open(&db, "run-1").unwrap();
+    assert_eq!(reopened.high_water_ms(), 100);
+
+    reopened.set_status("complete", 500).unwrap();
+
+    let (reopened_again, _v) = RunStore::open(&db, "run-1").unwrap();
+    assert_eq!(reopened_again.high_water_ms(), 500);
+}
+
 #[test]
 fn graph_yaml_round_trips() {
     let dir = tempfile::tempdir().unwrap();

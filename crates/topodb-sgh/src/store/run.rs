@@ -118,6 +118,12 @@ impl RunStore {
             "status".into(),
             PropValue::Str(RUN_STATUS_RUNNING.to_string()),
         );
+        // High-water mark for `high_water_ms`: see `set_status`'s doc comment
+        // for why this exists. Written here too (not just on every
+        // `set_status` call) so a run that never calls `set_status` again
+        // before a resume still has a mark at least as high as its creation
+        // time.
+        index_props.insert("last_ms".into(), PropValue::DateTime(now_ms));
         ops.push(Op::CreateNode {
             id: index_node,
             scope: Scope::Shared,
@@ -390,12 +396,24 @@ impl RunStore {
     /// Update the shared-scope index's status prop. LWW (`Op::SetNodeProps`),
     /// not supersession — the index carries current status only, and every
     /// run's own state history already lives on the run's HAS_STATE edges.
+    ///
+    /// Also stamps `last_ms` in the same batch: the executor's monotone tick
+    /// clamp (`tick`/`with_clock`) only protects timestamps *within* a
+    /// process. Resuming in a new process — after an NTP correction, a VM
+    /// snapshot restore, or simply a clock that reads slightly behind where
+    /// it left off — can hand the executor a `now_ms` that is behind this
+    /// run's own history, and every superseding write from then on races
+    /// that history until `SghError::Contended`'s retry budget gives out (an
+    /// opaque failure whose real cause is the clock, not concurrency).
+    /// `high_water_ms` reads this mark back so `resume_cmd` can floor its
+    /// clock against it before calling `run`.
     pub fn set_status(&self, status: &str, now_ms: i64) -> Result<(), SghError> {
         let mut props = BTreeMap::new();
         props.insert(
             "status".to_string(),
             Some(PropValue::Str(status.to_string())),
         );
+        props.insert("last_ms".to_string(), Some(PropValue::DateTime(now_ms)));
         self.db.submit_at(
             vec![Op::SetNodeProps {
                 id: self.index_node,
@@ -404,6 +422,25 @@ impl RunStore {
             now_ms,
         )?;
         Ok(())
+    }
+
+    /// The highest `now_ms` this run is known to have written, read from the
+    /// shared-scope index's `last_ms` prop (see `set_status`). `0` when the
+    /// prop is absent — a run created before this fix shipped has no mark,
+    /// and `0` is always <= any real timestamp a caller would floor against,
+    /// so `resume_cmd`'s `max(now_ms(), high_water_ms() + 1)` degrades to
+    /// plain wall-clock time for those runs, exactly as before this fix.
+    pub fn high_water_ms(&self) -> i64 {
+        let Some(rec) = self
+            .db
+            .node(&ScopeSet::default().with_shared(), self.index_node)
+        else {
+            return 0;
+        };
+        match rec.props.get("last_ms") {
+            Some(PropValue::DateTime(ms)) => *ms,
+            _ => 0,
+        }
     }
 
     /// The stored graph yaml, written once at `create` time. Missing (or

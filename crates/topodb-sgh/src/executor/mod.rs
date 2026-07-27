@@ -212,12 +212,17 @@ impl<'r> Executor<'r> {
     /// call's superseding writes race the run's own prior history and
     /// surfaces as an opaque `SghError::Contended` once the write's internal
     /// retry budget is exhausted — the real cause is the caller's clock, not
-    /// genuine concurrent contention. The CLI always passes wall-clock
-    /// milliseconds, which satisfies this automatically (real time never
-    /// runs backwards); a library caller using the default logical clock
-    /// (no `with_clock`) instead must carry the prior run's high-water mark
-    /// forward itself, e.g. resuming with a `start_ms` comfortably above the
-    /// original run's tick range.
+    /// genuine concurrent contention. Within a single process this is
+    /// automatic: `tick`'s monotone clamp (`max(clock(), previous)`) means
+    /// real time never runs backwards *for the duration of one run*. It does
+    /// NOT hold across processes — an NTP correction or a VM snapshot
+    /// restore between runs can hand a fresh process a wall clock that reads
+    /// behind where the prior process left off — so `resume_cmd` floors its
+    /// `start_ms` against `RunStore::high_water_ms` before calling `run`. A
+    /// library caller using the default logical clock (no `with_clock`)
+    /// instead must carry the prior run's high-water mark forward itself,
+    /// e.g. resuming with a `start_ms` comfortably above the original run's
+    /// tick range.
     pub fn run(&mut self, start_ms: i64) -> Result<RunReport, SghError> {
         // Command nodes have a shell path only when a CommandRunner is
         // configured. Without one, dispatching a command node through
@@ -658,6 +663,41 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
     let prior_repairs = prior.iter().filter(|(rung, _)| rung == "repair").count() as u32;
     let mut retries_left = original.budget.retries.saturating_sub(prior_retries);
     let mut repairs_left = repair_budget.saturating_sub(prior_repairs);
+
+    // Spec: "the original bound holds across any number of resumes". A node
+    // that already reached BLOCK in a prior run of this store spent its
+    // full `1 + r + 2p` allowance getting there — the ladder's first
+    // attempt below is unconditional, so without this check a resume would
+    // hand the node one more model call than the graph's published bound
+    // allows. "cancelled" does not trigger this: cancellation is recorded
+    // before any call is made for that attempt, so the node's spend is
+    // unchanged and a resume re-attempting it stays within bound. Gate
+    // nodes never reach here (they return above) and record no "block"
+    // attempts on their own blocking path, so this is agent/command only.
+    if let Some((_, last_error)) = prior.iter().rev().find(|(rung, _)| rung == "block") {
+        let reason = if last_error.is_empty() {
+            "blocked in a prior run".to_string()
+        } else {
+            last_error.clone()
+        };
+        let t = tick(shared);
+        shared
+            .blocked_reasons
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), reason.clone());
+        shared.store.set_state(id, NodeState::Blocked, t)?;
+        if let Some(sink) = shared.events {
+            sink.emit(
+                t,
+                &RunEvent::NodeBlocked {
+                    node_id: id.to_string(),
+                    reason: Some(reason),
+                },
+            );
+        }
+        return Ok(());
+    }
 
     // `NodeStarted` is emitted once per node execution — the first ladder
     // iteration only, not on every retry re-entry into the loop.
