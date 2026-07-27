@@ -209,6 +209,176 @@ impl RunStore {
         Ok(store)
     }
 
+    /// Reattach to an existing run: resolve the shared-scope index by
+    /// `run_id`, rebuild the id maps by scoped label scans, and revalidate
+    /// the stored graph. Returns the store plus the graph exactly as
+    /// originally run (a fresh, deterministic `validate` pass over the
+    /// stored yaml — `Kahn` with declaration-order ties, so this reproduces
+    /// the same `Validated` `create` built).
+    pub fn open(db: &Db, run_id: &str) -> Result<(Self, Validated), SghError> {
+        // 1. Resolve the shared-scope index by run_id.
+        let shared = ScopeSet::default().with_shared();
+        let candidates = db.nodes_by_label(&shared, LABEL_RUN_INDEX);
+        let matches: Vec<_> = candidates
+            .into_iter()
+            .filter(|rec| matches!(rec.props.get("run_id"), Some(PropValue::Str(s)) if s == run_id))
+            .collect();
+        let index_rec = match matches.len() {
+            0 => {
+                return Err(SghError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })
+            }
+            1 => matches.into_iter().next().unwrap(),
+            _ => {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!(
+                        "{} shared-scope index nodes share run_id {run_id:?}",
+                        matches.len()
+                    ),
+                })
+            }
+        };
+        let index_node = index_rec.id;
+
+        // 2. Scope from the index's `scope_id` prop.
+        let scope_id_str = match index_rec.props.get("scope_id") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: "index node missing scope_id prop".to_string(),
+                })
+            }
+        };
+        let sid: ScopeId = scope_id_str.parse().map_err(|e| SghError::CorruptRun {
+            run_id: run_id.to_string(),
+            reason: format!("index scope_id {scope_id_str:?} does not parse as a ScopeId: {e}"),
+        })?;
+        let scope = Scope::Id(sid);
+        let scopes = ScopeSet::of(&[sid]);
+
+        // 3. Exactly one run node in this scope; read goal + graph_yaml.
+        let run_recs = db.nodes_by_label(&scopes, LABEL_RUN);
+        if run_recs.len() != 1 {
+            return Err(SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!("expected exactly one SghRun node, found {}", run_recs.len()),
+            });
+        }
+        let run_rec = &run_recs[0];
+        let run_node = run_rec.id;
+        let graph_yaml = match run_rec.props.get("graph_yaml") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: "run node missing graph_yaml prop".to_string(),
+                })
+            }
+        };
+
+        // 4. Reconstruct + revalidate the graph.
+        let graph =
+            crate::schema::Graph::from_yaml(&graph_yaml).map_err(|e| SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!("stored graph_yaml does not parse: {e}"),
+            })?;
+        let v = crate::schema::validate::validate(&graph).map_err(|errs| SghError::CorruptRun {
+            run_id: run_id.to_string(),
+            reason: format!("stored graph fails validation: {errs:?}"),
+        })?;
+
+        // 5. `nodes` map: one SghNode per declared graph node, no extras.
+        let node_recs = db.nodes_by_label(&scopes, LABEL_NODE);
+        let mut nodes: HashMap<String, NodeId> = HashMap::new();
+        for rec in &node_recs {
+            let node_id = match rec.props.get("node_id") {
+                Some(PropValue::Str(s)) => s.clone(),
+                _ => {
+                    return Err(SghError::CorruptRun {
+                        run_id: run_id.to_string(),
+                        reason: "SghNode record missing node_id prop".to_string(),
+                    })
+                }
+            };
+            if nodes.insert(node_id.clone(), rec.id).is_some() {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("duplicate SghNode record for node_id {node_id:?}"),
+                });
+            }
+        }
+        for n in &v.graph.nodes {
+            if !nodes.contains_key(&n.id) {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("graph node {:?} has no matching SghNode record", n.id),
+                });
+            }
+        }
+        if nodes.len() != v.graph.nodes.len() {
+            return Err(SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!(
+                    "found {} SghNode records but the graph declares {} nodes",
+                    nodes.len(),
+                    v.graph.nodes.len()
+                ),
+            });
+        }
+
+        // 6. `states` map: one SghState node per NodeState variant, no extras.
+        let state_recs = db.nodes_by_label(&scopes, LABEL_STATE);
+        let mut states: HashMap<&'static str, NodeId> = HashMap::new();
+        for rec in &state_recs {
+            let name = match rec.props.get("name") {
+                Some(PropValue::Str(s)) => s.clone(),
+                _ => {
+                    return Err(SghError::CorruptRun {
+                        run_id: run_id.to_string(),
+                        reason: "SghState record missing name prop".to_string(),
+                    })
+                }
+            };
+            let Some(st) = NodeState::from_str(&name) else {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("SghState record has unknown state name {name:?}"),
+                });
+            };
+            if states.insert(st.as_str(), rec.id).is_some() {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("duplicate SghState record for state {:?}", st.as_str()),
+                });
+            }
+        }
+        if states.len() != NodeState::ALL.len() {
+            return Err(SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!(
+                    "found {} SghState records but {} states are required",
+                    states.len(),
+                    NodeState::ALL.len()
+                ),
+            });
+        }
+
+        let store = RunStore {
+            db: db.clone(),
+            scope,
+            scopes,
+            run_id: run_id.to_string(),
+            run_node,
+            index_node,
+            nodes,
+            states,
+        };
+        Ok((store, v))
+    }
+
     pub fn scope(&self) -> Scope {
         self.scope
     }

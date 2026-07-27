@@ -1,8 +1,12 @@
-use topodb::{Db, PropValue, Scope, ScopeId, ScopeSet};
+use std::collections::BTreeMap;
+
+use topodb::{Db, Op, PropValue, Scope, ScopeId, ScopeSet};
 use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::Graph;
 use topodb_sgh::store::run::{NodeState, RunStore};
-use topodb_sgh::store::{EDGE_PRODUCED, EDGE_REVISION_OF, LABEL_NODE, LABEL_RUN, LABEL_RUN_INDEX};
+use topodb_sgh::store::{
+    SghError, EDGE_PRODUCED, EDGE_REVISION_OF, LABEL_NODE, LABEL_RUN, LABEL_RUN_INDEX,
+};
 
 fn store(db: &Db) -> RunStore {
     let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
@@ -360,4 +364,124 @@ fn index_is_the_only_shared_scope_write() {
         db.nodes_by_label(&shared, LABEL_NODE).is_empty(),
         "SghNode nodes must stay in the run scope"
     );
+}
+
+#[test]
+fn open_round_trips_a_created_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    {
+        let s = store(&db);
+        assert_eq!(s.state("survey").unwrap(), NodeState::Pending);
+    }
+    // The original `RunStore` handle is dropped; reattach purely from the db.
+    let (reopened, v) = RunStore::open(&db, "run-1").expect("run reopens");
+
+    let orig = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let orig_v = validate(&orig).unwrap();
+    assert_eq!(v.topo_order, orig_v.topo_order);
+
+    assert_eq!(reopened.state("survey").unwrap(), NodeState::Pending);
+
+    // Writes through the reopened handle work.
+    reopened
+        .set_state("survey", NodeState::Succeeded, 200)
+        .unwrap();
+    assert_eq!(reopened.state("survey").unwrap(), NodeState::Succeeded);
+}
+
+#[test]
+fn open_sees_prior_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    {
+        let s = store(&db);
+        s.set_state("survey", NodeState::Succeeded, 150).unwrap();
+        s.record_output("survey", "{\"n\":1}", 150).unwrap();
+        s.record_attempt("build", "retry", "boom", 160).unwrap();
+    }
+
+    let (reopened, _v) = RunStore::open(&db, "run-1").expect("run reopens");
+    assert_eq!(reopened.state("survey").unwrap(), NodeState::Succeeded);
+    assert_eq!(
+        reopened.output("survey").unwrap().as_deref(),
+        Some("{\"n\":1}")
+    );
+    let attempts = reopened.attempts("build").unwrap();
+    assert!(
+        attempts
+            .iter()
+            .any(|(rung, err)| rung == "retry" && err == "boom"),
+        "expected (\"retry\", \"boom\") in {attempts:?}"
+    );
+}
+
+#[test]
+fn open_unknown_run_is_run_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let _s = store(&db);
+
+    let err = match RunStore::open(&db, "nope") {
+        Err(e) => e,
+        Ok(_) => panic!("unknown run must error"),
+    };
+    match err {
+        SghError::RunNotFound { run_id } => assert_eq!(run_id, "nope"),
+        other => panic!("expected RunNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_rejects_a_corrupt_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    let run_node = s.run_node();
+    let mut props = BTreeMap::new();
+    props.insert(
+        "graph_yaml".to_string(),
+        Some(PropValue::Str("version: 1\n".to_string())),
+    );
+    db.submit_at(
+        vec![Op::SetNodeProps {
+            id: run_node,
+            props,
+        }],
+        300,
+    )
+    .unwrap();
+
+    let err = match RunStore::open(&db, "run-1") {
+        Err(e) => e,
+        Ok(_) => panic!("corrupt graph must error"),
+    };
+    match err {
+        SghError::CorruptRun { run_id, reason } => {
+            assert_eq!(run_id, "run-1");
+            assert!(!reason.is_empty(), "reason must name what went wrong");
+        }
+        other => panic!("expected CorruptRun, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_run_ids_are_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+
+    let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let v = validate(&g).unwrap();
+    RunStore::create(&db, "dup-run", &v, 100).expect("first create");
+    RunStore::create(&db, "dup-run", &v, 200).expect("second create, same run_id");
+
+    let err = match RunStore::open(&db, "dup-run") {
+        Err(e) => e,
+        Ok(_) => panic!("duplicate index must be corrupt"),
+    };
+    match err {
+        SghError::CorruptRun { run_id, .. } => assert_eq!(run_id, "dup-run"),
+        other => panic!("expected CorruptRun, got {other:?}"),
+    }
 }
