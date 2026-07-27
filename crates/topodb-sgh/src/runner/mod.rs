@@ -1,3 +1,4 @@
+pub mod cancel;
 #[cfg(feature = "claude-code")]
 pub mod claude;
 pub mod command;
@@ -5,6 +6,7 @@ pub mod common;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod mock;
+pub mod proc;
 pub mod rails;
 
 use std::collections::BTreeMap;
