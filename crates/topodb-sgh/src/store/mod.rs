@@ -44,4 +44,6 @@ pub enum SghError {
          Executor::with_command_runner"
     )]
     NoCommandRunner { nodes: Vec<String> },
+    #[error("worker panicked while executing node {node}")]
+    WorkerPanic { node: String },
 }

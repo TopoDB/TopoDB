@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -355,7 +356,19 @@ fn run_parallel(shared: &Shared) -> Result<(), SghError> {
                 let tx = tx.clone();
                 let id_owned = id.clone();
                 scope.spawn(move || {
-                    let res = execute_node(shared, &id_owned);
+                    // A panicking runner must not deadlock the scheduler: if
+                    // the worker never sends, `rx.recv()` below blocks
+                    // forever (this thread's own `tx` clone keeps the
+                    // channel alive), and `thread::scope` only re-raises the
+                    // panic after every spawned closure returns — which
+                    // never happens. Catch it and report a clean error
+                    // instead of resuming the unwind.
+                    let res = catch_unwind(AssertUnwindSafe(|| execute_node(shared, &id_owned)))
+                        .unwrap_or_else(|_| {
+                            Err(SghError::WorkerPanic {
+                                node: id_owned.clone(),
+                            })
+                        });
                     let _ = tx.send((id_owned, res));
                 });
             }

@@ -11,6 +11,9 @@ use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(600);
 
 pub trait CliCodec: Send + Sync {
+    /// Must return a non-empty argv; argv[0] is the binary. `CliPrintRunner`
+    /// treats an empty argv as a codec bug and reports it as a `Failed`
+    /// outcome rather than indexing into an empty vec.
     fn argv(&self, req: &NodeRequest) -> Vec<String>;
     /// Interpret a completed invocation. Raw bytes: the codec owns UTF-8
     /// policy (claude's: non-zero exit reports stderr lossily; zero exit
@@ -53,6 +56,11 @@ impl CliPrintRunner {
 impl AgentRunner for CliPrintRunner {
     fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
         let argv = self.codec.argv(req);
+        if argv.is_empty() {
+            return Ok(NodeOutcome::Failed {
+                error: "codec produced empty argv".into(),
+            });
+        }
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.stdout(std::process::Stdio::piped());
