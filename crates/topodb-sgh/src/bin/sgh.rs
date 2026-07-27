@@ -553,349 +553,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider,
             base_url,
         } => {
-            // `--yes-including-revisions` implies `--yes` for anything else
-            // in this command that reads `yes` (there is nothing else today,
-            // but keeping the invariant explicit here means a future reader
-            // of `yes` doesn't have to know about the other flag).
-            let yes = yes || yes_including_revisions;
-
-            // Canonicalize bash grants: trim each one, then validate. Pass trimmed
-            // grants to the runner so build_argv interpolates canonicalized values.
-            let agent_bash: Vec<String> = agent_bash
-                .into_iter()
-                .map(|g| g.trim().to_string())
-                .collect();
-
-            // Validate bash grants before anything runs.
-            for grant in &agent_bash {
-                if let Err(e) = topodb_sgh::runner::rails::validate_bash_grant(grant) {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }
-            }
-
-            // Flag rails: provider/base-url/agent-bash compatibility, and
-            // the compiled-feature check for the requested provider. These
-            // must run before the graph file is even read — a bad flag
-            // combination is a rail violation, not something that depends
-            // on the graph.
-            validate_provider_flags(provider, &base_url, !agent_bash.is_empty());
-            #[cfg(not(feature = "claude-code"))]
-            if provider == Provider::ClaudeCode {
-                eprintln!("error: this sgh was built without the claude-code feature");
-                std::process::exit(2);
-            }
-            if replan && provider != Provider::ClaudeCode {
-                eprintln!(
-                    "error: --replan with --provider {provider} arrives with ApiBackend (next task)"
-                );
-                std::process::exit(2);
-            }
-
-            let src = std::fs::read_to_string(&graph)?;
-            let g = Graph::from_yaml(&src)?;
-            let v = match validate(&g) {
-                Ok(v) => v,
-                Err(errors) => {
-                    for e in &errors {
-                        eprintln!("error: {e}");
-                    }
-                    std::process::exit(2);
-                }
-            };
-
-            let mcp_argv = match agent_mcp.as_deref() {
-                Some(cmd) => match topodb_sgh::runner::rails::validate_mcp_server_command(cmd) {
-                    Ok(argv) => Some(argv),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(2);
-                    }
-                },
-                None => None,
-            };
-            let db = Db::open(&cli.db)?;
-            let command_runner =
-                ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
-
-            // claude-code path: built eagerly, exactly as before this task —
-            // the mcp-config file is temp-dir JSON, not a spawned process,
-            // so nothing runs ahead of the approval gate below.
-            #[cfg(feature = "claude-code")]
-            let mut runner: Option<BuiltRunner> = if provider == Provider::ClaudeCode {
-                let mcp_wiring = match &mcp_argv {
-                    Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
-                        config_path: write_mcp_config(argv)?.to_string_lossy().into_owned(),
-                    }),
-                    None => None,
-                };
-                Some(BuiltRunner::Claude(ClaudeCodeRunner::new(
-                    model.clone(),
-                    agent_bash.clone(),
-                    mcp_wiring,
-                )))
-            } else {
-                None
-            };
-            #[cfg(not(feature = "claude-code"))]
-            let mut runner: Option<BuiltRunner> = None;
-
-            // HTTP providers: the provider client is built now (from_env
-            // only reads env vars — no IO), but the MCP bridge spawns a
-            // subprocess, so it waits until after the first gate approval
-            // in the loop below (`runner.is_none()` there).
-            let mut pending_http_provider: Option<Box<dyn topodb_sgh::provider::ChatProvider>> =
-                match provider {
-                    Provider::ClaudeCode => None,
-                    Provider::Anthropic | Provider::Openai => Some(build_http_provider(
-                        provider,
-                        model.clone(),
-                        base_url.clone(),
-                    )),
-                };
-
-            let mut current = v;
-            let mut replans_used = 0u32;
-            // False for the graph supplied on the command line; set true
-            // once a revision replaces `current` at the bottom of the loop.
-            // Drives `needs_prompt` — the gate `--yes` alone must never
-            // skip.
-            let mut is_revision = false;
-
-            loop {
-                let bound = worst_case(&current);
-                println!("Goal: {}", current.graph.goal);
-                println!("Nodes: {}", current.graph.nodes.len());
-                println!("Bound: {bound}");
-
-                let commands = command_preview(&current);
-                if !commands.is_empty() {
-                    println!("\nCommands that will execute in a shell:");
-                    for line in &commands {
-                        println!("  {line}");
-                    }
-                }
-
-                let grants = grants_preview(&agent_bash);
-                if !grants.is_empty() {
-                    println!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
-                    for grant in &grants {
-                        println!("  {grant}:*");
-                    }
-                }
-
-                print_unconstrained(&current);
-
-                if let Some(err) = mcp_pairing_error(&current, agent_mcp.as_deref()) {
-                    eprintln!("error: {err}");
-                    std::process::exit(2);
-                }
-
-                if let Some(cmd) = &agent_mcp {
-                    println!();
-                    let lines = match provider {
-                        Provider::ClaudeCode => {
-                            #[cfg(feature = "claude-code")]
-                            {
-                                mcp_gate_lines(&current, cmd)
-                            }
-                            #[cfg(not(feature = "claude-code"))]
-                            {
-                                unreachable!(
-                                    "claude-code provider without the feature already \
-                                     exited at the flag-rail stage"
-                                )
-                            }
-                        }
-                        Provider::Anthropic | Provider::Openai => {
-                            http_mcp_gate_lines(&current, cmd)
-                        }
-                    };
-                    for line in lines {
-                        println!("{line}");
-                    }
-                }
-
-                // The gate preview above (commands + grants) prints on stdout
-                // whether or not a prompt follows, so a --yes run is never
-                // silent about the widened surface — no separate stderr echo.
-                if needs_prompt(is_revision, yes, yes_including_revisions) {
-                    println!("\nProceed? [y/N]");
-                    let mut line = String::new();
-                    std::io::stdin().read_line(&mut line)?;
-                    if !line.trim().eq_ignore_ascii_case("y") {
-                        println!("aborted");
-                        return Ok(());
-                    }
-                }
-
-                // HTTP providers only: build the runner now, post-approval —
-                // this is where the MCP bridge (if the graph opts in) spawns
-                // its subprocess, so no server starts for a run the operator
-                // rejects. Happens once; subsequent loop iterations (replan
-                // revisions) reuse the same runner and bridge.
-                if runner.is_none() {
-                    #[cfg(feature = "http")]
-                    {
-                        let bridge = if !mcp_nodes(&current).is_empty() {
-                            // mcp_pairing_error above already guarantees
-                            // mcp_argv is Some whenever a node opts in.
-                            let argv = mcp_argv
-                                .as_ref()
-                                .expect("mcp_pairing_error enforces this pairing");
-                            match topodb_sgh::mcp_bridge::McpBridge::spawn(argv) {
-                                Ok(b) => Some(b),
-                                Err(e) => {
-                                    eprintln!("error: {e}");
-                                    std::process::exit(2);
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        let provider_client = pending_http_provider.take().expect(
-                            "pending_http_provider is Some whenever provider != ClaudeCode",
-                        );
-                        runner = Some(BuiltRunner::Http(
-                            topodb_sgh::runner::http::HttpChatRunner::new(
-                                provider_client,
-                                model.clone(),
-                                bridge,
-                            ),
-                        ));
-                    }
-                }
-                let runner_ref = runner
-                    .as_ref()
-                    .expect("built either eagerly (claude-code) or just above (http)")
-                    .as_agent_runner();
-
-                let run_id = ulid::Ulid::new().to_string();
-                let now = 1;
-                let store = RunStore::create(&db, &run_id, &current, now)?;
-                let mut ex = Executor::new(store, current.clone(), runner_ref)
-                    .with_command_runner(&command_runner);
-                let report = ex.run(now + 1)?;
-
-                println!("\nrun {run_id}");
-                println!("  succeeded: {:?}", report.succeeded);
-                println!("  blocked:   {:?}", report.blocked);
-                println!("  skipped:   {:?}", report.skipped);
-                for id in &report.blocked {
-                    // A failed node prints its reason; a gate blocked on purpose
-                    // and has none — leave it to the exit-3 checkpoint message
-                    // below rather than labelling an intentional halt a failure.
-                    if let Some(reason) = report.blocked_reasons.get(id) {
-                        println!("    {id}: {}", one_line(reason));
-                    }
-                }
-                println!(
-                    "  model calls: {} (bound was {})",
-                    report.model_calls, bound.agent_calls
-                );
-                println!(
-                    "  command runs: {} (bound was {})",
-                    report.command_runs, bound.command_runs
-                );
-
-                if report.blocked.is_empty() {
-                    return Ok(());
-                }
-
-                // Compute failure context before touching the replan budget:
-                // a gate-only halt must not consume it (see
-                // `all_blocked_are_gates`), so this has to happen before
-                // `next_step` would otherwise increment `replans_used`.
-                let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
-
-                match outcome_of(&report, &ctx) {
-                    Outcome::Completed => {
-                        unreachable!("report.blocked was already checked non-empty above")
-                    }
-                    Outcome::HaltedAtCheckpoint => {
-                        println!(
-                            "\nrun halted at an intentional checkpoint, not a failure: {:?}",
-                            ctx.gated
-                        );
-                        println!(
-                            "no replan attempted — this is the run stopping as designed; the \
-                             replan budget was not spent."
-                        );
-                        std::process::exit(exit_code(&Outcome::HaltedAtCheckpoint));
-                    }
-                    Outcome::Blocked => {
-                        eprintln!("\nrun blocked by a failure: {:?}", ctx.blocked);
-                    }
-                }
-
-                match next_step(false, replan, replans_used, max_replans) {
-                    Step::Success => {
-                        unreachable!("report.blocked was already checked non-empty above")
-                    }
-                    Step::Exhausted => {
-                        if replan {
-                            eprintln!(
-                                "error: run halted and the replan budget of {max_replans} is exhausted"
-                            );
-                        }
-                        std::process::exit(1);
-                    }
-                    Step::Replan(n) => {
-                        replans_used = n;
-                    }
-                }
-                println!("{}", replan_banner(replans_used, max_replans));
-
-                // Reached only when `replan` is true, which the flag rail
-                // above already tied to `provider == ClaudeCode` — and that,
-                // in turn, was already rejected at the rail stage when the
-                // claude-code feature isn't compiled in. So the claude
-                // planner is always what's wanted here in this task; HTTP
-                // providers' replan support (ApiBackend) is the next task.
-                #[cfg(feature = "claude-code")]
-                let planner = claude_planner(model.clone(), 3);
-                #[cfg(not(feature = "claude-code"))]
-                let planner: topodb_sgh::planner::BoundedPlanner =
-                    unreachable!("replan with a non-claude-code provider already rejected above");
-                let revised = match propose_revision(&planner, &current, &ctx) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        eprintln!("error: replan failed: {e}");
-                        std::process::exit(1);
-                    }
-                };
-
-                // Validate before persisting: an invalid revision must never
-                // land in the run's revision history.
-                let validated = match validate(&revised) {
-                    Ok(v) => v,
-                    Err(errors) => {
-                        for e in &errors {
-                            eprintln!("error: proposed revision is invalid: {e}");
-                        }
-                        std::process::exit(2);
-                    }
-                };
-
-                // Stamp strictly after every write the run itself made
-                // (`ex.clock()` is the executor's logical clock after
-                // `run()` returns), not `now + 2` — the executor's clock
-                // ticks on every state write and can reach well past that by
-                // the time the run halts, so a fixed `now + 2` recorded the
-                // revision as existing *during* the run that produced it.
-                let revised_yaml = serde_yaml::to_string(&revised)?;
-                ex.store_ref().record_revision(
-                    &revised_yaml,
-                    &format!("blocked: {:?}", report.blocked),
-                    ex.clock() + 1,
-                )?;
-
-                current = validated;
-                is_revision = true;
-
-                println!("proposed revision:\n{revised_yaml}");
-                // Loop back: the revision re-enters the gate exactly like the
-                // original graph. It is never executed without approval.
+            let code = run_cmd(
+                &cli.db,
+                graph,
+                model,
+                yes,
+                yes_including_revisions,
+                agent_bash,
+                agent_mcp,
+                command_timeout,
+                replan,
+                max_replans,
+                provider,
+                base_url,
+            )?;
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Cmd::Plan {
@@ -906,7 +579,403 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider,
             base_url,
             max_attempts,
-        } => {
+        } => plan_cmd(goal, out, context, model, provider, base_url, max_attempts)?,
+    }
+
+    Ok(())
+}
+
+/// The `run` subcommand's body, factored out of `main` so every exit code is
+/// a plain `Result` value instead of a `std::process::exit` call. This
+/// matters specifically because `std::process::exit` skips destructors: an
+/// HTTP provider's `McpBridge` (a live child process) is owned by a local
+/// here, and only a normal `return` — not `process::exit` — runs `Drop`
+/// (kill+wait) on it before the process actually terminates. `main` is the
+/// only place still allowed to call `process::exit`, and only after this
+/// function has already returned (so everything local to it, runner and
+/// bridge included, has already dropped).
+#[allow(clippy::too_many_arguments)]
+fn run_cmd(
+    db_path: &std::path::Path,
+    graph: PathBuf,
+    model: Option<String>,
+    yes: bool,
+    yes_including_revisions: bool,
+    agent_bash: Vec<String>,
+    agent_mcp: Option<String>,
+    command_timeout: u64,
+    replan: bool,
+    max_replans: u32,
+    provider: Provider,
+    base_url: Option<String>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    // `--yes-including-revisions` implies `--yes` for anything else
+    // in this command that reads `yes` (there is nothing else today,
+    // but keeping the invariant explicit here means a future reader
+    // of `yes` doesn't have to know about the other flag).
+    let yes = yes || yes_including_revisions;
+
+    // Canonicalize bash grants: trim each one, then validate. Pass trimmed
+    // grants to the runner so build_argv interpolates canonicalized values.
+    let agent_bash: Vec<String> = agent_bash
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .collect();
+
+    // Validate bash grants before anything runs. Nothing has been spawned
+    // yet at any of these flag-rail checks, so a plain `process::exit` here
+    // (rather than a returned code) can't skip cleanup of anything live.
+    for grant in &agent_bash {
+        if let Err(e) = topodb_sgh::runner::rails::validate_bash_grant(grant) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+
+    // Flag rails: provider/base-url/agent-bash compatibility, and
+    // the compiled-feature check for the requested provider. These
+    // must run before the graph file is even read — a bad flag
+    // combination is a rail violation, not something that depends
+    // on the graph.
+    validate_provider_flags(provider, &base_url, !agent_bash.is_empty());
+    #[cfg(not(feature = "claude-code"))]
+    if provider == Provider::ClaudeCode {
+        eprintln!("error: this sgh was built without the claude-code feature");
+        std::process::exit(2);
+    }
+    if replan && provider != Provider::ClaudeCode {
+        eprintln!(
+            "error: --replan with --provider {provider} arrives with ApiBackend (next task)"
+        );
+        std::process::exit(2);
+    }
+
+    let src = std::fs::read_to_string(&graph)?;
+    let g = Graph::from_yaml(&src)?;
+    let v = match validate(&g) {
+        Ok(v) => v,
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("error: {e}");
+            }
+            std::process::exit(2);
+        }
+    };
+
+    let mcp_argv = match agent_mcp.as_deref() {
+        Some(cmd) => match topodb_sgh::runner::rails::validate_mcp_server_command(cmd) {
+            Ok(argv) => Some(argv),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
+    // claude-code path: built eagerly, in the same place (before `Db::open`)
+    // and order as before this task — the mcp-config file is temp-dir JSON,
+    // not a spawned process, so nothing runs ahead of the approval gate
+    // below.
+    #[cfg(feature = "claude-code")]
+    let mut runner: Option<BuiltRunner> = if provider == Provider::ClaudeCode {
+        let mcp_wiring = match &mcp_argv {
+            Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
+                config_path: write_mcp_config(argv)?.to_string_lossy().into_owned(),
+            }),
+            None => None,
+        };
+        Some(BuiltRunner::Claude(ClaudeCodeRunner::new(
+            model.clone(),
+            agent_bash.clone(),
+            mcp_wiring,
+        )))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "claude-code"))]
+    let mut runner: Option<BuiltRunner> = None;
+
+    let db = Db::open(db_path)?;
+    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
+
+    // HTTP providers: the provider client is built now (from_env
+    // only reads env vars — no IO), but the MCP bridge spawns a
+    // subprocess, so it waits until after the first gate approval
+    // in the loop below (`runner.is_none()` there).
+    let mut pending_http_provider: Option<Box<dyn topodb_sgh::provider::ChatProvider>> =
+        match provider {
+            Provider::ClaudeCode => None,
+            Provider::Anthropic | Provider::Openai => Some(build_http_provider(
+                provider,
+                model.clone(),
+                base_url.clone(),
+            )),
+        };
+
+    let mut current = v;
+    let mut replans_used = 0u32;
+    // False for the graph supplied on the command line; set true
+    // once a revision replaces `current` at the bottom of the loop.
+    // Drives `needs_prompt` — the gate `--yes` alone must never
+    // skip.
+    let mut is_revision = false;
+
+    loop {
+        let bound = worst_case(&current);
+        println!("Goal: {}", current.graph.goal);
+        println!("Nodes: {}", current.graph.nodes.len());
+        println!("Bound: {bound}");
+
+        let commands = command_preview(&current);
+        if !commands.is_empty() {
+            println!("\nCommands that will execute in a shell:");
+            for line in &commands {
+                println!("  {line}");
+            }
+        }
+
+        let grants = grants_preview(&agent_bash);
+        if !grants.is_empty() {
+            println!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
+            for grant in &grants {
+                println!("  {grant}:*");
+            }
+        }
+
+        print_unconstrained(&current);
+
+        // From here on a bridge/runner from a previous loop iteration may
+        // already be alive (a replan revision re-enters this loop with
+        // `runner` already `Some`), so every exit below returns a code
+        // instead of calling `std::process::exit` — the caller in `main`
+        // only calls that once this function, and everything it owns, has
+        // already dropped.
+        if let Some(err) = mcp_pairing_error(&current, agent_mcp.as_deref()) {
+            eprintln!("error: {err}");
+            return Ok(2);
+        }
+
+        if let Some(cmd) = &agent_mcp {
+            println!();
+            let lines = match provider {
+                Provider::ClaudeCode => {
+                    #[cfg(feature = "claude-code")]
+                    {
+                        mcp_gate_lines(&current, cmd)
+                    }
+                    #[cfg(not(feature = "claude-code"))]
+                    {
+                        unreachable!(
+                            "claude-code provider without the feature already \
+                             exited at the flag-rail stage"
+                        )
+                    }
+                }
+                Provider::Anthropic | Provider::Openai => http_mcp_gate_lines(&current, cmd),
+            };
+            for line in lines {
+                println!("{line}");
+            }
+        }
+
+        // The gate preview above (commands + grants) prints on stdout
+        // whether or not a prompt follows, so a --yes run is never
+        // silent about the widened surface — no separate stderr echo.
+        if needs_prompt(is_revision, yes, yes_including_revisions) {
+            println!("\nProceed? [y/N]");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("y") {
+                println!("aborted");
+                return Ok(0);
+            }
+        }
+
+        // HTTP providers only: build the runner now, post-approval —
+        // this is where the MCP bridge (if the graph opts in) spawns
+        // its subprocess, so no server starts for a run the operator
+        // rejects. Happens once; subsequent loop iterations (replan
+        // revisions) reuse the same runner and bridge.
+        if runner.is_none() {
+            #[cfg(feature = "http")]
+            {
+                let bridge = if !mcp_nodes(&current).is_empty() {
+                    // mcp_pairing_error above already guarantees
+                    // mcp_argv is Some whenever a node opts in.
+                    let argv = mcp_argv
+                        .as_ref()
+                        .expect("mcp_pairing_error enforces this pairing");
+                    match topodb_sgh::mcp_bridge::McpBridge::spawn(argv) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return Ok(2);
+                        }
+                    }
+                } else {
+                    None
+                };
+                let provider_client = pending_http_provider
+                    .take()
+                    .expect("pending_http_provider is Some whenever provider != ClaudeCode");
+                runner = Some(BuiltRunner::Http(
+                    topodb_sgh::runner::http::HttpChatRunner::new(
+                        provider_client,
+                        model.clone(),
+                        bridge,
+                    ),
+                ));
+            }
+        }
+        let runner_ref = runner
+            .as_ref()
+            .expect("built either eagerly (claude-code) or just above (http)")
+            .as_agent_runner();
+
+        let run_id = ulid::Ulid::new().to_string();
+        let now = 1;
+        let store = RunStore::create(&db, &run_id, &current, now)?;
+        let mut ex =
+            Executor::new(store, current.clone(), runner_ref).with_command_runner(&command_runner);
+        let report = ex.run(now + 1)?;
+
+        println!("\nrun {run_id}");
+        println!("  succeeded: {:?}", report.succeeded);
+        println!("  blocked:   {:?}", report.blocked);
+        println!("  skipped:   {:?}", report.skipped);
+        for id in &report.blocked {
+            // A failed node prints its reason; a gate blocked on purpose
+            // and has none — leave it to the exit-3 checkpoint message
+            // below rather than labelling an intentional halt a failure.
+            if let Some(reason) = report.blocked_reasons.get(id) {
+                println!("    {id}: {}", one_line(reason));
+            }
+        }
+        println!(
+            "  model calls: {} (bound was {})",
+            report.model_calls, bound.agent_calls
+        );
+        println!(
+            "  command runs: {} (bound was {})",
+            report.command_runs, bound.command_runs
+        );
+
+        if report.blocked.is_empty() {
+            return Ok(0);
+        }
+
+        // Compute failure context before touching the replan budget:
+        // a gate-only halt must not consume it (see
+        // `all_blocked_are_gates`), so this has to happen before
+        // `next_step` would otherwise increment `replans_used`.
+        let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
+
+        match outcome_of(&report, &ctx) {
+            Outcome::Completed => {
+                unreachable!("report.blocked was already checked non-empty above")
+            }
+            Outcome::HaltedAtCheckpoint => {
+                println!(
+                    "\nrun halted at an intentional checkpoint, not a failure: {:?}",
+                    ctx.gated
+                );
+                println!(
+                    "no replan attempted — this is the run stopping as designed; the \
+                     replan budget was not spent."
+                );
+                return Ok(exit_code(&Outcome::HaltedAtCheckpoint));
+            }
+            Outcome::Blocked => {
+                eprintln!("\nrun blocked by a failure: {:?}", ctx.blocked);
+            }
+        }
+
+        match next_step(false, replan, replans_used, max_replans) {
+            Step::Success => {
+                unreachable!("report.blocked was already checked non-empty above")
+            }
+            Step::Exhausted => {
+                if replan {
+                    eprintln!(
+                        "error: run halted and the replan budget of {max_replans} is exhausted"
+                    );
+                }
+                return Ok(1);
+            }
+            Step::Replan(n) => {
+                replans_used = n;
+            }
+        }
+        println!("{}", replan_banner(replans_used, max_replans));
+
+        // Reached only when `replan` is true, which the flag rail
+        // above already tied to `provider == ClaudeCode` — and that,
+        // in turn, was already rejected at the rail stage when the
+        // claude-code feature isn't compiled in. So the claude
+        // planner is always what's wanted here in this task; HTTP
+        // providers' replan support (ApiBackend) is the next task.
+        #[cfg(feature = "claude-code")]
+        let planner = claude_planner(model.clone(), 3);
+        #[cfg(not(feature = "claude-code"))]
+        let planner: topodb_sgh::planner::BoundedPlanner =
+            unreachable!("replan with a non-claude-code provider already rejected above");
+        let revised = match propose_revision(&planner, &current, &ctx) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("error: replan failed: {e}");
+                return Ok(1);
+            }
+        };
+
+        // Validate before persisting: an invalid revision must never
+        // land in the run's revision history.
+        let validated = match validate(&revised) {
+            Ok(v) => v,
+            Err(errors) => {
+                for e in &errors {
+                    eprintln!("error: proposed revision is invalid: {e}");
+                }
+                return Ok(2);
+            }
+        };
+
+        // Stamp strictly after every write the run itself made
+        // (`ex.clock()` is the executor's logical clock after
+        // `run()` returns), not `now + 2` — the executor's clock
+        // ticks on every state write and can reach well past that by
+        // the time the run halts, so a fixed `now + 2` recorded the
+        // revision as existing *during* the run that produced it.
+        let revised_yaml = serde_yaml::to_string(&revised)?;
+        ex.store_ref().record_revision(
+            &revised_yaml,
+            &format!("blocked: {:?}", report.blocked),
+            ex.clock() + 1,
+        )?;
+
+        current = validated;
+        is_revision = true;
+
+        println!("proposed revision:\n{revised_yaml}");
+        // Loop back: the revision re-enters the gate exactly like the
+        // original graph. It is never executed without approval.
+    }
+}
+
+/// The `plan` subcommand's body. Never builds a bridge/persistent child
+/// process, so — unlike `run_cmd` — plain `std::process::exit` throughout is
+/// fine; kept as a function only for symmetry with `run_cmd`'s call site in
+/// `main`.
+#[allow(clippy::too_many_arguments)]
+fn plan_cmd(
+    goal: String,
+    out: Option<PathBuf>,
+    context: Option<String>,
+    model: Option<String>,
+    provider: Provider,
+    base_url: Option<String>,
+    max_attempts: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
             // Flag rails before anything else, same as `run`.
             validate_provider_flags(provider, &base_url, false);
             // This task keeps `plan` claude-only; Task 10's ApiBackend
@@ -970,8 +1039,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => print!("{yaml}"),
                 }
             }
-        }
-    }
 
     Ok(())
 }
