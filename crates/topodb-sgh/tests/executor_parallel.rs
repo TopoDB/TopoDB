@@ -149,16 +149,17 @@ fn inflight_never_exceeds_the_cap() {
     let report = ex.run(10).unwrap();
 
     assert_eq!(report.succeeded.len(), 6);
+    // Overlap-engagement (that concurrency actually reaches 2, not just
+    // that it never exceeds it) is proven deterministically by
+    // `independent_branches_actually_overlap_at_inflight_2` — the
+    // rendezvous there hangs rather than silently passing if the scheduler
+    // never runs two nodes at once. This assertion covers only the cap
+    // itself, which timing can never make flaky in the wrong direction:
+    // under contention `high_water` can only under-count real overlap,
+    // never overshoot the cap.
     assert!(
         runner.high_water() <= 2,
         "inflight high-water mark {} exceeded the cap of 2",
-        runner.high_water()
-    );
-    assert!(
-        runner.high_water() >= 2,
-        "inflight high-water mark {} never reached 2 — parallelism did not \
-         actually engage (the 50ms sleep should make overlap overwhelmingly \
-         likely at cap 2 across 6 independent nodes)",
         runner.high_water()
     );
 }
