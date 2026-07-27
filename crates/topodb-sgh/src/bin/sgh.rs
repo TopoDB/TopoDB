@@ -1,9 +1,10 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use topodb::Db;
-use topodb_sgh::executor::{Executor, RunReport};
+use topodb_sgh::executor::{ClockFn, Executor, RunReport};
 #[cfg(feature = "claude-code")]
 use topodb_sgh::planner::claude::claude_planner_with_timeout_and_cancel;
 use topodb_sgh::planner::{PlanRequest, Planner};
@@ -329,6 +330,17 @@ fn one_line(s: &str) -> String {
     }
     let head: String = flat.chars().take(200).collect();
     format!("{head}…")
+}
+
+/// Current wall clock, in epoch milliseconds, for `Executor::with_clock`.
+/// Saturating: a clock before the Unix epoch (never expected in practice)
+/// yields 0 rather than panicking.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        .min(i64::MAX as u128) as i64
 }
 
 /// Announce a replanning attempt and the ceiling it counts against, so the
@@ -916,13 +928,15 @@ fn run_cmd(
             .as_agent_runner();
 
         let run_id = ulid::Ulid::new().to_string();
-        let now = 1;
+        let now = now_ms();
         let store = RunStore::create(&db, &run_id, &current, now)?;
+        let clock: ClockFn = Arc::new(now_ms);
         let mut ex = Executor::new(store, current.clone(), runner_ref)
             .with_command_runner(&command_runner)
             .with_cancel(cancel.clone())
-            .with_max_inflight(max_inflight);
-        let report = ex.run(now + 1)?;
+            .with_max_inflight(max_inflight)
+            .with_clock(clock);
+        let report = ex.run(now)?;
 
         println!("\nrun {run_id}");
         println!("  succeeded: {:?}", report.succeeded);

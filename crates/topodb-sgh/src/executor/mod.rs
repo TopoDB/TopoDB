@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::recovery::{contract_preserved, NoopRepairer, Repairer, Rung};
 use crate::runner::cancel::CancelToken;
@@ -52,6 +52,9 @@ struct Shared<'r> {
     repairer: &'r dyn Repairer,
     command_runner: Option<&'r dyn CommandRunner>,
     clock: AtomicI64,
+    /// When set, `tick` clamps the logical clock forward to wall time
+    /// instead of just incrementing it. See `ClockFn` and `with_clock`.
+    wall_clock: Option<ClockFn>,
     model_calls: AtomicU64,
     command_runs: AtomicU64,
     /// Why each failed node blocked, captured at the block point where the
@@ -67,6 +70,11 @@ struct Shared<'r> {
     aborted: AtomicBool,
 }
 
+/// A wall-clock source, injected via `Executor::with_clock`. Returns epoch
+/// milliseconds (or any caller-chosen unit, as long as it's non-decreasing
+/// enough for the monotone clamp in `tick` to be meaningful).
+pub type ClockFn = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 pub struct Executor<'r> {
     shared: Shared<'r>,
 }
@@ -81,6 +89,7 @@ impl<'r> Executor<'r> {
                 repairer: &NoopRepairer,
                 command_runner: None,
                 clock: AtomicI64::new(0),
+                wall_clock: None,
                 model_calls: AtomicU64::new(0),
                 command_runs: AtomicU64::new(0),
                 blocked_reasons: Mutex::new(BTreeMap::new()),
@@ -122,6 +131,22 @@ impl<'r> Executor<'r> {
     /// never touch this knob.
     pub fn with_max_inflight(mut self, n: usize) -> Self {
         self.shared.max_inflight = n.max(1);
+        self
+    }
+
+    /// Override the tick source with a real clock (epoch ms). Ticks remain
+    /// non-decreasing via a monotone clamp: `tick = max(clock(), previous)`.
+    /// Default (no clock): the existing logical counter — unchanged.
+    ///
+    /// Deliberate spec deviation: the spec says "the executor's internal
+    /// logical tick disappears"; instead the logical tick stays as the
+    /// DEFAULT and the wall clock is opt-in. Rationale: every existing test
+    /// (including `state_history_is_preserved`) pins logical-tick
+    /// determinism, and library users get deterministic replay for free;
+    /// the CLI always injects the wall clock, so production behavior
+    /// matches the spec's intent. Treat this as chosen, not missed.
+    pub fn with_clock(mut self, clock: ClockFn) -> Self {
+        self.shared.wall_clock = Some(clock);
         self
     }
 
@@ -244,8 +269,25 @@ impl<'r> Executor<'r> {
 /// run's timeline is reproducible. `fetch_add` preserves both uniqueness and
 /// monotonicity; in today's single-threaded caller this produces the exact
 /// same sequence as the previous `self.clock += 1; self.clock`.
+///
+/// When a `wall_clock` is injected (see `Executor::with_clock`), ticks
+/// clamp forward to wall time instead: `shared.clock` tracks the high-water
+/// mark ever observed, so a stalled or backwards-jumping clock still only
+/// ever produces non-decreasing ticks. Consecutive ticks are allowed to be
+/// equal in this path (unlike the default, which is always strictly
+/// increasing) — supersession's close-old/create-new writes are meant to
+/// land atomically at the same wall-clock instant, and rejecting an equal
+/// timestamp there would turn a real atomic swap into an artificially
+/// ordered pair.
 fn tick(shared: &Shared) -> i64 {
-    shared.clock.fetch_add(1, Ordering::SeqCst) + 1
+    match &shared.wall_clock {
+        None => shared.clock.fetch_add(1, Ordering::SeqCst) + 1,
+        Some(c) => {
+            let now = c();
+            shared.clock.fetch_max(now, Ordering::SeqCst);
+            shared.clock.load(Ordering::SeqCst).max(now)
+        }
+    }
 }
 
 /// The ready-set scheduler for `max_inflight > 1`: workers borrow `&Shared`
