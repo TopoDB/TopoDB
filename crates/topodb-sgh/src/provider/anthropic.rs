@@ -7,6 +7,16 @@
 use super::{ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, ProviderError, Role, StopReason};
 use serde_json::{json, Value};
 
+/// Safely elide a response body to ~200 chars, preserving UTF-8 boundaries.
+fn elide_body(body: &[u8]) -> String {
+    let s = String::from_utf8_lossy(body);
+    if s.len() > 200 {
+        s.chars().take(200).collect()
+    } else {
+        s.into_owned()
+    }
+}
+
 /// Anthropic Messages API provider.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -160,11 +170,10 @@ impl ChatProvider for AnthropicProvider {
                 val.get("error")
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
-                    .unwrap_or(&body.iter().take(200).map(|&b| b as char).collect::<String>())
-                    .to_string()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| elide_body(body))
             } else {
-                String::from_utf8_lossy(&body.iter().take(200).copied().collect::<Vec<_>>())
-                    .to_string()
+                elide_body(body)
             };
             return Err(ProviderError::Malformed(format!(
                 "HTTP {}: {}",
