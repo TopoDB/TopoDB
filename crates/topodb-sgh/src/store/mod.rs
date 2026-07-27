@@ -68,6 +68,8 @@ pub enum SghError {
     Yaml(#[from] serde_yaml::Error),
     #[error("corrupt run {run_id}: {reason}")]
     CorruptRun { run_id: String, reason: String },
+    #[error("run {run_id:?} not found in this database")]
+    RunNotFound { run_id: String },
     #[error(
         "graph contains command nodes but no CommandRunner was configured: {nodes:?}; call \
          Executor::with_command_runner"
