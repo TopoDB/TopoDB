@@ -28,7 +28,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 [[bin]]
 name = "sgh"
 path = "src/bin/sgh.rs"
-required-features = ["cli", "claude-code"]
+required-features = ["cli"]
 
 [dev-dependencies]
 proptest = "1"
