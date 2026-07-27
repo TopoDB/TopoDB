@@ -1,8 +1,10 @@
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
+use topodb::{Db, PropValue, ScopeSet, TopoError};
 use topodb_sgh::executor::{ClockFn, Executor, RunReport};
 #[cfg(feature = "claude-code")]
 use topodb_sgh::planner::claude::claude_planner_with_timeout_and_cancel;
@@ -228,6 +230,16 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         max_inflight: usize,
     },
+    /// Inspect runs without touching the (possibly locked) database.
+    Show {
+        /// Run id to display (omit with --list).
+        run_id: Option<String>,
+        #[arg(long)]
+        list: bool,
+        /// Keep tailing the event file as the run progresses (Ctrl-C to stop).
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 /// Every command node's id and full `run:` string, in declaration order.
@@ -415,7 +427,7 @@ fn open_event_sink(
 fn open_db_or_exit(db_path: &std::path::Path) -> topodb::Db {
     match topodb::Db::open(db_path) {
         Ok(db) => db,
-        Err(topodb::TopoError::Busy) => {
+        Err(TopoError::Busy) => {
             eprintln!(
                 "error: database is held by another process (a run in progress?) — try 'sgh show <run-id>' for live status"
             );
@@ -681,6 +693,359 @@ fn build_replan_planner(
     }
 }
 
+/// Inspect an event log or list all runs. Validates that run_id XOR --list is
+/// provided, and that --follow requires run_id.
+fn show_cmd(
+    db_path: &std::path::Path,
+    run_id: Option<String>,
+    list: bool,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate: run_id XOR list, and --follow requires run_id
+    match (&run_id, list) {
+        (None, false) => {
+            eprintln!("error: either <run_id> or --list is required");
+            std::process::exit(2);
+        }
+        (Some(_), true) => {
+            eprintln!("error: cannot use both <run_id> and --list");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+    if follow && run_id.is_none() {
+        eprintln!("error: --follow requires a run_id");
+        std::process::exit(2);
+    }
+
+    if let Some(id) = run_id {
+        show_event_log(db_path, &id, follow)?;
+    } else if list {
+        show_list(db_path)?;
+    }
+
+    Ok(())
+}
+
+/// Pretty-print an event log, optionally following new lines as they're appended.
+fn show_event_log(
+    db_path: &std::path::Path,
+    run_id: &str,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let event_file = events_dir(db_path).join(format!("{run_id}.jsonl"));
+
+    if !event_file.exists() {
+        eprintln!("error: no event log for run {run_id} (older run, or events were disabled)");
+        std::process::exit(2);
+    }
+
+    let file = std::fs::File::open(&event_file)?;
+    let reader = std::io::BufReader::new(file);
+
+    // Read all current lines
+    let mut first_ts: Option<i64> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        print_event_line(&line, &mut first_ts)?;
+    }
+
+    // If following, poll for new lines
+    if follow {
+        use std::io::{Seek, SeekFrom};
+        use std::thread;
+        use std::time::Duration as StdDuration;
+
+        let mut file = std::fs::File::open(&event_file)?;
+        file.seek(SeekFrom::End(0))?;
+        let mut reader = std::io::BufReader::new(file);
+
+        loop {
+            // Try to read a new line
+            let mut line = String::new();
+            use std::io::BufRead;
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // EOF: sleep and retry
+                    thread::sleep(StdDuration::from_millis(250));
+                    continue;
+                }
+                Ok(_) => {
+                    if !line.is_empty() && line != "\n" {
+                        print_event_line(&line, &mut first_ts)?;
+                    }
+                }
+                Err(_) => {
+                    // Try to re-open the file (it may have been rotated or moved)
+                    thread::sleep(StdDuration::from_millis(250));
+                    if event_file.exists() {
+                        match std::fs::File::open(&event_file) {
+                            Ok(f) => {
+                                file = f;
+                                file.seek(SeekFrom::End(0))?;
+                                reader = std::io::BufReader::new(file);
+                            }
+                            Err(_) => {
+                                // File still doesn't exist or can't be opened; keep trying
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse and pretty-print a single event line. Tracks the first timestamp to
+/// compute relative seconds for all subsequent events.
+fn print_event_line(
+    line: &str,
+    first_ts: &mut Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(obj) => {
+            let ts = obj.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            let event_type = obj
+                .get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            // Set first_ts if not yet set
+            if first_ts.is_none() {
+                *first_ts = Some(ts);
+            }
+
+            let base_ts = first_ts.unwrap_or(0);
+            let rel_s = (ts - base_ts).max(0) / 1000;
+
+            match event_type {
+                "run_started" => {
+                    let goal = obj
+                        .get("goal")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no goal)");
+                    println!("[+{rel_s}s] run_started: {goal}");
+                }
+                "node_started" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_started: {node_id}");
+                }
+                "attempt_finished" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let rung = obj.get("rung").and_then(|v| v.as_str()).unwrap_or("?");
+                    let error = obj.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                    let error_short = if error.chars().count() > 120 {
+                        let truncated: String = error.chars().take(120).collect();
+                        format!("{}…", truncated)
+                    } else {
+                        error.to_string()
+                    };
+                    println!("[+{rel_s}s] attempt {node_id}: {rung} — {error_short}");
+                }
+                "node_succeeded" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_succeeded: {node_id}");
+                }
+                "node_blocked" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_blocked: {node_id}");
+                }
+                "node_skipped" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_skipped: {node_id}");
+                }
+                "gate_reached" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] gate_reached: {node_id}");
+                }
+                "run_finished" => {
+                    let succeeded: Vec<String> = obj
+                        .get("succeeded")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let blocked: Vec<String> = obj
+                        .get("blocked")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let skipped: Vec<String> = obj
+                        .get("skipped")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let model_calls = obj.get("model_calls").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let command_runs = obj
+                        .get("command_runs")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    println!(
+                        "[+{rel_s}s] run_finished: succeeded={}, blocked={}, skipped={}, model_calls={}, command_runs={}",
+                        succeeded.len(),
+                        blocked.len(),
+                        skipped.len(),
+                        model_calls,
+                        command_runs
+                    );
+                }
+                _ => {
+                    println!("[+{rel_s}s] {event_type}");
+                }
+            }
+        }
+        Err(_) => {
+            // Unparseable line: print raw with ? prefix
+            println!("? {trimmed}");
+        }
+    }
+
+    Ok(())
+}
+
+/// List all runs from the shared-scope run index, or if the DB is busy,
+/// list the event files as a fallback.
+fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    match Db::open(db_path) {
+        Ok(db) => {
+            let shared = ScopeSet::of(&[]).with_shared();
+            let runs = db.nodes_by_label(&shared, topodb_sgh::store::LABEL_RUN_INDEX);
+
+            if runs.is_empty() {
+                println!("(no runs)");
+                return Ok(());
+            }
+
+            // Collect and sort by creation timestamp (node id works as ULID)
+            let mut run_records: Vec<_> = runs.into_iter().collect();
+            run_records.sort_by_key(|a| a.id);
+
+            // Header
+            println!("RUN_ID          STATUS      CREATED_MS  GOAL");
+
+            for rec in run_records {
+                let run_id = rec
+                    .props
+                    .get("run_id")
+                    .and_then(|pv| {
+                        if let PropValue::Str(s) = pv {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(unknown)".to_string());
+
+                let status = rec
+                    .props
+                    .get("status")
+                    .and_then(|pv| {
+                        if let PropValue::Str(s) = pv {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(no status)".to_string());
+
+                let created_ms = rec
+                    .props
+                    .get("created_ms")
+                    .and_then(|pv| {
+                        if let PropValue::Int(i) = pv {
+                            Some(i.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(unknown)".to_string());
+
+                let goal = rec
+                    .props
+                    .get("goal")
+                    .and_then(|pv| {
+                        if let PropValue::Str(s) = pv {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(no goal)".to_string());
+
+                let goal_short = if goal.chars().count() > 60 {
+                    let truncated: String = goal.chars().take(60).collect();
+                    format!("{}…", truncated)
+                } else {
+                    goal
+                };
+
+                println!(
+                    "{:<15} {:<11} {:<11} {}",
+                    run_id, status, created_ms, goal_short
+                );
+            }
+        }
+        Err(TopoError::Busy) => {
+            println!("database busy (run in progress) — listing event logs instead:");
+            let events_path = events_dir(db_path);
+            if let Ok(entries) = std::fs::read_dir(&events_path) {
+                let mut files: Vec<_> = entries
+                    .filter_map(|entry| {
+                        let entry = entry.ok()?;
+                        let path = entry.path();
+                        if path.is_file() && path.extension().map(|e| e == "jsonl").unwrap_or(false)
+                        {
+                            let file_name = path
+                                .file_stem()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let metadata = entry.metadata().ok()?;
+                            let modified = metadata.modified().ok()?;
+                            Some((file_name, modified))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                files.sort_by_key(|b| std::cmp::Reverse(b.1)); // Newest first
+
+                for (name, _mtime) in files {
+                    println!("  {name}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -804,6 +1169,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if code != 0 {
                 std::process::exit(code);
             }
+        }
+        Cmd::Show {
+            run_id,
+            list,
+            follow,
+        } => {
+            show_cmd(&cli.db, run_id, list, follow)?;
         }
     }
 
