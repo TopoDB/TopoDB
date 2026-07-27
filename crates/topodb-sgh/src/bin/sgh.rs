@@ -770,7 +770,8 @@ fn run_cmd(
     let mut runner: Option<BuiltRunner> = None;
 
     let db = Db::open(db_path)?;
-    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
+    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout))
+        .with_cancel(cancel.clone());
 
     // HTTP providers: the provider client is built now (from_env
     // only reads env vars — no IO), but the MCP bridge spawns a
