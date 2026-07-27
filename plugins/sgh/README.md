@@ -52,6 +52,15 @@ bash grant has nothing to attach to. **The plugin itself is unaffected**: its
 slash commands always drive the local `claude` CLI (`--provider claude-code`,
 the default), unchanged by this flag existing.
 
+Under `--provider anthropic|openai`, `sgh` itself hosts the MCP server for
+the whole run, and that server holds redb's exclusive lock on the memory db
+for as long as `sgh` is running. If a `command` node shells out to `topodb`
+against the *same* db mid-run, it will fail with "database held by another
+process" — verify db state after the run finishes instead, or point
+command-node checks at a different db. This doesn't bite under
+`claude-code`, since claude spawns the MCP server per node invocation rather
+than once for the whole run.
+
 ## Commands
 
 - `/sgh:plan <goal>` — compile a goal into `.sgh/graph.yaml` and print its

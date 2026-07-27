@@ -34,10 +34,17 @@ fn chat_turn_roundtrips_parts() {
 struct Stub;
 impl ChatProvider for Stub {
     fn request(&self, _t: &ChatTurn) -> Result<HttpPayload, ProviderError> {
-        Ok(HttpPayload { url: "http://x".into(), headers: vec![], body: vec![] })
+        Ok(HttpPayload {
+            url: "http://x".into(),
+            headers: vec![],
+            body: vec![],
+        })
     }
     fn parse(&self, _s: u16, _b: &[u8]) -> Result<ChatResponse, ProviderError> {
-        Ok(ChatResponse { parts: vec![ContentPart::Text { text: "t".into() }], stop: StopReason::EndTurn })
+        Ok(ChatResponse {
+            parts: vec![ContentPart::Text { text: "t".into() }],
+            stop: StopReason::EndTurn,
+        })
     }
 }
 

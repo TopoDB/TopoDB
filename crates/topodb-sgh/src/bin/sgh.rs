@@ -237,10 +237,7 @@ fn mcp_gate_lines_named(v: &Validated, server_cmd: &str, surface: &str) -> Vec<S
             "  tools: {surface} -> no node opts in (flag is inert for this graph)"
         ));
     } else {
-        lines.push(format!(
-            "  tools: {surface} -> nodes: {}",
-            nodes.join(", ")
-        ));
+        lines.push(format!("  tools: {surface} -> nodes: {}", nodes.join(", ")));
     }
     lines
 }
@@ -468,7 +465,7 @@ fn build_http_provider(
             #[cfg(feature = "anthropic")]
             {
                 match topodb_sgh::provider::anthropic::AnthropicProvider::from_env(model) {
-                    Ok(p) => return Box::new(p),
+                    Ok(p) => Box::new(p),
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(2);
@@ -485,7 +482,7 @@ fn build_http_provider(
             #[cfg(feature = "openai")]
             {
                 match topodb_sgh::provider::openai::OpenAiProvider::from_env(model, base_url) {
-                    Ok(p) => return Box::new(p),
+                    Ok(p) => Box::new(p),
                     Err(e) => {
                         eprintln!("error: {e}");
                         std::process::exit(2);
@@ -1008,88 +1005,82 @@ fn plan_cmd(
     base_url: Option<String>,
     max_attempts: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-            // Flag rails before anything else, same as `run`.
-            validate_provider_flags(provider, &base_url, false);
-            #[cfg(not(feature = "claude-code"))]
-            if provider == Provider::ClaudeCode {
-                eprintln!("error: this sgh was built without the claude-code feature");
-                std::process::exit(2);
-            }
+    // Flag rails before anything else, same as `run`.
+    validate_provider_flags(provider, &base_url, false);
+    #[cfg(not(feature = "claude-code"))]
+    if provider == Provider::ClaudeCode {
+        eprintln!("error: this sgh was built without the claude-code feature");
+        std::process::exit(2);
+    }
 
-            {
-                let planner: topodb_sgh::planner::BoundedPlanner = match provider {
-                    Provider::ClaudeCode => {
-                        #[cfg(feature = "claude-code")]
-                        {
-                            claude_planner(model, max_attempts)
-                        }
-                        #[cfg(not(feature = "claude-code"))]
-                        {
-                            unreachable!(
-                                "claude-code provider without the feature already rejected above"
-                            )
-                        }
-                    }
-                    Provider::Anthropic | Provider::Openai => {
-                        #[cfg(feature = "http")]
-                        {
-                            let provider_client =
-                                build_http_provider(provider, model.clone(), base_url);
-                            let backend = topodb_sgh::planner::api::ApiBackend::new(
-                                provider_client,
-                                model,
-                            );
-                            topodb_sgh::planner::BoundedPlanner::with_backend(
-                                Box::new(backend),
-                                max_attempts,
-                            )
-                        }
-                        #[cfg(not(feature = "http"))]
-                        {
-                            eprintln!("error: this sgh was built without the http feature");
-                            std::process::exit(2);
-                        }
-                    }
-                };
-                let graph = match planner.plan(&PlanRequest { goal, context }) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(2);
-                    }
-                };
-
-                // The planner only returns validated graphs, but re-validate so
-                // the bound below is computed from a proof-carrying value rather
-                // than a trusted one.
-                let v = match validate(&graph) {
-                    Ok(v) => v,
-                    Err(errors) => {
-                        for e in &errors {
-                            eprintln!("error: {e}");
-                        }
-                        std::process::exit(2);
-                    }
-                };
-
-                let yaml = serde_yaml::to_string(&graph)?;
-                match &out {
-                    Some(path) => {
-                        std::fs::write(path, &yaml)?;
-                        eprintln!("wrote {} ({} node(s))", path.display(), v.graph.nodes.len());
-                        eprintln!("{}", worst_case(&v));
-                        let commands = command_preview(&v);
-                        if !commands.is_empty() {
-                            eprintln!("command nodes ({}):", commands.len());
-                            for line in &commands {
-                                eprintln!("  {line}");
-                            }
-                        }
-                        eprintln!("review it, then: sgh run {}", path.display());
-                    }
-                    None => print!("{yaml}"),
+    {
+        let planner: topodb_sgh::planner::BoundedPlanner = match provider {
+            Provider::ClaudeCode => {
+                #[cfg(feature = "claude-code")]
+                {
+                    claude_planner(model, max_attempts)
+                }
+                #[cfg(not(feature = "claude-code"))]
+                {
+                    unreachable!("claude-code provider without the feature already rejected above")
                 }
             }
+            Provider::Anthropic | Provider::Openai => {
+                #[cfg(feature = "http")]
+                {
+                    let provider_client = build_http_provider(provider, model.clone(), base_url);
+                    let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model);
+                    topodb_sgh::planner::BoundedPlanner::with_backend(
+                        Box::new(backend),
+                        max_attempts,
+                    )
+                }
+                #[cfg(not(feature = "http"))]
+                {
+                    eprintln!("error: this sgh was built without the http feature");
+                    std::process::exit(2);
+                }
+            }
+        };
+        let graph = match planner.plan(&PlanRequest { goal, context }) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        };
+
+        // The planner only returns validated graphs, but re-validate so
+        // the bound below is computed from a proof-carrying value rather
+        // than a trusted one.
+        let v = match validate(&graph) {
+            Ok(v) => v,
+            Err(errors) => {
+                for e in &errors {
+                    eprintln!("error: {e}");
+                }
+                std::process::exit(2);
+            }
+        };
+
+        let yaml = serde_yaml::to_string(&graph)?;
+        match &out {
+            Some(path) => {
+                std::fs::write(path, &yaml)?;
+                eprintln!("wrote {} ({} node(s))", path.display(), v.graph.nodes.len());
+                eprintln!("{}", worst_case(&v));
+                let commands = command_preview(&v);
+                if !commands.is_empty() {
+                    eprintln!("command nodes ({}):", commands.len());
+                    for line in &commands {
+                        eprintln!("  {line}");
+                    }
+                }
+                eprintln!("review it, then: sgh run {}", path.display());
+            }
+            None => print!("{yaml}"),
+        }
+    }
 
     Ok(())
 }

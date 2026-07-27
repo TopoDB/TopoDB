@@ -1,10 +1,10 @@
 //! Minimal MCP stdio client: exactly the subset needed to host topodb-mcp
 //! for HTTP providers (initialize, tools/list, tools/call). Not a general
 //! MCP client. JSON-RPC 2.0, one message per line (MCP stdio framing).
+use crate::provider::ToolDef;
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use serde_json::{json, Value};
-use crate::provider::ToolDef;
 
 pub const TOOL_NAMESPACE: &str = "topodb__";
 
@@ -45,19 +45,15 @@ impl McpBridge {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "failed to open child stdin",
-            ))
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeError::Io(std::io::Error::other("failed to open child stdin")))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "failed to open child stdout",
-            ))
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeError::Io(std::io::Error::other("failed to open child stdout")))?;
 
         let stdout = BufReader::new(stdout);
         let mut bridge = McpBridge {
@@ -111,9 +107,10 @@ impl McpBridge {
             }
         });
 
-        self.send_request(&request)?;
-        let response = self.read_response(self.next_id)?;
+        let id = self.next_id;
         self.next_id += 1;
+        self.send_request(&request)?;
+        let response = self.read_response(id)?;
 
         let result = Self::expect_result(&response)?;
         let is_error = result
@@ -156,9 +153,10 @@ impl McpBridge {
             }
         });
 
-        self.send_request(&request)?;
-        let response = self.read_response(self.next_id)?;
+        let id = self.next_id;
         self.next_id += 1;
+        self.send_request(&request)?;
+        let response = self.read_response(id)?;
 
         let _ = Self::expect_result(&response)?;
         Ok(())
@@ -172,9 +170,10 @@ impl McpBridge {
             "params": {}
         });
 
-        self.send_request(&request)?;
-        let response = self.read_response(self.next_id)?;
+        let id = self.next_id;
         self.next_id += 1;
+        self.send_request(&request)?;
+        let response = self.read_response(id)?;
 
         let result = Self::expect_result(&response)?;
         if let Some(tools_array) = result.get("tools").and_then(|v| v.as_array()) {
@@ -267,9 +266,9 @@ impl McpBridge {
 
             // This should be a response (has id)
             if let Some(id_val) = json.get("id") {
-                let response_id = id_val
-                    .as_u64()
-                    .ok_or_else(|| BridgeError::Malformed("response id is not a number".to_string()))?;
+                let response_id = id_val.as_u64().ok_or_else(|| {
+                    BridgeError::Malformed("response id is not a number".to_string())
+                })?;
 
                 if response_id != awaited_id {
                     return Err(BridgeError::Malformed(format!(

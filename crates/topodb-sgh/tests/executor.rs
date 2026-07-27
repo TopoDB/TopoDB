@@ -482,7 +482,12 @@ fn denied_outcome_blocks_with_debranded_reason() {
     )
     .unwrap();
     let v = validate(&graph).unwrap();
-    let runner = MockRunner::new().script("a", vec![NodeOutcome::Denied { tool: "Write".into() }]);
+    let runner = MockRunner::new().script(
+        "a",
+        vec![NodeOutcome::Denied {
+            tool: "Write".into(),
+        }],
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
@@ -493,6 +498,9 @@ fn denied_outcome_blocks_with_debranded_reason() {
 
     assert_eq!(report.blocked, vec!["a".to_string()]);
     let reason = &report.blocked_reasons["a"];
-    assert!(reason.contains("provider denied tool Write"), "got: {reason}");
+    assert!(
+        reason.contains("provider denied tool Write"),
+        "got: {reason}"
+    );
     assert!(!reason.to_lowercase().contains("claude"), "got: {reason}");
 }

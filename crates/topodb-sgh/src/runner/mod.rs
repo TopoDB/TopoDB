@@ -27,13 +27,19 @@ pub struct NodeRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeOutcome {
-    Succeeded { output: String },
-    Failed { error: String },
+    Succeeded {
+        output: String,
+    },
+    Failed {
+        error: String,
+    },
     /// The provider refused a tool the node needed (Claude Code permission
     /// denial; HTTP providers calling a tool outside the offered surface).
     /// Ladder-equivalent to `Failed`, but the tool name is structured data
     /// instead of a load-bearing substring.
-    Denied { tool: String },
+    Denied {
+        tool: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

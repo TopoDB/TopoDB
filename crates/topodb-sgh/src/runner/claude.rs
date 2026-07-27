@@ -2,9 +2,9 @@ use std::process::Command;
 
 use super::{AgentRunner, NodeOutcome, NodeRequest, RunnerError};
 
+use super::common::elide;
 pub use super::common::{build_prompt, extract_json};
 pub use super::rails::{validate_bash_grant, validate_mcp_server_command};
-use super::common::elide;
 
 /// Run-level MCP wiring for opted-in agent nodes: the path of the generated
 /// mcp-config file naming the `topodb` stdio server. Presence of a value
@@ -116,7 +116,9 @@ pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
         .unwrap_or_default();
 
     if !denied.is_empty() {
-        return NodeOutcome::Denied { tool: denied.join(", ") };
+        return NodeOutcome::Denied {
+            tool: denied.join(", "),
+        };
     }
 
     if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
