@@ -1,6 +1,7 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::runner::cancel::CancelToken;
 use crate::runner::proc::{self, ProcEnd};
 
 use super::PlannerError;
@@ -21,6 +22,11 @@ pub struct ClaudeBackend {
     /// unix) is killed if `claude -p` has not exited by this point. Default
     /// 600s (see `Default` impl).
     pub timeout: Duration,
+    /// Ctrl-C wiring: when set, the child (and its process group, on unix)
+    /// is killed as soon as the token is cancelled, instead of only at the
+    /// timeout. `None` (the default) preserves prior behavior — no
+    /// cancellation surface, deadline-only.
+    pub cancel: Option<CancelToken>,
 }
 
 impl Default for ClaudeBackend {
@@ -28,6 +34,7 @@ impl Default for ClaudeBackend {
         ClaudeBackend {
             model: None,
             timeout: DEFAULT_TIMEOUT,
+            cancel: None,
         }
     }
 }
@@ -42,7 +49,7 @@ impl PlanBackend for ClaudeBackend {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let (out, end) = proc::run_with_deadline(&mut cmd, self.timeout, None)
+        let (out, end) = proc::run_with_deadline(&mut cmd, self.timeout, self.cancel.as_ref())
             .map_err(|e| PlannerError::Runner(format!("spawning claude: {e}")))?;
 
         match end {
@@ -53,7 +60,7 @@ impl PlanBackend for ClaudeBackend {
                 )));
             }
             ProcEnd::Cancelled => {
-                unreachable!("run_with_deadline was called with cancel: None")
+                return Err(PlannerError::Runner("cancelled".into()));
             }
             ProcEnd::Exited => {}
         }
@@ -84,5 +91,31 @@ pub fn claude_planner_with_timeout(
     max_attempts: u32,
     timeout: Duration,
 ) -> BoundedPlanner {
-    BoundedPlanner::with_backend(Box::new(ClaudeBackend { model, timeout }), max_attempts)
+    BoundedPlanner::with_backend(
+        Box::new(ClaudeBackend {
+            model,
+            timeout,
+            cancel: None,
+        }),
+        max_attempts,
+    )
+}
+
+/// Same as `claude_planner_with_timeout`, additionally wiring a `CancelToken`
+/// so a Ctrl-C mid-replan kills the `claude -p` subprocess instead of
+/// leaving it orphaned and the caller blocked on its exit.
+pub fn claude_planner_with_timeout_and_cancel(
+    model: Option<String>,
+    max_attempts: u32,
+    timeout: Duration,
+    cancel: CancelToken,
+) -> BoundedPlanner {
+    BoundedPlanner::with_backend(
+        Box::new(ClaudeBackend {
+            model,
+            timeout,
+            cancel: Some(cancel),
+        }),
+        max_attempts,
+    )
 }

@@ -77,7 +77,9 @@ how long and how wide a run is allowed to get:
 - **Ctrl-C** — a `sgh run` in progress cancels gracefully on the first
   interrupt: inflight children are killed as a process group, the run is
   marked blocked, and the process exits `1`. It does not delete anything —
-  the run's state is left in the db for a future replan or resume.
+  the run's state is left in the db for a future replan or resume. Process-
+  group kill is unix-only; on Windows only the direct child is killed, not
+  any of its own descendants.
 
 ## Commands
 

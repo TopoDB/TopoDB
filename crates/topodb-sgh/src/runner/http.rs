@@ -193,7 +193,12 @@ impl HttpChatRunner {
 
 impl AgentRunner for HttpChatRunner {
     fn run(&self, req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
-        let deadline_at = Instant::now() + self.node_deadline;
+        // `Instant + Duration` panics on overflow; an operator-supplied
+        // `--agent-timeout` near `u64::MAX` seconds could otherwise take
+        // down the run instead of just being a very long (effectively
+        // unbounded) deadline. Clamp to a far-future-but-safe ceiling first.
+        let safe_deadline = self.node_deadline.min(Duration::from_secs(86400 * 365));
+        let deadline_at = Instant::now() + safe_deadline;
         // Returns `Some(remaining)` while there's still budget, or emits the
         // Failed outcome and returns None once the deadline has passed.
         // Called before every transport send and every bridge call so no

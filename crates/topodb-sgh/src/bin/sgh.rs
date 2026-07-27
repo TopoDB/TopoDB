@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use topodb::Db;
 use topodb_sgh::executor::{Executor, RunReport};
 #[cfg(feature = "claude-code")]
-use topodb_sgh::planner::claude::claude_planner_with_timeout;
+use topodb_sgh::planner::claude::claude_planner_with_timeout_and_cancel;
 use topodb_sgh::planner::{PlanRequest, Planner};
 use topodb_sgh::replan::{collect_failure_context, propose_revision, FailureContext};
 #[cfg(feature = "claude-code")]
@@ -525,12 +525,13 @@ fn build_replan_planner(
     model: Option<String>,
     base_url: Option<String>,
     agent_timeout: Duration,
+    cancel: topodb_sgh::runner::cancel::CancelToken,
 ) -> topodb_sgh::planner::BoundedPlanner {
     match provider {
         Provider::ClaudeCode => {
             #[cfg(feature = "claude-code")]
             {
-                claude_planner_with_timeout(model, 3, agent_timeout)
+                claude_planner_with_timeout_and_cancel(model, 3, agent_timeout, cancel)
             }
             #[cfg(not(feature = "claude-code"))]
             {
@@ -542,6 +543,12 @@ fn build_replan_planner(
         Provider::Anthropic | Provider::Openai => {
             #[cfg(feature = "http")]
             {
+                // HTTP arm: `cancel` is unused here. `ApiBackend` bounds
+                // itself with `with_timeout` (a per-request timeout), which
+                // already caps how long a replan can hang — unlike the
+                // claude-code subprocess arm, there is no orphaned child
+                // process to kill on Ctrl-C, so no cancel wiring is needed.
+                let _ = &cancel;
                 let provider_client = build_http_provider(provider, model.clone(), base_url);
                 let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model)
                     .with_timeout(agent_timeout);
@@ -938,6 +945,18 @@ fn run_cmd(
             report.command_runs, bound.command_runs
         );
 
+        // A cancelled run (Ctrl-C mid-run) must never report success: the
+        // report can still land with `blocked` empty (every started node
+        // finished before the signal landed; only the not-yet-started ones
+        // were skipped by the cancellation-aware claim pass), which would
+        // otherwise fall through to the `Ok(0)` below and exit 0 on an
+        // interrupted run. Check this before the replan step too — a
+        // cancelled run must not spawn a planner subprocess.
+        if cancel.is_cancelled() {
+            eprintln!("run cancelled");
+            return Ok(1);
+        }
+
         if report.blocked.is_empty() {
             return Ok(0);
         }
@@ -989,8 +1008,13 @@ fn run_cmd(
         // The planner mirrors whatever `--provider` executed the run: a
         // claude-code run replans with `claude_planner`, an HTTP-provider
         // run replans with a fresh `ApiBackend` over the same provider.
-        let planner =
-            build_replan_planner(provider, model.clone(), base_url.clone(), agent_timeout);
+        let planner = build_replan_planner(
+            provider,
+            model.clone(),
+            base_url.clone(),
+            agent_timeout,
+            cancel.clone(),
+        );
         let revised = match propose_revision(&planner, &current, &ctx) {
             Ok(g) => g,
             Err(e) => {
@@ -1057,12 +1081,24 @@ fn plan_cmd(
         std::process::exit(2);
     }
 
+    // Same Ctrl-C wiring as `run_cmd`: a claude-code planner shells out to
+    // `claude -p`, and without this a Ctrl-C during `plan` leaves that
+    // subprocess orphaned rather than killed.
+    let cancel = topodb_sgh::runner::cancel::CancelToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())?;
+
     {
         let planner: topodb_sgh::planner::BoundedPlanner = match provider {
             Provider::ClaudeCode => {
                 #[cfg(feature = "claude-code")]
                 {
-                    claude_planner_with_timeout(model, max_attempts, agent_timeout)
+                    claude_planner_with_timeout_and_cancel(
+                        model,
+                        max_attempts,
+                        agent_timeout,
+                        cancel.clone(),
+                    )
                 }
                 #[cfg(not(feature = "claude-code"))]
                 {
@@ -1090,6 +1126,10 @@ fn plan_cmd(
         let graph = match planner.plan(&PlanRequest { goal, context }) {
             Ok(g) => g,
             Err(e) => {
+                if cancel.is_cancelled() {
+                    eprintln!("plan cancelled");
+                    std::process::exit(1);
+                }
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }

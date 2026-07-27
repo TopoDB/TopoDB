@@ -90,7 +90,7 @@ fn independent_branches_actually_overlap_at_inflight_2() {
 }
 
 #[test]
-fn sequential_default_would_deadlock_rendezvous_so_it_must_not_be_used_here() {
+fn sequential_default_still_completes_the_same_graph() {
     // Guard test for the test above: with max_inflight(1) the rendezvous
     // would hang; assert the parallel path is what made it pass by checking
     // a plain runner still works sequentially on the same graph.
@@ -180,4 +180,44 @@ fn a_blocked_node_poisons_only_descendants_in_parallel_mode() {
     let succeeded: BTreeMap<&str, ()> = report.succeeded.iter().map(|s| (s.as_str(), ())).collect();
     assert!(succeeded.contains_key("a"), "a has no failing dep");
     assert!(succeeded.contains_key("c"), "c is independent of b");
+}
+
+/// A panicking runner must not hang the scheduler: the run returns an error
+/// instead of deadlocking on a never-sent worker result.
+#[test]
+fn a_panicking_runner_errors_instead_of_hanging() {
+    struct Panicker;
+    impl AgentRunner for Panicker {
+        fn run(&self, _req: &NodeRequest) -> Result<NodeOutcome, RunnerError> {
+            panic!("boom");
+        }
+    }
+    let v = two_independent();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "panic", &v, 1).unwrap();
+    let mut ex = Executor::new(store, v, &Panicker).with_max_inflight(2);
+    let err = ex.run(10).unwrap_err();
+    assert!(err.to_string().contains("panicked"), "got: {err}");
+}
+
+/// Pre-cancelled parallel run: every node skipped, no worker spawned, no hang.
+#[test]
+fn a_pre_cancelled_parallel_run_skips_everything() {
+    let v = two_independent();
+    let runner = topodb_sgh::runner::mock::MockRunner::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "precancel", &v, 1).unwrap();
+    let token = topodb_sgh::runner::cancel::CancelToken::new();
+    token.cancel();
+    let mut ex = Executor::new(store, v, &runner)
+        .with_max_inflight(4)
+        .with_cancel(token);
+    let report = ex.run(10).unwrap();
+
+    assert!(report.succeeded.is_empty(), "nothing should have run");
+    assert_eq!(runner.call_count(), 0, "no worker should have been spawned");
+    assert_eq!(report.model_calls, 0);
+    assert_eq!(report.skipped.len(), 2, "both nodes should be skipped");
 }
