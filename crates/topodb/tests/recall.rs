@@ -5,43 +5,77 @@ use topodb::*;
 /// Wait for a node's access counter to finish landing.
 ///
 /// Bumps are async: a read `try_send`s a bump, a bumper thread forwards it to
-/// the applier only on a ~100ms `recv_timeout` (or a 256-item batch), and the
-/// applier then writes it. A fixed sleep races that pipeline on a slow/loaded
-/// runner — it flaked `test (windows-latest)` because 300ms was not always
-/// enough for the applier write to land. Instead of guessing a duration, poll
-/// the watched counter until it stops moving: once its value has held steady
-/// for a sustained window — after enough total time for the bumper's timeout
-/// to have fired — every in-flight bump for it has been applied.
+/// the applier only on a ~100ms `recv_timeout` (or a 256-item batch — see
+/// `crates/topodb/src/db.rs`'s `bumper` thread), and the applier then writes
+/// it. A prior fix (#14) replaced a bare 300ms sleep with a poll that
+/// declared victory once the counter had held its current value for a single
+/// 300ms *wall-clock* window. That's still a race: `stable_since` starts
+/// ticking from whatever value `read()` happens to observe first, which can
+/// be a value the bumper hasn't even started flushing yet (all in-flight
+/// bumps still sitting in the channel). If that pre-flush value then happens
+/// to hold for 300ms before the real flush lands — plausible on a loaded
+/// runner where the bumper's own thread is scheduled late — the poll returns
+/// "settled" on a stale reading, and a later flush changes the counter out
+/// after the test has already sampled it. This is exactly the failure
+/// observed in CI: `scoring_reads_do_not_bump_counters` and
+/// `access_boost_lifts_a_frequently_read_node` both flaked
+/// `test (windows-latest)` on unrelated PRs with mismatched left/right access
+/// counts, in both directions (sometimes too high, sometimes too low) —
+/// consistent with sampling on either side of a late flush rather than a
+/// directional engine bug.
 ///
-/// Adaptive, so a fast machine returns quickly and a slow one waits as long as
-/// the counter keeps changing (bounded by a safety cap). A pathologically
-/// starved bumper could still, in theory, not have fired its timeout by the
-/// floor — no wall-clock settle can be perfect against total CPU starvation —
-/// but this eliminates the realistic-CI flake a bare sleep left in.
+/// Fix: require several *consecutive* polls to agree, each spaced past the
+/// bumper's 100ms tick, rather than one elapsed-time window. Repetition
+/// confirms we crossed at least `REQUIRED_STABLE - 1` real flush
+/// opportunities, not just a lucky quiet moment. If quiescence still isn't
+/// reached within the deadline, panic loudly with the observed sequence
+/// instead of silently returning "settled" — a masked timeout previously
+/// surfaced as a confusing assertion mismatch with no diagnostic trail.
 fn settle_counters(db: &Db, watch: NodeId) {
+    /// Comfortably past the bumper's 100ms `recv_timeout` tick, so each poll
+    /// has a real chance to observe a flush if one is pending.
+    const POLL: Duration = Duration::from_millis(150);
+    /// Consecutive identical reads required before declaring quiescence.
+    const REQUIRED_STABLE: u32 = 4;
+    /// Safety cap: never hang a test on a starved bumper. Generous relative
+    /// to `POLL * REQUIRED_STABLE` (~600ms) to absorb real CI slowness.
+    const DEADLINE: Duration = Duration::from_secs(15);
+
     let read = || {
         db.access_stats(&scopes(), watch)
             .ok()
             .flatten()
             .map(|s| s.access_count)
     };
+
     let start = Instant::now();
     let mut last = read();
-    let mut stable_since = Instant::now();
-    let deadline = start + Duration::from_secs(10);
+    let mut stable_count: u32 = 1;
+    let mut history = vec![last];
+
     loop {
-        std::thread::sleep(Duration::from_millis(40));
-        let cur = read();
-        if cur != last {
-            last = cur;
-            stable_since = Instant::now();
-        } else if stable_since.elapsed() >= Duration::from_millis(300)
-            && start.elapsed() >= Duration::from_millis(300)
-        {
-            return; // held steady past the bumper's flush window: drained
+        if stable_count >= REQUIRED_STABLE {
+            return; // agreed across REQUIRED_STABLE polls past the bumper's tick: drained
         }
-        if Instant::now() >= deadline {
-            return; // safety cap; never hang a test
+        if start.elapsed() >= DEADLINE {
+            panic!(
+                "settle_counters on {watch:?} never reached {REQUIRED_STABLE} \
+                 consecutive stable reads within {DEADLINE:?} (needed \
+                 {stable_count}); observed sequence: {history:?} — the bumper \
+                 or applier is starved far beyond its normal ~100ms tick"
+            );
+        }
+        std::thread::sleep(POLL);
+        let cur = read();
+        if cur == last {
+            stable_count += 1;
+        } else {
+            stable_count = 1;
+            last = cur;
+        }
+        history.push(cur);
+        if history.len() > 32 {
+            history.remove(0); // cap the panic message; only the tail matters
         }
     }
 }
