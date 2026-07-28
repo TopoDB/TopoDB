@@ -61,6 +61,26 @@ command-node checks at a different db. This doesn't bite under
 `claude-code`, since claude spawns the MCP server per node invocation rather
 than once for the whole run.
 
+### Hardening flags
+
+`run` (and, for `--agent-timeout`, `plan` too) take a few flags that bound
+how long and how wide a run is allowed to get:
+
+- `--agent-timeout <secs>` (default `600`) — the whole-node deadline for a
+  single agent call, for every provider: the claude-code subprocess and both
+  HTTP runners' tool loop alike. A node that blows through it is treated as
+  failed, not left running.
+- `--max-inflight <n>` (default `4`, only on `run`) — how many ready nodes the
+  executor will run concurrently. `1` forces strictly sequential execution,
+  which is useful when you want deterministic ordering or your provider rate-
+  limits concurrent calls.
+- **Ctrl-C** — a `sgh run` in progress cancels gracefully on the first
+  interrupt: inflight children are killed as a process group, the run is
+  marked blocked, and the process exits `1`. It does not delete anything —
+  the run's state is left in the db for a future replan or resume. Process-
+  group kill is unix-only; on Windows only the direct child is killed, not
+  any of its own descendants.
+
 ## Commands
 
 - `/sgh:plan <goal>` — compile a goal into `.sgh/graph.yaml` and print its
@@ -163,8 +183,42 @@ Runs are recorded in a per-project database under
 default is `./sgh.redb` in the working directory; the plugin never uses that.
 Override with `SGH_DB`.
 
+## Runs are durable
+
+Every run gets a stable wall-clock timestamp the moment `sgh` starts. Runs are
+findable after completion, crash, or interruption:
+
+- `sgh show --list` enumerates all runs in the database, with their status
+  (running, checkpoint, blocked, complete) and wall-clock start time.
+- `sgh show <id>` reads and prints the run's event log.
+- `sgh show <id> --follow` streams events as they arrive, even while the
+  database is locked by a running process. This is the replay of a run already
+  in progress, not a live co-execution — events are buffered to an external
+  events directory (`<db>.events/`) and streamed from there.
+
+**Important:** The events directory is a disposable projection. The database is
+the source of truth. Deleting `<db>.events/` loses the stream, but the run
+state and bound proof persist in the database and survive a full node restart.
+
+Interrupted or crashed runs are resumable:
+
+- `sgh resume <id>` continues a run from where it left off, skipping all
+  completed nodes. The budget (agent-call cap) carries over from the original
+  run's bound, so total calls across both processes stay within the worst-case
+  limit.
+- `sgh resume <id> --approve-gate <node>` approves a node that was halted at
+  an approval gate (status "checkpoint") and resumes from there. Exit code 3's
+  second half: the node passes the gate and execution resumes normally,
+  exiting 0 when complete. The approval itself is recorded before the resumed
+  run executes anything and is durable: if the resume is killed or errors out
+  partway through, the gate stays approved — approval is an audited fact
+  about what you authorized, not something an aborted resume can undo.
+
+The database path override (`SGH_DB`) works unchanged for all of these.
+
 ## Not included yet
 
-- `/sgh:show` — needs an IPC layer, because redb takes an exclusive
-  cross-process lock and `show` cannot read the database while a run holds it.
+- `/sgh:show` — the CLI side is unblocked, but the plugin command itself is
+  follow-up. You can inspect runs with `sgh show <id>` / `sgh show --list`
+  directly from a terminal.
 - Pi packaging (`npm/topodb-sgh-pi`).

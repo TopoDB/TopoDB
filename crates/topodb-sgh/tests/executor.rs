@@ -4,7 +4,7 @@ use topodb_sgh::runner::mock::MockRunner;
 use topodb_sgh::runner::NodeOutcome;
 use topodb_sgh::schema::validate::{validate, Validated};
 use topodb_sgh::schema::Graph;
-use topodb_sgh::store::run::RunStore;
+use topodb_sgh::store::run::{NodeState, RunStore};
 use topodb_sgh::store::SghError;
 
 fn diamond() -> Validated {
@@ -473,6 +473,119 @@ fn a_retry_of_a_schema_node_feeds_back_the_error_and_demands_json() {
     );
 }
 
+/// A pre-cancelled run starts nothing: every node is skipped, none succeed,
+/// and the report carries no model calls.
+#[test]
+fn a_cancelled_run_starts_no_nodes() {
+    use topodb_sgh::runner::cancel::CancelToken;
+
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+    let runner = MockRunner::new();
+
+    let token = CancelToken::new();
+    token.cancel(); // Pre-cancel before run
+
+    let mut ex = Executor::new(store, v, &runner).with_cancel(token);
+    let report = ex.run(10).unwrap();
+
+    assert!(
+        report.succeeded.is_empty(),
+        "no nodes should succeed when pre-cancelled"
+    );
+    assert_eq!(
+        report.model_calls, 0,
+        "no model calls should happen when pre-cancelled"
+    );
+    assert_eq!(
+        report.skipped,
+        vec!["a".to_string()],
+        "the node should be skipped when pre-cancelled"
+    );
+}
+
+/// Cancellation between ladder rungs blocks the node with reason "cancelled"
+/// and records a "cancelled" attempt instead of burning the retry budget.
+#[test]
+fn cancellation_mid_ladder_blocks_with_cancelled_attempt() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use topodb_sgh::runner::cancel::CancelToken;
+
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 3, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "r", &v, 1).unwrap();
+
+    // Custom runner that cancels the token then returns Failed.
+    let token = CancelToken::new();
+    let token_for_runner = token.clone();
+
+    struct CancellingRunner {
+        token: CancelToken,
+        calls: AtomicUsize,
+    }
+
+    impl topodb_sgh::runner::AgentRunner for CancellingRunner {
+        fn run(
+            &self,
+            _req: &topodb_sgh::runner::NodeRequest,
+        ) -> Result<topodb_sgh::runner::NodeOutcome, topodb_sgh::runner::RunnerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.token.cancel();
+            Ok(topodb_sgh::runner::NodeOutcome::Failed {
+                error: "fail".into(),
+            })
+        }
+    }
+
+    let runner = CancellingRunner {
+        token: token_for_runner.clone(),
+        calls: AtomicUsize::new(0),
+    };
+
+    let mut ex = Executor::new(store, v, &runner).with_cancel(token);
+    let report = ex.run(10).unwrap();
+
+    assert_eq!(
+        report.blocked,
+        vec!["a".to_string()],
+        "the node should be blocked due to cancellation"
+    );
+    assert_eq!(
+        report.blocked_reasons.get("a").map(String::as_str),
+        Some("cancelled"),
+        "the blocked reason should be 'cancelled'"
+    );
+
+    let attempts = ex.store_ref().attempts("a").unwrap();
+    assert!(
+        attempts
+            .iter()
+            .any(|(rung, error)| rung == "cancelled" && error == "cancelled"),
+        "should have a 'cancelled' attempt with error 'cancelled', got: {attempts:?}"
+    );
+
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        1,
+        "cancellation must prevent the retry from executing"
+    );
+}
+
 /// A Denied outcome climbs the ladder exactly like Failed, and the blocked
 /// reason names the tool without any provider branding.
 #[test]
@@ -503,4 +616,44 @@ fn denied_outcome_blocks_with_debranded_reason() {
         "got: {reason}"
     );
     assert!(!reason.to_lowercase().contains("claude"), "got: {reason}");
+}
+
+/// With an injected wall clock, store timestamps are real epoch ms and
+/// non-decreasing even when the clock stalls (monotone clamp).
+#[test]
+fn injected_clock_stamps_states_with_wall_time() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    let graph = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n  - id: a\n    kind: agent\n    prompt: p\n    budget: {retries: 0, repairs: 0}\n",
+    )
+    .unwrap();
+    let v = validate(&graph).unwrap();
+    let runner = MockRunner::new();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let store = RunStore::create(&db, "wall", &v, 1_000_000).unwrap();
+
+    // A fake clock that returns 1_000_000 forever (stalled clock).
+    static NOW: AtomicI64 = AtomicI64::new(1_000_000);
+    let clock: topodb_sgh::executor::ClockFn = Arc::new(|| NOW.load(Ordering::SeqCst));
+
+    let mut ex = Executor::new(store, v, &runner).with_clock(clock);
+    let report = ex.run(1_000_000).unwrap();
+
+    assert_eq!(report.succeeded, vec!["a".to_string()]);
+
+    // Before the run's own start time, the node had no state yet.
+    assert_eq!(ex.store_ref().state_at("a", 999_999).unwrap(), None);
+
+    // At the "latest" sentinel, the node is Succeeded — every transition
+    // landed at or after 1_000_000 despite the stalled clock: the
+    // monotone clamp held, with no panic and no store rejection from
+    // descending or repeated timestamps.
+    assert_eq!(
+        ex.store_ref().state_at("a", i64::MAX - 1).unwrap(),
+        Some(NodeState::Succeeded)
+    );
 }

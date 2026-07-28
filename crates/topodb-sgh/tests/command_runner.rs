@@ -154,9 +154,17 @@ fn a_backgrounded_grandchild_does_not_block_the_success_path() {
     // after starting it, so the command succeeds right away — but a reader
     // thread joined unconditionally would still block until that orphaned
     // `sleep` exits (or forever, for a true daemon).
+    // See the analogous proc_engine test for why `$!` (not `$$`) is used to
+    // capture the real grandchild pid on macOS's bash-based `/bin/sh`.
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let script = format!(
+        "(exec sleep 30) & echo $! > {}; echo done",
+        pidfile.display()
+    );
     let r = ShellCommandRunner::new(Duration::from_secs(10));
     let started = Instant::now();
-    match r.run(&req("sleep 30 & echo done")).unwrap() {
+    match r.run(&req(&script)).unwrap() {
         NodeOutcome::Succeeded { output } => {
             let v: serde_json::Value = serde_json::from_str(&output).expect("valid json");
             assert_eq!(v["stdout"], "done");
@@ -168,6 +176,47 @@ fn a_backgrounded_grandchild_does_not_block_the_success_path() {
         "must not wait on the orphaned grandchild's pipe: took {:?}",
         started.elapsed()
     );
+    #[cfg(unix)]
+    {
+        // The group kill only fires on the timeout path; on the success
+        // path `sh` exits on its own without ever killing anything, so the
+        // backgrounded grandchild is expected to still be alive here. This
+        // just confirms the pidfile/probe technique itself is sound and the
+        // grandchild really was running (i.e. the success-path assertions
+        // above are exercising a live orphan, not a no-op).
+        std::thread::sleep(Duration::from_millis(200));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            alive,
+            "grandchild {pid} should still be running (not group-killed on the success path)"
+        );
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn cancellation_kills_the_command_and_reports_cancelled() {
+    use topodb_sgh::runner::cancel::CancelToken;
+    let token = CancelToken::new();
+    let t2 = token.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        t2.cancel();
+    });
+    let runner = ShellCommandRunner::new(Duration::from_secs(30)).with_cancel(token);
+    let started = Instant::now();
+    match runner.run(&req("sleep 30")).unwrap() {
+        NodeOutcome::Failed { error } => assert_eq!(error, "cancelled"),
+        other => panic!("expected Failed(cancelled), got {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
@@ -176,9 +225,15 @@ fn a_backgrounded_grandchild_does_not_block_the_timeout_path() {
     // (a second foreground `sleep`) when the runner's short timeout fires
     // and kills it. The backgrounded `sleep 30` still holds the pipe open
     // after the kill, so the post-kill drain must not block on it either.
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let script = format!(
+        "(exec sleep 30) & echo $! > {}; sleep 30",
+        pidfile.display()
+    );
     let r = ShellCommandRunner::new(Duration::from_millis(300));
     let started = Instant::now();
-    match r.run(&req("sleep 30 & sleep 30")).unwrap() {
+    match r.run(&req(&script)).unwrap() {
         NodeOutcome::Failed { error } => assert!(
             error.to_lowercase().contains("timed out"),
             "timeout must be named in the error: {error}"
@@ -190,4 +245,18 @@ fn a_backgrounded_grandchild_does_not_block_the_timeout_path() {
         "must not wait on the orphaned grandchild's pipe: took {:?}",
         started.elapsed()
     );
+    #[cfg(unix)]
+    {
+        // On the timeout path the whole process group is killed, so the
+        // backgrounded grandchild must be dead too, not merely the
+        // immediate `sh` child.
+        std::thread::sleep(Duration::from_millis(200));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "grandchild {pid} survived the timeout's group kill");
+    }
 }

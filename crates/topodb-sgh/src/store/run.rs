@@ -1,14 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use topodb::{
     Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
 };
 
-use super::supersede::link_superseding;
+use super::supersede::{link_superseding, link_superseding_with};
 use super::{
     SghError, EDGE_ATTEMPT_OF, EDGE_DEPENDS_ON, EDGE_HAS_STATE, EDGE_MEMBER_OF, EDGE_PRODUCED,
     EDGE_REVISION_OF, LABEL_ATTEMPT, LABEL_NODE, LABEL_OUTPUT, LABEL_REVISION, LABEL_RUN,
-    LABEL_STATE,
+    LABEL_RUN_INDEX, LABEL_STATE, RUN_STATUS_RUNNING,
 };
 use crate::schema::validate::Validated;
 
@@ -77,7 +77,9 @@ pub struct RunStore {
     db: Db,
     scope: Scope,
     scopes: ScopeSet,
+    run_id: String,
     run_node: NodeId,
+    index_node: NodeId,
     /// graph node id -> engine node id
     nodes: HashMap<String, NodeId>,
     /// state name -> engine node id
@@ -91,15 +93,43 @@ impl RunStore {
         let scopes = ScopeSet::of(&[sid]);
 
         let run_node = NodeId::new();
+        let graph_yaml = serde_yaml::to_string(&v.graph)?;
         let mut props = Props::new();
         props.insert("run_id".into(), PropValue::Str(run_id.to_string()));
         props.insert("goal".into(), PropValue::Str(v.graph.goal.clone()));
+        props.insert("graph_yaml".into(), PropValue::Str(graph_yaml));
         let mut ops = vec![Op::CreateNode {
             id: run_node,
             scope,
             label: LABEL_RUN.into(),
             props,
         }];
+
+        // The shared-scope index: a standalone record (no edges to the run's
+        // own scope — see `LABEL_RUN_INDEX`'s doc comment) joined to this run
+        // purely by the `run_id`/`scope_id` props a reader can look up.
+        let index_node = NodeId::new();
+        let mut index_props = Props::new();
+        index_props.insert("run_id".into(), PropValue::Str(run_id.to_string()));
+        index_props.insert("scope_id".into(), PropValue::Str(sid.to_string()));
+        index_props.insert("goal".into(), PropValue::Str(v.graph.goal.clone()));
+        index_props.insert("created_at".into(), PropValue::DateTime(now_ms));
+        index_props.insert(
+            "status".into(),
+            PropValue::Str(RUN_STATUS_RUNNING.to_string()),
+        );
+        // High-water mark for `high_water_ms`: see `set_status`'s doc comment
+        // for why this exists. Written here too (not just on every
+        // `set_status` call) so a run that never calls `set_status` again
+        // before a resume still has a mark at least as high as its creation
+        // time.
+        index_props.insert("last_ms".into(), PropValue::DateTime(now_ms));
+        ops.push(Op::CreateNode {
+            id: index_node,
+            scope: Scope::Shared,
+            label: LABEL_RUN_INDEX.into(),
+            props: index_props,
+        });
 
         // One state node per variant, per run.
         let mut states = HashMap::new();
@@ -143,7 +173,9 @@ impl RunStore {
             db: db.clone(),
             scope,
             scopes,
+            run_id: run_id.to_string(),
             run_node,
+            index_node,
             nodes,
             states,
         };
@@ -183,12 +215,252 @@ impl RunStore {
         Ok(store)
     }
 
+    /// Reattach to an existing run: resolve the shared-scope index by
+    /// `run_id`, rebuild the id maps by scoped label scans, and revalidate
+    /// the stored graph. Returns the store plus the graph exactly as
+    /// originally run (a fresh, deterministic `validate` pass over the
+    /// stored yaml — `Kahn` with declaration-order ties, so this reproduces
+    /// the same `Validated` `create` built).
+    pub fn open(db: &Db, run_id: &str) -> Result<(Self, Validated), SghError> {
+        // 1. Resolve the shared-scope index by run_id.
+        let shared = ScopeSet::default().with_shared();
+        let candidates = db.nodes_by_label(&shared, LABEL_RUN_INDEX);
+        let matches: Vec<_> = candidates
+            .into_iter()
+            .filter(|rec| matches!(rec.props.get("run_id"), Some(PropValue::Str(s)) if s == run_id))
+            .collect();
+        let index_rec = match matches.len() {
+            0 => {
+                return Err(SghError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })
+            }
+            1 => matches.into_iter().next().unwrap(),
+            _ => {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!(
+                        "{} shared-scope index nodes share run_id {run_id:?}",
+                        matches.len()
+                    ),
+                })
+            }
+        };
+        let index_node = index_rec.id;
+
+        // 2. Scope from the index's `scope_id` prop.
+        let scope_id_str = match index_rec.props.get("scope_id") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: "index node missing scope_id prop".to_string(),
+                })
+            }
+        };
+        let sid: ScopeId = scope_id_str.parse().map_err(|e| SghError::CorruptRun {
+            run_id: run_id.to_string(),
+            reason: format!("index scope_id {scope_id_str:?} does not parse as a ScopeId: {e}"),
+        })?;
+        let scope = Scope::Id(sid);
+        let scopes = ScopeSet::of(&[sid]);
+
+        // 3. Exactly one run node in this scope; read goal + graph_yaml.
+        let run_recs = db.nodes_by_label(&scopes, LABEL_RUN);
+        if run_recs.len() != 1 {
+            return Err(SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!("expected exactly one SghRun node, found {}", run_recs.len()),
+            });
+        }
+        let run_rec = &run_recs[0];
+        let run_node = run_rec.id;
+        let graph_yaml = match run_rec.props.get("graph_yaml") {
+            Some(PropValue::Str(s)) => s.clone(),
+            _ => {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: "run node missing graph_yaml prop".to_string(),
+                })
+            }
+        };
+
+        // 4. Reconstruct + revalidate the graph.
+        let graph =
+            crate::schema::Graph::from_yaml(&graph_yaml).map_err(|e| SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!("stored graph_yaml does not parse: {e}"),
+            })?;
+        let v = crate::schema::validate::validate(&graph).map_err(|errs| SghError::CorruptRun {
+            run_id: run_id.to_string(),
+            reason: format!("stored graph fails validation: {errs:?}"),
+        })?;
+
+        // 5. `nodes` map: one SghNode per declared graph node, no extras.
+        let node_recs = db.nodes_by_label(&scopes, LABEL_NODE);
+        let mut nodes: HashMap<String, NodeId> = HashMap::new();
+        for rec in &node_recs {
+            let node_id = match rec.props.get("node_id") {
+                Some(PropValue::Str(s)) => s.clone(),
+                _ => {
+                    return Err(SghError::CorruptRun {
+                        run_id: run_id.to_string(),
+                        reason: "SghNode record missing node_id prop".to_string(),
+                    })
+                }
+            };
+            if nodes.insert(node_id.clone(), rec.id).is_some() {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("duplicate SghNode record for node_id {node_id:?}"),
+                });
+            }
+        }
+        for n in &v.graph.nodes {
+            if !nodes.contains_key(&n.id) {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("graph node {:?} has no matching SghNode record", n.id),
+                });
+            }
+        }
+        if nodes.len() != v.graph.nodes.len() {
+            return Err(SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!(
+                    "found {} SghNode records but the graph declares {} nodes",
+                    nodes.len(),
+                    v.graph.nodes.len()
+                ),
+            });
+        }
+
+        // 6. `states` map: one SghState node per NodeState variant, no extras.
+        let state_recs = db.nodes_by_label(&scopes, LABEL_STATE);
+        let mut states: HashMap<&'static str, NodeId> = HashMap::new();
+        for rec in &state_recs {
+            let name = match rec.props.get("name") {
+                Some(PropValue::Str(s)) => s.clone(),
+                _ => {
+                    return Err(SghError::CorruptRun {
+                        run_id: run_id.to_string(),
+                        reason: "SghState record missing name prop".to_string(),
+                    })
+                }
+            };
+            let Some(st) = NodeState::from_str(&name) else {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("SghState record has unknown state name {name:?}"),
+                });
+            };
+            if states.insert(st.as_str(), rec.id).is_some() {
+                return Err(SghError::CorruptRun {
+                    run_id: run_id.to_string(),
+                    reason: format!("duplicate SghState record for state {:?}", st.as_str()),
+                });
+            }
+        }
+        if states.len() != NodeState::ALL.len() {
+            return Err(SghError::CorruptRun {
+                run_id: run_id.to_string(),
+                reason: format!(
+                    "found {} SghState records but {} states are required",
+                    states.len(),
+                    NodeState::ALL.len()
+                ),
+            });
+        }
+
+        let store = RunStore {
+            db: db.clone(),
+            scope,
+            scopes,
+            run_id: run_id.to_string(),
+            run_node,
+            index_node,
+            nodes,
+            states,
+        };
+        Ok((store, v))
+    }
+
     pub fn scope(&self) -> Scope {
         self.scope
     }
 
     pub fn run_node(&self) -> NodeId {
         self.run_node
+    }
+
+    /// Update the shared-scope index's status prop. LWW (`Op::SetNodeProps`),
+    /// not supersession — the index carries current status only, and every
+    /// run's own state history already lives on the run's HAS_STATE edges.
+    ///
+    /// Also stamps `last_ms` in the same batch: the executor's monotone tick
+    /// clamp (`tick`/`with_clock`) only protects timestamps *within* a
+    /// process. Resuming in a new process — after an NTP correction, a VM
+    /// snapshot restore, or simply a clock that reads slightly behind where
+    /// it left off — can hand the executor a `now_ms` that is behind this
+    /// run's own history, and every superseding write from then on races
+    /// that history until `SghError::Contended`'s retry budget gives out (an
+    /// opaque failure whose real cause is the clock, not concurrency).
+    /// `high_water_ms` reads this mark back so `resume_cmd` can floor its
+    /// clock against it before calling `run`.
+    pub fn set_status(&self, status: &str, now_ms: i64) -> Result<(), SghError> {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "status".to_string(),
+            Some(PropValue::Str(status.to_string())),
+        );
+        props.insert("last_ms".to_string(), Some(PropValue::DateTime(now_ms)));
+        self.db.submit_at(
+            vec![Op::SetNodeProps {
+                id: self.index_node,
+                props,
+            }],
+            now_ms,
+        )?;
+        Ok(())
+    }
+
+    /// The highest `now_ms` this run is known to have written, read from the
+    /// shared-scope index's `last_ms` prop (see `set_status`). `0` when the
+    /// prop is absent — a run created before this fix shipped has no mark,
+    /// and `0` is always <= any real timestamp a caller would floor against,
+    /// so `resume_cmd`'s `max(now_ms(), high_water_ms() + 1)` degrades to
+    /// plain wall-clock time for those runs, exactly as before this fix.
+    pub fn high_water_ms(&self) -> i64 {
+        let Some(rec) = self
+            .db
+            .node(&ScopeSet::default().with_shared(), self.index_node)
+        else {
+            return 0;
+        };
+        match rec.props.get("last_ms") {
+            Some(PropValue::DateTime(ms)) => *ms,
+            _ => 0,
+        }
+    }
+
+    /// The stored graph yaml, written once at `create` time. Missing (or
+    /// non-string) means the run node is corrupt — `create` always writes
+    /// this prop, so its absence is not a normal "not found" case.
+    pub fn graph_yaml(&self) -> Result<String, SghError> {
+        let rec =
+            self.db
+                .node(&self.scopes, self.run_node)
+                .ok_or_else(|| SghError::CorruptRun {
+                    run_id: self.run_id.clone(),
+                    reason: "run node missing".to_string(),
+                })?;
+        match rec.props.get("graph_yaml") {
+            Some(PropValue::Str(s)) => Ok(s.clone()),
+            _ => Err(SghError::CorruptRun {
+                run_id: self.run_id.clone(),
+                reason: "graph_yaml prop missing or not a string".to_string(),
+            }),
+        }
     }
 
     pub fn set_state(&self, node_id: &str, state: NodeState, now_ms: i64) -> Result<(), SghError> {
@@ -258,27 +530,35 @@ impl RunStore {
     }
 
     /// Outputs are a mutable current value, same as node state: a fresh
-    /// `SghOutput` node is created on every call, then linked with
-    /// `link_superseding` as `node -[EDGE_PRODUCED]-> output` so the prior
+    /// `SghOutput` node is minted and linked with `link_superseding_with` as
+    /// `node -[EDGE_PRODUCED]-> output` in a SINGLE batch, so the prior
     /// output edge for this node (if any) is closed rather than left open
-    /// alongside the new one. The edge direction matters here — supersession
-    /// is keyed on `(from, ty)`, so it must key on the stable node id, not on
-    /// the freshly-created output id (which would never match a prior edge).
+    /// alongside the new one, and the output node's creation can never be
+    /// left orphaned by a crash between two separate `submit_at` calls (see
+    /// `link_superseding_with`'s doc comment). The edge direction matters
+    /// here — supersession is keyed on `(from, ty)`, so it must key on the
+    /// stable node id, not on the freshly-created output id (which would
+    /// never match a prior edge).
     pub fn record_output(&self, node_id: &str, json: &str, now_ms: i64) -> Result<(), SghError> {
         let node = self.nodes[node_id];
         let id = NodeId::new();
         let mut props = Props::new();
         props.insert("content".into(), PropValue::Str(json.to_string()));
-        self.db.submit_at(
-            vec![Op::CreateNode {
-                id,
-                scope: self.scope,
-                label: LABEL_OUTPUT.into(),
-                props,
-            }],
+        let prelude = vec![Op::CreateNode {
+            id,
+            scope: self.scope,
+            label: LABEL_OUTPUT.into(),
+            props,
+        }];
+        link_superseding_with(
+            &self.db,
+            self.scope,
+            node,
+            id,
+            EDGE_PRODUCED,
             now_ms,
+            prelude,
         )?;
-        link_superseding(&self.db, self.scope, node, id, EDGE_PRODUCED, now_ms)?;
         Ok(())
     }
 
@@ -395,23 +675,21 @@ impl RunStore {
         props.insert("reason".into(), PropValue::Str(reason.to_string()));
         props.insert("at".into(), PropValue::DateTime(now_ms));
 
-        self.db.submit_at(
-            vec![Op::CreateNode {
-                id,
-                scope: self.scope,
-                label: LABEL_REVISION.into(),
-                props,
-            }],
-            now_ms,
-        )?;
+        let prelude = vec![Op::CreateNode {
+            id,
+            scope: self.scope,
+            label: LABEL_REVISION.into(),
+            props,
+        }];
 
-        link_superseding(
+        link_superseding_with(
             &self.db,
             self.scope,
             self.run_node,
             id,
             EDGE_REVISION_OF,
             now_ms,
+            prelude,
         )?;
         Ok(())
     }

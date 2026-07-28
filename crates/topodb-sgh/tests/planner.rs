@@ -210,6 +210,81 @@ fn unparseable_yaml_is_retried_like_any_other_rejection() {
     assert_eq!(backend.prompts().len(), 2);
 }
 
+/// A `claude` that never returns, faked with a PATH shim (unix-only
+/// technique — a shell script with a shebang, made executable, placed ahead
+/// of the real `claude` on PATH). PATH mutation is process-global, so other
+/// tests in the same binary may run concurrently with this one; to avoid
+/// cross-test interference the fake dir is prepended, `complete()` is
+/// called, and PATH is restored immediately after `complete()` returns and
+/// before any assertion runs.
+#[test]
+#[cfg(all(unix, feature = "claude-code"))]
+fn claude_backend_deadline_fails_instead_of_hanging() {
+    use std::time::{Duration, Instant};
+    use topodb_sgh::planner::claude::ClaudeBackend;
+    use topodb_sgh::planner::PlanBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("claude");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var("PATH").unwrap();
+    std::env::set_var("PATH", format!("{}:{}", dir.path().display(), old_path));
+    let backend = ClaudeBackend {
+        model: None,
+        timeout: Duration::from_millis(300),
+        cancel: None,
+    };
+    let started = Instant::now();
+    let result = backend.complete("p");
+    std::env::set_var("PATH", old_path);
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("deadline exceeded"), "got: {err}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A `claude` that never returns, cancelled mid-flight via a `CancelToken`
+/// instead of the deadline: proves Ctrl-C during a replan kills the
+/// subprocess (rather than leaving it orphaned while the caller blocks)
+/// well before the (long) timeout would have fired. Same PATH-shim
+/// technique as `claude_backend_deadline_fails_instead_of_hanging`.
+#[test]
+#[cfg(all(unix, feature = "claude-code"))]
+fn claude_backend_cancellation_kills_the_subprocess() {
+    use std::time::{Duration, Instant};
+    use topodb_sgh::planner::claude::ClaudeBackend;
+    use topodb_sgh::planner::PlanBackend;
+    use topodb_sgh::runner::cancel::CancelToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("claude");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var("PATH").unwrap();
+    std::env::set_var("PATH", format!("{}:{}", dir.path().display(), old_path));
+
+    let cancel = CancelToken::new();
+    let backend = ClaudeBackend {
+        model: None,
+        timeout: Duration::from_secs(30),
+        cancel: Some(cancel.clone()),
+    };
+    let cancel_after = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        cancel_after.cancel();
+    });
+
+    let started = Instant::now();
+    let result = backend.complete("p");
+    std::env::set_var("PATH", old_path);
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "got: {err}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
 /// ApiBackend is a PlanBackend: BoundedPlanner drives it exactly like any
 /// other backend, proving plan-over-HTTP shares the bounded retry loop.
 #[cfg(feature = "http")]

@@ -12,7 +12,7 @@ claude-code = []
 http = ["dep:ureq"]
 anthropic = ["http"]
 openai = ["http"]
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:ctrlc"]
 
 [dependencies]
 topodb = { path = "../topodb", version = "0.0.12" }
@@ -24,6 +24,7 @@ thiserror = "1"
 ulid = "1"
 ureq = { version = "2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", optional = true }
 
 [[bin]]
 name = "sgh"
@@ -33,3 +34,9 @@ required-features = ["cli"]
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

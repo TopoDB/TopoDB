@@ -11,7 +11,11 @@
 //! sgh plan "goal" --provider anthropic
 //! sgh run .sgh/graph.yaml --provider anthropic \
 //!     --agent-mcp '/abs/topodb-mcp --db /path/mem.redb --scope shared --embeddings off'
+//! sgh show --list
+//! sgh show <run-id> --follow
+//! sgh resume <run-id> --approve-gate <node> --yes
 //! ```
+pub mod events;
 pub mod executor;
 pub mod mcp_bridge;
 pub mod planner;

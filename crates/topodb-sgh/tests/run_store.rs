@@ -1,8 +1,12 @@
-use topodb::{Db, PropValue, Scope, ScopeSet};
+use std::collections::BTreeMap;
+
+use topodb::{Db, Op, PropValue, Scope, ScopeId, ScopeSet};
 use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::Graph;
 use topodb_sgh::store::run::{NodeState, RunStore};
-use topodb_sgh::store::EDGE_REVISION_OF;
+use topodb_sgh::store::{
+    SghError, EDGE_PRODUCED, EDGE_REVISION_OF, LABEL_NODE, LABEL_RUN, LABEL_RUN_INDEX,
+};
 
 fn store(db: &Db) -> RunStore {
     let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
@@ -63,6 +67,61 @@ fn record_output_supersedes_prior_output() {
     assert_eq!(
         s.output("survey").unwrap().as_deref(),
         Some(r#"{"sites":["a"]}"#)
+    );
+}
+
+/// A node's output write is atomic: output node + superseding PRODUCED edge
+/// carry the same timestamp (one batch — no crash window between them).
+///
+/// `ChangeEvent` (see `crates/topodb/src/db.rs`) carries only `seq` + `op` —
+/// no explicit batch/group id — so there is no `ops_since`-based same-batch
+/// proof available; this uses the timestamp form the brief allows as
+/// fallback: the closed (superseded) edge's `valid_to` and the freshly
+/// opened edge's `valid_from` must be identical, which is only possible if
+/// both writes (and the output node's creation) landed in the same
+/// `submit_at` call.
+#[test]
+fn record_output_is_single_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    s.record_output("survey", "{}", 200).unwrap();
+    assert_eq!(s.output("survey").unwrap().as_deref(), Some("{}"));
+
+    s.record_output("survey", "{\"v\":2}", 201).unwrap();
+    assert_eq!(
+        s.output("survey").unwrap().as_deref(),
+        Some("{\"v\":2}"),
+        "second output visible"
+    );
+
+    // Inspect the PRODUCED edges directly via the debug dump (there is no
+    // public unfiltered-by-as_of read, and this run only ever writes PRODUCED
+    // edges for "survey"'s output): the first must be closed at 201 (the
+    // second call's timestamp) and the second must open at 201 — both writes
+    // for the second call share one batch.
+    let all: Vec<_> = db
+        .debug_dump_edges()
+        .into_iter()
+        .filter(|e| e.ty.as_str() == EDGE_PRODUCED)
+        .collect();
+    assert_eq!(all.len(), 2, "both output edges survive as history");
+
+    let closed: Vec<_> = all.iter().filter(|e| e.valid_to.is_some()).collect();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(
+        closed[0].valid_to,
+        Some(201),
+        "prior PRODUCED edge closed at the second record_output's timestamp"
+    );
+
+    let open: Vec<_> = all.iter().filter(|e| e.valid_to.is_none()).collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].valid_from, 201,
+        "new PRODUCED edge opens at the same timestamp — same batch as the close \
+         and the output node's own creation"
     );
 }
 
@@ -205,4 +264,246 @@ fn revisions_round_trip_and_supersede() {
         "superseded revision's payload is still readable, not wiped"
     );
     assert_eq!(superseded_reason, "survey blocked");
+}
+
+#[test]
+fn create_writes_a_shared_scope_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    let shared = ScopeSet::default().with_shared();
+    let recs = db.nodes_by_label(&shared, LABEL_RUN_INDEX);
+    assert_eq!(recs.len(), 1, "exactly one shared-scope index node");
+    let rec = &recs[0];
+
+    match rec.props.get("run_id") {
+        Some(PropValue::Str(s)) => assert_eq!(s, "run-1"),
+        other => panic!("expected run_id str prop, got {other:?}"),
+    }
+    match rec.props.get("status") {
+        Some(PropValue::Str(s)) => assert_eq!(s, "running"),
+        other => panic!("expected status str prop, got {other:?}"),
+    }
+    match rec.props.get("goal") {
+        Some(PropValue::Str(g)) => assert_eq!(g, "port the search analyzer"),
+        other => panic!("expected goal str prop, got {other:?}"),
+    }
+    match rec.props.get("created_at") {
+        Some(PropValue::DateTime(t)) => assert_eq!(*t, 100),
+        other => panic!("expected created_at datetime prop, got {other:?}"),
+    }
+
+    let scope_id = match s.scope() {
+        Scope::Id(id) => id,
+        Scope::Shared => panic!("run scope must be Scope::Id"),
+    };
+    match rec.props.get("scope_id") {
+        Some(PropValue::Str(sid)) => {
+            let parsed: ScopeId = sid.parse().expect("scope_id parses back to a ScopeId");
+            assert_eq!(
+                parsed, scope_id,
+                "scope_id round-trips to the store's scope"
+            );
+        }
+        other => panic!("expected scope_id str prop, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_status_rewrites_the_index_prop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    s.set_status("complete", 200).unwrap();
+
+    let shared = ScopeSet::default().with_shared();
+    let recs = db.nodes_by_label(&shared, LABEL_RUN_INDEX);
+    assert_eq!(recs.len(), 1);
+    let rec = &recs[0];
+
+    match rec.props.get("status") {
+        Some(PropValue::Str(status)) => assert_eq!(status, "complete"),
+        other => panic!("expected status str prop, got {other:?}"),
+    }
+    match rec.props.get("created_at") {
+        Some(PropValue::DateTime(t)) => assert_eq!(*t, 100, "created_at must not change"),
+        other => panic!("expected created_at datetime prop, got {other:?}"),
+    }
+}
+
+/// See `RunStore::set_status`'s doc comment: `high_water_ms` is the
+/// cross-process defense against a resuming process whose wall clock reads
+/// behind this run's own history (NTP correction, VM snapshot restore).
+/// `create` stamps it at creation time and `set_status` re-stamps it on
+/// every status change; both must be visible after a fresh `RunStore::open`
+/// — the mark has to survive being read back in a new process, since that's
+/// the only place it's ever consulted (`resume_cmd`).
+#[test]
+fn high_water_ms_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let _s = store(&db); // created at now_ms=100, see `store()` above
+
+    let (reopened, _v) = RunStore::open(&db, "run-1").unwrap();
+    assert_eq!(reopened.high_water_ms(), 100);
+
+    reopened.set_status("complete", 500).unwrap();
+
+    let (reopened_again, _v) = RunStore::open(&db, "run-1").unwrap();
+    assert_eq!(reopened_again.high_water_ms(), 500);
+}
+
+#[test]
+fn graph_yaml_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    let yaml = s.graph_yaml().unwrap();
+    let g = Graph::from_yaml(&yaml).unwrap();
+    let v = validate(&g).unwrap();
+
+    let orig = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let orig_v = validate(&orig).unwrap();
+
+    assert_eq!(v.topo_order, orig_v.topo_order);
+}
+
+#[test]
+fn index_is_the_only_shared_scope_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let _s = store(&db);
+
+    let shared = ScopeSet::default().with_shared();
+    assert!(
+        db.nodes_by_label(&shared, LABEL_RUN).is_empty(),
+        "SghRun nodes must stay in the run scope"
+    );
+    assert!(
+        db.nodes_by_label(&shared, LABEL_NODE).is_empty(),
+        "SghNode nodes must stay in the run scope"
+    );
+}
+
+#[test]
+fn open_round_trips_a_created_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    {
+        let s = store(&db);
+        assert_eq!(s.state("survey").unwrap(), NodeState::Pending);
+    }
+    // The original `RunStore` handle is dropped; reattach purely from the db.
+    let (reopened, v) = RunStore::open(&db, "run-1").expect("run reopens");
+
+    let orig = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let orig_v = validate(&orig).unwrap();
+    assert_eq!(v.topo_order, orig_v.topo_order);
+
+    assert_eq!(reopened.state("survey").unwrap(), NodeState::Pending);
+
+    // Writes through the reopened handle work.
+    reopened
+        .set_state("survey", NodeState::Succeeded, 200)
+        .unwrap();
+    assert_eq!(reopened.state("survey").unwrap(), NodeState::Succeeded);
+}
+
+#[test]
+fn open_sees_prior_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    {
+        let s = store(&db);
+        s.set_state("survey", NodeState::Succeeded, 150).unwrap();
+        s.record_output("survey", "{\"n\":1}", 150).unwrap();
+        s.record_attempt("build", "retry", "boom", 160).unwrap();
+    }
+
+    let (reopened, _v) = RunStore::open(&db, "run-1").expect("run reopens");
+    assert_eq!(reopened.state("survey").unwrap(), NodeState::Succeeded);
+    assert_eq!(
+        reopened.output("survey").unwrap().as_deref(),
+        Some("{\"n\":1}")
+    );
+    let attempts = reopened.attempts("build").unwrap();
+    assert!(
+        attempts
+            .iter()
+            .any(|(rung, err)| rung == "retry" && err == "boom"),
+        "expected (\"retry\", \"boom\") in {attempts:?}"
+    );
+}
+
+#[test]
+fn open_unknown_run_is_run_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let _s = store(&db);
+
+    let err = match RunStore::open(&db, "nope") {
+        Err(e) => e,
+        Ok(_) => panic!("unknown run must error"),
+    };
+    match err {
+        SghError::RunNotFound { run_id } => assert_eq!(run_id, "nope"),
+        other => panic!("expected RunNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_rejects_a_corrupt_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let s = store(&db);
+
+    let run_node = s.run_node();
+    let mut props = BTreeMap::new();
+    props.insert(
+        "graph_yaml".to_string(),
+        Some(PropValue::Str("version: 1\n".to_string())),
+    );
+    db.submit_at(
+        vec![Op::SetNodeProps {
+            id: run_node,
+            props,
+        }],
+        300,
+    )
+    .unwrap();
+
+    let err = match RunStore::open(&db, "run-1") {
+        Err(e) => e,
+        Ok(_) => panic!("corrupt graph must error"),
+    };
+    match err {
+        SghError::CorruptRun { run_id, reason } => {
+            assert_eq!(run_id, "run-1");
+            assert!(!reason.is_empty(), "reason must name what went wrong");
+        }
+        other => panic!("expected CorruptRun, got {other:?}"),
+    }
+}
+
+#[test]
+fn duplicate_run_ids_are_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+
+    let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let v = validate(&g).unwrap();
+    RunStore::create(&db, "dup-run", &v, 100).expect("first create");
+    RunStore::create(&db, "dup-run", &v, 200).expect("second create, same run_id");
+
+    let err = match RunStore::open(&db, "dup-run") {
+        Err(e) => e,
+        Ok(_) => panic!("duplicate index must be corrupt"),
+    };
+    match err {
+        SghError::CorruptRun { run_id, .. } => assert_eq!(run_id, "dup-run"),
+        other => panic!("expected CorruptRun, got {other:?}"),
+    }
 }

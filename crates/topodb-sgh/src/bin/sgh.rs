@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use topodb::Db;
-use topodb_sgh::executor::{Executor, RunReport};
+use topodb::{Db, PropValue, ScopeSet, TopoError};
+use topodb_sgh::executor::{ClockFn, Executor, RunReport};
 #[cfg(feature = "claude-code")]
-use topodb_sgh::planner::claude::claude_planner;
+use topodb_sgh::planner::claude::claude_planner_with_timeout_and_cancel;
 use topodb_sgh::planner::{PlanRequest, Planner};
 use topodb_sgh::replan::{collect_failure_context, propose_revision, FailureContext};
 #[cfg(feature = "claude-code")]
@@ -142,12 +144,22 @@ enum Cmd {
         /// Seconds a single command node may run before it is killed.
         #[arg(long, default_value_t = 120)]
         command_timeout: u64,
+        /// Seconds a single agent-node model call (the whole node, not one
+        /// HTTP request) may run before it is treated as failed. Applies to
+        /// both the claude-code runner (subprocess deadline) and the HTTP
+        /// runners (whole tool-loop deadline).
+        #[arg(long, default_value_t = 600)]
+        agent_timeout: u64,
         /// On a halted run, ask the planner for a revised graph.
         #[arg(long)]
         replan: bool,
         /// How many revisions may be proposed before giving up.
         #[arg(long, default_value_t = 1)]
         max_replans: u32,
+        /// Maximum number of ready nodes executed concurrently. 1 forces
+        /// strictly sequential execution.
+        #[arg(long, default_value_t = 4)]
+        max_inflight: usize,
     },
     /// Compile a goal into a graph.yaml and print its worst-case bound.
     Plan {
@@ -172,6 +184,60 @@ enum Cmd {
         /// How many times the planner may retry an invalid graph.
         #[arg(long, default_value_t = 3)]
         max_attempts: u32,
+        /// Seconds a single planner call may run before it is treated as
+        /// failed.
+        #[arg(long, default_value_t = 600)]
+        agent_timeout: u64,
+    },
+    /// Resume a persisted run: re-execute what is not yet succeeded, spending
+    /// only the budget the original graph declared and has not yet consumed.
+    Resume {
+        run_id: String,
+        /// Approve a gate node by id (repeatable) so its dependents may
+        /// proceed. Every id must name a `kind: gate` node in the recovered
+        /// graph.
+        #[arg(long = "approve-gate")]
+        approve_gate: Vec<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Which backend executes agent nodes. Defaults to the local `claude`
+        /// CLI (requires the claude-code feature).
+        #[arg(long, value_enum, default_value = "claude-code")]
+        provider: Provider,
+        /// Base URL override, valid only with --provider openai.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Skip the approval prompt for the recovered graph.
+        #[arg(long)]
+        yes: bool,
+        /// Grant agent nodes permission to run shell commands starting with this
+        /// prefix (repeatable). Additive on top of Read/Write/Edit.
+        #[arg(long = "agent-bash")]
+        agent_bash: Vec<String>,
+        /// Supply agent nodes with the TopoDB MCP server: the full server
+        /// command (binary + args).
+        #[arg(long = "agent-mcp")]
+        agent_mcp: Option<String>,
+        /// Seconds a single command node may run before it is killed.
+        #[arg(long, default_value_t = 120)]
+        command_timeout: u64,
+        /// Seconds a single agent-node model call may run before it is
+        /// treated as failed.
+        #[arg(long, default_value_t = 600)]
+        agent_timeout: u64,
+        /// Maximum number of ready nodes executed concurrently.
+        #[arg(long, default_value_t = 4)]
+        max_inflight: usize,
+    },
+    /// Inspect runs without touching the (possibly locked) database.
+    Show {
+        /// Run id to display (omit with --list).
+        run_id: Option<String>,
+        #[arg(long)]
+        list: bool,
+        /// Keep tailing the event file as the run progresses (Ctrl-C to stop).
+        #[arg(long)]
+        follow: bool,
     },
 }
 
@@ -316,6 +382,108 @@ fn one_line(s: &str) -> String {
     format!("{head}…")
 }
 
+/// Sidecar event directory for a given db file: a sibling directory named
+/// `<file-name>.events` (e.g. `sgh.redb` -> `sgh.redb.events/`). Each run's
+/// JSONL event file lives at `events_dir(db_path).join("<run_id>.jsonl")`.
+/// A resumed run reopens (and appends to) the same file — see `JsonlSink::
+/// create`, which always opens in append mode.
+fn events_dir(db_path: &std::path::Path) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir_name = format!("{file_name}.events");
+    match db_path.parent() {
+        Some(parent) => parent.join(dir_name),
+        None => PathBuf::from(dir_name),
+    }
+}
+
+/// Rejects a run id that could escape `events_dir` via path components —
+/// `/`, `\`, or `..` — before it is ever joined into a path. Every run id
+/// this crate creates itself is a ULID (`[0-9A-Z]{26}`, no separators), so
+/// this only ever fires on a run id that arrived from the outside: a CLI
+/// argument to `sgh show <run_id>` or `sgh resume <run_id>`.
+fn invalid_run_id(run_id: &str) -> bool {
+    run_id.contains('/') || run_id.contains('\\') || run_id.contains("..")
+}
+
+/// Open the event JSONL file for `run_id` under `db_path`'s sidecar events
+/// dir. On failure (rare: disk full, permissions), warn to stderr and return
+/// `None` — an unwritable event log must never fail the run it observes.
+///
+/// `run_id` is checked against `invalid_run_id` before the path join below
+/// even though every caller in this binary passes either a freshly minted
+/// ULID (`run_cmd`) or a `run_id` `show`/`resume` already validated on the
+/// way in — kept here too as a non-bypassable last line, since this
+/// function is the one place that actually performs the join.
+///
+/// Single-writer safety of the event file depends on `Db::open`'s exclusive
+/// lock having already been taken by the time this is called — the lock is
+/// what rules out a second `sgh run`/`resume` process appending to the same
+/// run's `.jsonl` concurrently. Both call sites (`run_cmd`, `resume_cmd`)
+/// open the db before calling this; do not reorder this to run first.
+fn open_event_sink(
+    db_path: &std::path::Path,
+    run_id: &str,
+) -> Option<topodb_sgh::events::JsonlSink> {
+    if invalid_run_id(run_id) {
+        eprintln!("error: invalid run id {run_id:?}");
+        std::process::exit(2);
+    }
+    let path = events_dir(db_path).join(format!("{run_id}.jsonl"));
+    match topodb_sgh::events::JsonlSink::create(&path) {
+        Ok(sink) => Some(sink),
+        Err(e) => {
+            eprintln!(
+                "warning: could not open event log at {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Map a `Db::open` failure to the CLI's Busy-specific message, or pass any
+/// other error through as its default `Display`. `Db::open` returns
+/// `TopoError` directly (not boxed), so this matches it without any
+/// downcasting. Used by both `run_cmd` and `resume_cmd`.
+fn open_db_or_exit(db_path: &std::path::Path) -> topodb::Db {
+    match topodb::Db::open(db_path) {
+        Ok(db) => db,
+        Err(TopoError::Busy) => {
+            eprintln!(
+                "error: database is held by another process (a run in progress?) — try 'sgh show <run-id>' for live status"
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Map an `Outcome` to the run status stored on the shared-scope index.
+fn status_for_outcome(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Completed => topodb_sgh::store::RUN_STATUS_COMPLETE,
+        Outcome::HaltedAtCheckpoint => topodb_sgh::store::RUN_STATUS_CHECKPOINT,
+        Outcome::Blocked => topodb_sgh::store::RUN_STATUS_BLOCKED,
+    }
+}
+
+/// Current wall clock, in epoch milliseconds, for `Executor::with_clock`.
+/// Saturating: a clock before the Unix epoch (never expected in practice)
+/// yields 0 rather than panicking.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        .min(i64::MAX as u128) as i64
+}
+
 /// Announce a replanning attempt and the ceiling it counts against, so the
 /// bound on autonomous work is visible rather than implicit.
 fn replan_banner(attempt: u32, max: u32) -> String {
@@ -426,7 +594,7 @@ enum BuiltRunner {
     #[cfg(feature = "claude-code")]
     Claude(ClaudeCodeRunner),
     #[cfg(feature = "http")]
-    Http(topodb_sgh::runner::http::HttpChatRunner),
+    Http(Box<topodb_sgh::runner::http::HttpChatRunner>),
 }
 
 impl BuiltRunner {
@@ -435,7 +603,7 @@ impl BuiltRunner {
             #[cfg(feature = "claude-code")]
             BuiltRunner::Claude(r) => r,
             #[cfg(feature = "http")]
-            BuiltRunner::Http(r) => r,
+            BuiltRunner::Http(r) => r.as_ref(),
             // With neither feature compiled, `BuiltRunner` has no variants
             // and no value of it can ever exist — every provider is
             // rejected at the flag-rail stage before construction. `&T` is
@@ -509,12 +677,14 @@ fn build_replan_planner(
     provider: Provider,
     model: Option<String>,
     base_url: Option<String>,
+    agent_timeout: Duration,
+    cancel: topodb_sgh::runner::cancel::CancelToken,
 ) -> topodb_sgh::planner::BoundedPlanner {
     match provider {
         Provider::ClaudeCode => {
             #[cfg(feature = "claude-code")]
             {
-                claude_planner(model, 3)
+                claude_planner_with_timeout_and_cancel(model, 3, agent_timeout, cancel)
             }
             #[cfg(not(feature = "claude-code"))]
             {
@@ -526,8 +696,15 @@ fn build_replan_planner(
         Provider::Anthropic | Provider::Openai => {
             #[cfg(feature = "http")]
             {
+                // HTTP arm: `cancel` is unused here. `ApiBackend` bounds
+                // itself with `with_timeout` (a per-request timeout), which
+                // already caps how long a replan can hang — unlike the
+                // claude-code subprocess arm, there is no orphaned child
+                // process to kill on Ctrl-C, so no cancel wiring is needed.
+                let _ = &cancel;
                 let provider_client = build_http_provider(provider, model.clone(), base_url);
-                let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model);
+                let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model)
+                    .with_timeout(agent_timeout);
                 topodb_sgh::planner::BoundedPlanner::with_backend(Box::new(backend), 3)
             }
             #[cfg(not(feature = "http"))]
@@ -538,6 +715,403 @@ fn build_replan_planner(
             }
         }
     }
+}
+
+/// Inspect an event log or list all runs. Validates that run_id XOR --list is
+/// provided, and that --follow requires run_id.
+fn show_cmd(
+    db_path: &std::path::Path,
+    run_id: Option<String>,
+    list: bool,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate: run_id XOR list, and --follow requires run_id
+    match (&run_id, list) {
+        (None, false) => {
+            eprintln!("error: either <run_id> or --list is required");
+            std::process::exit(2);
+        }
+        (Some(_), true) => {
+            eprintln!("error: cannot use both <run_id> and --list");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+    if follow && run_id.is_none() {
+        eprintln!("error: --follow requires a run_id");
+        std::process::exit(2);
+    }
+
+    if let Some(id) = run_id {
+        show_event_log(db_path, &id, follow)?;
+    } else if list {
+        show_list(db_path)?;
+    }
+
+    Ok(())
+}
+
+/// Pretty-print an event log, optionally following new lines as they're appended.
+fn show_event_log(
+    db_path: &std::path::Path,
+    run_id: &str,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if invalid_run_id(run_id) {
+        eprintln!("error: invalid run id {run_id:?}");
+        std::process::exit(2);
+    }
+    let event_file = events_dir(db_path).join(format!("{run_id}.jsonl"));
+
+    if !event_file.exists() {
+        eprintln!("error: no event log for run {run_id} (older run, or events were disabled)");
+        std::process::exit(2);
+    }
+
+    let file = std::fs::File::open(&event_file)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first_ts: Option<i64> = None;
+
+    // Catch-up, then (if `--follow`) tail: ONE file handle and reader for
+    // both phases. The previous implementation read to EOF, then opened a
+    // *second* `File` and seeked it to `End` — any line appended in the
+    // window between those two calls was never read by either handle and
+    // vanished from the output. Keeping the same reader across both phases
+    // (`read_complete_lines` just keeps calling `read_line` on it) means
+    // there is no window: whatever wasn't there for catch-up is still
+    // sitting at the reader's current position for the tail loop to pick
+    // up next.
+    //
+    // `emit_trailing_partial: !follow` on this catch-up call: a one-shot
+    // `show` (no `--follow`) has no writer to wait on, so a final line with
+    // no trailing newline (a file that just doesn't end in one, or a run
+    // that died mid-write) is still the caller's whole answer and gets
+    // printed as-is — exactly like the old `.lines()`-based catch-up did.
+    // Under `--follow`, that same trailing partial is deliberately withheld
+    // (`false` below and in the tail loop) since a writer may still be
+    // mid-line; withholding it is what fixes the truncated-mid-write case.
+    read_complete_lines(&mut reader, !follow, &mut |line| {
+        print_event_line(line, &mut first_ts)
+    })?;
+
+    if follow {
+        use std::thread;
+        use std::time::Duration as StdDuration;
+
+        loop {
+            // On a read error, deliberately do NOT reopen the file or seek
+            // anywhere — `read_complete_lines` already rewinds past any
+            // partial (not yet newline-terminated) line it read before the
+            // error, so the reader's position stays exactly where the next
+            // complete line will start. Reopening+seek-to-`End` (the old
+            // behavior) is exactly the pattern that drops lines: anything
+            // written between the error and the reopen would be skipped.
+            let _ = read_complete_lines(&mut reader, false, &mut |line| {
+                print_event_line(line, &mut first_ts)
+            });
+            thread::sleep(StdDuration::from_millis(250));
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads every complete (newline-terminated) line currently available from
+/// `reader`, calling `on_line` with each one (newline stripped). A line read
+/// at EOF without a trailing `\n` — the writer flushed a partial write, or
+/// (during `--follow`) simply hasn't finished the line yet — is normally put
+/// back: `BufReader::read_line` already consumed those bytes out of its
+/// internal buffer, so without the seek-back they would vanish rather than
+/// being re-read (and printed, once complete) on a later call. This is also
+/// what makes a single reader safe to reuse across the catch-up and follow
+/// phases in `show_event_log`.
+///
+/// `emit_trailing_partial`: when true, a trailing unterminated line is
+/// emitted immediately instead of being held back — the right behavior for
+/// a one-shot (non-`--follow`) read, where there is no later call that would
+/// ever pick it up otherwise. `--follow` always passes `false`.
+fn read_complete_lines(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    emit_trailing_partial: bool,
+    on_line: &mut impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    loop {
+        let pos_before = reader.stream_position()?;
+        let mut buf = String::new();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break; // EOF, nothing pending
+        }
+        if buf.ends_with('\n') {
+            let line = buf.trim_end_matches(['\n', '\r']);
+            on_line(line)?;
+        } else if emit_trailing_partial {
+            on_line(&buf)?;
+            break;
+        } else {
+            // Partial line: rewind to before it was read and stop for now.
+            reader.seek(SeekFrom::Start(pos_before))?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Parse and pretty-print a single event line. Tracks the first timestamp to
+/// compute relative seconds for all subsequent events.
+fn print_event_line(
+    line: &str,
+    first_ts: &mut Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(obj) => {
+            let ts = obj.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            let event_type = obj
+                .get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            // Set first_ts if not yet set
+            if first_ts.is_none() {
+                *first_ts = Some(ts);
+            }
+
+            let base_ts = first_ts.unwrap_or(0);
+            let rel_s = (ts - base_ts).max(0) / 1000;
+
+            match event_type {
+                "run_started" => {
+                    let goal = obj
+                        .get("goal")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no goal)");
+                    println!("[+{rel_s}s] run_started: {goal}");
+                }
+                "node_started" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_started: {node_id}");
+                }
+                "attempt_finished" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let rung = obj.get("rung").and_then(|v| v.as_str()).unwrap_or("?");
+                    let error = obj.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                    let error_short = if error.chars().count() > 120 {
+                        let truncated: String = error.chars().take(120).collect();
+                        format!("{}…", truncated)
+                    } else {
+                        error.to_string()
+                    };
+                    println!("[+{rel_s}s] attempt {node_id}: {rung} — {error_short}");
+                }
+                "node_succeeded" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_succeeded: {node_id}");
+                }
+                "node_blocked" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_blocked: {node_id}");
+                }
+                "node_skipped" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] node_skipped: {node_id}");
+                }
+                "gate_reached" => {
+                    let node_id = obj.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[+{rel_s}s] gate_reached: {node_id}");
+                }
+                "run_finished" => {
+                    let succeeded: Vec<String> = obj
+                        .get("succeeded")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let blocked: Vec<String> = obj
+                        .get("blocked")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let skipped: Vec<String> = obj
+                        .get("skipped")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let model_calls = obj.get("model_calls").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let command_runs = obj
+                        .get("command_runs")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    println!(
+                        "[+{rel_s}s] run_finished: succeeded={}, blocked={}, skipped={}, model_calls={}, command_runs={}",
+                        succeeded.len(),
+                        blocked.len(),
+                        skipped.len(),
+                        model_calls,
+                        command_runs
+                    );
+                }
+                _ => {
+                    println!("[+{rel_s}s] {event_type}");
+                }
+            }
+        }
+        Err(_) => {
+            // Unparseable line: print raw with ? prefix
+            println!("? {trimmed}");
+        }
+    }
+
+    Ok(())
+}
+
+/// List all runs from the shared-scope run index, or if the DB is busy,
+/// list the event files as a fallback.
+fn show_list(db_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    match Db::open(db_path) {
+        Ok(db) => {
+            let shared = ScopeSet::of(&[]).with_shared();
+            let runs = db.nodes_by_label(&shared, topodb_sgh::store::LABEL_RUN_INDEX);
+
+            if runs.is_empty() {
+                println!("(no runs)");
+                return Ok(());
+            }
+
+            // Collect and sort by creation timestamp (node id works as ULID)
+            let mut run_records: Vec<_> = runs.into_iter().collect();
+            run_records.sort_by_key(|a| a.id);
+
+            // Header. Run ids are ULIDs (26 chars) — a 15-wide column
+            // truncated the header's alignment against every real row.
+            println!(
+                "{:<26} {:<11} {:<11} GOAL",
+                "RUN_ID", "STATUS", "CREATED_MS"
+            );
+
+            for rec in run_records {
+                let run_id = rec
+                    .props
+                    .get("run_id")
+                    .and_then(|pv| {
+                        if let PropValue::Str(s) = pv {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(unknown)".to_string());
+
+                let status = rec
+                    .props
+                    .get("status")
+                    .and_then(|pv| {
+                        if let PropValue::Str(s) = pv {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(no status)".to_string());
+
+                // CREATED_MS: raw epoch-ms integer (no date-formatting dependency in crate;
+                // consumers can pipe to their own formatter if needed)
+                let created_ms = prop_ms(&rec.props, "created_at")
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+
+                let goal = rec
+                    .props
+                    .get("goal")
+                    .and_then(|pv| {
+                        if let PropValue::Str(s) = pv {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "(no goal)".to_string());
+
+                let goal_short = if goal.chars().count() > 60 {
+                    let truncated: String = goal.chars().take(60).collect();
+                    format!("{}…", truncated)
+                } else {
+                    goal
+                };
+
+                println!(
+                    "{:<26} {:<11} {:<11} {}",
+                    run_id, status, created_ms, goal_short
+                );
+            }
+        }
+        Err(TopoError::Busy) => {
+            println!("database busy (run in progress) — listing event logs instead:");
+            let events_path = events_dir(db_path);
+            if let Ok(entries) = std::fs::read_dir(&events_path) {
+                let mut files: Vec<_> = entries
+                    .filter_map(|entry| {
+                        let entry = entry.ok()?;
+                        let path = entry.path();
+                        if path.is_file() && path.extension().map(|e| e == "jsonl").unwrap_or(false)
+                        {
+                            let file_name = path
+                                .file_stem()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let metadata = entry.metadata().ok()?;
+                            let modified = metadata.modified().ok()?;
+                            Some((file_name, modified))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                files.sort_by_key(|b| std::cmp::Reverse(b.1)); // Newest first
+
+                for (name, _mtime) in files {
+                    println!("  {name}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract milliseconds from a property, accepting both DateTime and Int variants.
+fn prop_ms(props: &topodb::Props, key: &str) -> Option<i64> {
+    props.get(key).and_then(|pv| match pv {
+        PropValue::DateTime(ms) => Some(*ms),
+        PropValue::Int(i) => Some(*i),
+        _ => None,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -587,10 +1161,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_bash,
             agent_mcp,
             command_timeout,
+            agent_timeout,
             replan,
             max_replans,
             provider,
             base_url,
+            max_inflight,
         } => {
             let code = run_cmd(
                 &cli.db,
@@ -601,10 +1177,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 agent_bash,
                 agent_mcp,
                 command_timeout,
+                agent_timeout,
                 replan,
                 max_replans,
                 provider,
                 base_url,
+                max_inflight,
             )?;
             if code != 0 {
                 std::process::exit(code);
@@ -618,7 +1196,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider,
             base_url,
             max_attempts,
-        } => plan_cmd(goal, out, context, model, provider, base_url, max_attempts)?,
+            agent_timeout,
+        } => plan_cmd(
+            goal,
+            out,
+            context,
+            model,
+            provider,
+            base_url,
+            max_attempts,
+            agent_timeout,
+        )?,
+        Cmd::Resume {
+            run_id,
+            approve_gate,
+            model,
+            provider,
+            base_url,
+            yes,
+            agent_bash,
+            agent_mcp,
+            command_timeout,
+            agent_timeout,
+            max_inflight,
+        } => {
+            let code = resume_cmd(
+                &cli.db,
+                run_id,
+                approve_gate,
+                model,
+                yes,
+                agent_bash,
+                agent_mcp,
+                command_timeout,
+                agent_timeout,
+                provider,
+                base_url,
+                max_inflight,
+            )?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Cmd::Show {
+            run_id,
+            list,
+            follow,
+        } => {
+            show_cmd(&cli.db, run_id, list, follow)?;
+        }
     }
 
     Ok(())
@@ -643,11 +1269,17 @@ fn run_cmd(
     agent_bash: Vec<String>,
     agent_mcp: Option<String>,
     command_timeout: u64,
+    agent_timeout: u64,
     replan: bool,
     max_replans: u32,
     provider: Provider,
     base_url: Option<String>,
+    max_inflight: usize,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    let agent_timeout = Duration::from_secs(agent_timeout);
+    let cancel = topodb_sgh::runner::cancel::CancelToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())?;
     // `--yes-including-revisions` implies `--yes` for anything else
     // in this command that reads `yes` (there is nothing else today,
     // but keeping the invariant explicit here means a future reader
@@ -721,19 +1353,20 @@ fn run_cmd(
             }),
             None => None,
         };
-        Some(BuiltRunner::Claude(ClaudeCodeRunner::new(
-            model.clone(),
-            agent_bash.clone(),
-            mcp_wiring,
-        )))
+        Some(BuiltRunner::Claude(
+            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
+                .with_deadline(agent_timeout)
+                .with_cancel(cancel.clone()),
+        ))
     } else {
         None
     };
     #[cfg(not(feature = "claude-code"))]
     let mut runner: Option<BuiltRunner> = None;
 
-    let db = Db::open(db_path)?;
-    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout));
+    let db = open_db_or_exit(db_path);
+    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout))
+        .with_cancel(cancel.clone());
 
     // HTTP providers: the provider client is built now (from_env
     // only reads env vars — no IO), but the MCP bridge spawns a
@@ -855,13 +1488,14 @@ fn run_cmd(
                 let provider_client = pending_http_provider
                     .take()
                     .expect("pending_http_provider is Some whenever provider != ClaudeCode");
-                runner = Some(BuiltRunner::Http(
-                    topodb_sgh::runner::http::HttpChatRunner::new(
-                        provider_client,
-                        model.clone(),
-                        bridge,
-                    ),
-                ));
+                let mut http_runner = topodb_sgh::runner::http::HttpChatRunner::new(
+                    provider_client,
+                    model.clone(),
+                    bridge,
+                );
+                http_runner.node_deadline = agent_timeout;
+                http_runner.cancel = Some(cancel.clone());
+                runner = Some(BuiltRunner::Http(Box::new(http_runner)));
             }
         }
         let runner_ref = runner
@@ -870,11 +1504,35 @@ fn run_cmd(
             .as_agent_runner();
 
         let run_id = ulid::Ulid::new().to_string();
-        let now = 1;
+        let now = now_ms();
         let store = RunStore::create(&db, &run_id, &current, now)?;
-        let mut ex =
-            Executor::new(store, current.clone(), runner_ref).with_command_runner(&command_runner);
-        let report = ex.run(now + 1)?;
+        let clock: ClockFn = Arc::new(now_ms);
+        let sink = open_event_sink(db_path, &run_id);
+        let mut ex = Executor::new(store, current.clone(), runner_ref)
+            .with_command_runner(&command_runner)
+            .with_cancel(cancel.clone())
+            .with_max_inflight(max_inflight)
+            .with_clock(clock);
+        if let Some(sink) = &sink {
+            ex = ex.with_events(sink).with_run_id(run_id.clone());
+        }
+        // On `Err`, best-effort mark the run BLOCKED before propagating —
+        // otherwise an executor-internal failure (as opposed to a node
+        // blocking, which the normal path below already marks) leaves the
+        // shared-scope index reading "running" forever, and `sgh show
+        // --list` shows a run as perpetually in flight when it has in fact
+        // stopped. `ex` is still alive here (the executor owns the store,
+        // not the reverse), so `ex.store_ref()` is available in the `Err`
+        // arm even though `?` would otherwise propagate immediately.
+        let report = match ex.run(now) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = ex
+                    .store_ref()
+                    .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms());
+                return Err(e.into());
+            }
+        };
 
         println!("\nrun {run_id}");
         println!("  succeeded: {:?}", report.succeeded);
@@ -897,7 +1555,23 @@ fn run_cmd(
             report.command_runs, bound.command_runs
         );
 
+        // A cancelled run (Ctrl-C mid-run) must never report success: the
+        // report can still land with `blocked` empty (every started node
+        // finished before the signal landed; only the not-yet-started ones
+        // were skipped by the cancellation-aware claim pass), which would
+        // otherwise fall through to the `Ok(0)` below and exit 0 on an
+        // interrupted run. Check this before the replan step too — a
+        // cancelled run must not spawn a planner subprocess.
+        if cancel.is_cancelled() {
+            eprintln!("run cancelled");
+            ex.store_ref()
+                .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms())?;
+            return Ok(1);
+        }
+
         if report.blocked.is_empty() {
+            ex.store_ref()
+                .set_status(status_for_outcome(&Outcome::Completed), now_ms())?;
             return Ok(0);
         }
 
@@ -906,8 +1580,11 @@ fn run_cmd(
         // `all_blocked_are_gates`), so this has to happen before
         // `next_step` would otherwise increment `replans_used`.
         let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
+        let outcome = outcome_of(&report, &ctx);
+        ex.store_ref()
+            .set_status(status_for_outcome(&outcome), now_ms())?;
 
-        match outcome_of(&report, &ctx) {
+        match outcome {
             Outcome::Completed => {
                 unreachable!("report.blocked was already checked non-empty above")
             }
@@ -948,7 +1625,13 @@ fn run_cmd(
         // The planner mirrors whatever `--provider` executed the run: a
         // claude-code run replans with `claude_planner`, an HTTP-provider
         // run replans with a fresh `ApiBackend` over the same provider.
-        let planner = build_replan_planner(provider, model.clone(), base_url.clone());
+        let planner = build_replan_planner(
+            provider,
+            model.clone(),
+            base_url.clone(),
+            agent_timeout,
+            cancel.clone(),
+        );
         let revised = match propose_revision(&planner, &current, &ctx) {
             Ok(g) => g,
             Err(e) => {
@@ -991,6 +1674,340 @@ fn run_cmd(
     }
 }
 
+/// The `resume` subcommand's body: reopen a persisted run via
+/// `RunStore::open`, approve any gates named by `--approve-gate`, and
+/// re-execute whatever is not yet succeeded — spending only the budget the
+/// original graph declared and has not yet consumed (see `execute_node`'s
+/// resume-awareness). There is no replan here: a resumed run either
+/// finishes or blocks again; the operator resumes again (with different
+/// gates approved) or falls back to `sgh run --replan` on a fresh graph.
+///
+/// Mirrors `run_cmd`'s flag rails, gate preview/prompt, and runner/bridge
+/// construction (cross-referenced below at each divergence) rather than
+/// sharing code with it, because `run_cmd`'s body is a `loop` built around
+/// the replan cycle and extracting a shared helper would have required
+/// restructuring that loop, which the task explicitly avoided.
+#[allow(clippy::too_many_arguments)]
+fn resume_cmd(
+    db_path: &std::path::Path,
+    run_id: String,
+    approve_gate: Vec<String>,
+    model: Option<String>,
+    yes: bool,
+    agent_bash: Vec<String>,
+    agent_mcp: Option<String>,
+    command_timeout: u64,
+    agent_timeout: u64,
+    provider: Provider,
+    base_url: Option<String>,
+    max_inflight: usize,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let agent_timeout = Duration::from_secs(agent_timeout);
+    let cancel = topodb_sgh::runner::cancel::CancelToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())?;
+
+    // Same flag rails as `run_cmd` (see there for rationale): these must run
+    // before any file or db IO.
+    let agent_bash: Vec<String> = agent_bash
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .collect();
+    for grant in &agent_bash {
+        if let Err(e) = topodb_sgh::runner::rails::validate_bash_grant(grant) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+    validate_provider_flags(provider, &base_url, !agent_bash.is_empty());
+    #[cfg(not(feature = "claude-code"))]
+    if provider == Provider::ClaudeCode {
+        eprintln!("error: this sgh was built without the claude-code feature");
+        std::process::exit(2);
+    }
+
+    let mcp_argv = match agent_mcp.as_deref() {
+        Some(cmd) => match topodb_sgh::runner::rails::validate_mcp_server_command(cmd) {
+            Ok(argv) => Some(argv),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
+    #[cfg(feature = "claude-code")]
+    let mut runner: Option<BuiltRunner> = if provider == Provider::ClaudeCode {
+        let mcp_wiring = match &mcp_argv {
+            Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
+                config_path: write_mcp_config(argv)?.to_string_lossy().into_owned(),
+            }),
+            None => None,
+        };
+        Some(BuiltRunner::Claude(
+            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
+                .with_deadline(agent_timeout)
+                .with_cancel(cancel.clone()),
+        ))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "claude-code"))]
+    let mut runner: Option<BuiltRunner> = None;
+
+    let db = open_db_or_exit(db_path);
+
+    let mut pending_http_provider: Option<Box<dyn topodb_sgh::provider::ChatProvider>> =
+        match provider {
+            Provider::ClaudeCode => None,
+            Provider::Anthropic | Provider::Openai => Some(build_http_provider(
+                provider,
+                model.clone(),
+                base_url.clone(),
+            )),
+        };
+
+    let (store, current) = match RunStore::open(&db, &run_id) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Every `--approve-gate` id must name a `kind: gate` node in the
+    // recovered graph — approving a non-gate id (or one absent from the
+    // graph entirely) is a rail violation, caught before the gate preview
+    // below rather than silently doing nothing at run time.
+    for gate in &approve_gate {
+        match current.graph.node(gate) {
+            Some(n) if n.kind == NodeKind::Gate => {}
+            Some(_) => {
+                eprintln!("error: node {gate:?} is not a gate node");
+                std::process::exit(2);
+            }
+            None => {
+                eprintln!("error: no node {gate:?} in the recovered graph");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let bound = worst_case(&current);
+    println!("Goal: {}", current.graph.goal);
+    println!("Nodes: {}", current.graph.nodes.len());
+    println!("Bound: {bound}");
+
+    let commands = command_preview(&current);
+    if !commands.is_empty() {
+        println!("\nCommands that will execute in a shell:");
+        for line in &commands {
+            println!("  {line}");
+        }
+    }
+
+    let grants = grants_preview(&agent_bash);
+    if !grants.is_empty() {
+        println!("\nAgent-node Bash grants (additive; agent prompts are ungated):");
+        for grant in &grants {
+            println!("  {grant}:*");
+        }
+    }
+
+    print_unconstrained(&current);
+
+    if !approve_gate.is_empty() {
+        println!("\nGates approved on resume: {}", approve_gate.join(", "));
+    }
+
+    if let Some(err) = mcp_pairing_error(&current, agent_mcp.as_deref()) {
+        eprintln!("error: {err}");
+        return Ok(2);
+    }
+
+    if let Some(cmd) = &agent_mcp {
+        println!();
+        let lines = match provider {
+            Provider::ClaudeCode => {
+                #[cfg(feature = "claude-code")]
+                {
+                    mcp_gate_lines(&current, cmd)
+                }
+                #[cfg(not(feature = "claude-code"))]
+                {
+                    unreachable!(
+                        "claude-code provider without the feature already \
+                         exited at the flag-rail stage"
+                    )
+                }
+            }
+            Provider::Anthropic | Provider::Openai => http_mcp_gate_lines(&current, cmd),
+        };
+        for line in lines {
+            println!("{line}");
+        }
+    }
+
+    // Same gate semantics as `run_cmd`: a resumed run is a new process, so
+    // the operator re-approves the shell strings that will execute — `--yes`
+    // skips as usual. There is no revision concept on resume (no replan), so
+    // `is_revision` is always false and `yes_including_revisions` is always
+    // false.
+    if needs_prompt(false, yes, false) {
+        println!("\nProceed? [y/N]");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("aborted");
+            return Ok(0);
+        }
+    }
+
+    // HTTP providers only: build the runner now, post-approval — see
+    // `run_cmd`'s matching block for why (no MCP bridge subprocess for a
+    // run the operator rejects).
+    if runner.is_none() {
+        #[cfg(feature = "http")]
+        {
+            let bridge = if !mcp_nodes(&current).is_empty() {
+                let argv = mcp_argv
+                    .as_ref()
+                    .expect("mcp_pairing_error enforces this pairing");
+                match topodb_sgh::mcp_bridge::McpBridge::spawn(argv) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return Ok(2);
+                    }
+                }
+            } else {
+                None
+            };
+            let provider_client = pending_http_provider
+                .take()
+                .expect("pending_http_provider is Some whenever provider != ClaudeCode");
+            let mut http_runner = topodb_sgh::runner::http::HttpChatRunner::new(
+                provider_client,
+                model.clone(),
+                bridge,
+            );
+            http_runner.node_deadline = agent_timeout;
+            http_runner.cancel = Some(cancel.clone());
+            runner = Some(BuiltRunner::Http(Box::new(http_runner)));
+        }
+    }
+    let runner_ref = runner
+        .as_ref()
+        .expect("built either eagerly (claude-code) or just above (http)")
+        .as_agent_runner();
+
+    let command_runner = ShellCommandRunner::new(std::time::Duration::from_secs(command_timeout))
+        .with_cancel(cancel.clone());
+
+    // Record an "approve" attempt for each approved gate BEFORE the run:
+    // `execute_node` checks a gate's attempt history at execution time (see
+    // its resume-awareness comment), so these must land before `ex.run()`.
+    // Floor against the store's own high-water mark, not just wall time: an
+    // NTP correction or a VM snapshot restore between the original run and
+    // this resume can hand this process a wall clock that reads behind the
+    // run's own recorded history, and every superseding write from then on
+    // would race that history until `SghError::Contended`'s retry budget
+    // runs out — a clock problem surfacing as an opaque concurrency error.
+    // `+1` keeps this resume's writes strictly after the recorded mark
+    // rather than merely equal to it.
+    let now = std::cmp::max(now_ms(), store.high_water_ms() + 1);
+    // Gate approvals are recorded here, before `ex.run()` is even
+    // constructed, and are durable regardless of what happens to the run
+    // itself: if this process is killed or the executor errors out before
+    // `run()` returns, the "approve" attempts already written stand. This is
+    // deliberate — an approval is an audited fact about what the operator
+    // authorized, not a provisional part of this resume attempt, so an
+    // aborted resume must not un-approve anything.
+    for gate in &approve_gate {
+        store.record_attempt(gate, "approve", "", now)?;
+    }
+
+    // The event file is the SAME file the original run wrote (append mode —
+    // see `JsonlSink::create`): a resumed run continues that run's event
+    // stream rather than starting a new one.
+    let sink = open_event_sink(db_path, &run_id);
+    let clock: ClockFn = Arc::new(now_ms);
+    let mut ex = Executor::new(store, current.clone(), runner_ref)
+        .with_command_runner(&command_runner)
+        .with_cancel(cancel.clone())
+        .with_max_inflight(max_inflight)
+        .with_clock(clock);
+    if let Some(sink) = &sink {
+        ex = ex.with_events(sink).with_run_id(run_id.clone());
+    }
+    // Same best-effort BLOCKED-on-error handling as `run_cmd` — see there
+    // for rationale.
+    let report = match ex.run(now) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ex
+                .store_ref()
+                .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms());
+            return Err(e.into());
+        }
+    };
+
+    println!("\nrun {run_id}");
+    println!("  succeeded: {:?}", report.succeeded);
+    println!("  blocked:   {:?}", report.blocked);
+    println!("  skipped:   {:?}", report.skipped);
+    for id in &report.blocked {
+        if let Some(reason) = report.blocked_reasons.get(id) {
+            println!("    {id}: {}", one_line(reason));
+        }
+    }
+    println!(
+        "  model calls: {} (bound was {})",
+        report.model_calls, bound.agent_calls
+    );
+    println!(
+        "  command runs: {} (bound was {})",
+        report.command_runs, bound.command_runs
+    );
+
+    if cancel.is_cancelled() {
+        eprintln!("run cancelled");
+        ex.store_ref()
+            .set_status(topodb_sgh::store::RUN_STATUS_BLOCKED, now_ms())?;
+        return Ok(1);
+    }
+
+    if report.blocked.is_empty() {
+        ex.store_ref()
+            .set_status(status_for_outcome(&Outcome::Completed), now_ms())?;
+        return Ok(0);
+    }
+
+    let ctx = collect_failure_context(ex.store_ref(), &current, &report)?;
+    let outcome = outcome_of(&report, &ctx);
+    ex.store_ref()
+        .set_status(status_for_outcome(&outcome), now_ms())?;
+
+    match outcome {
+        Outcome::Completed => {
+            unreachable!("report.blocked was already checked non-empty above")
+        }
+        Outcome::HaltedAtCheckpoint => {
+            println!(
+                "\nrun halted at an intentional checkpoint, not a failure: {:?}",
+                ctx.gated
+            );
+            println!("no replan on resume — approve the remaining gate(s) and resume again.");
+            Ok(exit_code(&Outcome::HaltedAtCheckpoint))
+        }
+        Outcome::Blocked => {
+            eprintln!("\nrun blocked by a failure: {:?}", ctx.blocked);
+            Ok(1)
+        }
+    }
+}
+
 /// The `plan` subcommand's body. Never builds a bridge/persistent child
 /// process, so — unlike `run_cmd` — plain `std::process::exit` throughout is
 /// fine; kept as a function only for symmetry with `run_cmd`'s call site in
@@ -1004,7 +2021,9 @@ fn plan_cmd(
     provider: Provider,
     base_url: Option<String>,
     max_attempts: u32,
+    agent_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_timeout = Duration::from_secs(agent_timeout);
     // Flag rails before anything else, same as `run`.
     validate_provider_flags(provider, &base_url, false);
     #[cfg(not(feature = "claude-code"))]
@@ -1013,12 +2032,24 @@ fn plan_cmd(
         std::process::exit(2);
     }
 
+    // Same Ctrl-C wiring as `run_cmd`: a claude-code planner shells out to
+    // `claude -p`, and without this a Ctrl-C during `plan` leaves that
+    // subprocess orphaned rather than killed.
+    let cancel = topodb_sgh::runner::cancel::CancelToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())?;
+
     {
         let planner: topodb_sgh::planner::BoundedPlanner = match provider {
             Provider::ClaudeCode => {
                 #[cfg(feature = "claude-code")]
                 {
-                    claude_planner(model, max_attempts)
+                    claude_planner_with_timeout_and_cancel(
+                        model,
+                        max_attempts,
+                        agent_timeout,
+                        cancel.clone(),
+                    )
                 }
                 #[cfg(not(feature = "claude-code"))]
                 {
@@ -1029,7 +2060,8 @@ fn plan_cmd(
                 #[cfg(feature = "http")]
                 {
                     let provider_client = build_http_provider(provider, model.clone(), base_url);
-                    let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model);
+                    let backend = topodb_sgh::planner::api::ApiBackend::new(provider_client, model)
+                        .with_timeout(agent_timeout);
                     topodb_sgh::planner::BoundedPlanner::with_backend(
                         Box::new(backend),
                         max_attempts,
@@ -1045,6 +2077,10 @@ fn plan_cmd(
         let graph = match planner.plan(&PlanRequest { goal, context }) {
             Ok(g) => g,
             Err(e) => {
+                if cancel.is_cancelled() {
+                    eprintln!("plan cancelled");
+                    std::process::exit(1);
+                }
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }
@@ -1462,5 +2498,32 @@ mod tests {
             lines[2],
             "  tools: mcp__topodb -> no node opts in (flag is inert for this graph)"
         );
+    }
+
+    #[test]
+    fn prop_ms_extracts_datetime() {
+        let mut props = topodb::Props::new();
+        props.insert("ts".into(), PropValue::DateTime(1000));
+        assert_eq!(prop_ms(&props, "ts"), Some(1000));
+    }
+
+    #[test]
+    fn prop_ms_extracts_int() {
+        let mut props = topodb::Props::new();
+        props.insert("ts".into(), PropValue::Int(2000));
+        assert_eq!(prop_ms(&props, "ts"), Some(2000));
+    }
+
+    #[test]
+    fn prop_ms_returns_none_for_missing() {
+        let props = topodb::Props::new();
+        assert_eq!(prop_ms(&props, "ts"), None);
+    }
+
+    #[test]
+    fn prop_ms_returns_none_for_wrong_type() {
+        let mut props = topodb::Props::new();
+        props.insert("ts".into(), PropValue::Str("not a number".into()));
+        assert_eq!(prop_ms(&props, "ts"), None);
     }
 }
