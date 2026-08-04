@@ -17,6 +17,9 @@ fn main() {
     test_lease_spawns_and_release_reaps(&dir.join("t1"));
     test_two_leases_share_one_child(&dir.join("t2"));
     test_release_then_lease_respawns(&dir.join("t3"));
+    test_tool_error_keeps_child_alive(&dir.join("t4"));
+    test_dead_child_clears_slot_and_respawns(&dir.join("t5"));
+    test_spawn_failure_leaves_bridge_reusable(&dir.join("t6"));
     println!("bridge_lifecycle: all tests passed");
 }
 
@@ -128,6 +131,55 @@ fn test_release_then_lease_respawns(dir: &Path) {
     println!("  release_then_lease_respawns: ok");
 }
 
+fn test_tool_error_keeps_child_alive(dir: &Path) {
+    let bridge = topodb_sgh::mcp_bridge::on_demand::OnDemandBridge::new(stub_argv(dir));
+    let lease = bridge.lease().unwrap();
+    let err = lease.call("topodb__toolerr", &json!({})).unwrap_err();
+    assert!(matches!(err, topodb_sgh::mcp_bridge::BridgeError::Tool(_)));
+    assert!(stub_alive(dir), "Tool error must not kill the child");
+    lease
+        .call("topodb__ping", &json!({}))
+        .expect("same child still serves");
+    assert_eq!(spawn_count(dir), 1, "no respawn after a Tool error");
+    drop(lease);
+    println!("  tool_error_keeps_child_alive: ok");
+}
+
+fn test_dead_child_clears_slot_and_respawns(dir: &Path) {
+    let bridge = topodb_sgh::mcp_bridge::on_demand::OnDemandBridge::new(stub_argv(dir));
+    let lease = bridge.lease().unwrap();
+    let err = lease.call("topodb__die", &json!({})).unwrap_err();
+    assert!(
+        !matches!(err, topodb_sgh::mcp_bridge::BridgeError::Tool(_)),
+        "child death is a transport-class error, got: {err}"
+    );
+    // Same lease, next call: respawns on demand.
+    lease
+        .call("topodb__ping", &json!({}))
+        .expect("respawn mid-lease");
+    assert_eq!(spawn_count(dir), 2);
+    drop(lease);
+    assert!(!stub_alive(dir));
+    println!("  dead_child_clears_slot_and_respawns: ok");
+}
+
+fn test_spawn_failure_leaves_bridge_reusable(dir: &Path) {
+    // argv[0] that cannot exist: lease() must return Err, and a later
+    // lease against a fixed OnDemandBridge is not required — what IS
+    // required is that the failure does not wedge the refcount. We prove
+    // it by leasing twice against the bad argv: both fail cleanly.
+    let bad = topodb_sgh::mcp_bridge::on_demand::OnDemandBridge::new(vec![dir
+        .join("no-such-binary")
+        .to_string_lossy()
+        .into_owned()]);
+    assert!(bad.lease().is_err());
+    assert!(
+        bad.lease().is_err(),
+        "second lease after spawn failure also fails cleanly"
+    );
+    println!("  spawn_failure_leaves_bridge_reusable: ok");
+}
+
 // ---------------- stub server ----------------
 
 fn stub_server(state_dir: &Path) {
@@ -168,15 +220,32 @@ fn stub_server(state_dir: &Path) {
             Some("notifications/initialized") => None,
             Some("tools/list") => Some(json!({
                 "jsonrpc": "2.0", "id": id,
-                "result": {"tools": [{"name": "ping",
-                    "description": "echo", "inputSchema": {"type": "object"}}]}
+                "result": {"tools": [
+                    {"name": "ping", "description": "echo", "inputSchema": {"type": "object"}},
+                    {"name": "die", "description": "exit immediately", "inputSchema": {"type": "object"}},
+                    {"name": "toolerr", "description": "return tool error", "inputSchema": {"type": "object"}}
+                ]}
             })),
             Some("tools/call") => {
-                let echo = msg["params"]["arguments"].to_string();
-                Some(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": echo}]}
-                }))
+                let tool_name = msg["params"]["name"].as_str().unwrap_or("");
+                if tool_name == "die" {
+                    std::process::exit(0);
+                }
+                if tool_name == "toolerr" {
+                    Some(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "isError": true,
+                            "content": [{"type": "text", "text": "boom"}]
+                        }
+                    }))
+                } else {
+                    let echo = msg["params"]["arguments"].to_string();
+                    Some(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": echo}]}
+                    }))
+                }
             }
             _ => None,
         };
