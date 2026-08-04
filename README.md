@@ -111,6 +111,12 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 - All 17 engine operations plus `remember`, `forget`, `obsidian-ingest`, `obsidian-seed`; JSON in/out, exit-code contract (incl. `set-props` / `remove-node` / bulk submit)
 - One-command Pi install (`@topodb/pi`); Claude Code plugin (managed server + session-start recall/hygiene injection); Obsidian vault bridge (`obsidian-ingest` / `obsidian-seed`) — vault as working memory, graph as LTM
 
+**Agent harness — `topodb-sgh`, sgh plugin**
+
+- Frozen-DAG execution with a pre-computed worst-case model-call bound; approval gate; durable, crash-resumable runs (event sidecar, `sgh show --follow` mid-run)
+- Providers: `claude`-CLI, Anthropic API, any OpenAI-compatible endpoint; agent nodes opt into TopoDB memory via `tools: [topodb]` (node-scoped MCP bridge — the memory db unlocks between tool nodes)
+- Claude Code plugin: `/sgh:plan`, `/sgh:run`, `/sgh:lifecycle`, `/sgh:show`
+
 **Planned:** multi-scope reads over the CLI · API stabilization (0.1) · reproducible benchmarks
 
 **Never — by principle:** LLM calls inside the engine (principle 4) · a server process as a prerequisite (principle 5)
@@ -124,6 +130,7 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 | [`topodb-mcp`](crates/topodb-mcp) | [![crates.io](https://img.shields.io/crates/v/topodb-mcp.svg)](https://crates.io/crates/topodb-mcp) | An MCP (Model Context Protocol) server exposing a `topodb` database over stdio, for coding agents and other MCP clients that want scoped recall/write tools without embedding Rust. |
 | [`topodb-cli`](crates/topodb-cli) | [![crates.io](https://img.shields.io/crates/v/topodb-cli.svg)](https://crates.io/crates/topodb-cli) | A direct-embedded `topodb` command-line binary — JSON in, JSON out, predictable exit codes — for scripting and ad hoc inspection of a database file without a server or an MCP client. |
 | [`topodb-obsidian`](crates/topodb-obsidian) | [![crates.io](https://img.shields.io/crates/v/topodb-obsidian.svg)](https://crates.io/crates/topodb-obsidian) | Deterministic Obsidian-vault ⇄ graph transforms (ingest/seed) shared by the CLI and MCP server. |
+| [`topodb-sgh`](crates/topodb-sgh) | [![crates.io](https://img.shields.io/crates/v/topodb-sgh.svg)](https://crates.io/crates/topodb-sgh) | The Structured Graph Harness — frozen-DAG agent execution over a `topodb` database: validated graphs with a worst-case bound, durable resumable runs, an approval gate, and agent nodes that opt into the TopoDB MCP tool surface. Installs a binary named `sgh` (also via `npm i -g @topodb/topodb-sgh` from the first `topodb-sgh-v*` release tag). |
 
 ### topodb-cli
 
