@@ -117,3 +117,35 @@ fn connect_refused_is_err() {
         .expect_err("connect failure is transport-level Err");
     let _ = err; // io::Error — kind varies by platform; Err-ness is the contract
 }
+
+#[test]
+fn stalled_server_times_out_as_err() {
+    // Pins the whole-call timeout leg of the contract: a server that
+    // accepts and then goes silent must yield Err within (roughly) the
+    // passed timeout, not hang. The server thread wakes and exits on its
+    // own after 3s; it is deliberately not joined — the client must have
+    // returned long before that, and the assertion below proves it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        drop(sock);
+    });
+    let start = std::time::Instant::now();
+    let err = UreqTransport
+        .post(
+            &payload(format!("http://{addr}/t")),
+            Duration::from_millis(200),
+        )
+        .expect_err("a stalled server must time out as a transport-level Err");
+    let _ = err;
+    // Generous CI margin above the 200ms timeout, but well below the 3s
+    // server sleep — if the timeout didn't bind the call, the post would
+    // only return when the server closes the socket and this fails.
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "timed out in {:?}, expected ~200ms",
+        start.elapsed()
+    );
+}

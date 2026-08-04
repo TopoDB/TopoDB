@@ -152,6 +152,12 @@ impl HttpTransport for UreqTransport {
                 resp.into_body().into_reader().read_to_end(&mut buf)?;
                 Ok((status, buf))
             }
+            // One contract delta vs the old ureq 2 impl: 3xx responses ureq
+            // won't follow (307/308 with a POST body, or any 3xx without a
+            // Location header) surface here as Err instead of the old
+            // Ok((3xx, body)) — pathological for the fixed API endpoints
+            // this transport talks to, but a future reader tracing a
+            // "transport failure" on a redirecting endpoint should look here.
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
