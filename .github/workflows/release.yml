@@ -412,3 +412,93 @@ jobs:
           npm ci
           npm run build
           npm publish --access public
+
+  # Publishes @topodb/topodb-sgh + platform sub-packages to npm from the
+  # topodb-sgh binaries that `host` just uploaded to the GitHub Release.
+  # This is NOT a cargo-dist-generated job; hand-appended for the npm channel,
+  # cloned from `publish-npm` (see that job's comments for rationale).
+  publish-npm-sgh:
+    # `host` is the cargo-dist job that creates the GitHub Release and uploads
+    # artifacts (jobs: plan, build-local-artifacts, build-global-artifacts,
+    # host, announce). Depend on it so the release assets exist to download.
+    needs: [host]
+    runs-on: ubuntu-latest
+    # cargo-dist uses per-package tags. Only publish npm for a topodb-sgh
+    # release tag (`topodb-sgh-v<version>`), never any other package's tag.
+    if: startsWith(github.ref_name, 'topodb-sgh-v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Derive version from tag
+        id: ver
+        # Tag is `topodb-sgh-v0.0.1` → version `0.0.1`.
+        run: echo "version=${GITHUB_REF_NAME#topodb-sgh-v}" >> "$GITHUB_OUTPUT"
+      - name: Download topodb-sgh release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          declare -A TARGET=(
+            [darwin-arm64]=aarch64-apple-darwin
+            [darwin-x64]=x86_64-apple-darwin
+            [linux-x64]=x86_64-unknown-linux-gnu
+            [linux-arm64]=aarch64-unknown-linux-gnu
+            [win32-x64]=x86_64-pc-windows-msvc
+          )
+          mkdir -p bins
+          for key in "${!TARGET[@]}"; do
+            triple="${TARGET[$key]}"
+            mkdir -p "bins/$key"
+            tmp="$(mktemp -d)"
+            if [ "$key" = "win32-x64" ]; then
+              # cargo-dist names the archive after the PACKAGE (topodb-sgh),
+              # not the binary inside it.
+              asset="topodb-sgh-${triple}.zip"; bin="sgh.exe"
+              gh release download "$GITHUB_REF_NAME" -p "$asset" -O a.zip
+              unzip -q a.zip -d "$tmp"; rm a.zip
+            else
+              asset="topodb-sgh-${triple}.tar.xz"; bin="sgh"
+              gh release download "$GITHUB_REF_NAME" -p "$asset" -O a.tar.xz
+              tar -xf a.tar.xz -C "$tmp"; rm a.tar.xz
+            fi
+            # cargo-dist's executable-zip archives are not guaranteed to nest
+            # contents in a subdirectory (verified empirically: the
+            # x86_64-pc-windows-msvc .zip built by `dist build` for this repo
+            # has LICENSE-*/README.md/topodb-mcp.exe at the archive root, no
+            # wrapping folder) — search for the binary instead of assuming a
+            # fixed depth or using a "*/name" glob that only matches nested
+            # layouts.
+            found="$(find "$tmp" -type f -name "$bin" -print -quit)"
+            if [ -z "$found" ]; then
+              echo "::error::binary '$bin' not found in $asset (searched $tmp)" >&2
+              exit 1
+            fi
+            cp "$found" "bins/$key/$bin"
+            # cp does not reliably propagate the executable bit; the npm
+            # launcher spawns this binary directly, so it must be executable
+            # on non-Windows.
+            [ "$key" = "win32-x64" ] || chmod +x "bins/$key/$bin"
+            rm -rf "$tmp"
+          done
+      - name: Build npm packages
+        run: node scripts/build-npm-packages.mjs --version "${{ steps.ver.outputs.version }}" --binaries bins --out dist-npm --name topodb-sgh --bin sgh
+      - name: Publish sub-packages, then main
+        # optionalDependencies in the main package pin exact versions of the
+        # sub-packages, so the subs must exist on the registry before main
+        # is published, or npm install would fail to resolve them.
+        # npm publish is not idempotent — on a partial-failure re-run, already-published
+        # versions 409; re-run only publishes the missing packages (bump the version if a
+        # package was published but is broken).
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for d in dist-npm/topodb-sgh-*; do
+            (cd "$d" && npm publish --access public)
+          done
+          (cd dist-npm/topodb-sgh && npm publish --access public)
