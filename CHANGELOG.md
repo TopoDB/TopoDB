@@ -916,6 +916,10 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   every later node (the next tool-using node respawns it). A well-formed
   `--agent-mcp` command whose binary fails to start now surfaces as that
   node's failure (run exit 1) instead of exit 2 at approval time.
+- **npm distribution** — `npm i -g @topodb/topodb-sgh` installs the prebuilt
+  `sgh` binary (published from `topodb-sgh-v*` release tags: a dependency-free
+  launcher plus five platform sub-packages, exact-version pinned, mirroring
+  `@topodb/topodb-mcp`'s channel).
 - **`--model` is a flag rail for HTTP providers** — `--provider anthropic|openai`
   without `--model` now exits 2 at flag time on `run`/`resume`/`plan`, next to
   the other rails, instead of failing at the first request after the approval
@@ -944,6 +948,10 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 #### Added
 
+- **`/sgh:show`** — list this project's sgh runs or inspect one run's event
+  log, safely mid-run (`show <run-id>` reads only the event sidecar;
+  `show --list` falls back to the sidecar directory when the db is locked).
+  sgh plugin 0.1.1.
 - **`/sgh:lifecycle` + the shipped lifecycle graph** (`graphs/lifecycle.yaml`) — the F6 Phase D reference loop: a deterministic `lifecycle-candidates` sweep (command node, no model call), a judge agent that reviews decay candidates plus `find_duplicate_memories` pairs and applies its verdicts via `mcp__topodb` (`forget`, consolidations first), and a verify command node that re-reads the db and fails the run if any claimed action is not reflected — self-reports cannot fake it. Two-step gate mirrors `/sgh:run`; requires `topodb`, `topodb-mcp` and `jq`.
 - **`sgh-env.sh`: `SGH_MEMORY_DB` + `SGH_TOPODB`** — the per-project memory-db path is now exported once (and reused inside `SGH_MCP`), and the topodb CLI resolves with the established override → in-repo release → PATH → cargo-bin order (non-fatal on miss, like `SGH_MCP`).
 - **`/topodb:vault-seed` / `/topodb:vault-ingest`** — working-memory vault commands.
