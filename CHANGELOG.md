@@ -896,6 +896,61 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## `topodb-sgh`
 
+### 0.0.2 — 2026-08-04
+
+The first release of sgh as a provider-agnostic agent framework: everything
+merged since the pre-framework 0.0.1 binary, in three arcs — the provider
+framework (Phases 1–3), the follow-ups sweep, and distribution.
+
+#### Added
+
+- **Provider-agnostic execution** — agent nodes run over `--provider
+  claude-code` (default, the local `claude` CLI), `anthropic` (API), or
+  `openai` (any OpenAI-compatible endpoint via `--base-url`: vLLM, Ollama,
+  etc.), selected per run behind cargo features (`claude-code`, `anthropic`,
+  `openai`, `cli`; all default-on). One `HttpChatRunner` hosts thin provider
+  codecs; retry/backoff policy is shared by construction. Replanning works on
+  every provider.
+- **Durable, resumable runs** — a shared-scope run index (`sgh show --list`),
+  per-run status, the stored graph, and a JSONL event sidecar written as the
+  run progresses. `sgh resume <run-id>` continues a crashed or halted run
+  with the model-call bound held across resumes; `--approve-gate` records
+  operator approvals durably; `sgh show <run-id> [--follow]` tails the event
+  log without touching the (possibly locked) database.
+- **Parallel executor** — `--max-inflight` runs independent ready nodes
+  concurrently (CLI default 4; library default 1 is bit-identical to
+  sequential), panic-safe, with `--agent-timeout` deadlines everywhere and
+  cooperative Ctrl-C cancellation (cancelled runs exit 1).
+- **Node-scoped MCP bridge** — the `topodb-mcp` child starts when a
+  `tools: [topodb]` node begins and stops when the last one finishes, so the
+  memory db's exclusive lock is released between tool-using nodes — `command`
+  nodes can read the same db mid-run. A dead bridge child no longer fails
+  every later node (the next tool-using node respawns it). A well-formed
+  `--agent-mcp` command whose binary fails to start surfaces as that node's
+  failure (run exit 1) instead of exit 2 at approval time.
+- **npm distribution** — `npm i -g @topodb/topodb-sgh` installs the prebuilt
+  `sgh` binary (published from `topodb-sgh-v*` release tags: a dependency-free
+  launcher plus five platform sub-packages, exact-version pinned, mirroring
+  `@topodb/topodb-mcp`'s channel).
+- **`--model` is a flag rail for HTTP providers** — `--provider anthropic|openai`
+  without `--model` exits 2 at flag time on `run`/`resume`/`plan`, next to
+  the other rails, instead of failing at the first request after the approval
+  gate and burning retry budget. `claude-code` keeps `--model` optional (the
+  claude CLI's own default applies).
+- HTTP transport on ureq 3 (the workspace carries a single ureq major); the
+  transport contract (HTTP error statuses arrive as `Ok((status, body))` with
+  the body readable; only transport failures are `Err`) is pinned by loopback
+  tests.
+
+#### Fixed
+
+- **`sgh show --follow` no longer emits a garbled line after a hard IO read
+  error** — the reader rewinds to the failed line's start before the error
+  propagates, so the next poll re-reads a complete line.
+- **The run index's `last_ms` high-water mark can no longer move backwards**
+  under a clock that steps back mid-run (NTP correction, VM restore) — resume's
+  clock floor is now genuinely non-decreasing.
+
 ### 0.0.1 — 2026-07-27
 
 #### Added
@@ -909,36 +964,10 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   invocations to before. A graph opting in without the flag fails validation
   at the gate, not mid-run.
 - **Plugin `$SGH_MCP` helper** — `sgh-env.sh` now composes and exports `SGH_MCP`, the ready-made value for `sgh run --agent-mcp`: an absolute `topodb-mcp` binary (resolution mirrors `$SGH_BIN`: override, in-repo release, PATH, cargo bin dir) plus a per-project agent-memory database derived from `$SGH_DB` (`<same path>-memory.redb`, so an `SGH_DB` override keeps the pair together), with `--scope shared --embeddings off`. A missing `topodb-mcp` leaves `SGH_MCP` unset with a stderr note instead of failing — MCP is per-node opt-in, and graphs without opted-in nodes must keep working.
-- MCP bridge is now node-scoped: the `topodb-mcp` child starts when a
-  `tools: [topodb]` node begins and stops when the last one finishes, so the
-  memory db's exclusive lock is released between tool-using nodes — `command`
-  nodes can read the same db mid-run. A dead bridge child no longer fails
-  every later node (the next tool-using node respawns it). A well-formed
-  `--agent-mcp` command whose binary fails to start now surfaces as that
-  node's failure (run exit 1) instead of exit 2 at approval time.
-- **npm distribution** — `npm i -g @topodb/topodb-sgh` installs the prebuilt
-  `sgh` binary (published from `topodb-sgh-v*` release tags: a dependency-free
-  launcher plus five platform sub-packages, exact-version pinned, mirroring
-  `@topodb/topodb-mcp`'s channel).
-- **`--model` is a flag rail for HTTP providers** — `--provider anthropic|openai`
-  without `--model` now exits 2 at flag time on `run`/`resume`/`plan`, next to
-  the other rails, instead of failing at the first request after the approval
-  gate and burning retry budget. `claude-code` keeps `--model` optional (the
-  claude CLI's own default applies).
-- HTTP transport migrated to ureq 3 — the workspace now carries a single ureq
-  major — and the transport contract (HTTP error statuses arrive as
-  `Ok((status, body))` with the body readable; only transport failures are
-  `Err`) is newly pinned by loopback tests.
 
 #### Fixed
 
 - **`sgh validate` prints failures without a preceding success line** — the `--agent-mcp` rail and pairing checks now run before "valid: N node(s)" prints, so a failing validate no longer emits success-then-error.
-- **`sgh show --follow` no longer emits a garbled line after a hard IO read
-  error** — the reader rewinds to the failed line's start before the error
-  propagates, so the next poll re-reads a complete line.
-- **The run index's `last_ms` high-water mark can no longer move backwards**
-  under a clock that steps back mid-run (NTP correction, VM restore) — resume's
-  clock floor is now genuinely non-decreasing.
 
 ---
 
