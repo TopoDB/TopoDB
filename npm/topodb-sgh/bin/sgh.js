@@ -39,16 +39,17 @@ function binaryFileName(platform) {
 // Resolve the absolute path of the platform binary, or throw a clear error.
 // `resolve` is injectable so tests need not stage real sub-packages.
 //
-// A SUCCESSFUL RESOLVE IS NOT PROOF WE FOUND OUR OWN BINARY, and assuming it was
-// shipped a server two format generations old to a real user. `require.resolve`
+// A SUCCESSFUL RESOLVE IS NOT PROOF WE FOUND OUR OWN BINARY. `require.resolve`
 // does not stop at this package's own `node_modules`: it WALKS UP the directory
-// tree. On a Windows host where npm had installed the wrong platform package
-// (`topodb-sgh-linux-x64`), `topodb-sgh-win32-x64` was absent from the plugin's
+// tree. That exact failure mode was observed in the sibling @topodb/topodb-mcp
+// channel: on a Windows host where npm had installed the wrong platform package
+// (`topodb-mcp-linux-x64`), `topodb-mcp-win32-x64` was absent from the plugin's
 // data dir — so the walk-up carried on and found a stale
-// `topodb-sgh-win32-x64@0.0.3` lying elsewhere on the machine. It resolved
+// `topodb-mcp-win32-x64@0.0.3` lying elsewhere on the machine. It resolved
 // cleanly. The MODULE_NOT_FOUND branch below — the loud, actionable error whose
 // entire job is this situation — therefore never ran, and a 0.0.3 server was
-// launched while every version check in the stack read 0.0.7.
+// launched while every version check in the stack read 0.0.7. This launcher
+// inherits that hardening.
 //
 // `optionalDependencies` pins each platform package to this launcher's EXACT
 // version, so "the resolved package reports a different version" means, with no
@@ -120,8 +121,9 @@ function main() {
     return;
   }
   // stdio: 'inherit' hands the child the real stdin/stdout/stderr fds. Mandatory:
-  // sgh speaks newline-delimited JSON-RPC on stdout, so the launcher must
-  // never touch those streams. All args are forwarded verbatim.
+  // sgh's interactive approval gate needs the real TTY to prompt for and read
+  // approvals, so the launcher must never touch those streams. All args are
+  // forwarded verbatim.
   const result = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
   if (result.error) {
     process.stderr.write(`sgh: failed to launch binary: ${result.error.message}\n`);
