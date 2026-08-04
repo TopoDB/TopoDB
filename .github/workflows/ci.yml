@@ -20,6 +20,10 @@ jobs:
       - run: cargo test --workspace
       - name: sgh library without default features
         run: cargo check -p topodb-sgh --no-default-features --features anthropic,openai --all-targets
+      - name: sgh cli-only feature combo (deny warnings)
+        run: cargo check -p topodb-sgh --no-default-features --features cli --all-targets
+        env:
+          RUSTFLAGS: -D warnings
       - name: sgh all features
         run: cargo test -p topodb-sgh --all-features
       - run: cargo bench --no-run

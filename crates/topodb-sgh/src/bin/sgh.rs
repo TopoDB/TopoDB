@@ -7,6 +7,7 @@ use topodb::{Db, PropValue, ScopeSet, TopoError};
 use topodb_sgh::executor::{ClockFn, Executor, RunReport};
 #[cfg(feature = "claude-code")]
 use topodb_sgh::planner::claude::claude_planner_with_timeout_and_cancel;
+#[cfg(any(feature = "claude-code", feature = "http"))]
 use topodb_sgh::planner::{PlanRequest, Planner};
 use topodb_sgh::replan::{collect_failure_context, propose_revision, FailureContext};
 #[cfg(feature = "claude-code")]
@@ -656,6 +657,7 @@ fn build_http_provider(
             }
             #[cfg(not(feature = "anthropic"))]
             {
+                let _ = (&model, &base_url);
                 eprintln!("error: this sgh was built without the anthropic feature");
                 std::process::exit(2);
             }
@@ -673,6 +675,7 @@ fn build_http_provider(
             }
             #[cfg(not(feature = "openai"))]
             {
+                let _ = (&model, &base_url);
                 eprintln!("error: this sgh was built without the openai feature");
                 std::process::exit(2);
             }
@@ -702,6 +705,7 @@ fn build_replan_planner(
             }
             #[cfg(not(feature = "claude-code"))]
             {
+                let _ = (&model, &base_url, &agent_timeout, &cancel);
                 unreachable!(
                     "claude-code provider without the feature already rejected at the flag-rail stage"
                 )
@@ -723,6 +727,7 @@ fn build_replan_planner(
             }
             #[cfg(not(feature = "http"))]
             {
+                let _ = (&model, &base_url, &agent_timeout, &cancel);
                 unreachable!(
                     "http provider without the feature already rejected building the runner's own provider client above"
                 )
@@ -1376,6 +1381,7 @@ fn run_cmd(
     // not a spawned process, so nothing runs ahead of the approval gate
     // below.
     #[cfg(feature = "claude-code")]
+    #[cfg_attr(not(feature = "http"), allow(unused_mut))]
     let mut runner: Option<BuiltRunner> = if provider == Provider::ClaudeCode {
         let mcp_wiring = match &mcp_argv {
             Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
@@ -1392,6 +1398,7 @@ fn run_cmd(
         None
     };
     #[cfg(not(feature = "claude-code"))]
+    #[cfg_attr(not(feature = "http"), allow(unused_mut))]
     let mut runner: Option<BuiltRunner> = None;
 
     let db = open_db_or_exit(db_path);
@@ -1402,6 +1409,7 @@ fn run_cmd(
     // only reads env vars — no IO), but the MCP bridge spawns a
     // subprocess, so it waits until after the first gate approval
     // in the loop below (`runner.is_none()` there).
+    #[cfg_attr(not(feature = "http"), allow(unused_mut))]
     let mut pending_http_provider: Option<Box<dyn topodb_sgh::provider::ChatProvider>> =
         match provider {
             Provider::ClaudeCode => None,
@@ -1520,6 +1528,15 @@ fn run_cmd(
                 http_runner.node_deadline = agent_timeout;
                 http_runner.cancel = Some(cancel.clone());
                 runner = Some(BuiltRunner::Http(Box::new(http_runner)));
+            }
+            // Without the `http` feature, an HTTP provider was already
+            // rejected when `pending_http_provider` was built above (via
+            // `build_http_provider`), so this arm never actually runs —
+            // it exists only to give `mcp_argv`/`pending_http_provider` a
+            // read in builds where the block above is compiled out.
+            #[cfg(not(feature = "http"))]
+            {
+                let _ = (&mcp_argv, &pending_http_provider);
             }
         }
         let runner_ref = runner
@@ -1762,6 +1779,7 @@ fn resume_cmd(
     };
 
     #[cfg(feature = "claude-code")]
+    #[cfg_attr(not(feature = "http"), allow(unused_mut))]
     let mut runner: Option<BuiltRunner> = if provider == Provider::ClaudeCode {
         let mcp_wiring = match &mcp_argv {
             Some(argv) => Some(topodb_sgh::runner::claude::McpWiring {
@@ -1778,10 +1796,12 @@ fn resume_cmd(
         None
     };
     #[cfg(not(feature = "claude-code"))]
+    #[cfg_attr(not(feature = "http"), allow(unused_mut))]
     let mut runner: Option<BuiltRunner> = None;
 
     let db = open_db_or_exit(db_path);
 
+    #[cfg_attr(not(feature = "http"), allow(unused_mut))]
     let mut pending_http_provider: Option<Box<dyn topodb_sgh::provider::ChatProvider>> =
         match provider {
             Provider::ClaudeCode => None,
@@ -1911,6 +1931,16 @@ fn resume_cmd(
             http_runner.node_deadline = agent_timeout;
             http_runner.cancel = Some(cancel.clone());
             runner = Some(BuiltRunner::Http(Box::new(http_runner)));
+        }
+        // Without the `http` feature, an HTTP provider was already
+        // rejected when `pending_http_provider` was built above (via
+        // `build_http_provider`), so this arm never actually runs — it
+        // exists only to give `mcp_argv`/`pending_http_provider`/
+        // `agent_timeout` a read in builds where the block above is
+        // compiled out.
+        #[cfg(not(feature = "http"))]
+        {
+            let _ = (&mcp_argv, &pending_http_provider, &agent_timeout);
         }
     }
     let runner_ref = runner
@@ -2055,6 +2085,21 @@ fn plan_cmd(
     let cancel_for_handler = cancel.clone();
     ctrlc::set_handler(move || cancel_for_handler.cancel())?;
 
+    // Without either provider backend compiled in, every `Provider` value
+    // is invalid here: the claude-code case was already rejected above;
+    // reject the only remaining option (an HTTP provider) the same way,
+    // before anything below that only makes sense once a planner exists.
+    // This keeps the rest of the function's dead-in-this-build code out
+    // of the compiled output entirely, rather than relying on inline
+    // diverging arms the compiler can't see through from here.
+    #[cfg(not(any(feature = "claude-code", feature = "http")))]
+    {
+        let _ = (&goal, &out, &context, &max_attempts, &agent_timeout);
+        eprintln!("error: this sgh was built without the anthropic or openai feature");
+        std::process::exit(2);
+    }
+
+    #[cfg(any(feature = "claude-code", feature = "http"))]
     {
         let planner: topodb_sgh::planner::BoundedPlanner = match provider {
             Provider::ClaudeCode => {
@@ -2134,6 +2179,10 @@ fn plan_cmd(
         }
     }
 
+    // Reachable only when the block above is compiled in: without either
+    // provider backend, the `#[cfg(not(any(...)))]` branch above already
+    // diverged via `std::process::exit(2)`.
+    #[cfg(any(feature = "claude-code", feature = "http"))]
     Ok(())
 }
 
