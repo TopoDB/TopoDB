@@ -646,10 +646,11 @@ fn execute_node(shared: &Shared, id: &str) -> Result<(), SghError> {
         _ => 0,
     };
 
-    // `node` is the revisable working copy the ladder operates on; only
-    // its prompt ever changes (via a contract-preserving repair).
-    // `original` stays untouched so every repair is checked against the
-    // node's true, frozen contract, not against the last revision.
+    // `node` is the revisable working copy the ladder operates on: the
+    // retry rung rewrites its prompt, and the repair rung may replace the
+    // whole node (gated by `contract_preserved`). `original` stays
+    // untouched so every repair is checked against the node's true,
+    // frozen contract, not against the last revision.
     let mut node = original.clone();
 
     // Resume-awareness: budget consumed in a prior run of this node counts
