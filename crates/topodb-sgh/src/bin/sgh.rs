@@ -813,13 +813,13 @@ fn show_event_log(
         use std::time::Duration as StdDuration;
 
         loop {
-            // On a read error, deliberately do NOT reopen the file or seek
-            // anywhere — `read_complete_lines` already rewinds past any
-            // partial (not yet newline-terminated) line it read before the
-            // error, so the reader's position stays exactly where the next
-            // complete line will start. Reopening+seek-to-`End` (the old
-            // behavior) is exactly the pattern that drops lines: anything
-            // written between the error and the reopen would be skipped.
+            // `read_complete_lines` rewinds to the current line's start both
+            // for partial (not yet newline-terminated) lines and on a hard read
+            // error, so the reader's position always stays exactly where the next
+            // complete line will start. Deliberately do NOT reopen the file or
+            // seek anywhere — reopening+seek-to-`End` (the old behavior) is exactly
+            // the pattern that drops lines: anything written between the error and
+            // the reopen would be skipped.
             let _ = read_complete_lines(&mut reader, false, &mut |line| {
                 print_event_line(line, &mut first_ts)
             });
@@ -844,16 +844,31 @@ fn show_event_log(
 /// emitted immediately instead of being held back — the right behavior for
 /// a one-shot (non-`--follow`) read, where there is no later call that would
 /// ever pick it up otherwise. `--follow` always passes `false`.
-fn read_complete_lines(
-    reader: &mut std::io::BufReader<std::fs::File>,
+///
+/// On a hard IO error the reader is rewound to the failed line's start before
+/// the error propagates, so a `--follow` retry re-reads a complete line rather
+/// than a garbled tail.
+fn read_complete_lines<R: std::io::BufRead + std::io::Seek>(
+    reader: &mut R,
     emit_trailing_partial: bool,
     on_line: &mut impl FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{BufRead, Seek, SeekFrom};
+    use std::io::SeekFrom;
     loop {
         let pos_before = reader.stream_position()?;
         let mut buf = String::new();
-        let n = reader.read_line(&mut buf)?;
+        let n = match reader.read_line(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // A hard IO error mid-line: read_line may have consumed
+                // bytes before failing. Rewind to the line start so the
+                // next poll re-reads a complete line instead of emitting
+                // a garbled tail; best-effort — if the seek fails too,
+                // the original error still propagates.
+                let _ = reader.seek(SeekFrom::Start(pos_before));
+                return Err(e.into());
+            }
+        };
         if n == 0 {
             break; // EOF, nothing pending
         }
@@ -2526,5 +2541,65 @@ mod tests {
         let mut props = topodb::Props::new();
         props.insert("ts".into(), PropValue::Str("not a number".into()));
         assert_eq!(prop_ms(&props, "ts"), None);
+    }
+
+    // Test for read_complete_lines hard IO error rewind behavior.
+    use std::io::{self, Read, Seek, SeekFrom};
+
+    /// Yields `prefix` bytes, then fails every read with a hard IO error.
+    /// Tracks seeks so the test can assert the rewind.
+    struct FailAfter {
+        data: Vec<u8>,
+        pos: u64,
+        fail_from: u64,
+    }
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.fail_from {
+                return Err(io::Error::other("disk on fire"));
+            }
+            let start = self.pos as usize;
+            let end = (self.fail_from as usize)
+                .min(self.data.len())
+                .min(start + buf.len());
+            let n = end - start;
+            buf[..n].copy_from_slice(&self.data[start..end]);
+            self.pos = end as u64;
+            if n == 0 {
+                return Err(io::Error::other("disk on fire"));
+            }
+            Ok(n)
+        }
+    }
+    impl Seek for FailAfter {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            match pos {
+                SeekFrom::Start(p) => self.pos = p,
+                SeekFrom::Current(d) => self.pos = (self.pos as i64 + d) as u64,
+                SeekFrom::End(d) => self.pos = (self.data.len() as i64 + d) as u64,
+            }
+            Ok(self.pos)
+        }
+    }
+
+    #[test]
+    fn hard_io_error_rewinds_to_line_start() {
+        // One complete line, then a partial line, then the device fails.
+        // "ok\n" = 3 bytes; partial "gar" = 3 more; error from byte 6.
+        let mut r = std::io::BufReader::new(FailAfter {
+            data: b"ok\ngar".to_vec(),
+            pos: 0,
+            fail_from: 6,
+        });
+        let mut seen = Vec::new();
+        let res = read_complete_lines(&mut r, false, &mut |line| {
+            seen.push(line.to_string());
+            Ok(())
+        });
+        assert!(res.is_err(), "hard IO error propagates");
+        assert_eq!(seen, vec!["ok"], "no garbled partial line was emitted");
+        // The rewind: the underlying reader must be back at the start of
+        // the partial line (byte 3), not stranded mid-line at byte 6.
+        assert_eq!(r.get_mut().pos, 3, "position restored to the line start");
     }
 }
