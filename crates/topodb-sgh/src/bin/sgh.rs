@@ -1472,16 +1472,14 @@ fn run_cmd(
         if runner.is_none() {
             #[cfg(feature = "http")]
             {
-                let bridge = if !mcp_nodes(&current).is_empty() {
-                    // mcp_pairing_error above already guarantees
-                    // mcp_argv is Some whenever a node opts in.
-                    let argv = mcp_argv
-                        .as_ref()
-                        .expect("mcp_pairing_error enforces this pairing");
-                    Some(topodb_sgh::mcp_bridge::OnDemandBridge::new(argv.clone()))
-                } else {
-                    None
-                };
+                // Built whenever --agent-mcp was given, not only when the
+                // INITIAL graph opts in: a replan revision may introduce
+                // the run's first tools:[topodb] node, and the handle must
+                // already be there for it (construction is free — no child
+                // until a node leases).
+                let bridge = mcp_argv
+                    .clone()
+                    .map(topodb_sgh::mcp_bridge::OnDemandBridge::new);
                 let provider_client = pending_http_provider
                     .take()
                     .expect("pending_http_provider is Some whenever provider != ClaudeCode");
@@ -1867,14 +1865,12 @@ fn resume_cmd(
     if runner.is_none() {
         #[cfg(feature = "http")]
         {
-            let bridge = if !mcp_nodes(&current).is_empty() {
-                let argv = mcp_argv
-                    .as_ref()
-                    .expect("mcp_pairing_error enforces this pairing");
-                Some(topodb_sgh::mcp_bridge::OnDemandBridge::new(argv.clone()))
-            } else {
-                None
-            };
+            // Built whenever --agent-mcp was given (see run_cmd's matching
+            // block): a replan revision may introduce the first
+            // tools:[topodb] node, and construction is free.
+            let bridge = mcp_argv
+                .clone()
+                .map(topodb_sgh::mcp_bridge::OnDemandBridge::new);
             let provider_client = pending_http_provider
                 .take()
                 .expect("pending_http_provider is Some whenever provider != ClaudeCode");
