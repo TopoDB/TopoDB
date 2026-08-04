@@ -1,10 +1,9 @@
 //! One AgentRunner for every HTTP chat provider. Owns the tool loop, the
 //! structured-output fallback, transport retries, and denial mapping —
 //! a ChatProvider is only a wire-format codec.
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::mcp_bridge::{BridgeError, McpBridge};
+use crate::mcp_bridge::{BridgeError, OnDemandBridge};
 use crate::provider::{
     ChatMessage, ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, HttpTransport,
     Role, StopReason, ToolDef, UreqTransport,
@@ -96,7 +95,7 @@ pub struct HttpChatRunner {
     provider: Box<dyn ChatProvider>,
     transport: Box<dyn HttpTransport>,
     model: Option<String>,
-    bridge: Option<Mutex<McpBridge>>,
+    bridge: Option<OnDemandBridge>,
     /// Upper bound on model turns per node execution. The CLI backend's
     /// internal agent loop is opaque and bounded by claude itself; this is
     /// the HTTP analogue, bounded here. One node execution still counts as
@@ -119,6 +118,8 @@ pub struct HttpChatRunner {
     /// their own, so this field cannot bound them, only the transport
     /// sends around them. Phase 3's events make a stuck bridge call
     /// observable from the outside even though this field cannot kill it.
+    /// A dead child no longer outlives its node: bridge errors clear the
+    /// on-demand slot and the next lease respawns.
     pub node_deadline: Duration,
     /// Cooperative cancellation token. When set and cancelled, the runner
     /// aborts inflight work and returns a failed outcome.
@@ -129,7 +130,7 @@ impl HttpChatRunner {
     pub fn new(
         provider: Box<dyn ChatProvider>,
         model: Option<String>,
-        bridge: Option<McpBridge>,
+        bridge: Option<OnDemandBridge>,
     ) -> Self {
         Self::with_transport(provider, Box::new(UreqTransport), model, bridge)
     }
@@ -138,13 +139,13 @@ impl HttpChatRunner {
         provider: Box<dyn ChatProvider>,
         transport: Box<dyn HttpTransport>,
         model: Option<String>,
-        bridge: Option<McpBridge>,
+        bridge: Option<OnDemandBridge>,
     ) -> Self {
         HttpChatRunner {
             provider,
             transport,
             model,
-            bridge: bridge.map(Mutex::new),
+            bridge,
             max_tool_rounds: 16,
             max_tokens: 8192,
             request_timeout: Duration::from_secs(600),
@@ -222,8 +223,13 @@ impl AgentRunner for HttpChatRunner {
             }};
         }
 
-        // Clause 1: tool surface.
+        // Clause 1: tool surface. The lease is node-scoped: taking it
+        // spawns the topodb-mcp child if it isn't running, and dropping it
+        // (with this function's return) kills the child once no other node
+        // holds a lease — between tool-using nodes the memory db is
+        // unlocked (see mcp_bridge::on_demand).
         let wants_topodb = req.tools.iter().any(|t| t == TOPODB_TOOL);
+        let mut lease = None;
         let tools: Vec<ToolDef> = if wants_topodb {
             match &self.bridge {
                 None => {
@@ -233,14 +239,24 @@ impl AgentRunner for HttpChatRunner {
                 }
                 Some(bridge) => {
                     remaining_or_fail!();
-                    match bridge.lock() {
-                        Ok(guard) => guard.tools().to_vec(),
-                        Err(_) => {
+                    let l = match bridge.lease() {
+                        Ok(l) => l,
+                        Err(e) => {
                             return Ok(NodeOutcome::Failed {
-                                error: "mcp bridge mutex was poisoned".to_string(),
+                                error: format!("mcp bridge failed: {e}"),
                             });
                         }
-                    }
+                    };
+                    let tools = match l.tools() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return Ok(NodeOutcome::Failed {
+                                error: format!("mcp bridge failed: {e}"),
+                            });
+                        }
+                    };
+                    lease = Some(l);
+                    tools
                 }
             }
         } else {
@@ -311,19 +327,10 @@ impl AgentRunner for HttpChatRunner {
                 let mut result_parts = Vec::with_capacity(tool_uses.len());
                 for (id, name, input) in &tool_uses {
                     remaining_or_fail!();
-                    let bridge = self
-                        .bridge
+                    let lease_ref = lease
                         .as_ref()
-                        .expect("tool_uses non-empty implies bridge was validated above");
-                    let mut guard = match bridge.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            return Ok(NodeOutcome::Failed {
-                                error: "mcp bridge mutex was poisoned".to_string(),
-                            });
-                        }
-                    };
-                    match guard.call(name, input) {
+                        .expect("tool_uses non-empty implies the lease was taken above");
+                    match lease_ref.call(name, input) {
                         Ok(text) => result_parts.push(ContentPart::ToolResult {
                             tool_use_id: (*id).clone(),
                             content: text,
