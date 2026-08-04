@@ -1253,9 +1253,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The `run` subcommand's body, factored out of `main` so every exit code is
 /// a plain `Result` value instead of a `std::process::exit` call. This
 /// matters specifically because `std::process::exit` skips destructors: an
-/// HTTP provider's `McpBridge` (a live child process) is owned by a local
-/// here, and only a normal `return` — not `process::exit` — runs `Drop`
-/// (kill+wait) on it before the process actually terminates. `main` is the
+/// HTTP provider's `OnDemandBridge` (which may own a live child process) is
+/// owned by a local here, and only a normal `return` — not `process::exit`
+/// — runs `Drop` (kill+wait on any live child) on it before the process
+/// actually terminates. `main` is the
 /// only place still allowed to call `process::exit`, and only after this
 /// function has already returned (so everything local to it, runner and
 /// bridge included, has already dropped).
