@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use topodb_sgh::mcp_bridge::McpBridge;
+use topodb_sgh::mcp_bridge::OnDemandBridge;
 use topodb_sgh::provider::{
     ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, HttpTransport, ProviderError,
     StopReason,
@@ -162,7 +162,7 @@ fn end_turn(text: &str) -> ChatResponse {
 fn runner_with(
     provider: ScriptedProvider,
     transport: ScriptedTransport,
-    bridge: Option<McpBridge>,
+    bridge: Option<OnDemandBridge>,
 ) -> HttpChatRunner {
     let mut r =
         HttpChatRunner::with_transport(Box::new(provider), Box::new(transport), None, bridge);
@@ -256,7 +256,7 @@ fn schema_fallback_extracts_json() {
 
 #[test]
 fn tool_loop_executes_bridge_and_feeds_result() {
-    let bridge = McpBridge::spawn(&fake_server()).unwrap();
+    let bridge = OnDemandBridge::new(fake_server());
     let provider = ScriptedProvider::new(vec![
         ChatResponse {
             parts: vec![ContentPart::ToolUse {
@@ -300,7 +300,7 @@ fn tool_loop_executes_bridge_and_feeds_result() {
 
 #[test]
 fn out_of_surface_tool_is_denied() {
-    let bridge = McpBridge::spawn(&fake_server()).unwrap();
+    let bridge = OnDemandBridge::new(fake_server());
     let provider = ScriptedProvider::new(vec![ChatResponse {
         parts: vec![ContentPart::ToolUse {
             id: "t1".into(),
@@ -323,7 +323,7 @@ fn out_of_surface_tool_is_denied() {
 
 #[test]
 fn node_without_optin_gets_no_tools() {
-    let bridge = McpBridge::spawn(&fake_server()).unwrap();
+    let bridge = OnDemandBridge::new(fake_server());
     let provider = ScriptedProvider::new(vec![end_turn("ok")]);
     let inspect = provider.clone();
     let transport = ScriptedTransport::new(vec![200]);
@@ -357,7 +357,7 @@ fn missing_bridge_with_optin_fails() {
 
 #[test]
 fn tool_rounds_cap_fails() {
-    let bridge = McpBridge::spawn(&fake_server()).unwrap();
+    let bridge = OnDemandBridge::new(fake_server());
     let responses: Vec<ChatResponse> = (0..2)
         .map(|_| ChatResponse {
             parts: vec![ContentPart::ToolUse {

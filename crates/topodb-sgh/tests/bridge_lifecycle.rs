@@ -20,6 +20,7 @@ fn main() {
     test_tool_error_keeps_child_alive(&dir.join("t4"));
     test_dead_child_clears_slot_and_respawns(&dir.join("t5"));
     test_spawn_failure_leaves_bridge_reusable(&dir.join("t6"));
+    test_runner_releases_between_nodes(&dir.join("t7"));
     println!("bridge_lifecycle: all tests passed");
 }
 
@@ -178,6 +179,89 @@ fn test_spawn_failure_leaves_bridge_reusable(dir: &Path) {
         "second lease after spawn failure also fails cleanly"
     );
     println!("  spawn_failure_leaves_bridge_reusable: ok");
+}
+
+fn test_runner_releases_between_nodes(dir: &Path) {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use topodb_sgh::provider::{
+        ChatProvider, ChatResponse, ChatTurn, ContentPart, HttpPayload, HttpTransport,
+        ProviderError, StopReason,
+    };
+
+    // Minimal fake provider: round 1 asks for one topodb__ping tool call,
+    // round 2 finishes with text. Request bodies encode the round via the
+    // message count; parse is driven by a canned script keyed off it.
+    struct FakeProvider;
+    impl ChatProvider for FakeProvider {
+        fn request(&self, turn: &ChatTurn) -> Result<HttpPayload, ProviderError> {
+            Ok(HttpPayload {
+                url: "http://localhost:0/fake".to_string(),
+                headers: vec![],
+                body: vec![turn.messages.len() as u8],
+            })
+        }
+        fn parse(&self, _status: u16, body: &[u8]) -> Result<ChatResponse, ProviderError> {
+            if body == [1u8] {
+                Ok(ChatResponse {
+                    parts: vec![ContentPart::ToolUse {
+                        id: "tu1".to_string(),
+                        name: "topodb__ping".to_string(),
+                        input: json!({}),
+                    }],
+                    stop: StopReason::ToolUse,
+                })
+            } else {
+                Ok(ChatResponse {
+                    parts: vec![ContentPart::Text {
+                        text: "done".to_string(),
+                    }],
+                    stop: StopReason::EndTurn,
+                })
+            }
+        }
+    }
+    // Transport that echoes the request body back so parse sees the round.
+    struct EchoTransport;
+    impl HttpTransport for EchoTransport {
+        fn post(
+            &self,
+            payload: &HttpPayload,
+            _t: Duration,
+        ) -> Result<(u16, Vec<u8>), std::io::Error> {
+            Ok((200, payload.body.clone()))
+        }
+    }
+
+    let bridge = topodb_sgh::mcp_bridge::on_demand::OnDemandBridge::new(stub_argv(dir));
+    let runner = topodb_sgh::runner::http::HttpChatRunner::with_transport(
+        Box::new(FakeProvider),
+        Box::new(EchoTransport),
+        Some("m".to_string()),
+        Some(bridge),
+    );
+    use topodb_sgh::runner::{AgentRunner, NodeRequest};
+    let req = NodeRequest {
+        node_id: "n1".to_string(),
+        prompt: "do".to_string(),
+        inputs: BTreeMap::new(),
+        tools: vec!["topodb".to_string()],
+        output_schema: None,
+    };
+    let out1 = runner.run(&req).expect("node 1 runs");
+    assert!(
+        matches!(out1, topodb_sgh::runner::NodeOutcome::Succeeded { .. }),
+        "{out1:?}"
+    );
+    assert!(!stub_alive(dir), "child released after the node finished");
+    let out2 = runner.run(&req).expect("node 2 runs");
+    assert!(matches!(
+        out2,
+        topodb_sgh::runner::NodeOutcome::Succeeded { .. }
+    ));
+    assert_eq!(spawn_count(dir), 2, "one spawn per tool-using node burst");
+    assert!(!stub_alive(dir));
+    println!("  runner_releases_between_nodes: ok");
 }
 
 // ---------------- stub server ----------------
