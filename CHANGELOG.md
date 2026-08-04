@@ -916,10 +916,25 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   every later node (the next tool-using node respawns it). A well-formed
   `--agent-mcp` command whose binary fails to start now surfaces as that
   node's failure (run exit 1) instead of exit 2 at approval time.
+- **`--model` is a flag rail for HTTP providers** — `--provider anthropic|openai`
+  without `--model` now exits 2 at flag time on `run`/`resume`/`plan`, next to
+  the other rails, instead of failing at the first request after the approval
+  gate and burning retry budget. `claude-code` keeps `--model` optional (the
+  claude CLI's own default applies).
+- HTTP transport migrated to ureq 3 — the workspace now carries a single ureq
+  major — and the transport contract (HTTP error statuses arrive as
+  `Ok((status, body))` with the body readable; only transport failures are
+  `Err`) is newly pinned by loopback tests.
 
 #### Fixed
 
 - **`sgh validate` prints failures without a preceding success line** — the `--agent-mcp` rail and pairing checks now run before "valid: N node(s)" prints, so a failing validate no longer emits success-then-error.
+- **`sgh show --follow` no longer emits a garbled line after a hard IO read
+  error** — the reader rewinds to the failed line's start before the error
+  propagates, so the next poll re-reads a complete line.
+- **The run index's `last_ms` high-water mark can no longer move backwards**
+  under a clock that steps back mid-run (NTP correction, VM restore) — resume's
+  clock floor is now genuinely non-decreasing.
 
 ---
 
