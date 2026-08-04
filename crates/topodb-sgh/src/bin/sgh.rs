@@ -44,9 +44,14 @@ impl std::fmt::Display for Provider {
 }
 
 /// Validate the `--provider`/`--base-url`/`--agent-bash` combination shared by
-/// `run` and `plan`. Must run before any file IO — these are flag rails, not
+/// `run`, `resume`, and `plan`. Must run before any file IO — these are flag rails, not
 /// graph-dependent checks. Exits the process with code 2 on violation.
-fn validate_provider_flags(provider: Provider, base_url: &Option<String>, agent_bash_used: bool) {
+fn validate_provider_flags(
+    provider: Provider,
+    base_url: &Option<String>,
+    agent_bash_used: bool,
+    model: &Option<String>,
+) {
     if base_url.is_some() && provider != Provider::Openai {
         eprintln!("error: --base-url applies only to --provider openai");
         std::process::exit(2);
@@ -55,6 +60,15 @@ fn validate_provider_flags(provider: Provider, base_url: &Option<String>, agent_
         eprintln!(
             "error: --agent-bash applies only to --provider claude-code (HTTP providers execute no shell)"
         );
+        std::process::exit(2);
+    }
+    // HTTP providers have no server-side default model: a missing --model
+    // would sail through construction, the approval gate, and the bridge
+    // handle, then surface as the first node's "no model specified"
+    // failure, burning retry budget. Fail it here with the other rails.
+    // claude-code stays exempt: model None = the claude CLI's own default.
+    if model.is_none() && matches!(provider, Provider::Anthropic | Provider::Openai) {
+        eprintln!("error: --provider {provider} requires --model");
         std::process::exit(2);
     }
 }
@@ -1309,7 +1323,7 @@ fn run_cmd(
     // must run before the graph file is even read — a bad flag
     // combination is a rail violation, not something that depends
     // on the graph.
-    validate_provider_flags(provider, &base_url, !agent_bash.is_empty());
+    validate_provider_flags(provider, &base_url, !agent_bash.is_empty(), &model);
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");
@@ -1714,7 +1728,7 @@ fn resume_cmd(
             std::process::exit(2);
         }
     }
-    validate_provider_flags(provider, &base_url, !agent_bash.is_empty());
+    validate_provider_flags(provider, &base_url, !agent_bash.is_empty(), &model);
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");
@@ -2012,7 +2026,7 @@ fn plan_cmd(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_timeout = Duration::from_secs(agent_timeout);
     // Flag rails before anything else, same as `run`.
-    validate_provider_flags(provider, &base_url, false);
+    validate_provider_flags(provider, &base_url, false, &model);
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");
