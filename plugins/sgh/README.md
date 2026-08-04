@@ -38,7 +38,10 @@ If none of those exist it tells you where it looked and stops — it never
 builds anything for you, because a slash command that silently starts a
 multi-minute compile is a bad surprise.
 
-npm packaging with prebuilt platform binaries is deliberately deferred.
+Install the prebuilt binary via npm: `npm i -g @topodb/topodb-sgh` (available
+from the first `topodb-sgh-v*` release tag), or build from source with
+`cargo install topodb-sgh`. A global npm install lands `sgh` on `PATH`, which
+step 3 above already covers.
 
 ## Providers
 
