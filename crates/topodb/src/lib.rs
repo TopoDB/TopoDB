@@ -9,6 +9,7 @@ mod disk;
 mod error;
 mod feed;
 mod fts;
+mod hnsw;
 mod ids;
 mod index;
 mod migrate;
