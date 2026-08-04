@@ -31,6 +31,11 @@ name = "sgh"
 path = "src/bin/sgh.rs"
 required-features = ["cli"]
 
+[[test]]
+name = "bridge_lifecycle"
+harness = false
+required-features = ["http"]
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

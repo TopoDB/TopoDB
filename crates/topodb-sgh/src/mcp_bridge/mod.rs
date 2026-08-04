@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+pub mod on_demand;
+pub use on_demand::{BridgeLease, OnDemandBridge};
+
 pub const TOOL_NAMESPACE: &str = "topodb__";
 
 #[derive(Debug, thiserror::Error)]
