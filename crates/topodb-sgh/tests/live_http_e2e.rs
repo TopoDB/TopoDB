@@ -33,7 +33,7 @@
 //! target/{release,debug}/topodb-mcp.
 
 use topodb_sgh::executor::Executor;
-use topodb_sgh::mcp_bridge::McpBridge;
+use topodb_sgh::mcp_bridge::OnDemandBridge;
 use topodb_sgh::provider::anthropic::AnthropicProvider;
 use topodb_sgh::runner::http::HttpChatRunner;
 
@@ -99,7 +99,7 @@ nodes:
         "--embeddings".to_string(),
         "off".to_string(),
     ];
-    let bridge = McpBridge::spawn(&mcp_argv).unwrap();
+    let bridge = OnDemandBridge::new(mcp_argv);
 
     let provider = AnthropicProvider::from_env(Some("claude-haiku-4-5".to_string())).unwrap();
     let runner = HttpChatRunner::new(Box::new(provider), None, Some(bridge));
