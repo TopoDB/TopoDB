@@ -909,6 +909,13 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
   invocations to before. A graph opting in without the flag fails validation
   at the gate, not mid-run.
 - **Plugin `$SGH_MCP` helper** — `sgh-env.sh` now composes and exports `SGH_MCP`, the ready-made value for `sgh run --agent-mcp`: an absolute `topodb-mcp` binary (resolution mirrors `$SGH_BIN`: override, in-repo release, PATH, cargo bin dir) plus a per-project agent-memory database derived from `$SGH_DB` (`<same path>-memory.redb`, so an `SGH_DB` override keeps the pair together), with `--scope shared --embeddings off`. A missing `topodb-mcp` leaves `SGH_MCP` unset with a stderr note instead of failing — MCP is per-node opt-in, and graphs without opted-in nodes must keep working.
+- MCP bridge is now node-scoped: the `topodb-mcp` child starts when a
+  `tools: [topodb]` node begins and stops when the last one finishes, so the
+  memory db's exclusive lock is released between tool-using nodes — `command`
+  nodes can read the same db mid-run. A dead bridge child no longer fails
+  every later node (the next tool-using node respawns it). A well-formed
+  `--agent-mcp` command whose binary fails to start now surfaces as that
+  node's failure (run exit 1) instead of exit 2 at approval time.
 
 #### Fixed
 
