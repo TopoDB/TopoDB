@@ -22,7 +22,7 @@ serde_json = "1"
 jsonschema = "0.18"
 thiserror = "1"
 ulid = "1"
-ureq = { version = "2", optional = true }
+ureq = { version = "3.3", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = { version = "3", optional = true }
 

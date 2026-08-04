@@ -127,26 +127,32 @@ impl HttpTransport for UreqTransport {
         payload: &HttpPayload,
         timeout: std::time::Duration,
     ) -> Result<(u16, Vec<u8>), std::io::Error> {
-        let mut req = ureq::post(&payload.url).timeout(timeout);
+        // http_status_as_error(false): 4xx/5xx come back as Ok responses
+        // so their bodies stay readable — the HttpTransport contract that
+        // send_with_retries and the codecs depend on. The timeout differs
+        // per call (remaining-deadline capped), hence per-request config
+        // rather than one fixed Agent.
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build();
+        let agent: ureq::Agent = config.into();
+        let mut req = agent.post(&payload.url);
         for (k, v) in &payload.headers {
-            req = req.set(k, v);
+            req = req.header(k, v);
         }
-        match req.send_bytes(&payload.body) {
+        match req.send(&payload.body[..]) {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status().as_u16();
                 let mut buf = Vec::new();
                 use std::io::Read;
-                resp.into_reader().read_to_end(&mut buf)?;
+                // into_reader() is unbounded by default (the 10MB cap only
+                // applies to Body::read_to_vec/read_to_string/read_json), so
+                // this mirrors v2's unbounded read_to_end exactly.
+                resp.into_body().into_reader().read_to_end(&mut buf)?;
                 Ok((status, buf))
             }
-            // ureq models 4xx/5xx as Err(Status) — normalize back to Ok.
-            Err(ureq::Error::Status(code, resp)) => {
-                let mut buf = Vec::new();
-                use std::io::Read;
-                resp.into_reader().read_to_end(&mut buf)?;
-                Ok((code, buf))
-            }
-            Err(ureq::Error::Transport(t)) => Err(std::io::Error::other(t.to_string())),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
 }
