@@ -151,6 +151,18 @@ surface (`mcp__topodb`, the full server API). Running such a graph requires
 echoed at the gate exactly like bash grants, subject to the same textual-honesty
 rule (grant the exact binary path you use in the prompt).
 
+**Bridge lifecycle.** The `topodb-mcp` child is node-scoped: it starts when a
+`tools: [topodb]` node begins executing and stops as soon as the last such
+node finishes, not for the whole run. Between tool-using nodes the memory
+db's exclusive lock is released, so a `command` node placed between (or
+after) them can read or write the same db with the `topodb` CLI — subject
+to `--lock-wait-ms` racing an adjacent tool node's own startup, since a
+respawn briefly reacquires the lock. Each contiguous burst of tool-using
+nodes pays exactly one server start (a burst that ends and later resumes
+pays a second). A well-formed `--agent-mcp` command whose binary fails to
+start surfaces as the failure of the first tool-using node that needs it,
+not as a validation-time error.
+
 ### Worked examples
 
 Agent node with bash:
