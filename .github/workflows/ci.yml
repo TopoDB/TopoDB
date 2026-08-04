@@ -47,6 +47,7 @@ jobs:
         with:
           node-version: 22
       - run: node --test npm/topodb-mcp/test/launcher.test.js
+      - run: node --test npm/topodb-sgh/test/launcher.test.js
       - run: node --test scripts/test/build-npm-packages.test.mjs
       - run: npm install --no-audit --no-fund
         working-directory: plugins/claude-code
