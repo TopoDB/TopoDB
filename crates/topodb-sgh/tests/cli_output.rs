@@ -209,3 +209,79 @@ not json at all {
         node_succeeded_pos
     );
 }
+
+#[test]
+fn run_openai_without_model_exits_2_before_io() {
+    // Non-existent graph path: the rail must fire before the file is read,
+    // so the error is the rail's, not "No such file".
+    let out = bin()
+        .args(["run", "/nonexistent/graph.yaml", "--provider", "openai"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: --provider openai requires --model"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No such file"),
+        "rail must fire before file IO"
+    );
+}
+
+#[test]
+fn run_anthropic_without_model_exits_2() {
+    let out = bin()
+        .args(["run", "/nonexistent/graph.yaml", "--provider", "anthropic"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("error: --provider anthropic requires --model"));
+}
+
+#[test]
+fn plan_openai_without_model_exits_2() {
+    let out = bin()
+        .args(["plan", "some goal", "--provider", "openai"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error: --provider openai requires --model")
+    );
+}
+
+#[test]
+fn resume_openai_without_model_exits_2() {
+    let out = bin()
+        .args([
+            "resume",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--provider",
+            "openai",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error: --provider openai requires --model")
+    );
+}
+
+#[test]
+fn claude_code_without_model_is_not_railed() {
+    // claude-code keeps model=None = CLI default; failure here must be
+    // anything BUT the model rail (missing graph file, exit != 2-with-rail).
+    let out = bin()
+        .args([
+            "run",
+            "/nonexistent/graph.yaml",
+            "--provider",
+            "claude-code",
+        ])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("requires --model"));
+}
