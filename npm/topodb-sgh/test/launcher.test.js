@@ -66,16 +66,18 @@ test('resolveBinary gives an actionable error when the platform package is not i
   );
 });
 
-// --- the ghost-binary bug ------------------------------------------------
+// --- the ghost-binary bug (observed in the sibling @topodb/topodb-mcp channel) ---
 //
-// A real Windows install ran a 0.0.3 SERVER while every version check in the
-// stack said 0.0.7. `npm` had installed the wrong platform package
-// (topodb-sgh-linux-x64 on a win32 host), so topodb-sgh-win32-x64 was absent
-// from the plugin's data dir -- and `require.resolve` does not stop there. It
-// WALKED UP the directory tree, found a stale topodb-sgh-win32-x64@0.0.3 left
-// somewhere else on that machine, and resolved successfully. Because it
-// succeeded, the MODULE_NOT_FOUND path above -- the loud, actionable error --
-// never fired, and a server two format generations old was executed silently.
+// A real Windows install of @topodb/topodb-mcp ran a 0.0.3 SERVER while every
+// version check in the stack said 0.0.7. `npm` had installed the wrong platform
+// package (topodb-mcp-linux-x64 on a win32 host), so topodb-mcp-win32-x64 was
+// absent from the plugin's data dir -- and `require.resolve` does not stop
+// there. It WALKED UP the directory tree, found a stale
+// topodb-mcp-win32-x64@0.0.3 left somewhere else on that machine, and resolved
+// successfully. Because it succeeded, the MODULE_NOT_FOUND path above -- the
+// loud, actionable error -- never fired, and a server two format generations
+// old was executed silently. This launcher (topodb-sgh) inherits the same
+// version-pin hardening as a precaution against the identical failure mode.
 //
 // Resolution succeeding is therefore NOT proof we resolved OUR OWN binary. The
 // invariant that makes it proof: `optionalDependencies` pins each platform

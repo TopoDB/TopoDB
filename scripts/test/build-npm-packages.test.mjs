@@ -6,13 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const KEYS = ['darwin-arm64', 'darwin-x64', 'linux-x64', 'linux-arm64', 'win32-x64'];
-const binName = (key) => (key === 'win32-x64' ? 'topodb-mcp.exe' : 'topodb-mcp');
+const binName = (key, bin = 'topodb-mcp') => (key === 'win32-x64' ? `${bin}.exe` : bin);
 
-function stageFakeBinaries() {
+function stageFakeBinaries(bin = 'topodb-mcp') {
   const dir = mkdtempSync(join(tmpdir(), 'topodb-bins-'));
   for (const key of KEYS) {
     mkdirSync(join(dir, key), { recursive: true });
-    writeFileSync(join(dir, key, binName(key)), `#!fake ${key}\n`);
+    writeFileSync(join(dir, key, binName(key, bin)), `#!fake ${key}\n`);
   }
   return dir;
 }
@@ -93,4 +93,43 @@ test('generator does not mutate the committed main package source', () => {
   const after = readFileSync(src, 'utf8');
   assert.equal(after, before,
     'committed npm/topodb-mcp/package.json must be untouched by a generate run');
+});
+
+test('generator supports the sgh shape via --name/--bin', () => {
+  const binaries = stageFakeBinaries('sgh');
+  const out = mkdtempSync(join(tmpdir(), 'topodb-out-'));
+  execFileSync('node', [
+    'scripts/build-npm-packages.mjs',
+    '--version', '4.5.6',
+    '--binaries', binaries,
+    '--out', out,
+    '--name', 'topodb-sgh',
+    '--bin', 'sgh',
+  ], { stdio: 'inherit' });
+
+  // Main package: name + optionalDependency pins for all five sgh sub-packages.
+  const main = JSON.parse(readFileSync(join(out, 'topodb-sgh', 'package.json'), 'utf8'));
+  assert.equal(main.name, '@topodb/topodb-sgh');
+  assert.equal(main.version, '4.5.6');
+  for (const key of KEYS) {
+    assert.equal(main.optionalDependencies[`@topodb/topodb-sgh-${key}`], '4.5.6');
+  }
+
+  // Sub-packages: correct name and the `sgh`/`sgh.exe` binary (not topodb-mcp's).
+  for (const key of KEYS) {
+    const pkgDir = join(out, `topodb-sgh-${key}`);
+    const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+    assert.equal(pkg.name, `@topodb/topodb-sgh-${key}`);
+    assert.equal(pkg.version, '4.5.6');
+  }
+  assert.ok(
+    JSON.parse(readFileSync(join(out, 'topodb-sgh-win32-x64', 'package.json'), 'utf8')).files
+      .includes('sgh.exe'),
+    'win32-x64 sub-package files includes sgh.exe',
+  );
+  assert.ok(
+    JSON.parse(readFileSync(join(out, 'topodb-sgh-linux-x64', 'package.json'), 'utf8')).files
+      .includes('sgh'),
+    'linux-x64 sub-package files includes sgh',
+  );
 });
