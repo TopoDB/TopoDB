@@ -407,13 +407,18 @@ impl RunStore {
     /// opaque failure whose real cause is the clock, not concurrency).
     /// `high_water_ms` reads this mark back so `resume_cmd` can floor its
     /// clock against it before calling `run`.
+    /// The stamp itself is clamped: `max(high_water_ms(), now_ms)`, so an in-run clock step-back can never lower the mark.
     pub fn set_status(&self, status: &str, now_ms: i64) -> Result<(), SghError> {
         let mut props = BTreeMap::new();
         props.insert(
             "status".to_string(),
             Some(PropValue::Str(status.to_string())),
         );
-        props.insert("last_ms".to_string(), Some(PropValue::DateTime(now_ms)));
+        // High-water guard: a clock that stepped back mid-run (NTP, VM
+        // restore) must not lower the mark `resume_cmd` floors against —
+        // the doc comment above promises non-decreasing and now it's true.
+        let mark = self.high_water_ms().max(now_ms);
+        props.insert("last_ms".to_string(), Some(PropValue::DateTime(mark)));
         self.db.submit_at(
             vec![Op::SetNodeProps {
                 id: self.index_node,

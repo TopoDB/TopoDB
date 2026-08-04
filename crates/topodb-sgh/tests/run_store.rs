@@ -356,6 +356,29 @@ fn high_water_ms_round_trips() {
 }
 
 #[test]
+fn set_status_never_lowers_the_high_water_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let g = Graph::from_yaml(include_str!("fixtures/simple.yaml")).unwrap();
+    let v = validate(&g).unwrap();
+
+    let s = RunStore::create(&db, "run-hwm-test", &v, 1_000).expect("create run");
+
+    s.set_status("running", 5_000).unwrap();
+    assert_eq!(s.high_water_ms(), 5_000);
+    // Clock steps back mid-run (NTP correction): the mark must hold.
+    s.set_status("running", 3_000).unwrap();
+    assert_eq!(
+        s.high_water_ms(),
+        5_000,
+        "last_ms is a high-water mark; a stepped-back clock must not lower it"
+    );
+    // And it still advances.
+    s.set_status("complete", 6_000).unwrap();
+    assert_eq!(s.high_water_ms(), 6_000);
+}
+
+#[test]
 fn graph_yaml_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("t.redb")).unwrap();
