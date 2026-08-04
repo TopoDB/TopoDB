@@ -467,12 +467,11 @@ jobs:
               tar -xf a.tar.xz -C "$tmp"; rm a.tar.xz
             fi
             # cargo-dist's executable-zip archives are not guaranteed to nest
-            # contents in a subdirectory (verified empirically: the
-            # x86_64-pc-windows-msvc .zip built by `dist build` for this repo
-            # has LICENSE-*/README.md/topodb-mcp.exe at the archive root, no
-            # wrapping folder) — search for the binary instead of assuming a
-            # fixed depth or using a "*/name" glob that only matches nested
-            # layouts.
+            # contents in a subdirectory (verified empirically for this repo's
+            # topodb-mcp .zip: files sit at the archive root with no wrapping
+            # folder, and cargo-dist builds sgh's archives the same way) —
+            # search for the binary instead of assuming a fixed depth or using
+            # a "*/name" glob that only matches nested layouts.
             found="$(find "$tmp" -type f -name "$bin" -print -quit)"
             if [ -z "$found" ]; then
               echo "::error::binary '$bin' not found in $asset (searched $tmp)" >&2
