@@ -1461,10 +1461,12 @@ fn run_cmd(
             }
         }
 
-        // HTTP providers only: build the runner now, post-approval —
-        // this is where the MCP bridge (if the graph opts in) spawns
-        // its subprocess, so no server starts for a run the operator
-        // rejects. Happens once; subsequent loop iterations (replan
+        // HTTP providers only: build the runner now, post-approval — the
+        // MCP bridge (if the graph opts in) is on-demand (OnDemandBridge):
+        // construction here is free and spawns nothing; the subprocess
+        // starts only when a node execution takes a lease, and dies again
+        // between tool-using nodes, so a rejected run never starts one
+        // either. Happens once; subsequent loop iterations (replan
         // revisions) reuse the same runner and bridge.
         if runner.is_none() {
             #[cfg(feature = "http")]
@@ -1475,13 +1477,7 @@ fn run_cmd(
                     let argv = mcp_argv
                         .as_ref()
                         .expect("mcp_pairing_error enforces this pairing");
-                    match topodb_sgh::mcp_bridge::McpBridge::spawn(argv) {
-                        Ok(b) => Some(b),
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            return Ok(2);
-                        }
-                    }
+                    Some(topodb_sgh::mcp_bridge::OnDemandBridge::new(argv.clone()))
                 } else {
                     None
                 };
@@ -1865,8 +1861,8 @@ fn resume_cmd(
     }
 
     // HTTP providers only: build the runner now, post-approval — see
-    // `run_cmd`'s matching block for why (no MCP bridge subprocess for a
-    // run the operator rejects).
+    // `run_cmd`'s matching block for why (the OnDemandBridge, if any,
+    // spawns nothing until a node execution leases it).
     if runner.is_none() {
         #[cfg(feature = "http")]
         {
@@ -1874,13 +1870,7 @@ fn resume_cmd(
                 let argv = mcp_argv
                     .as_ref()
                     .expect("mcp_pairing_error enforces this pairing");
-                match topodb_sgh::mcp_bridge::McpBridge::spawn(argv) {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return Ok(2);
-                    }
-                }
+                Some(topodb_sgh::mcp_bridge::OnDemandBridge::new(argv.clone()))
             } else {
                 None
             };
