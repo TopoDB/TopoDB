@@ -488,3 +488,174 @@ fn cross_model_reembed_moves_clusters() {
     let m2_hits = query_top_ids(&db, "m2", 1);
     assert_eq!(m2_hits, vec![target]);
 }
+
+/// F8 Task 4 regression pin: `search_layer` must be able to route THROUGH a
+/// tombstoned slot as a pure waypoint (its `neighbors` list, not its score),
+/// most acutely when the tombstoned slot is the cluster's own
+/// `entry_slot` — every read-path search starts its greedy descent there
+/// (`hnsw::search`), so a stale/dangling entry is the single likeliest way
+/// for a revert of that fix to silently break search.
+///
+/// Deterministic by construction, unlike
+/// `remove_node_tombstones_and_ratio_triggers_rebuild` (which seeds with
+/// random `NodeId::new()`, so its removed victims only SOMETIMES land on
+/// `entry_slot`): `Op::CreateNode`'s handler (`storage.rs`) allocates node
+/// slots via `alloc_node_slot` strictly in submission order starting at 0
+/// (see `slots.rs`), and this test's `(model, scope)` cluster is otherwise
+/// empty, so seeding node `i` (0-indexed) always gives it slot `i` exactly.
+/// Fixed `NodeId::from_u128` ids (mirroring the determinism idiom
+/// `hnsw.rs`'s own inline tests use — see `alloc_node_slot(... ids[slot])`
+/// there) make that slot assignment, and therefore which id ends up at
+/// `entry_slot`, fully reproducible run to run — no extra `src` dump helper
+/// needed since `entry_slot -> id` is just `ids[entry_slot as usize]`.
+#[test]
+fn removing_the_entry_point_node_keeps_search_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_tiny(&dir.path().join("t.redb"));
+
+    let n = 12usize;
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::from_u128(9000 + i as u128))
+        .collect();
+    for (i, &id) in ids.iter().enumerate() {
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Shared,
+            label: "M".into(),
+            props: Default::default(),
+        }])
+        .unwrap();
+        db.submit(vec![Op::SetEmbedding {
+            id,
+            model: "m1".into(),
+            vector: vec_at(i),
+        }])
+        .unwrap();
+    }
+
+    let meta0 = only_meta_row(&db).expect("must be built: 12 >= threshold 8");
+    assert!(meta0.3, "cluster must be built");
+    let (model, scope) = (meta0.0, meta0.1);
+
+    // Tracks (id, original index) so the brute-force order (ascending
+    // index — per the module doc comment, strictly decreasing cosine for
+    // `i * 0.1` in `[0, pi/2)`, and `11 * 0.1 = 1.1 < pi/2`) can be
+    // recomputed after each removal.
+    let mut remaining: Vec<(NodeId, usize)> = ids.iter().copied().zip(0..n).collect();
+    let brute_force_ids = |remaining: &[(NodeId, usize)]| -> Vec<NodeId> {
+        let mut sorted = remaining.to_vec();
+        sorted.sort_by_key(|&(_, i)| i);
+        sorted.into_iter().map(|(id, _)| id).collect()
+    };
+    let link_tomb = |db: &Db, slot: u64| -> bool {
+        db.debug_dump_hnsw_links()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == model && r.1 == scope && r.2 == slot && r.3 == 0)
+            .map(|r| r.4)
+            .expect("level-0 link row must exist for every ever-inserted slot")
+    };
+
+    // --- Removal 1: the cluster's ACTUAL entry point. ---
+    let entry_slot_1 = meta0.4;
+    assert!(
+        !link_tomb(&db, entry_slot_1),
+        "sanity: entry slot must not already be tombstoned before any removal"
+    );
+    let victim_1 = ids[entry_slot_1 as usize];
+    db.submit(vec![Op::RemoveNode { id: victim_1 }]).unwrap();
+    remaining.retain(|&(id, _)| id != victim_1);
+
+    // Independent proof — not just re-use of the same index arithmetic —
+    // that `victim_1` really was the node occupying `entry_slot_1`:
+    // removing it must be exactly what flips THAT slot's level-0 link row
+    // tombstoned.
+    assert!(
+        link_tomb(&db, entry_slot_1),
+        "removing victim_1 must tombstone entry_slot_1's own link row"
+    );
+
+    // `hnsw::tombstone` only flips a slot's `tomb` bit and bumps
+    // `meta.stale`; it never rewrites `meta.entry_slot` (only a full
+    // rebuild does, via `maybe_rebuild_cluster`). With ratio defaults
+    // (rebuild_num/den = 3/10) and graph_len=12, one tombstone (stale=1) is
+    // nowhere near the rebuild threshold (stale*10 >= 12*3=36 needs
+    // stale>=4), so `entry_slot` is now a genuinely dangling, permanently
+    // dead waypoint — exactly the case the Task 4 fix must route through.
+    let meta1 = only_meta_row(&db).expect("cluster stays built");
+    assert!(meta1.3);
+    assert_eq!(
+        meta1.4, entry_slot_1,
+        "no rebuild yet: entry_slot must still point at the tombstoned slot"
+    );
+    assert_eq!(meta1.7, 1, "exactly one tombstone so far");
+
+    // Search must still work: brute-force top-k over the 11 survivors
+    // (default ef=128 covers all of them, so this is exact-order), and
+    // victim_1 must never appear.
+    let want1 = brute_force_ids(&remaining);
+    let got1 = query_top_ids(&db, "m1", remaining.len());
+    assert_eq!(
+        got1, want1,
+        "search through a tombstoned ENTRY POINT must still return the exact brute-force order"
+    );
+    assert!(!got1.contains(&victim_1));
+
+    // --- Removal 2: entry_slot_1's own first-hop routing neighbor. ---
+    // `entry_slot` never moves off a tombstoned slot without a rebuild
+    // (just established above), so there is no "new entry_slot value" to
+    // read back from `debug_dump_hnsw_meta` a second time. The genuine way
+    // to double up the dead-waypoint chain a correct read path must descend
+    // through is to also kill whichever slot search would hop to FIRST from
+    // the still-dead entry — one of entry_slot_1's own level-0 neighbors
+    // (`tombstone` never touches `neighbors`, only the `tomb` flag, so that
+    // list is still intact).
+    let entry_neighbors = db
+        .debug_dump_hnsw_links()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.0 == model && r.1 == scope && r.2 == entry_slot_1 && r.3 == 0)
+        .expect("entry_slot_1's level-0 row must still exist")
+        .5;
+    let next_hop_slot = *entry_neighbors
+        .iter()
+        .find(|&&s| s != entry_slot_1)
+        .expect("a 12-node cluster's entry must have at least one other neighbor");
+    assert!(
+        !link_tomb(&db, next_hop_slot),
+        "sanity: the chosen second victim's slot must not already be tombstoned"
+    );
+    let victim_2 = ids[next_hop_slot as usize];
+    assert_ne!(victim_2, victim_1, "must be a genuinely different node");
+
+    db.submit(vec![Op::RemoveNode { id: victim_2 }]).unwrap();
+    remaining.retain(|&(id, _)| id != victim_2);
+
+    assert!(
+        link_tomb(&db, next_hop_slot),
+        "removing victim_2 must tombstone its own link row"
+    );
+    let meta2 = only_meta_row(&db).expect("cluster stays built");
+    assert!(meta2.3);
+    assert_eq!(
+        meta2.4, entry_slot_1,
+        "still no rebuild: entry_slot pins to the same permanently-dead slot"
+    );
+    assert_eq!(
+        meta2.7, 2,
+        "two tombstones now, still short of the ratio's rebuild trigger"
+    );
+
+    // Search must still work through BOTH dead waypoints: the entry itself
+    // AND its first live-routing hop are now tombstoned, so a correct read
+    // path must keep descending past both to reach the 10 live survivors.
+    let want2 = brute_force_ids(&remaining);
+    let got2 = query_top_ids(&db, "m1", remaining.len());
+    assert_eq!(
+        got2, want2,
+        "search must still return the exact brute-force order after a SECOND \
+         consecutive entry-point-chain removal"
+    );
+    assert!(!got2.contains(&victim_1));
+    assert!(!got2.contains(&victim_2));
+}
