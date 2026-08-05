@@ -8,6 +8,7 @@ use crate::state::NodeRecord;
 use crate::storage::{AppliedBatch, Storage};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -116,6 +117,17 @@ struct Inner {
     // applier must never hold a strong ref back to `Inner`, or `Drop` would
     // deadlock.
     subs: Arc<Mutex<Vec<Sender<ChangeEvent>>>>,
+    // Debug-only instrumentation (F8 Task 4): flips to `true` when
+    // `vector_store::search_scan`'s per-scope routing took the built-graph
+    // branch (`hnsw::search`) and `false` when it took the brute-force scan
+    // branch, overwritten by every scope a query touches (so it reflects
+    // only the LAST scope's routing decision, not the whole query). Lives on
+    // `Inner` (not `Storage`, which this task's brief scopes out of) — never
+    // read from replay state or any persisted table. Surfaced via
+    // `Db::debug_last_search_used_graph`/`Db::debug_atomic` so tests can pin
+    // that the graph path is genuinely live rather than vacuously agreeing
+    // with brute force by still silently scanning.
+    debug_last_search_used_graph: AtomicBool,
 }
 
 impl Db {
@@ -335,6 +347,7 @@ impl Db {
                 subs,
                 bump_tx: Mutex::new(Some(bump_tx)),
                 bumper: Mutex::new(Some(bumper)),
+                debug_last_search_used_graph: AtomicBool::new(false),
             }),
         })
     }
@@ -345,6 +358,15 @@ impl Db {
     #[must_use]
     pub(crate) fn storage(&self) -> &Storage {
         &self.inner.storage
+    }
+
+    /// The debug-instrumentation atomic (F8 Task 4). Used by `search_vector`
+    /// (in `vector.rs`, a sibling module that can't touch `self.inner`) to
+    /// pass a stable reference down into `vector_store::search_scan`'s
+    /// per-scope routing, which sets it on every branch it takes.
+    #[must_use]
+    pub(crate) fn debug_atomic(&self) -> &AtomicBool {
+        &self.inner.debug_last_search_used_graph
     }
 
     /// The on-disk format version of the opened file (delegates to
@@ -1117,6 +1139,21 @@ impl Db {
         }
         out.sort_unstable();
         Ok(out)
+    }
+
+    /// Debug-only instrumentation (F8 Task 4): `true` if the LAST scope
+    /// touched by the most recent `search_vector`/`search_vector_unbumped`
+    /// call's `vector_store::search_scan` routing took the built-graph
+    /// branch (`hnsw::search`), `false` if it took the brute-force scan
+    /// branch. Backed by an `AtomicBool` on `Storage`, set unconditionally by
+    /// BOTH routing branches on every non-candidates scope iteration — never
+    /// part of replay state, never read by any production code path. Exists
+    /// so tests can pin that a built cluster's search genuinely dispatches
+    /// through the graph rather than vacuously agreeing with brute force by
+    /// still silently scanning. `#[doc(hidden)]` — see `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_last_search_used_graph(&self) -> bool {
+        self.debug_atomic().load(Ordering::SeqCst)
     }
 
     /// Test/inspection helper (F8): every `HNSW_META` cluster-header row,

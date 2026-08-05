@@ -14,12 +14,14 @@
 use crate::codec::{frame_value, unframe_value};
 use crate::dict::{DictKind, Dicts};
 use crate::error::{storage_err, TopoError};
+use crate::hnsw;
 use crate::scopes::ScopeRegistry;
 use crate::slots::{node_slot, NODE_SLOTS};
 use crate::vector::VectorQuery;
 use redb::{ReadTransaction, ReadableTable, Table, TableDefinition};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Clustered embedding rows: `vector_key(model, scope, slot)` -> framed
 /// postcard `Vec<f32>`.
@@ -318,11 +320,28 @@ pub(crate) fn push_topk(
 ///   like the old RAM-slab filter) via `read_vector_by_slot`'s O(1)
 ///   per-candidate lookup rather than a range scan — the candidates fast
 ///   path.
+///
+/// **F8 Task 4 routing.** `hnsw_meta`/`hnsw_links` are the `HNSW_META`/
+/// `HNSW_LINKS` tables, opened by the caller (`vector.rs`) from the SAME read
+/// transaction as everything else here. Only the non-candidates (whole-scope)
+/// loop routes per scope: `hnsw::read_meta` tells whether that `(model,
+/// scope)` cluster is built; if so, `hnsw::search` walks the graph instead of
+/// a range scan, feeding the exact same `push_topk` heap. Otherwise the
+/// pre-Task-4 range-scan body runs UNCHANGED. The candidates path never
+/// consults the graph — a candidate list is already small and pre-resolved,
+/// so a graph walk would buy nothing. `debug_used_graph` is debug-only
+/// instrumentation (never replay state): set to `true`/`false` by whichever
+/// branch a given scope takes, overwritten on every scope iteration, so it
+/// reflects only the LAST scope processed — see
+/// `Db::debug_last_search_used_graph`.
 pub(crate) fn search_scan(
     tx: &ReadTransaction,
     dicts: &Dicts,
     scope_registry: &ScopeRegistry,
     q: &VectorQuery,
+    hnsw_meta: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    hnsw_links: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    debug_used_graph: &AtomicBool,
 ) -> Result<Vec<(u64, f32)>, TopoError> {
     let Some(model_id) = dicts.id_of(DictKind::Model, &q.model) else {
         return Ok(Vec::new());
@@ -366,29 +385,46 @@ pub(crate) fn search_scan(
             let Some(scope_id) = scope_registry.id_of(scope) else {
                 continue;
             };
-            let prefix = vector_prefix(model_id, scope_id);
-            let mut start = prefix.to_vec();
-            start.extend_from_slice(&0u64.to_be_bytes());
-            let mut end = prefix.to_vec();
-            end.extend_from_slice(&u64::MAX.to_be_bytes());
-            for entry in vectors
-                .range(start.as_slice()..=end.as_slice())
-                .map_err(storage_err)?
-            {
-                let (key_guard, value_guard) = entry.map_err(storage_err)?;
-                let key = key_guard.value();
-                let slot_bytes: [u8; 8] = key[8..16]
-                    .try_into()
-                    .map_err(|_| TopoError::Encoding("bad vector_key length".into()))?;
-                let slot = u64::from_be_bytes(slot_bytes);
-                let raw = unframe_value(value_guard.value())?;
-                let vector: Vec<f32> =
-                    postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
-                if vector.len() != q.vector.len() {
-                    continue;
-                }
-                if let Some(score) = cosine(&vector, &q.vector) {
+            let built_meta = hnsw::read_meta(hnsw_meta, model_id, scope_id)?.filter(|m| m.built);
+            if let Some(meta_row) = built_meta {
+                debug_used_graph.store(true, Ordering::SeqCst);
+                let reader = hnsw::GraphReader {
+                    vectors: &vectors,
+                    refs: &refs,
+                    model: model_id,
+                    scope: scope_id,
+                };
+                let ef = hnsw::ef_search(q.k);
+                let hits = hnsw::search(hnsw_links, &meta_row, &reader, &q.vector, ef, q.k)?;
+                for (slot, score) in hits {
                     push_topk(&mut heap, score, slot, q.k);
+                }
+            } else {
+                debug_used_graph.store(false, Ordering::SeqCst);
+                let prefix = vector_prefix(model_id, scope_id);
+                let mut start = prefix.to_vec();
+                start.extend_from_slice(&0u64.to_be_bytes());
+                let mut end = prefix.to_vec();
+                end.extend_from_slice(&u64::MAX.to_be_bytes());
+                for entry in vectors
+                    .range(start.as_slice()..=end.as_slice())
+                    .map_err(storage_err)?
+                {
+                    let (key_guard, value_guard) = entry.map_err(storage_err)?;
+                    let key = key_guard.value();
+                    let slot_bytes: [u8; 8] = key[8..16]
+                        .try_into()
+                        .map_err(|_| TopoError::Encoding("bad vector_key length".into()))?;
+                    let slot = u64::from_be_bytes(slot_bytes);
+                    let raw = unframe_value(value_guard.value())?;
+                    let vector: Vec<f32> = postcard::from_bytes(&raw)
+                        .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                    if vector.len() != q.vector.len() {
+                        continue;
+                    }
+                    if let Some(score) = cosine(&vector, &q.vector) {
+                        push_topk(&mut heap, score, slot, q.k);
+                    }
                 }
             }
         }

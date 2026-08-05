@@ -288,24 +288,48 @@ where
         if !visited.insert(slot) {
             return Ok(());
         }
-        let Some((m, s, v)) = read_vector_by_slot(reader.vectors, reader.refs, slot)? else {
+        // A missing link row at this level means `slot` was never a graph
+        // member here (or this level's structure was since rebuilt away) —
+        // there is nothing to route through or rank.
+        let Some(row) = read_links(links, reader.model, reader.scope, slot, level)? else {
             return Ok(());
         };
-        if m != reader.model || s != reader.scope {
-            return Ok(());
-        }
-        let Some(score) = cosine(query, &v) else {
-            return Ok(());
+        // Resolve a live, in-cluster, non-zero-norm vector to score `slot`
+        // by. `None` covers three cases that all still need `slot` ROUTED
+        // through (its link row above proves it's a real graph member) even
+        // though it can never be RANKED: the node was fully removed
+        // (`RemoveNode`'s `remove_vector` deletes the `VECTORS`/
+        // `EMBEDDING_REF` rows entirely, unlike `tombstone` which only flips
+        // a flag — so a tombstoned slot's vector is gone by the time a
+        // search walks through it), it moved to a different cluster (a
+        // cross-model re-embed's `put_vector` deletes the OLD cluster's
+        // `VECTORS` row the same way), or its embedding is zero-norm
+        // (`cosine` returns `None`, mirroring `insert`'s zero-norm no-op).
+        let scoreable = match read_vector_by_slot(reader.vectors, reader.refs, slot)? {
+            Some((m, s, v)) if m == reader.model && s == reader.scope => cosine(query, &v),
+            _ => None,
         };
-        let os = OrderedScore(score);
-        candidates.push((os, Reverse(slot)));
-        let is_tomb = read_links(links, reader.model, reader.scope, slot, level)?
-            .map(|row| row.tomb)
-            .unwrap_or(false);
-        if !is_tomb {
-            results.push(Reverse((os, Reverse(slot))));
-            if results.len() > ef.max(1) {
-                results.pop();
+        match scoreable {
+            Some(score) => {
+                let os = OrderedScore(score);
+                candidates.push((os, Reverse(slot)));
+                if !row.tomb {
+                    results.push(Reverse((os, Reverse(slot))));
+                    if results.len() > ef.max(1) {
+                        results.pop();
+                    }
+                }
+            }
+            None => {
+                // Un-scoreable but still a real graph member at this level:
+                // push it into `candidates` at the HIGHEST possible priority
+                // (`f32::INFINITY` compares greatest under `total_cmp`) so
+                // it's expanded unconditionally, ignoring the ef/worst-score
+                // early-termination heuristic below — otherwise a removed
+                // (or moved-away) node would silently sever the graph's
+                // connectivity through it. Never eligible for `results`:
+                // there is no score to rank it by.
+                candidates.push((OrderedScore(f32::INFINITY), Reverse(slot)));
             }
         }
         Ok(())
@@ -707,6 +731,15 @@ pub(crate) fn tombstone(
     Ok(true)
 }
 
+/// The `ef` a read-path search uses for a built cluster's level-0 pass:
+/// `max(4*k, 64)` — wide enough to give small-`k` queries real recall
+/// headroom over the greedy descent while staying bounded regardless of how
+/// large `k` gets. `search`'s own `ef.max(k)` clamp still applies on top of
+/// this, so `ef_search(k) >= k` always holds trivially.
+pub(crate) fn ef_search(k: usize) -> usize {
+    (4 * k).max(64)
+}
+
 /// Greedy-descends from `meta_row`'s entry point (ef=1 per level down to 1),
 /// then runs one `search_layer` at level 0 with `ef = max(ef, k)`, returning
 /// up to that many non-tombstoned `(slot, exact cosine)` pairs sorted
@@ -721,7 +754,6 @@ pub(crate) fn tombstone(
 /// level-0 search visit no candidate and `results` stays empty all the way
 /// through. See `zero_norm_query_yields_empty_result` below for the pinned
 /// case.
-#[allow(dead_code)] // wired up by Task 4's read path
 pub(crate) fn search<V, R>(
     links: &impl ReadableTable<&'static [u8], &'static [u8]>,
     meta_row: &ClusterMeta,
@@ -911,6 +943,16 @@ mod tests {
         assert!(link_key(7, 9, 1, 5) < link_key(7, 9, 2, 0));
         assert!(link_key(7, 9, 2, 0) < link_key(7, 9, 2, 1));
         assert_eq!(meta_key(7, 9), p);
+    }
+
+    #[test]
+    fn ef_search_is_max_of_4k_and_64() {
+        assert_eq!(ef_search(0), 64);
+        assert_eq!(ef_search(1), 64);
+        assert_eq!(ef_search(10), 64); // 4*10=40 < 64
+        assert_eq!(ef_search(16), 64); // 4*16=64, boundary
+        assert_eq!(ef_search(17), 68); // 4*17=68 > 64
+        assert_eq!(ef_search(1000), 4000);
     }
 
     #[test]
