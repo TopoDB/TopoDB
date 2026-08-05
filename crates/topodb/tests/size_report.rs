@@ -22,10 +22,23 @@
 //! smaller, faster combined append+edit-heavy harness re-run once per
 //! `POSTINGS_CHUNK_TARGET` candidate (see BENCHMARKS.md's chunk-target
 //! experiment table for the four recorded runs).
-use std::collections::BTreeMap;
+//!
+//! F8 addition (Task 7 / BENCHMARKS.md F8 gate): `build_vector_fixture` /
+//! `vector_search_report`, a resumable 100k/1M-vector-scope report tier
+//! mirroring `build_open_fixture` / `open_report`'s split — build in a
+//! time-budgeted, resumable step; measure in a separate step that refuses to
+//! time a partial fixture. Reports the deterministic HNSW graph path's
+//! min/median/p95/max search latency over 50 queries AND recall@10 against a
+//! one-shot exact scan per query (forced through the SAME public
+//! `search_vector` entry point by passing every in-scope id as
+//! `q.candidates` — see `search_scan`'s `if let Some(candidates)` branch,
+//! which never consults the graph). See each test's doc comment for its
+//! exact invocation and env knobs.
+use std::collections::{BTreeMap, HashSet};
 use topodb::workload::{batches, WorkloadSpec};
 use topodb::{
     Db, DbOptions, IndexSpec, NodeId, Op, PropIndex, PropValue, Props, Scope, ScopeId, ScopeSet,
+    VectorQuery,
 };
 fn spec() -> IndexSpec {
     IndexSpec {
@@ -349,6 +362,13 @@ impl Rng {
     }
     fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
+    }
+    /// A pseudo-random float in `[-1.0, 1.0)`, for the vector-search report
+    /// tier below — mirrors `benches/storage.rs`'s `VecRng::next_f32` (dense
+    /// random coordinates, not one-hot; see that struct's doc comment for
+    /// why one-hot vectors pathologically tie on cosine score at scale).
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() as f32 / u64::MAX as f32) * 2.0 - 1.0
     }
 }
 const FTS_WORDS: [&str; 16] = [
@@ -760,4 +780,268 @@ fn chunk_target_experiment_report() {
             }
         }
     }
+}
+
+/// Fixed model name for the vector-search report tier's embeddings — one
+/// scope, one model, per the brief (mirrors `benches/storage.rs`'s
+/// `"bench-768"` naming style, distinct string so the two never collide if a
+/// db were ever shared, though each lives at its own fixture path).
+const VEC_REPORT_MODEL: &str = "vec-report";
+
+/// The single scope every vector-report node lives in.
+fn vec_report_scope_id() -> ScopeId {
+    ScopeId::from_u128(0xF8_5EED)
+}
+
+/// `IndexSpec` for the vector-report fixture: no equality/text declarations
+/// (`Default`) — this tier only exercises `search_vector` and
+/// `nodes_by_label`/`nodes_by_label_unbumped` (ground-truth id enumeration),
+/// neither of which needs `PROP_INDEX`/FTS. `LABEL_INDEX` (which
+/// `nodes_by_label` reads) is maintained unconditionally, independent of
+/// `IndexSpec` — see `storage.rs`'s `load_nodes_by_label`.
+fn vec_report_spec() -> IndexSpec {
+    IndexSpec::default()
+}
+
+/// Deterministic per-index node id: `NodeId::from_u128` (not `NodeId::new`,
+/// which is wall-clock-random) so `build_vector_fixture` can resume across
+/// process invocations purely from `db.current_seq()` — id `i` is always the
+/// same id, on this run or any later resumed one, without needing to persist
+/// an id list anywhere.
+fn vec_report_node_id(i: usize) -> NodeId {
+    NodeId::from_u128(0x5EED_0000_0000_0000_0000_0000_0000_0000 + i as u128)
+}
+
+/// Deterministic per-index embedding: a fresh `Rng`, seeded from `i` alone
+/// (not threaded sequentially through one shared generator), so any node's
+/// vector is reproducible independent of build order or resume point —
+/// critical for a resumable, chunked, possibly-multi-process build where a
+/// later invocation must reconstruct exactly the vectors an earlier
+/// invocation would have generated for the SAME indices, without replaying
+/// the whole prefix. Dense random floats (not one-hot), matching
+/// `benches/storage.rs`'s `VecRng` rationale.
+fn vec_report_vector(i: usize, dim: usize) -> Vec<f32> {
+    let seed = (i as u64)
+        .wrapping_add(0xC0FFEE)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut r = Rng(seed);
+    (0..dim).map(|_| r.next_f32()).collect()
+}
+
+/// Fixed (non-tempdir) path for the vector-report fixture, keyed by its
+/// shape (`n`, `dim`) so different report scales coexist — same convention
+/// as `open_fixture_path`/`ram_fixture_path`. Not cleaned up automatically.
+fn vec_report_fixture_path(n: usize, dim: usize) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("topodb_vec_report_{n}_{dim}.redb"))
+}
+
+/// Vector-search report tier, step 1 (resumable, time-budgeted build):
+/// `cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture`
+/// with `TOPODB_VEC_FIXTURE_N` (default 100_000), `TOPODB_VEC_DIM` (default
+/// 384), `TOPODB_VEC_BUILD_CHUNK` (nodes per submit, default 500), and
+/// `TOPODB_BUILD_BUDGET_SECS` (default 420) in the environment. One scope,
+/// one model (`VEC_REPORT_MODEL`), every node embedded (unlike
+/// `build_open_fixture`'s `embed_pct`-partial corpus — a pure vector-search
+/// gate needs every node in-scope to be a real candidate). Resumable exactly
+/// like `build_open_fixture`: `db.current_seq()` (2 ops/node, `CreateNode`
+/// paired with `SetEmbedding`) tells this run how many nodes are already
+/// committed, and `vec_report_node_id`/`vec_report_vector` are pure
+/// functions of the node index alone, so the next chunk picks up exactly
+/// where any prior run (in this process or an earlier one) left off. Rerun
+/// the identical command until it prints `complete=true`.
+///
+/// For the 1M/384-dim tier (deferred — see the module doc comment and
+/// BENCHMARKS.md): `TOPODB_VEC_FIXTURE_N=1000000 cargo test -p topodb
+/// --release --test size_report -- --ignored build_vector_fixture --nocapture`,
+/// rerun until `complete=true`. 1M x 384 x 4 bytes (f32) ~= 1.5 GB of raw
+/// embedding bytes alone, well past this machine's free disk during F8 —
+/// Task 8 documents this run as pending.
+#[test]
+#[ignore]
+fn build_vector_fixture() {
+    let n = env_usize("TOPODB_VEC_FIXTURE_N", 100_000);
+    let dim = env_usize("TOPODB_VEC_DIM", 384);
+    let chunk = env_usize("TOPODB_VEC_BUILD_CHUNK", 500);
+    let budget = std::time::Duration::from_secs(env_usize("TOPODB_BUILD_BUDGET_SECS", 420) as u64);
+    let path = vec_report_fixture_path(n, dim);
+    let scope = Scope::Id(vec_report_scope_id());
+
+    let db = Db::open_with(&path, vec_report_spec()).unwrap();
+    let done_ops = db.current_seq().unwrap() as usize;
+    assert_eq!(
+        done_ops % 2,
+        0,
+        "vector-report fixture ops must come in CreateNode+SetEmbedding pairs — got an odd current_seq"
+    );
+    let done_nodes = done_ops / 2;
+    assert!(
+        done_nodes <= n,
+        "fixture has more nodes ({done_nodes}) than requested (n={n}) — wrong TOPODB_VEC_FIXTURE_N/TOPODB_VEC_DIM?"
+    );
+
+    let start = std::time::Instant::now();
+    let mut submitted = done_nodes;
+    let mut idx = done_nodes;
+    while idx < n {
+        if start.elapsed() > budget {
+            break;
+        }
+        let end = (idx + chunk).min(n);
+        let mut ops = Vec::with_capacity((end - idx) * 2);
+        for i in idx..end {
+            let id = vec_report_node_id(i);
+            ops.push(Op::CreateNode {
+                id,
+                scope,
+                label: "Vec".into(),
+                props: Default::default(),
+            });
+            ops.push(Op::SetEmbedding {
+                id,
+                model: VEC_REPORT_MODEL.into(),
+                vector: vec_report_vector(i, dim),
+            });
+        }
+        db.submit(ops).unwrap();
+        submitted = end;
+        idx = end;
+        println!(
+            "  nodes {submitted}/{n} elapsed_secs={:.0}",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    println!(
+        "n={n} dim={dim} nodes={submitted}/{n} run_secs={:.1} complete={}",
+        start.elapsed().as_secs_f64(),
+        submitted == n
+    );
+}
+
+/// Prints min/median/p95/max (nearest-rank, matching `print_open_stats`'s
+/// method) for a sorted-ascending duration slice, in milliseconds, under
+/// `label` — the generic form of `print_open_stats` for reports (like this
+/// one) that time something other than `Db::open_with`.
+fn print_latency_stats(label: &str, times: &[std::time::Duration]) {
+    for (i, t) in times.iter().enumerate() {
+        println!("  {label}[{i}] = {:.2} ms", t.as_secs_f64() * 1000.0);
+    }
+    let p95_idx = (times.len() * 95 / 100).min(times.len() - 1);
+    println!(
+        "{label}_min_ms={:.2} {label}_median_ms={:.2} {label}_p95_ms={:.2} {label}_max_ms={:.2}",
+        times[0].as_secs_f64() * 1000.0,
+        times[times.len() / 2].as_secs_f64() * 1000.0,
+        times[p95_idx].as_secs_f64() * 1000.0,
+        times[times.len() - 1].as_secs_f64() * 1000.0,
+    );
+}
+
+/// Vector-search report tier, step 2 (measurement — F8 gate): `cargo test -p
+/// topodb --release --test size_report -- --ignored vector_search_report --nocapture`
+/// with the same `TOPODB_VEC_FIXTURE_N`/`TOPODB_VEC_DIM` as the completed
+/// `build_vector_fixture` run. Verifies the fixture is fully built (refusing
+/// to report a partial one, same discipline as `open_report`), then runs 50
+/// deterministic k=10 queries (query `i`'s vector is `vec_report_vector(n +
+/// i, dim)` — same generator, indices past the fixture so no query
+/// coincides with a fixture member) against the live HNSW graph path,
+/// printing min/median/p95/max search latency (`print_latency_stats`).
+///
+/// For each query this ALSO computes an exact top-10 by passing every
+/// in-scope node id as `q.candidates` — `search_scan`'s candidates branch
+/// (`vector.rs`) always does a per-candidate linear cosine scan and never
+/// consults the HNSW graph, so this is a true brute-force ground truth
+/// reached through the same public `search_vector` entry point, not a
+/// reimplementation of cosine scoring in this test. recall@10 is the mean
+/// fraction of the graph's top-10 ids present in the exact top-10 across all
+/// 50 queries; both the mean and the per-query value print, and the mean is
+/// asserted `>= 0.95` (the same recall floor `hnsw.rs`'s own recall gate
+/// enforces at smaller scale — see that module's determinism/recall test).
+#[test]
+#[ignore]
+fn vector_search_report() {
+    const QUERIES: usize = 50;
+    let n = env_usize("TOPODB_VEC_FIXTURE_N", 100_000);
+    let dim = env_usize("TOPODB_VEC_DIM", 384);
+    let path = vec_report_fixture_path(n, dim);
+    let scopes = ScopeSet::of(&[vec_report_scope_id()]);
+
+    let db = Db::open_with(&path, vec_report_spec()).unwrap();
+    let expected_ops = (n * 2) as u64;
+    assert_eq!(
+        db.current_seq().unwrap(),
+        expected_ops,
+        "fixture incomplete — rerun build_vector_fixture until complete=true"
+    );
+    println!("n={n} dim={dim}");
+    println!("file_bytes={}", std::fs::metadata(&path).unwrap().len());
+
+    // Ground-truth candidate pool: every node in the fixture's one scope,
+    // via the public label-scan read path (not a reimplementation).
+    let all_ids: Vec<NodeId> = db
+        .nodes_by_label_unbumped(&scopes, "Vec")
+        .into_iter()
+        .map(|rec| rec.id)
+        .collect();
+    assert_eq!(
+        all_ids.len(),
+        n,
+        "fixture's Vec-labeled node count must match n — rerun build_vector_fixture until complete=true"
+    );
+
+    let mut graph_times: Vec<std::time::Duration> = Vec::with_capacity(QUERIES);
+    let mut recalls: Vec<f64> = Vec::with_capacity(QUERIES);
+    for qi in 0..QUERIES {
+        let qv = vec_report_vector(n + qi, dim);
+
+        let graph_query = VectorQuery {
+            scopes: scopes.clone(),
+            model: VEC_REPORT_MODEL.into(),
+            vector: qv.clone(),
+            k: 10,
+            candidates: None,
+        };
+        let start = std::time::Instant::now();
+        let graph_hits = db.search_vector_unbumped(&graph_query).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            graph_hits.len(),
+            10,
+            "vector_search_report: graph query {qi} must return k=10 hits"
+        );
+        graph_times.push(elapsed);
+
+        let exact_query = VectorQuery {
+            scopes: scopes.clone(),
+            model: VEC_REPORT_MODEL.into(),
+            vector: qv,
+            k: 10,
+            candidates: Some(all_ids.clone()),
+        };
+        let exact_hits = db.search_vector_unbumped(&exact_query).unwrap();
+        assert_eq!(
+            exact_hits.len(),
+            10,
+            "vector_search_report: exact-scan query {qi} must return k=10 hits"
+        );
+        let exact_ids: HashSet<NodeId> = exact_hits.iter().map(|(rec, _)| rec.id).collect();
+        let hit_count = graph_hits
+            .iter()
+            .filter(|(rec, _)| exact_ids.contains(&rec.id))
+            .count();
+        let recall = hit_count as f64 / 10.0;
+        recalls.push(recall);
+        println!(
+            "query={qi} graph_ms={:.2} recall_at_10={recall:.2}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    graph_times.sort();
+    print_latency_stats("graph", &graph_times);
+
+    let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+    println!("recall_at_10_mean={mean_recall:.4}");
+    assert!(
+        mean_recall >= 0.95,
+        "GATE: mean recall@10 must be >= 0.95, got {mean_recall:.4}"
+    );
 }
