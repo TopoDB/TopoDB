@@ -747,10 +747,11 @@ build-from-genesis file's are), and an `ensure_hnsw_params` reconcile (a
 params change triggers `hnsw::build_cluster`, a from-scratch bulk rebuild
 under the new params, discarding whatever incremental structure existed
 before). After either event, the FIRST `rebuild_state_from_ops` on that file
-produces a canonical-but-different graph than a hypothetical from-genesis
-replay would have — a real graph, valid and exactly reproducible from that
-point forward, but not necessarily bit-for-bit what an unbroken from-genesis
-history under the stamped params would have built. This is a one-time
+produces the canonical from-genesis graph under the stamped params — which
+is not necessarily bit-for-bit the graph the LIVE tables held before the
+rebuild (those were shaped by the lazy build or reconcile, events with no
+op-log trace). The rebuilt graph is real, valid, and exactly reproducible by
+every subsequent replay. This is a one-time
 perturbation of the *candidate set* `hnsw::search` approximately explores,
 never of correctness: every score `search` reports is the exact cosine
 distance for the vectors it visits (see "Vectors," above, and `hnsw.rs`'s
