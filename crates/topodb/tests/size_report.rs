@@ -828,11 +828,106 @@ fn vec_report_vector(i: usize, dim: usize) -> Vec<f32> {
     (0..dim).map(|_| r.next_f32()).collect()
 }
 
+/// Corpus geometry for the vector-report tier, from `TOPODB_VEC_GEOMETRY`:
+/// `"uniform"` (default — i.i.d. `vec_report_vector`, HNSW's known
+/// pathological worst case at high `dim`, kept as the stressor row) or
+/// `"manifold"` (`vec_report_vector_manifold` — the realistic row: real
+/// embedding corpora have LOW INTRINSIC DIMENSION and CLUSTER STRUCTURE,
+/// which is what graph navigability actually depends on; the first 100k
+/// gate run measured recall 0.078 on uniform-384d for a graph that was
+/// 100% connected — geometry, not construction, was the bottleneck).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum VecGeometry {
+    Uniform,
+    Manifold,
+}
+
+fn vec_report_geometry() -> VecGeometry {
+    match std::env::var("TOPODB_VEC_GEOMETRY").as_deref() {
+        Err(_) | Ok("uniform") => VecGeometry::Uniform,
+        Ok("manifold") => VecGeometry::Manifold,
+        Ok(other) => panic!("TOPODB_VEC_GEOMETRY must be uniform|manifold, got {other:?}"),
+    }
+}
+
+/// Manifold-geometry constants: points live near a `MANIFOLD_LATENT_DIM`-
+/// dimensional linear subspace of the ambient space, gathered around
+/// `MANIFOLD_CLUSTERS` cluster centers, with a small full-rank ambient
+/// noise floor. All three magnitudes are fixed (not env knobs) so a
+/// "manifold" fixture is one reproducible shape per `(n, dim)`.
+const MANIFOLD_LATENT_DIM: usize = 12;
+const MANIFOLD_CLUSTERS: usize = 32;
+const MANIFOLD_LOCAL_SPREAD: f32 = 0.25;
+const MANIFOLD_AMBIENT_NOISE: f32 = 0.02;
+
+/// Deterministic per-index embedding on the clustered manifold. Like
+/// `vec_report_vector`, a pure function of `i` alone (resume-safe): the
+/// basis and cluster centers come from fixed seeds, the local offset and
+/// ambient noise from `i`-derived seeds. `v = Σ_j latent_j · basis_j +
+/// noise`, `latent = center[i % CLUSTERS] + LOCAL_SPREAD · local(i)`.
+fn vec_report_vector_manifold(i: usize, dim: usize) -> Vec<f32> {
+    let cluster = i % MANIFOLD_CLUSTERS;
+    let mut center = Rng(0xC3A7_E400_u64
+        .wrapping_add(cluster as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut local = Rng((i as u64)
+        .wrapping_add(0x10CA1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let latent: Vec<f32> = (0..MANIFOLD_LATENT_DIM)
+        .map(|_| center.next_f32() + MANIFOLD_LOCAL_SPREAD * local.next_f32())
+        .collect();
+    let mut noise = Rng((i as u64)
+        .wrapping_add(0x4015E)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut v = vec![0.0f32; dim];
+    for (j, &l) in latent.iter().enumerate() {
+        let mut basis = Rng(0xBA51_5000_u64
+            .wrapping_add(j as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        for slot in v.iter_mut() {
+            *slot += l * basis.next_f32();
+        }
+    }
+    for slot in v.iter_mut() {
+        *slot += MANIFOLD_AMBIENT_NOISE * noise.next_f32();
+    }
+    v
+}
+
+/// Geometry-dispatched generator — every fixture-build and report call site
+/// goes through this so corpus and queries always share one distribution.
+fn vec_report_vector_geo(i: usize, dim: usize, geometry: VecGeometry) -> Vec<f32> {
+    match geometry {
+        VecGeometry::Uniform => vec_report_vector(i, dim),
+        VecGeometry::Manifold => vec_report_vector_manifold(i, dim),
+    }
+}
+
+#[test]
+fn manifold_generator_is_deterministic_and_shaped() {
+    // Resume-safety pin (mirrors `vec_report_vector`'s contract): same
+    // index twice gives the identical vector with no shared generator
+    // state, distinct indices differ, and the norm is non-degenerate
+    // (cosine-scoreable) at the report tier's dim.
+    let a = vec_report_vector_manifold(7, 384);
+    assert_eq!(a, vec_report_vector_manifold(7, 384));
+    assert_ne!(a, vec_report_vector_manifold(8, 384));
+    assert_eq!(a.len(), 384);
+    let norm = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(norm > 0.1, "manifold vector must be scoreable, norm={norm}");
+}
+
 /// Fixed (non-tempdir) path for the vector-report fixture, keyed by its
-/// shape (`n`, `dim`) so different report scales coexist — same convention
-/// as `open_fixture_path`/`ram_fixture_path`. Not cleaned up automatically.
-fn vec_report_fixture_path(n: usize, dim: usize) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("topodb_vec_report_{n}_{dim}.redb"))
+/// shape (`n`, `dim`) and geometry so different report scales and corpus
+/// shapes coexist — same convention as `open_fixture_path`/
+/// `ram_fixture_path`; the uniform name is the legacy one so existing
+/// fixtures stay resumable. Not cleaned up automatically.
+fn vec_report_fixture_path(n: usize, dim: usize, geometry: VecGeometry) -> std::path::PathBuf {
+    let name = match geometry {
+        VecGeometry::Uniform => format!("topodb_vec_report_{n}_{dim}.redb"),
+        VecGeometry::Manifold => format!("topodb_vec_report_{n}_{dim}_manifold.redb"),
+    };
+    std::env::temp_dir().join(name)
 }
 
 /// Vector-search report tier, step 1 (resumable, time-budgeted build):
@@ -863,7 +958,8 @@ fn build_vector_fixture() {
     let dim = env_usize("TOPODB_VEC_DIM", 384);
     let chunk = env_usize("TOPODB_VEC_BUILD_CHUNK", 500);
     let budget = std::time::Duration::from_secs(env_usize("TOPODB_BUILD_BUDGET_SECS", 420) as u64);
-    let path = vec_report_fixture_path(n, dim);
+    let geometry = vec_report_geometry();
+    let path = vec_report_fixture_path(n, dim, geometry);
     let scope = Scope::Id(vec_report_scope_id());
 
     let db = Db::open_with(&path, vec_report_spec()).unwrap();
@@ -899,7 +995,7 @@ fn build_vector_fixture() {
             ops.push(Op::SetEmbedding {
                 id,
                 model: VEC_REPORT_MODEL.into(),
-                vector: vec_report_vector(i, dim),
+                vector: vec_report_vector_geo(i, dim, geometry),
             });
         }
         db.submit(ops).unwrap();
@@ -911,7 +1007,7 @@ fn build_vector_fixture() {
         );
     }
     println!(
-        "n={n} dim={dim} nodes={submitted}/{n} run_secs={:.1} complete={}",
+        "n={n} dim={dim} geometry={geometry:?} nodes={submitted}/{n} run_secs={:.1} complete={}",
         start.elapsed().as_secs_f64(),
         submitted == n
     );
@@ -961,7 +1057,8 @@ fn vector_search_report() {
     const QUERIES: usize = 50;
     let n = env_usize("TOPODB_VEC_FIXTURE_N", 100_000);
     let dim = env_usize("TOPODB_VEC_DIM", 384);
-    let path = vec_report_fixture_path(n, dim);
+    let geometry = vec_report_geometry();
+    let path = vec_report_fixture_path(n, dim, geometry);
     let scopes = ScopeSet::of(&[vec_report_scope_id()]);
 
     let db = Db::open_with(&path, vec_report_spec()).unwrap();
@@ -990,7 +1087,7 @@ fn vector_search_report() {
     let mut graph_times: Vec<std::time::Duration> = Vec::with_capacity(QUERIES);
     let mut recalls: Vec<f64> = Vec::with_capacity(QUERIES);
     for qi in 0..QUERIES {
-        let qv = vec_report_vector(n + qi, dim);
+        let qv = vec_report_vector_geo(n + qi, dim, geometry);
 
         let graph_query = VectorQuery {
             scopes: scopes.clone(),
@@ -1039,7 +1136,7 @@ fn vector_search_report() {
     print_latency_stats("graph", &graph_times);
 
     let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
-    println!("recall_at_10_mean={mean_recall:.4}");
+    println!("geometry={geometry:?} recall_at_10_mean={mean_recall:.4}");
     assert!(
         mean_recall >= 0.95,
         "GATE: mean recall@10 must be >= 0.95, got {mean_recall:.4}"
