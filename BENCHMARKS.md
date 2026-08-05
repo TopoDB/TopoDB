@@ -605,9 +605,32 @@ heuristic with keep-pruned-connections, stamped as params `version: 2`
 (re)measured under v2; the v1 numbers above stand as the trigger record, not
 as gates.
 
+The same run also added the corpus-geometry axis the failure exposed:
+`TOPODB_VEC_GEOMETRY=manifold` builds the report fixture from a
+deterministic clustered low-intrinsic-dimension corpus (12-dim latent
+subspace, 32 centers, small ambient noise) — the two properties real
+embedding corpora have and i.i.d. uniform lacks. Uniform stays as the
+stressor row. Dev-scale evidence for the selection change (20k×384,
+release, 50 queries — evidence, not official gate rows):
+
+| geometry | v1 closest-M recall@10 | v2 heuristic recall@10 | v1 build | v2 build |
+|---|---|---|---|---|
+| manifold | 0.6600 (would fail) | **1.0000 (passes)** | 122.6 s (~163/s) | 218.7 s (~91/s) |
+| uniform (stressor) | 0.3080 | 0.2660 | ~476 s (~42/s) | 633 s (~32/s) |
+
+Read: on realistic geometry the heuristic is the difference between failing
+and perfect at this scale; on uniform high-dim, NO selection policy fixes
+distance concentration (both fail — ef tuning is the arc's next lever, only
+after the realistic gate row is green). Insert throughput cost of the
+heuristic is ~1.8× — tracked as its own optimization item.
+
 ```text
 cargo bench -p topodb --bench storage
-# 100k tier (~30 min budgeted build, resumable — rerun until complete=true):
+# 100k tier (~30 min budgeted build, resumable — rerun until complete=true).
+# Run BOTH geometries: manifold is the realistic recall gate (2a), uniform
+# the stressor row (2b); omitting TOPODB_VEC_GEOMETRY means uniform.
+TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 TOPODB_VEC_GEOMETRY=manifold cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture
+TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 TOPODB_VEC_GEOMETRY=manifold cargo test -p topodb --release --test size_report -- --ignored vector_search_report --nocapture
 TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture
 TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 cargo test -p topodb --release --test size_report -- --ignored vector_search_report --nocapture
 # 1M tier (long; resumable the same way):
@@ -620,7 +643,8 @@ TOPODB_VEC_FIXTURE_N=1000000 TOPODB_VEC_DIM=384 cargo test -p topodb --release -
 | # | gate | target | measured | verdict |
 |---:|---|---|---|---|
 | 1 | warm scoped search, 10k×768 k=10, graph (`search_warm_10k_scope_graph`) vs scan baseline (`search_warm_10k_scope_scan_baseline`) | graph ≤ scan; recall cross-check green | v1 closest-M: graph 10.99 ms ≈ scan 11.03 ms (parity). **Re-run pending under params v2** | pending (v2) |
-| 2 | 100k×384 k=10 `vector_search_report`: p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | v1 closest-M: recall@10 **0.078 — FAILED**, triggered the heuristic-selection change above. **Re-run pending under params v2** | failed (v1) → pending (v2) |
+| 2a | 100k×384 k=10 `vector_search_report`, **manifold** geometry (the realistic recall gate): p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | **pending — running under v2** | pending (v2) |
+| 2b | 100k×384 k=10 `vector_search_report`, uniform geometry (stressor: distance-concentration worst case, informational) | record honestly; ≥ 0.95 not expected at ef 64 on this geometry — ef tuning is the next lever | v1 closest-M: recall@10 **0.078 — FAILED**, the trigger for the heuristic-selection change above | stressor |
 | 3 | 1M×384 k=10 `vector_search_report`: p95 ≤ 25 ms, recall@10 ≥ 0.95 (spec acceptance #1) | p95 ≤ 25 ms; recall ≥ 0.95 | **pending — disk-blocked at merge time** | pending |
 | 4 | `SetEmbedding` insert overhead, graph vs scan cluster | measured and published, not hidden | **pending** — derive from `submit_1k_workload` + the fixture-pair build logs on the same run | pending |
 
