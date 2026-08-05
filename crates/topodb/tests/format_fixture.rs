@@ -375,6 +375,11 @@ fn v6_fixture_migrates_to_v7_and_reads() {
     assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 7);
+    // The fixture's single `m1` embedding is below `build_threshold` (HNSW's
+    // default is far above 1 vector), so it must stay on the scan path: no
+    // graph rows at all, in either table.
+    assert!(db.debug_dump_hnsw_meta().unwrap().is_empty());
+    assert!(db.debug_dump_hnsw_links().unwrap().is_empty());
 }
 
 /// Task 5 (format v7, F8): the native v7 fixture, written by
@@ -425,6 +430,10 @@ fn v7_fixture_opens_and_reads() {
     assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 7);
+    // Same sub-threshold scenario as the v6->v7 migration test above: one
+    // `m1` embedding, well under `build_threshold`, so no graph gets built.
+    assert!(db.debug_dump_hnsw_meta().unwrap().is_empty());
+    assert!(db.debug_dump_hnsw_links().unwrap().is_empty());
 }
 
 #[test]
@@ -721,4 +730,51 @@ fn v4_fixture_opens_and_reads() {
     );
     assert_eq!(db.current_seq().unwrap(), 3);
     assert_eq!(db.format_version(), 7);
+}
+
+/// F8 review fix: `ensure_hnsw_params` must decode the stored META
+/// `"hnsw_params"` stamp before comparing it byte-wise, exactly like
+/// `index_spec_reconcile_decision` decodes `"index_spec"` before comparing
+/// it. Sabotaging the stamp with undecodable garbage (mirrors
+/// `stale_norm_version_triggers_prop_index_rebuild_on_open` in
+/// `prop_index.rs` and `stale_analyzer_version_triggers_fts_rebuild_on_open`
+/// in `text_search.rs`, which corrupt OTHER stamps via a raw redb write) must
+/// surface as a `TopoError::Encoding` on the next open, not be silently
+/// treated as "different params" and trigger a drain+rebuild that papers
+/// over the corruption.
+#[test]
+fn corrupt_hnsw_params_stamp_fails_open_with_encoding_error() {
+    use redb::TableDefinition;
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.redb");
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![],
+    };
+    {
+        let db = Db::open_with(&path, spec.clone()).unwrap();
+        drop(db);
+    }
+    {
+        // Sabotage from outside: overwrite the stamp with bytes that are not
+        // a valid postcard-encoded `HnswParams`.
+        let raw = redb::Database::open(&path).unwrap();
+        let tx = raw.begin_write().unwrap();
+        {
+            // A lone `0xFF` is an incomplete postcard varint (continuation
+            // bit set, no following byte) — guaranteed to fail decode as the
+            // first field of `HnswParams` (a `u32`), regardless of the
+            // struct's exact field list.
+            let mut meta = tx.open_table(META).unwrap();
+            meta.insert("hnsw_params", [0xFFu8].as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let err = Db::open_with(&path, spec).unwrap_err();
+    assert!(
+        matches!(err, TopoError::Encoding(ref msg) if msg.contains("hnsw_params")),
+        "corrupt hnsw_params stamp must fail open with an Encoding error, got: {err:?}"
+    );
 }

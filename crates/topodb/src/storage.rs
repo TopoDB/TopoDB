@@ -640,6 +640,13 @@ impl Storage {
             let tx = self.db.begin_read().map_err(storage_err)?;
             let meta = tx.open_table(META).map_err(storage_err)?;
             if let Some(v) = meta.get("hnsw_params").map_err(storage_err)? {
+                // Decode first — an undecodable stamp is corruption, not
+                // "different params", and must surface as an error rather
+                // than silently falling through to a drain+rebuild (mirrors
+                // `index_spec_reconcile_decision`'s handling of
+                // `"index_spec"`).
+                let _: HnswParams = postcard::from_bytes(v.value())
+                    .map_err(|e| TopoError::Encoding(format!("bad hnsw_params stamp: {e}")))?;
                 if v.value() == incoming_bytes.as_slice() {
                     return Ok(());
                 }
@@ -650,6 +657,10 @@ impl Storage {
         let stored_bytes: Option<Vec<u8>> = {
             let meta = tx.open_table(META).map_err(storage_err)?;
             let found = meta.get("hnsw_params").map_err(storage_err)?;
+            if let Some(v) = &found {
+                let _: HnswParams = postcard::from_bytes(v.value())
+                    .map_err(|e| TopoError::Encoding(format!("bad hnsw_params stamp: {e}")))?;
+            }
             found.map(|v| v.value().to_vec())
         };
 
