@@ -577,3 +577,55 @@ one. Changing the const required re-measuring gates 6 and 6b above at the
 new value (done — the numbers in those sections are already at 4 KB), and
 the full workspace test suite was re-run and passed after the change (no
 test was tuned to a specific byte target).
+
+## v7 (format 7: deterministic HNSW vector index)
+
+Code landed 2026-08-04 on branch `f8-hnsw`. **No release-mode measurements
+have been taken yet**: the dev machine's disk was full (< 600 MiB free)
+throughout the branch, which blocks release builds entirely — recording that
+plainly rather than shipping numbers from a debug smoke run as if they were
+gates. The harnesses are committed, compile-verified, and smoke-tested in
+debug at tiny scale (N=1500, dim=16: graph built, 50 queries, recall@10
+mean 1.0000 — evidence the harness works, NOT a performance claim; at that
+scale `ef_search(10) = 64` explores ~4% of the corpus and recall ~1.0 is
+expected). Regenerate — in this order, once ~20 GiB is free:
+
+```text
+cargo bench -p topodb --bench storage
+# 100k tier (~30 min budgeted build, resumable — rerun until complete=true):
+TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture
+TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 cargo test -p topodb --release --test size_report -- --ignored vector_search_report --nocapture
+# 1M tier (long; resumable the same way):
+TOPODB_VEC_FIXTURE_N=1000000 TOPODB_VEC_DIM=384 cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture
+TOPODB_VEC_FIXTURE_N=1000000 TOPODB_VEC_DIM=384 cargo test -p topodb --release --test size_report -- --ignored vector_search_report --nocapture
+```
+
+### Gate summary
+
+| # | gate | target | measured | verdict |
+|---:|---|---|---|---|
+| 1 | warm scoped search, 10k×768 k=10, graph (`search_warm_10k_scope_graph`) vs scan baseline (`search_warm_10k_scope_scan_baseline`) | graph ≤ scan; recall cross-check green | **pending — disk-blocked at merge time** (commands above) | pending |
+| 2 | 100k×384 k=10 `vector_search_report`: p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | **pending — disk-blocked at merge time** | pending |
+| 3 | 1M×384 k=10 `vector_search_report`: p95 ≤ 25 ms, recall@10 ≥ 0.95 (spec acceptance #1) | p95 ≤ 25 ms; recall ≥ 0.95 | **pending — disk-blocked at merge time** | pending |
+| 4 | `SetEmbedding` insert overhead, graph vs scan cluster | measured and published, not hidden | **pending** — derive from `submit_1k_workload` + the fixture-pair build logs on the same run | pending |
+
+Notes recorded for whoever runs the gates:
+
+- The v4 section's `search_warm_10k_scope` bench was RENAMED in v7 to
+  `search_warm_10k_scope_graph` (the 10k fixture now exceeds the default
+  build threshold of 1024, so the old name silently became a graph
+  measurement); `search_warm_10k_scope_scan_baseline` (a second fixture
+  opened with `build_threshold: u64::MAX`, identical dataset) is the honest
+  successor of the v4 number. The v4 table above is historical and
+  unchanged.
+- Correctness at scale does not wait on these numbers: recall ≥ 0.95 is
+  hard-asserted inside `vector_search_report` itself (it fails, not just
+  reports), the CI-scale recall gate (`tests/hnsw_recall.rs`, 2000×32d,
+  measured 0.9660) runs on every `cargo test -p topodb`, and replay
+  determinism of the graph tables is proptest-pinned (`tests/determinism.rs`).
+- Known perf edge to watch in the gate runs: tombstoned waypoints carry
+  infinite candidate priority (they must remain routable), which defeats the
+  ef early-break until the 30% rebuild ratio reclaims them — a query against
+  a heavily-tombstoned cluster mid-window explores more of the graph than
+  ef suggests. If gate runs show it, the number goes in this table, not
+  under a rug.

@@ -18,6 +18,23 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **Deterministic HNSW vector index (F8, on-disk format v7)** — `search_vector`
+  (and hybrid recall's vector leg) now routes clusters that crossed a build
+  threshold (default 1024 vectors per `(model, scope)`) through an HNSW graph
+  instead of the brute-force scan; sub-threshold clusters and `candidates`
+  queries keep the exact scan bit-for-bit. Approximation affects only which
+  candidates surface — scores stay exact cosine and the public
+  `(score desc, NodeId asc)` order is unchanged, with recall@10 ≥ 0.95 gated
+  in tests. The graph is fully deterministic (integer-only level function,
+  slot-ascending tie-breaks, op-order insertion) and rebuilt byte-identically
+  by op-log replay, proptest-pinned. Deletes tombstone (waypoints stay
+  routable); a 30% stale ratio triggers an inline cluster rebuild; graph
+  parameters are stamped in META (`hnsw_params`) and reconciled on open —
+  a changed override drains and rebuilds, a corrupt stamp errors. Format
+  v6 → v7 migration is O(1) (two new tables, no data pass; graphs build
+  lazily). Public API unchanged; `DbOptions.hnsw_params` is the only new
+  surface. Release-mode benchmark gates are recorded as pending in
+  BENCHMARKS.md (dev-machine disk blocked release builds at merge time).
 - **`SearchOptions.prop_retain`** — a mechanism-only string-prop allowlist (`PropRetain { prop, any_of, absent_as }`): a candidate survives iff its `prop` value (a missing/non-`Str` value reads as `absent_as` when set) is in `any_of`. Filtered before top-k in every text-search path, never access-bumped when dropped, and re-applied post-fusion in `recall` so vector/graph-leg candidates cannot leak past it. The engine names no prop and no vocabulary; empty `prop`/`any_of` are rejected.
 - **`RecallQuery.tombstone_props` / `Db::search_text_live` takes a prop SET** — tombstone filtering generalizes from one prop (`tombstone_prop: Option<String>`) to any number (`tombstone_props: Vec<String>` / `&[&str]`): a candidate is dropped when ANY listed prop holds an `Int` timestamp `<=` the query's effective now. Per-prop semantics unchanged (future marks kept, non-`Int` values ignored, filtered before top-k, never access-bumped). **Breaking for struct-literal construction** of `RecallQuery` and for `search_text_live` callers — pass `vec![prop]` / `&[prop]` for the old behavior.
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
