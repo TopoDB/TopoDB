@@ -16,6 +16,7 @@
 //! `SetEmbedding` arm directly.
 use crate::db::Db;
 use crate::error::{storage_err, TopoError};
+use crate::hnsw::{HNSW_LINKS, HNSW_META};
 use crate::ids::{NodeId, ScopeSet};
 use crate::state::NodeRecord;
 use crate::storage::{read_node_by_slot, NODES};
@@ -92,7 +93,17 @@ impl Db {
             .read()
             .expect("scope registry lock poisoned");
 
-        let hits = search_scan(&tx, &dicts, &scope_registry, q)?;
+        let hnsw_meta = tx.open_table(HNSW_META).map_err(storage_err)?;
+        let hnsw_links = tx.open_table(HNSW_LINKS).map_err(storage_err)?;
+        let hits = search_scan(
+            &tx,
+            &dicts,
+            &scope_registry,
+            q,
+            &hnsw_meta,
+            &hnsw_links,
+            self.debug_atomic(),
+        )?;
 
         let nodes = tx.open_table(NODES).map_err(storage_err)?;
         let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
