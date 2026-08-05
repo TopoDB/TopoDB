@@ -48,7 +48,10 @@ pub struct HnswParams {
 impl Default for HnswParams {
     fn default() -> Self {
         HnswParams {
-            version: 1,
+            // v2: heuristic neighbor selection (keep-pruned-connections)
+            // replaced closest-M — a write-side structure change, so v1
+            // graphs drain + rebuild on open via `ensure_hnsw_params`.
+            version: 2,
             m: 16,
             m0: 32,
             ef_construction: 128,
@@ -377,11 +380,70 @@ where
     Ok(out)
 }
 
-/// Re-ranks `neighbor_slot`'s link row at `level` after appending
-/// `new_slot`, by cosine distance FROM THE NEIGHBOR (not from the original
-/// query) to every one of its (possibly now `max_m + 1`) neighbors, closest
-/// first, slot-ascending on ties — then truncates to `max_m`. No-op if the
-/// row is already within budget after the append.
+/// Heuristic neighbor selection with keep-pruned-connections (Malkov &
+/// Yashunin Alg. 4, similarity-space form) — the shared policy behind
+/// `insert`, `reinsert_links`, and `prune_neighbor`. `candidates` is
+/// `(similarity-to-query, slot)` in `search_layer`'s output order
+/// (score desc, slot asc); a candidate is KEPT only when it is strictly
+/// closer to the query than to every already-kept neighbor
+/// (`sim(e, query) > sim(e, kept)` — an exact tie prunes), which stops a
+/// mutually-close clump from monopolizing the row the way plain closest-M
+/// does. Pruned candidates backfill remaining budget in candidate order
+/// (keep-pruned-connections), so a row is short only when the candidate
+/// list itself is. The returned row preserves candidate order.
+///
+/// Determinism: the walk order is the caller's sorted order, every
+/// comparison is `total_cmp` over the same `cosine` the graph is built
+/// from, and the one `HashSet` is membership-only (never iterated). A
+/// slot `resolve`ing to `None` (removed / moved cluster mid-txn) is
+/// skipped entirely — never kept, never backfilled; an unscoreable
+/// kept-pair (`cosine` `None`) cannot block a candidate.
+fn select_neighbors<F>(
+    candidates: &[(OrderedScore, u64)],
+    max_m: usize,
+    mut resolve: F,
+) -> Result<Vec<u64>, TopoError>
+where
+    F: FnMut(u64) -> Result<Option<Vec<f32>>, TopoError>,
+{
+    let mut kept: Vec<(u64, Vec<f32>)> = Vec::with_capacity(max_m.min(candidates.len()));
+    let mut pruned: Vec<u64> = Vec::new();
+    for &(score, slot) in candidates {
+        if kept.len() >= max_m {
+            break;
+        }
+        let Some(v) = resolve(slot)? else {
+            continue;
+        };
+        let diverse = kept.iter().all(|(_, kv)| match cosine(&v, kv) {
+            Some(sim_to_kept) => OrderedScore(sim_to_kept) < score,
+            None => true,
+        });
+        if diverse {
+            kept.push((slot, v));
+        } else {
+            pruned.push(slot);
+        }
+    }
+    let mut members: HashSet<u64> = kept.iter().map(|&(slot, _)| slot).collect();
+    for slot in pruned {
+        if members.len() >= max_m {
+            break;
+        }
+        members.insert(slot);
+    }
+    Ok(candidates
+        .iter()
+        .map(|&(_, slot)| slot)
+        .filter(|slot| members.contains(slot))
+        .collect())
+}
+
+/// Re-selects `neighbor_slot`'s link row at `level` after appending
+/// `new_slot`: scores every one of its (possibly now `max_m + 1`) neighbors
+/// by cosine FROM THE NEIGHBOR (not from the original query), closest first,
+/// slot-ascending on ties, then applies `select_neighbors` down to `max_m`.
+/// No-op if the row is already within budget after the append.
 fn prune_neighbor<V, R>(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
     reader: &GraphReader<'_, V, R>,
@@ -418,6 +480,7 @@ where
         match own_vector {
             Some(nv) => {
                 let mut scored: Vec<(OrderedScore, u64)> = Vec::with_capacity(row.neighbors.len());
+                let mut resolved: Vec<(u64, Vec<f32>)> = Vec::with_capacity(row.neighbors.len());
                 for &cand in &row.neighbors {
                     let cand_vector = match read_vector_by_slot(reader.vectors, reader.refs, cand)?
                     {
@@ -433,12 +496,21 @@ where
                     if let Some(cv) = cand_vector {
                         if let Some(score) = cosine(&nv, &cv) {
                             scored.push((OrderedScore(score), cand));
+                            resolved.push((cand, cv));
                         }
                     }
                 }
                 scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                scored.truncate(max_m);
-                row.neighbors = scored.into_iter().map(|(_, s)| s).collect();
+                // Same heuristic as `insert`, from the NEIGHBOR's own
+                // perspective (`nv` is the "query"); the resolver serves the
+                // vectors read in the scoring loop above (a linear find over
+                // <= max_m + 1 entries), never re-touching the tables.
+                row.neighbors = select_neighbors(&scored, max_m, |s| {
+                    Ok(resolved
+                        .iter()
+                        .find(|&&(cand, _)| cand == s)
+                        .map(|(_, cv)| cv.clone()))
+                })?;
             }
             None => {
                 // Defensive fallback only: `neighbor_slot` was reached
@@ -470,7 +542,8 @@ where
 /// bootstraps `meta` directly; every later node greedily descends from the
 /// current entry point (ef=1) down to `level + 1`, then does a full
 /// `ef_construction` search at each level from `min(level, entry_level)`
-/// down to 0, wiring itself to the closest `M`/`M0` (`M0` at level 0) and
+/// down to 0, wiring itself to `M`/`M0` (`M0` at level 0) neighbors chosen
+/// by `select_neighbors` (the diversity heuristic, not plain closest-M) and
 /// pruning each of those neighbors back down to its own budget.
 pub(crate) fn insert<V, R>(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -566,7 +639,12 @@ where
         let ef_c = params.ef_construction as usize;
         let candidates = search_layer(links, reader, &entry_pts, vector, ef_c, cur_level)?;
         let max_m = if cur_level == 0 { params.m0 } else { params.m } as usize;
-        let selected: Vec<u64> = candidates.iter().take(max_m).map(|&(_, s)| s).collect();
+        let selected = select_neighbors(&candidates, max_m, |s| {
+            Ok(match read_vector_by_slot(reader.vectors, reader.refs, s)? {
+                Some((m, sc, v)) if m == reader.model && sc == reader.scope => Some(v),
+                _ => None,
+            })
+        })?;
 
         write_links(
             links,
@@ -703,7 +781,12 @@ where
         let filtered: Vec<(OrderedScore, u64)> =
             candidates.into_iter().filter(|&(_, s)| s != slot).collect();
         let max_m = if cur_level == 0 { params.m0 } else { params.m } as usize;
-        let selected: Vec<u64> = filtered.iter().take(max_m).map(|&(_, s)| s).collect();
+        let selected = select_neighbors(&filtered, max_m, |s| {
+            Ok(match read_vector_by_slot(reader.vectors, reader.refs, s)? {
+                Some((m, sc, v)) if m == reader.model && sc == reader.scope => Some(v),
+                _ => None,
+            })
+        })?;
 
         write_links(
             links,
@@ -1750,5 +1833,146 @@ mod tests {
         let vtab = tx.open_table(VECTORS).unwrap();
         assert_eq!(cluster_vector_count(&vtab, model, scope).unwrap(), 5);
         assert_eq!(cluster_vector_count(&vtab, model, 2).unwrap(), 0);
+    }
+
+    // -- Heuristic neighbor selection (revisit arc: 100k recall gate) -------
+
+    /// Unit vector at `deg` degrees in the plane — the 2-d geometry the
+    /// selection tests are built on: cosine similarity between two of these
+    /// is exactly the cosine of their angular separation, so "clumped vs
+    /// diverse" is controlled directly in degrees.
+    fn unit2(deg: f32) -> Vec<f32> {
+        let r = deg.to_radians();
+        vec![r.cos(), r.sin()]
+    }
+
+    /// A `select_neighbors` resolver over a plain slot-indexed table.
+    fn table_resolver(
+        table: &[Vec<f32>],
+    ) -> impl FnMut(u64) -> Result<Option<Vec<f32>>, TopoError> + '_ {
+        move |slot: u64| Ok(table.get(slot as usize).cloned())
+    }
+
+    /// Candidates scored against `query`, in `search_layer`'s output order
+    /// (score desc, slot asc) — the exact shape `insert` hands to selection.
+    fn scored_candidates(query: &[f32], table: &[Vec<f32>]) -> Vec<(OrderedScore, u64)> {
+        let mut out: Vec<(OrderedScore, u64)> = table
+            .iter()
+            .enumerate()
+            .map(|(slot, v)| (OrderedScore(cosine(query, v).unwrap()), slot as u64))
+            .collect();
+        out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
+    #[test]
+    fn heuristic_selection_prefers_diverse_over_clumped() {
+        // a (5°) and b (8°) clump together on one side of the query (0°);
+        // c (-25°) sits alone on the other side. Closest-2 keeps {a, b};
+        // the heuristic must prune b (closer to already-kept a than to the
+        // query: cos3° > cos8°) and keep the diverse c (cos30° < cos25°).
+        let table = vec![unit2(5.0), unit2(8.0), unit2(-25.0)];
+        let query = unit2(0.0);
+        let selected = select_neighbors(
+            &scored_candidates(&query, &table),
+            2,
+            table_resolver(&table),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec![0, 2],
+            "keep closest + diverse, prune the clump"
+        );
+    }
+
+    #[test]
+    fn heuristic_backfills_pruned_in_candidate_order() {
+        // Clump {a=5°, b=8°, d=10°} plus diverse c=-25°, budget 3. The
+        // heuristic keeps {a, c} and prunes both clump members; keep-pruned
+        // backfill must then take b (the FIRST pruned in candidate order),
+        // not d, and the final row keeps (score desc, slot asc) order.
+        let table = vec![unit2(5.0), unit2(8.0), unit2(10.0), unit2(-25.0)];
+        let query = unit2(0.0);
+        let selected = select_neighbors(
+            &scored_candidates(&query, &table),
+            3,
+            table_resolver(&table),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec![0, 1, 3],
+            "a + backfilled b + diverse c; d stays pruned"
+        );
+    }
+
+    #[test]
+    fn heuristic_duplicate_candidates_keep_lowest_slot_first() {
+        // Two identical vectors: the lower slot wins the tie in candidate
+        // order and is kept; the duplicate is pruned (it is exactly as
+        // close to the kept copy as anything can be) and only returns via
+        // backfill when the budget allows.
+        let table = vec![unit2(5.0), unit2(5.0)];
+        let query = unit2(0.0);
+        let selected = select_neighbors(
+            &scored_candidates(&query, &table),
+            2,
+            table_resolver(&table),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec![0, 1],
+            "slot 0 kept on the tie, slot 1 backfilled"
+        );
+        let selected_one = select_neighbors(
+            &scored_candidates(&query, &table),
+            1,
+            table_resolver(&table),
+        )
+        .unwrap();
+        assert_eq!(
+            selected_one,
+            vec![0],
+            "no backfill room: the duplicate stays pruned"
+        );
+    }
+
+    #[test]
+    fn insert_wires_diverse_neighbors_not_closest_clump() {
+        // Site-level: the same geometry as the unit test, driven through the
+        // real `insert` path. After inserting clump {a=5°, b=8°} and diverse
+        // c=-25°, a 0° node with m0=2 must wire to {a, c}, not closest-2
+        // {a, b}.
+        let model = 1;
+        let scope = 1;
+        let params = HnswParams {
+            m: 2,
+            m0: 2,
+            ef_construction: 8,
+            ..HnswParams::default()
+        };
+        let vectors = vec![unit2(5.0), unit2(8.0), unit2(-25.0), unit2(0.0)];
+        let (_dir, db) = open_db();
+        insert_incrementally(&db, model, scope, &vectors, &params);
+
+        let tx = db.begin_read().unwrap();
+        let links = tx.open_table(HNSW_LINKS).unwrap();
+        let row = read_links(&links, model, scope, 3, 0).unwrap().unwrap();
+        assert_eq!(
+            row.neighbors,
+            vec![0, 2],
+            "diverse {{a, c}}, not the {{a, b}} clump"
+        );
+    }
+
+    #[test]
+    fn default_params_version_is_bumped_for_heuristic_selection() {
+        // Selection policy is write-side graph structure: switching to the
+        // heuristic MUST bump the stamped params version so pre-existing
+        // graphs (built with closest-M) drain + rebuild on open via
+        // `ensure_hnsw_params` instead of silently mixing policies.
+        assert_eq!(HnswParams::default().version, 2);
     }
 }

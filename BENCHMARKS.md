@@ -590,6 +590,21 @@ mean 1.0000 — evidence the harness works, NOT a performance claim; at that
 scale `ef_search(10) = 64` explores ~4% of the corpus and recall ~1.0 is
 expected). Regenerate — in this order, once ~20 GiB is free:
 
+**2026-08-05 update — first gate run, and a selection-policy change.** The
+10k/100k gates first ran under params `version: 1` (plain closest-M neighbor
+selection). Gate 1 measured parity (graph 10.99 ms ≈ scan 11.03 ms — the
+crossover was expected above 10k). Gate 2 **hard-failed exactly as the
+harness was built to**: recall@10 = 0.078 at 100k×384 uniform. Diagnosis
+(preserved at `docs/superpowers/f8-diag-recall.rs`): the graph was 100%
+reachable with saturated degree but not NAVIGABLE — recall 0.10 at ef 64
+rising only to 0.635 at ef 1024 — i.i.d. uniform 384-dim geometry plus
+closest-M letting mutually-close clumps monopolize link rows. That tripped
+the spec's pre-registered fallback: neighbor selection is now the diversity
+heuristic with keep-pruned-connections, stamped as params `version: 2`
+(v1-stamped graphs drain + rebuild on open). Every v7 gate row below must be
+(re)measured under v2; the v1 numbers above stand as the trigger record, not
+as gates.
+
 ```text
 cargo bench -p topodb --bench storage
 # 100k tier (~30 min budgeted build, resumable — rerun until complete=true):
@@ -604,8 +619,8 @@ TOPODB_VEC_FIXTURE_N=1000000 TOPODB_VEC_DIM=384 cargo test -p topodb --release -
 
 | # | gate | target | measured | verdict |
 |---:|---|---|---|---|
-| 1 | warm scoped search, 10k×768 k=10, graph (`search_warm_10k_scope_graph`) vs scan baseline (`search_warm_10k_scope_scan_baseline`) | graph ≤ scan; recall cross-check green | **pending — disk-blocked at merge time** (commands above) | pending |
-| 2 | 100k×384 k=10 `vector_search_report`: p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | **pending — disk-blocked at merge time** | pending |
+| 1 | warm scoped search, 10k×768 k=10, graph (`search_warm_10k_scope_graph`) vs scan baseline (`search_warm_10k_scope_scan_baseline`) | graph ≤ scan; recall cross-check green | v1 closest-M: graph 10.99 ms ≈ scan 11.03 ms (parity). **Re-run pending under params v2** | pending (v2) |
+| 2 | 100k×384 k=10 `vector_search_report`: p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | v1 closest-M: recall@10 **0.078 — FAILED**, triggered the heuristic-selection change above. **Re-run pending under params v2** | failed (v1) → pending (v2) |
 | 3 | 1M×384 k=10 `vector_search_report`: p95 ≤ 25 ms, recall@10 ≥ 0.95 (spec acceptance #1) | p95 ≤ 25 ms; recall ≥ 0.95 | **pending — disk-blocked at merge time** | pending |
 | 4 | `SetEmbedding` insert overhead, graph vs scan cluster | measured and published, not hidden | **pending** — derive from `submit_1k_workload` + the fixture-pair build logs on the same run | pending |
 
@@ -621,7 +636,8 @@ Notes recorded for whoever runs the gates:
 - Correctness at scale does not wait on these numbers: recall ≥ 0.95 is
   hard-asserted inside `vector_search_report` itself (it fails, not just
   reports), the CI-scale recall gate (`tests/hnsw_recall.rs`, 2000×32d,
-  measured 0.9660) runs on every `cargo test -p topodb`, and replay
+  measured 0.9660 under v1 closest-M, 0.9820 under v2 heuristic selection)
+  runs on every `cargo test -p topodb`, and replay
   determinism of the graph tables is proptest-pinned (`tests/determinism.rs`).
 - Known perf edge to watch in the gate runs: tombstoned waypoints carry
   infinite candidate priority (they must remain routable), which defeats the
