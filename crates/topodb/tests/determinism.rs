@@ -374,7 +374,19 @@ proptest! {
     fn state_from_replay_equals_state_from_execution(script in scripts()) {
         let (n_scoped, n_shared, intents) = script;
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+        // `build_threshold: 4` (default is 1024) so the 3-10-node scripts
+        // generated here genuinely cross the HNSW build/tombstone/rebuild
+        // thresholds in many cases, rather than staying perpetually
+        // brute-force-only — see the module doc for the zero-norm/threshold
+        // interaction this has with `Intent::Embed`'s 1-dim vector recipe.
+        let options = DbOptions {
+            hnsw_params: Some(HnswParams {
+                build_threshold: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let db = Db::open_with_options(dir.path().join("t.redb"), spec(), options).unwrap();
         let scope_id = run_script(&db, n_scoped, n_shared, &intents);
         // Covers both script scopes: the one generated scope plus Shared —
         // every read path under test (`nodes_by_prop`, `search_text`,
@@ -418,6 +430,14 @@ proptest! {
         // `rebuild_state_from_ops` repopulates it byte-for-byte, not just
         // "close enough" to keep query results looking right.
         let label_index_raw_before = db.debug_dump_label_index().unwrap();
+        // HNSW cluster tables (F8 Task 6): entry-for-entry parity, the same
+        // load-bearing check as the other raw v4/v7 dumps above — a rebuild
+        // that reproduced identical `search_vector` results while silently
+        // reordering HNSW_LINKS neighbor lists, dropping a tombstone flag, or
+        // losing a cluster's HNSW_META entry-point/level/`stale` bookkeeping
+        // would sail through the "finds it" checks but fail here.
+        let hnsw_meta_raw_before = db.debug_dump_hnsw_meta().unwrap();
+        let hnsw_links_raw_before = db.debug_dump_hnsw_links().unwrap();
 
         // Recall-layer parity, BEFORE rebuild. `text_k` is computed from the
         // pre-rebuild live count (rebuild never changes the live set — that's
@@ -472,6 +492,10 @@ proptest! {
         prop_assert_eq!(vector_dims_raw_before, vector_dims_raw_after);
         let label_index_raw_after = db.debug_dump_label_index().unwrap();
         prop_assert_eq!(label_index_raw_before, label_index_raw_after);
+        let hnsw_meta_raw_after = db.debug_dump_hnsw_meta().unwrap();
+        prop_assert_eq!(hnsw_meta_raw_before, hnsw_meta_raw_after);
+        let hnsw_links_raw_after = db.debug_dump_hnsw_links().unwrap();
+        prop_assert_eq!(hnsw_links_raw_before, hnsw_links_raw_after);
 
         // Recall-layer parity, AFTER rebuild. Equality/vector re-assert the
         // same "finds it" property against the rebuilt state; FTS asserts the
@@ -588,4 +612,123 @@ fn label_reads_are_identical_before_and_after_rebuild() {
         "Entity hits must survive rebuild unchanged"
     );
     assert_eq!(before_m, after_m, "M hits must survive rebuild unchanged");
+}
+
+/// F8 Task 6: HNSW's observable contract — `search_vector` results, not just
+/// the raw `HNSW_META`/`HNSW_LINKS` byte parity the proptest above pins —
+/// must be identical before and after `rebuild_state_from_ops`, over a corpus
+/// large enough (12 embeddings at `build_threshold: 4`) to actually cross the
+/// build threshold, followed by two `RemoveNode`s (tombstoning graph entries,
+/// and — depending on how far under the ratio that pushes the live count —
+/// possibly triggering an in-band rebuild) before the replay-rebuild under
+/// test. Companion to `label_reads_are_identical_before_and_after_rebuild`:
+/// that test pins the read-path/index-table agreement for LABEL_INDEX, this
+/// one pins it for the HNSW cluster tables. Multi-dimensional vectors are
+/// fine here (unlike the proptest's frozen `vec![node_ix as f32]`
+/// single-dimension vocabulary in `Intent::Embed` above) since this test owns
+/// its own embedding recipe independently.
+#[test]
+fn search_vector_is_identical_before_and_after_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = DbOptions {
+        hnsw_params: Some(HnswParams {
+            build_threshold: 4,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let db = Db::open_with_options(dir.path().join("t.redb"), spec(), options).unwrap();
+
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+    let ids: Vec<NodeId> = (0..12).map(|_| NodeId::new()).collect();
+    let create_ops: Vec<Op> = ids
+        .iter()
+        .map(|&id| Op::CreateNode {
+            id,
+            scope,
+            label: "M".into(),
+            props: Default::default(),
+        })
+        .collect();
+    db.submit(create_ops).unwrap();
+
+    // Deterministic 3-dim vectors, one non-zero component walked across the
+    // corpus so every node's embedding is distinct and none is zero-norm.
+    for (i, &id) in ids.iter().enumerate() {
+        let vector = vec![(i as f32) + 1.0, ((i * 3) % 7) as f32, (i % 5) as f32];
+        db.submit(vec![Op::SetEmbedding {
+            id,
+            model: "m".into(),
+            vector,
+        }])
+        .unwrap();
+    }
+
+    let scopes = ScopeSet::of(&[scope_id]).with_shared();
+    let queries: Vec<Vec<f32>> = vec![
+        vec![1.0, 0.0, 0.0],
+        vec![5.0, 2.0, 4.0],
+        vec![10.0, 1.0, 3.0],
+    ];
+    let k = ids.len();
+
+    // Two removals: tombstones graph entries, and — depending on live count
+    // vs. `rebuild_num`/`rebuild_den` (3/10 default) against `build_threshold`
+    // (4) — may cross the ratio and trigger an in-band rebuild too.
+    db.submit(vec![Op::RemoveNode { id: ids[2] }]).unwrap();
+    db.submit(vec![Op::RemoveNode { id: ids[7] }]).unwrap();
+
+    let search_before_removal_rebuild: Vec<Vec<(NodeId, f32)>> = queries
+        .iter()
+        .map(|q| {
+            db.search_vector(&VectorQuery {
+                scopes: scopes.clone(),
+                model: "m".into(),
+                vector: q.clone(),
+                k,
+                candidates: None,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|(rec, score)| (rec.id, score))
+            .collect()
+        })
+        .collect();
+    let hnsw_meta_before = db.debug_dump_hnsw_meta().unwrap();
+    let hnsw_links_before = db.debug_dump_hnsw_links().unwrap();
+
+    db.rebuild_state_from_ops().unwrap();
+
+    let search_after: Vec<Vec<(NodeId, f32)>> = queries
+        .iter()
+        .map(|q| {
+            db.search_vector(&VectorQuery {
+                scopes: scopes.clone(),
+                model: "m".into(),
+                vector: q.clone(),
+                k,
+                candidates: None,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|(rec, score)| (rec.id, score))
+            .collect()
+        })
+        .collect();
+    let hnsw_meta_after = db.debug_dump_hnsw_meta().unwrap();
+    let hnsw_links_after = db.debug_dump_hnsw_links().unwrap();
+
+    assert_eq!(
+        search_before_removal_rebuild, search_after,
+        "search_vector results must survive rebuild_state_from_ops unchanged"
+    );
+    assert_eq!(
+        hnsw_meta_before, hnsw_meta_after,
+        "HNSW_META must be byte-identical before/after rebuild_state_from_ops"
+    );
+    assert_eq!(
+        hnsw_links_before, hnsw_links_after,
+        "HNSW_LINKS must be byte-identical before/after rebuild_state_from_ops"
+    );
 }
