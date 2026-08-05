@@ -552,9 +552,19 @@ dependence anywhere in the module.
   it is preserved, but never returned from `search`) and `neighbors`
   (`Vec<u64>` of slots, bounded to `m0` at level 0 or `m` at every level
   above, closest-first via cosine distance FROM THE OWNING SLOT).
+- **Neighbor selection** (`hnsw_params` `version: 2`): membership in a
+  `neighbors` row is chosen by the diversity heuristic with
+  keep-pruned-connections (`hnsw::select_neighbors`), not plain closest-M:
+  walking candidates closest-first, a candidate is kept only when it is
+  STRICTLY closer to the query point than to every already-kept neighbor
+  (an exact cosine tie prunes); pruned candidates backfill any remaining
+  budget in candidate order. Selection policy is write-side graph
+  structure, so it is versioned by the params stamp: a `version: 1`
+  (closest-M) stamp mismatches the current default and the open-time
+  reconcile drains and rebuilds those graphs (see `"hnsw_params"` above).
 - **Tie-break rule**: every ordering decision in the module — candidate pop
   order in `search_layer`'s priority queues, result-set eviction order,
-  final search output order, neighbor-list truncation in `prune_neighbor` —
+  final search output order, neighbor-list selection in `prune_neighbor` —
   breaks ties by slot ascending. Combined with the pure `level_for` function
   above and op-log-ordered construction, this is what makes the whole module
   reproducible byte-for-byte on replay.
