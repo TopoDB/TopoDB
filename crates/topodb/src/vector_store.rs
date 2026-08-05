@@ -189,8 +189,10 @@ pub(crate) fn read_vector_by_slot(
 /// path): a single accumulation pass over `a.iter().zip(b)`, `None` when
 /// either side's squared-norm accumulator is exactly `0.0` — the zero-norm
 /// skip. Every scored row in [`search_scan`] is routed through this, never a
-/// hand-rolled dot product.
-fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+/// hand-rolled dot product. `pub(crate)` (not private) because `hnsw.rs`
+/// shares this exact formula for its own scoring/zero-norm detection rather
+/// than duplicating it.
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
     for (x, y) in a.iter().zip(b) {
         dot += x * y;
