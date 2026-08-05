@@ -6,11 +6,12 @@
 //! `tests/size_report.rs` as the resumable `build_open_fixture` /
 //! `open_report` pair instead (see that module's doc comment).
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use std::collections::HashSet;
 use std::thread;
 use topodb::workload::{batches, WorkloadSpec};
 use topodb::{
-    Db, Direction, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, ScopeId, ScopeSet,
-    TraversalQuery, VectorQuery,
+    Db, DbOptions, Direction, HnswParams, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope,
+    ScopeId, ScopeSet, TraversalQuery, VectorQuery,
 };
 fn spec() -> IndexSpec {
     IndexSpec {
@@ -381,13 +382,102 @@ fn vector_fixture() -> (
     (dir, path, scopes, ids[0], q)
 }
 
-/// Warm scoped vector search p95 (Task 9 gate 2): repeated `search_vector`
-/// calls on one already-open `Db` handle. Criterion's `sample.json` supplies
-/// the p95 the same way `traverse_warm_10k` does (see that bench's header
-/// comment in BENCHMARKS.md's v3 section).
-fn search_warm_10k_scope(c: &mut Criterion) {
-    let (_dir, path, scopes, _seed, q) = vector_fixture();
-    let db = Db::open_with(&path, spec()).unwrap();
+/// Builds the SAME 10k-vector/768-dim dataset (ids + embeddings + query)
+/// used by [`vector_fixture`] TWICE over — once opened with default
+/// `HnswParams` (the graph builds once the 10k corpus crosses the default
+/// `build_threshold` of 1024 — F8) and once opened with
+/// `build_threshold: u64::MAX` (the threshold only gates graph construction
+/// at write time — see `hnsw.rs`'s doc comment — so this fixture's cluster
+/// never builds a graph and `search_scan` falls through to its honest linear
+/// scan, an "as if F8 never shipped" baseline). Both fixtures share
+/// IDENTICAL ids and vector coordinates (same `VecRng(0xC0FFEE)` stream, same
+/// generation order, seeded into both dbs from the same in-memory `ids`/
+/// `vectors`), so a recall cross-check between the two paths' *results* is
+/// meaningful — a hit in one fixture and a hit in the other refer to the
+/// same underlying node identity and coordinates, not merely a
+/// same-shaped-but-different corpus.
+fn vector_fixture_pair() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    ScopeSet,
+    Vec<f32>,
+) {
+    const DIM: usize = 768;
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+    let mut ids = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        ids.push(NodeId::new());
+    }
+    let mut r = VecRng(0xC0FFEE);
+    let vectors: Vec<Vec<f32>> = (0..10_000)
+        .map(|_| (0..DIM).map(|_| r.next_f32()).collect())
+        .collect();
+    let q: Vec<f32> = (0..DIM).map(|_| r.next_f32()).collect();
+
+    let build = |path: &std::path::Path, opts: DbOptions| {
+        let db = Db::open_with_options(path, spec(), opts).unwrap();
+        for (id_chunk, vec_chunk) in ids
+            .chunks(VECTOR_SEED_CHUNK)
+            .zip(vectors.chunks(VECTOR_SEED_CHUNK))
+        {
+            let mut ops = Vec::with_capacity(id_chunk.len() * 2);
+            for (&id, v) in id_chunk.iter().zip(vec_chunk) {
+                ops.push(Op::CreateNode {
+                    id,
+                    scope,
+                    label: "Vec".into(),
+                    props: Default::default(),
+                });
+                ops.push(Op::SetEmbedding {
+                    id,
+                    model: "bench-768".into(),
+                    vector: v.clone(),
+                });
+            }
+            db.submit(ops).unwrap();
+        }
+        drop(db);
+    };
+
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("vec-graph.redb");
+    build(&graph_path, DbOptions::default());
+
+    let scan_dir = tempfile::tempdir().unwrap();
+    let scan_path = scan_dir.path().join("vec-scan.redb");
+    build(
+        &scan_path,
+        DbOptions {
+            hnsw_params: Some(HnswParams {
+                build_threshold: u64::MAX,
+                ..HnswParams::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let scopes = ScopeSet::of(&[scope_id]);
+    (graph_dir, graph_path, scan_dir, scan_path, scopes, q)
+}
+
+/// Warm scoped vector search p95, GRAPH path (Task 9 gate 2 / F8 rename):
+/// repeated `search_vector` calls on one already-open `Db` handle whose 10k
+/// vectors crossed the default `build_threshold` at write time, so this
+/// measures the HNSW graph search path (`hnsw::search`), not a linear scan.
+/// Renamed from `search_warm_10k_scope` (F8 Task 7): before F8 that name's
+/// fixture had no graph to build and always scanned; after F8 the same
+/// fixture shape crosses the default threshold and the graph builds
+/// silently underneath the old name, which stopped saying what it measures.
+/// `search_warm_10k_scope_scan_baseline` (below) is this bench's honest-scan
+/// counterpart, sharing the identical dataset via `vector_fixture_pair`.
+/// Criterion's `sample.json` supplies the p95 the same way `traverse_warm_10k`
+/// does (see that bench's header comment in BENCHMARKS.md's v3 section).
+fn search_warm_10k_scope_graph(c: &mut Criterion) {
+    let (_graph_dir, graph_path, _scan_dir, scan_path, scopes, q) = vector_fixture_pair();
+    let graph_db = Db::open_with(&graph_path, spec()).unwrap();
     let query = VectorQuery {
         scopes: scopes.clone(),
         model: "bench-768".into(),
@@ -395,13 +485,74 @@ fn search_warm_10k_scope(c: &mut Criterion) {
         k: 10,
         candidates: None,
     };
+    let graph_hits = graph_db.search_vector(&query).unwrap();
+    assert_eq!(
+        graph_hits.len(),
+        10,
+        "search_warm_10k_scope_graph fixture must return k=10 hits from a 10k-vector scope"
+    );
+
+    // Recall cross-check, run ONCE before the timing loop (not per
+    // iteration): the graph path's k=10 hits must be a subset of the
+    // honest-scan path's top-40 on the SAME dataset — a cheap proxy that the
+    // deterministic HNSW graph is returning genuinely close neighbors on
+    // this corpus, not an artifact of a degenerate fixture. `k=40` (not 10)
+    // gives the scan side slack for legitimate near-ties the graph's greedy
+    // search might resolve in a different but still-valid order.
+    let scan_db = Db::open_with(&scan_path, spec()).unwrap();
+    let scan_query = VectorQuery {
+        k: 40,
+        ..query.clone()
+    };
+    let scan_top40: HashSet<NodeId> = scan_db
+        .search_vector(&scan_query)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n.id)
+        .collect();
+    assert_eq!(
+        scan_top40.len(),
+        40,
+        "search_warm_10k_scope_graph: scan-baseline fixture must return k=40 hits for the recall cross-check"
+    );
+    for (n, _) in &graph_hits {
+        assert!(
+            scan_top40.contains(&n.id),
+            "search_warm_10k_scope_graph: graph hit {:?} missing from the scan-baseline's top-40 (recall regression)",
+            n.id
+        );
+    }
+
+    c.bench_function("search_warm_10k_scope_graph", |b| {
+        b.iter(|| graph_db.search_vector(&query).unwrap())
+    });
+}
+
+/// Warm scoped vector search p95, SCAN-BASELINE path (F8 Task 7): the
+/// `search_warm_10k_scope_graph` bench above's honest-scan counterpart —
+/// same ids and vector coordinates (`vector_fixture_pair`), opened with
+/// `build_threshold: u64::MAX` so no graph ever builds and `search_scan`
+/// always falls through to its linear cosine scan over the 10k-vector
+/// cluster. This is "as if F8 never shipped" for the identical dataset the
+/// graph bench measures, so the two `sample.json`s are the honest
+/// before/after comparison BENCHMARKS.md's F8 gate cites.
+fn search_warm_10k_scope_scan_baseline(c: &mut Criterion) {
+    let (_graph_dir, _graph_path, _scan_dir, scan_path, scopes, q) = vector_fixture_pair();
+    let db = Db::open_with(&scan_path, spec()).unwrap();
+    let query = VectorQuery {
+        scopes,
+        model: "bench-768".into(),
+        vector: q,
+        k: 10,
+        candidates: None,
+    };
     let sanity = db.search_vector(&query).unwrap();
     assert_eq!(
         sanity.len(),
         10,
-        "search_warm_10k_scope fixture must return k=10 hits from a 10k-vector scope"
+        "search_warm_10k_scope_scan_baseline fixture must return k=10 hits from a 10k-vector scope"
     );
-    c.bench_function("search_warm_10k_scope", |b| {
+    c.bench_function("search_warm_10k_scope_scan_baseline", |b| {
         b.iter(|| db.search_vector(&query).unwrap())
     });
 }
@@ -461,7 +612,8 @@ criterion_group!(
     nodes_by_label_newest_10k,
     traverse_warm,
     traverse_cold,
-    search_warm_10k_scope,
+    search_warm_10k_scope_graph,
+    search_warm_10k_scope_scan_baseline,
     search_cold_10k_scope,
     get_node_embedded
 );
