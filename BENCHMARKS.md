@@ -629,3 +629,13 @@ Notes recorded for whoever runs the gates:
   a heavily-tombstoned cluster mid-window explores more of the graph than
   ef suggests. If gate runs show it, the number goes in this table, not
   under a rug.
+- `hnsw::build_cluster` (a fresh build/rebuild of one `(model, scope)`
+  cluster's graph — the "lazy first build" and `ensure_hnsw_params` reconcile
+  paths in FORMAT.md's determinism note both go through it) now STREAMS the
+  cluster's vectors row-by-row instead of buffering them all in a `Vec<(u64,
+  Vec<f32>)>` first; the old buffered form was an ~1.5 GB transient at 1M
+  rows x 384 dims. Residual memory is O(1) in cluster size (one decoded
+  vector plus `insert`'s own O(M * ef_construction) working set), so the 1M
+  tier's peak-WS measurement above should watch for that ceiling holding
+  flat as N grows, not scaling with the fixture size the way it would have
+  under the old buffered build.

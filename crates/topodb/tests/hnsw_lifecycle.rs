@@ -659,3 +659,73 @@ fn removing_the_entry_point_node_keeps_search_correct() {
     assert!(!got2.contains(&victim_1));
     assert!(!got2.contains(&victim_2));
 }
+
+/// Whole-branch review finding #1: `search_scan`'s graph branch used to call
+/// `hnsw::search` with no dimension check at all, unlike the scan branch's
+/// per-vector `vector.len() != q.vector.len()` skip — and `cosine` silently
+/// zip-truncates mismatched-length vectors instead of erroring, so a wrong-
+/// dim query against a BUILT cluster used to come back with k garbage-scored
+/// hits instead of the pre-F8 `[]`. Seeds a dim-3 cluster past
+/// `build_threshold=8` (so it's graph-routed) and a dim-3 cluster well under
+/// threshold (so it stays scan-routed), then queries both with a dim-2
+/// vector: both must return empty, and — since both are `[]` — must compare
+/// equal, pinning that the graph branch's new dim-guard produces the exact
+/// same `[]` semantics as the pre-existing scan-branch skip rather than
+/// merely "also happens to be empty."
+#[test]
+fn dim_mismatch_query_returns_empty_for_graph_and_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_tiny(&dir.path().join("t.redb"));
+
+    let seed_dim3 = |db: &Db, model: &str, n: usize| {
+        for i in 0..n {
+            let id = NodeId::new();
+            db.submit(vec![Op::CreateNode {
+                id,
+                scope: Scope::Shared,
+                label: "M".into(),
+                props: Default::default(),
+            }])
+            .unwrap();
+            db.submit(vec![Op::SetEmbedding {
+                id,
+                model: model.into(),
+                vector: vec![1.0, 0.0, i as f32 * 0.01],
+            }])
+            .unwrap();
+        }
+    };
+
+    // model "m1": 10 dim-3 vectors, crosses build_threshold=8 -> built/graph.
+    seed_dim3(&db, "m1", 10);
+    // model "m2": 3 dim-3 vectors, well under threshold -> stays scan.
+    seed_dim3(&db, "m2", 3);
+
+    let rows = db.debug_dump_hnsw_meta().unwrap();
+    let m1_built = rows.iter().any(|r| r.3);
+    assert!(
+        m1_built,
+        "model m1's 10-vector cluster must have crossed build_threshold=8"
+    );
+
+    // dim-2 query against the built (graph-routed) cluster.
+    let graph_hits = query_top_ids_with(&db, "m1", &[1.0, 0.0], 5);
+    assert!(
+        graph_hits.is_empty(),
+        "a dim-mismatched query against a built cluster must return no hits, \
+         not garbage-scored ones from a zip-truncated cosine"
+    );
+
+    // Same dim-2 query against the sub-threshold (scan-routed) cluster.
+    let scan_hits = query_top_ids_with(&db, "m2", &[1.0, 0.0], 5);
+    assert!(
+        scan_hits.is_empty(),
+        "a dim-mismatched query against a sub-threshold cluster must return no hits"
+    );
+
+    assert_eq!(
+        graph_hits, scan_hits,
+        "graph-branch and scan-branch dim-mismatch results must be pinned \
+         equal ([] == [])"
+    );
+}
