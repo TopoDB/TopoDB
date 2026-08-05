@@ -457,7 +457,10 @@ impl TopoDB {
         cache_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let spec = convert::parse_index_spec(py, index_spec)?;
-        let opts = DbOptions { cache_size_bytes };
+        let opts = DbOptions {
+            cache_size_bytes,
+            ..Default::default()
+        };
         let db = py
             .allow_threads(|| Db::open_with_options(&path, spec, opts))
             .map_err(|e| errors::to_py(py, e))?;

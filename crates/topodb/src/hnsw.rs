@@ -23,7 +23,7 @@ pub(crate) const HNSW_META_FORMAT_V0: u8 = 0;
 /// `topodb::HnswParams` (mirroring how `IndexSpec` is exposed) so a host can
 /// tune it, and so tests can open with a tiny `build_threshold` to exercise
 /// graph activation on small corpora without seeding thousands of rows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HnswParams {
     pub version: u32,
     pub m: u32,
@@ -481,9 +481,8 @@ where
         if let Some(&(_, best)) = hits.first() {
             entry_slot = best;
         }
-        if descend_level == 0 {
-            break;
-        }
+        // The `while` guard keeps descend_level >= 1 inside the body (level
+        // is unsigned), so this decrement can never underflow.
         descend_level -= 1;
     }
 
@@ -636,9 +635,8 @@ where
         if let Some(&(_, best)) = hits.iter().find(|&&(_, s)| s != slot) {
             entry_slot = best;
         }
-        if descend_level == 0 {
-            break;
-        }
+        // The `while` guard keeps descend_level >= 1 inside the body (level
+        // is unsigned), so this decrement can never underflow.
         descend_level -= 1;
     }
 

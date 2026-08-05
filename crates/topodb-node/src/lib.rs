@@ -515,6 +515,7 @@ impl TopoDb {
             .map_err(|e| errors::rejected(format!("invalid index spec: {e}")))?;
         let opts = DbOptions {
             cache_size_bytes: cache_size_bytes.map(|s| s as usize),
+            ..Default::default()
         };
         let db = blocking(move || Db::open_with_options(&path, spec, opts)).await?;
         Ok(TopoDb {

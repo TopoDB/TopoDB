@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Tuning knobs for [`Db::open_with_options`]. Additive: every field
 /// defaults to `None`, under which redb's own default is used, so a fresh
 /// `DbOptions::default()` behaves identically to `Db::open`/`Db::open_with`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DbOptions {
     /// Threaded straight to `redb::Builder::set_cache_size`. `None` leaves
     /// redb's own default (1 GiB, split 90/10 read/write) in place.

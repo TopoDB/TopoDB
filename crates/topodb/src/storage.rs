@@ -134,7 +134,7 @@ impl Storage {
         // invalid override must reject the whole open without ever creating
         // or touching the database file, exactly like `spec.validate()` one
         // layer up in `Db::open_with_options`.
-        let resolved_hnsw = options.hnsw_params.clone().unwrap_or_default();
+        let resolved_hnsw = options.hnsw_params.unwrap_or_default();
         resolved_hnsw.validate()?;
 
         let mut builder = Database::builder();
