@@ -165,6 +165,73 @@ fn v5_fixture_migrates_on_first_open_then_takes_the_fast_path() {
     );
 }
 
+/// The v6 twin of the test above (F8/v7): a v6 file has a stale
+/// `format_version` (the `Some(6)` stamp-only hop must run — see
+/// `storage.rs`'s version-dispatch match), so `open_needs_write` must report
+/// true on the first open; only the *second* open, once the file is
+/// genuinely stamped 7, may take the fast path.
+#[test]
+fn v6_fixture_migrates_on_first_open_then_takes_the_fast_path() {
+    use topodb::{IndexSpec, PropIndex, ScopeSet};
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v6.redb");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v6.redb");
+    std::fs::copy(&src, &path).expect("copy fixture"); // never open the committed file read-write
+
+    // The spec the fixture was written with, so `ensure_index_spec` has no
+    // reindex of its own to do and the only reason to write is the migration
+    // (plus `ensure_hnsw_params`'s absent-stamp write — see below).
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+
+    let before_migration = digest(&path);
+    {
+        let db = Db::open_with(&path, spec.clone()).expect("open v6 fixture");
+        let scopes = ScopeSet::of(&[topodb::ScopeId::from_u128(1)]);
+        assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+        assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    }
+    let after_migration = digest(&path);
+
+    assert!(
+        before_migration.1 != after_migration.1,
+        "a v6 file must be migrated (stamp 7 + hnsw_params stamp) on open, \
+         not skipped by the read-only fast path"
+    );
+
+    // Now current: the second open has nothing to do and must not write.
+    {
+        let _db = Db::open_with(&path, spec.clone()).expect("reopen migrated file");
+    }
+    let after_reopen = digest(&path);
+    assert!(
+        after_migration.1 == after_reopen.1,
+        "reopening the migrated file must take the read-only fast path"
+    );
+
+    // And the migrated data must still be intact and queryable after that
+    // fast-path open.
+    let db = Db::open_with(&path, spec).expect("final open");
+    let scopes = ScopeSet::of(&[topodb::ScopeId::from_u128(1)]);
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(
+        db.search_text(&scopes, "databases", 10)
+            .expect("text search")
+            .len(),
+        1,
+        "text index survives migration + fast-path reopen"
+    );
+}
+
 #[test]
 fn a_reopened_database_still_reads_correctly() {
     // The fast path must not skip state the engine needs at runtime: the

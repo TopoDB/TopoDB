@@ -70,7 +70,7 @@ pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::n
 /// makes per-(label,scope) key order = mint-time order.
 pub(crate) const LABEL_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("label_index");
 
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -183,10 +183,12 @@ impl Storage {
             tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
             tx.open_table(VECTORS).map_err(storage_err)?;
             tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
-            // F8: opened unconditionally (harmless pre-v7 — `open_needs_write`
-            // just creates them empty, same as every other table here).
-            // FORMAT_VERSION stays 6 in this task; the v7 flip is a later
-            // task.
+            // F8/v7: opened unconditionally, same as every other table here
+            // — harmless on a pre-v7 file too, since `open_needs_write` just
+            // creates them empty and the version-dispatch match below does
+            // v7's actual work (stamping the version; graphs themselves
+            // build lazily via `ensure_hnsw_params`/the write path, not a
+            // migration data pass).
             tx.open_table(HNSW_META).map_err(storage_err)?;
             tx.open_table(HNSW_LINKS).map_err(storage_err)?;
             tx.open_table(DICT).map_err(storage_err)?;
@@ -219,7 +221,24 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(6) => {}
+            Some(7) => {}
+            Some(6) => {
+                // v6 -> v7 adds exactly two derived tables (HNSW_META,
+                // HNSW_LINKS) that the open block above already created
+                // unconditionally (harmless-empty on every pre-v7 file), plus
+                // the `"hnsw_params"` META stamp — but that stamp is written
+                // by `ensure_hnsw_params` (called from `finish_open`, AFTER
+                // this transaction commits), not here, mirroring how v6's
+                // `LABEL_INDEX` table is created here but v5's `PROP_INDEX`
+                // norm-version stamp is handled by `ensure_index_spec`
+                // instead of a version-match arm. No data pass: HNSW graphs
+                // build lazily (threshold-triggered, on the write path or via
+                // `ensure_hnsw_params`'s reconcile), so there is nothing to
+                // migrate out of an empty table pair. Just the stamp.
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(5) => {
                 // v5 -> v6 adds exactly one derived table (LABEL_INDEX) with
                 // no other layout changes: a single NODES scan, decoding
@@ -566,7 +585,117 @@ impl Storage {
             .expect("scope registry lock poisoned") = ScopeRegistry::load(&r)?;
         drop(r);
         self.ensure_index_spec()?;
+        self.ensure_hnsw_params()?;
         Ok(self)
+    }
+
+    /// Reconciles the on-disk HNSW tuning (`META` `"hnsw_params"`, postcard
+    /// [`HnswParams`]) with `self.resolved_hnsw` — the params THIS open
+    /// resolved from `DbOptions` (see the field doc comment on
+    /// `Storage::resolved_hnsw`). Called from `finish_open`, right after
+    /// `ensure_index_spec`.
+    ///
+    /// This is the determinism spine of the whole HNSW feature: after this
+    /// call returns, the params that GOVERN the database are exactly the
+    /// stamped ones, and the stamped ones are always made equal to
+    /// `self.resolved_hnsw` before returning. A `DbOptions` override that
+    /// differs from what is currently stamped therefore always triggers the
+    /// rebuild-and-restamp branch below — there is no way to open a file with
+    /// one set of params in effect while a DIFFERENT set remains stamped.
+    /// `Storage::rebuild_state_from_ops` leans on exactly this invariant: it
+    /// reads the STAMPED params (not `self.resolved_hnsw` directly, though by
+    /// this invariant they're the same value post-open) before replaying, so
+    /// a full-log replay always reproduces the params that actually governed
+    /// the live graph's history, even if some future caller changes that
+    /// distinction.
+    ///
+    /// Read-only precheck mirrors `ensure_index_spec`'s: the common open is
+    /// against a file already stamped with these exact params, and that case
+    /// must not pay a write transaction's fsync. Decision:
+    /// - Stamp absent (a fresh file, or a file freshly migrated from pre-v7 —
+    ///   HNSW is new in v7, so there is no pre-existing graph state to
+    ///   reconcile against): stamp `self.resolved_hnsw` WITHOUT any rebuild.
+    ///   An absent stamp's tables are either genuinely empty (fresh file) or
+    ///   were just created empty by the v6->v7 migration arm (see the
+    ///   version-dispatch match), so there is nothing inconsistent to fix.
+    /// - Stamp present and byte-identical to `incoming`: no-op (handled by
+    ///   the read-only precheck below, never reaches the write transaction).
+    /// - Stamp present and DIFFERENT: the file's live graphs were built under
+    ///   params that no longer match this open's resolved params. Drains
+    ///   BOTH `HNSW_META` and `HNSW_LINKS` unconditionally (not a per-cluster
+    ///   diff — simpler, and cheap relative to the rebuild passes that
+    ///   follow), then, for every distinct `(model, scope)` cluster present
+    ///   in `VECTORS` (`hnsw::clusters`), rebuilds it via `hnsw::
+    ///   build_cluster` IF its current vector count meets the NEW
+    ///   `build_threshold` — exactly the same threshold gate the live write
+    ///   path (`apply_hnsw_set_embedding`) uses for a fresh cluster, so a
+    ///   cluster below threshold is left unbuilt here too, not force-built.
+    ///   Then restamps.
+    fn ensure_hnsw_params(&self) -> Result<(), TopoError> {
+        let incoming = self.resolved_hnsw;
+        let incoming_bytes =
+            postcard::to_allocvec(&incoming).map_err(|e| TopoError::Encoding(e.to_string()))?;
+
+        {
+            let tx = self.db.begin_read().map_err(storage_err)?;
+            let meta = tx.open_table(META).map_err(storage_err)?;
+            if let Some(v) = meta.get("hnsw_params").map_err(storage_err)? {
+                if v.value() == incoming_bytes.as_slice() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let tx = self.db.begin_write().map_err(storage_err)?;
+        let stored_bytes: Option<Vec<u8>> = {
+            let meta = tx.open_table(META).map_err(storage_err)?;
+            let found = meta.get("hnsw_params").map_err(storage_err)?;
+            found.map(|v| v.value().to_vec())
+        };
+
+        // By the precheck above, reaching here means `stored_bytes` is
+        // either `None` or byte-different from `incoming_bytes` — no TOCTOU
+        // window exists between the two reads (same single-writer argument
+        // `ensure_index_spec`'s doc comment makes: this `Storage` was just
+        // constructed and no other handle to it exists yet).
+        if let Some(_old_bytes) = &stored_bytes {
+            let mut hnsw_links = tx.open_table(HNSW_LINKS).map_err(storage_err)?;
+            let mut hnsw_meta = tx.open_table(HNSW_META).map_err(storage_err)?;
+            hnsw_links.retain(|_, _| false).map_err(storage_err)?;
+            hnsw_meta.retain(|_, _| false).map_err(storage_err)?;
+
+            let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
+            let embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+            let node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
+            for (model, scope) in hnsw::clusters(&vectors)? {
+                let count = hnsw::cluster_vector_count(&vectors, model, scope)?;
+                if count >= incoming.build_threshold {
+                    let reader = hnsw::GraphReader {
+                        vectors: &vectors,
+                        refs: &embedding_ref,
+                        model,
+                        scope,
+                    };
+                    hnsw::build_cluster(
+                        &mut hnsw_links,
+                        &mut hnsw_meta,
+                        &vectors,
+                        &reader,
+                        &node_ids,
+                        &incoming,
+                        model,
+                        scope,
+                    )?;
+                }
+            }
+        }
+
+        let mut meta = tx.open_table(META).map_err(storage_err)?;
+        meta.insert("hnsw_params", incoming_bytes.as_slice())
+            .map_err(storage_err)?;
+        drop(meta);
+        tx.commit().map_err(storage_err)?;
+        Ok(())
     }
 
     /// Reconciles the on-disk text AND equality indexes with the `IndexSpec`
@@ -1946,6 +2075,23 @@ impl Storage {
                 let mut hnsw_meta = tx.open_table(HNSW_META).map_err(storage_err)?;
                 let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
                 let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
+                // The STAMPED params govern replay, not necessarily
+                // `self.resolved_hnsw` (though by `ensure_hnsw_params`'s
+                // invariant they're the same value post-open — see its doc
+                // comment): read here, BEFORE anything is drained, so a
+                // full-log replay always reproduces the params that actually
+                // built the live graph's history, whatever this `Storage`
+                // instance's own `DbOptions` happened to resolve to. Absent
+                // only on a database that has never completed an
+                // `ensure_hnsw_params` pass (shouldn't occur post-v7 open,
+                // but falls back to `self.resolved_hnsw` rather than
+                // panicking).
+                let hnsw_params: HnswParams =
+                    match slot_meta.get("hnsw_params").map_err(storage_err)? {
+                        Some(v) => postcard::from_bytes(v.value())
+                            .map_err(|e| TopoError::Encoding(e.to_string()))?,
+                        None => self.resolved_hnsw,
+                    };
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
                 let mut node_ids = tx.open_table(NODE_IDS).map_err(storage_err)?;
                 let mut edge_slots = tx.open_table(EDGE_SLOTS).map_err(storage_err)?;
@@ -2070,7 +2216,7 @@ impl Storage {
                         &mut journal,
                         &mut hnsw_links,
                         &mut hnsw_meta,
-                        &self.resolved_hnsw,
+                        &hnsw_params,
                     )?;
                     if !matches!(op, Op::RemoveNode { .. }) {
                         let id = match &op {
