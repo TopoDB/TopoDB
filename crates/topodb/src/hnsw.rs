@@ -816,6 +816,40 @@ pub(crate) fn cluster_vector_count(
     Ok(count)
 }
 
+/// Every distinct `(model, scope)` pair with at least one row in `VECTORS`,
+/// in ascending key order (`vector_key`'s `(model, scope)` prefix sorts
+/// first, so every row belonging to one cluster is contiguous). A single
+/// forward scan of the whole table, deduping consecutive rows that share the
+/// same 8-byte prefix — `VECTORS` has no secondary index over just the
+/// prefix, so this is the only way to enumerate clusters without already
+/// knowing which `(model, scope)` pairs exist. Used by `Storage::
+/// ensure_hnsw_params` after an `hnsw_params` mismatch has already drained
+/// both HNSW tables, to decide which clusters are eligible to rebuild — paid
+/// only on that reconcile path, never on an ordinary open.
+pub(crate) fn clusters(
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<Vec<(u32, u32)>, TopoError> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for entry in vectors.iter().map_err(storage_err)? {
+        let (key_guard, _) = entry.map_err(storage_err)?;
+        let key = key_guard.value();
+        let model = u32::from_be_bytes(
+            key[0..4]
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad vector_key length".into()))?,
+        );
+        let scope = u32::from_be_bytes(
+            key[4..8]
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad vector_key length".into()))?,
+        );
+        if out.last() != Some(&(model, scope)) {
+            out.push((model, scope));
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuilds the `(model, scope)` graph from scratch: deletes every
 /// `HNSW_LINKS` row under `link_prefix(model, scope)`, drops the cluster's
 /// `meta` row entirely (not merely resets its fields — an ABSENT meta row is

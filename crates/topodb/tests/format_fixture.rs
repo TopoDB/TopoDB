@@ -106,7 +106,18 @@
 //! 5 anymore. Its old generator is repurposed below as
 //! `regenerate_v6_fixture` (same content recipe, targeting `v6.redb`), the
 //! same generator-repurposing move every earlier version flip made.
-//! `v6.redb` is now the ONLY fixture this build can regenerate.
+//!
+//! Format v7 (F8, HNSW) adds exactly two derived tables, `HNSW_META`/
+//! `HNSW_LINKS`, plus one META stamp (`"hnsw_params"`) — see `hnsw.rs` and
+//! `storage.rs::ensure_hnsw_params`. No existing table's layout changes, and
+//! HNSW graphs build lazily (threshold-triggered), so there is no data pass
+//! on migration — every fixture below now migrates/opens to
+//! `FORMAT_VERSION == 7`. `v6.redb` is therefore FROZEN now (a TENTH frozen
+//! fixture, the v6 migration-input file) — no build on this branch can stamp
+//! a fresh file at 6 anymore. Its old generator is repurposed below as
+//! `regenerate_v7_fixture` (same content recipe, targeting `v7.redb`), the
+//! same generator-repurposing move every earlier version flip made.
+//! `v7.redb` is now the ONLY fixture this build can regenerate.
 //!
 //! Node/scope ids use `NodeId::from_u128`/`ScopeId::from_u128`
 //! (`#[doc(hidden)]` debug-seam constructors added in `ids.rs` for exactly
@@ -120,16 +131,16 @@ use topodb::*;
 
 /// Regenerate with: cargo test -p topodb --test format_fixture -- --ignored regenerate
 ///
-/// Repurposed from the old `regenerate_v5_fixture` (itself repurposed from
-/// the Task 5-era `regenerate_v3_fixture`, itself from `regenerate_v3_
-/// fixture`): same content recipe, now targeting `v6.redb` — this build's
-/// `FORMAT_VERSION` is 6 everywhere, so `Db::open_with` below stamps a
-/// native v6 file with no migration involved. `v5.redb` is untouched by this
+/// Repurposed from the old `regenerate_v6_fixture` (itself repurposed from
+/// `regenerate_v5_fixture`, itself from the Task 5-era `regenerate_v3_
+/// fixture`): same content recipe, now targeting `v7.redb` — this build's
+/// `FORMAT_VERSION` is 7 everywhere, so `Db::open_with` below stamps a
+/// native v7 file with no migration involved. `v6.redb` is untouched by this
 /// function and stays frozen (see the module doc comment).
 #[test]
 #[ignore]
-fn regenerate_v6_fixture() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v6.redb");
+fn regenerate_v7_fixture() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v7.redb");
     let _ = std::fs::remove_file(&path);
     let spec = IndexSpec {
         equality: vec![PropIndex {
@@ -192,7 +203,7 @@ fn regenerate_v6_fixture() {
 
     assert!(
         path.exists(),
-        "regenerate_v6_fixture: fixture file was not created at {path:?}"
+        "regenerate_v7_fixture: fixture file was not created at {path:?}"
     );
 }
 
@@ -261,17 +272,18 @@ fn v5_fixture_migrates_to_v6_and_reads() {
         "recipe's known corpus: exactly one Memory node (n2)"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
 }
 
-/// Task 7 (format v6): the native v6 fixture, written by
-/// `regenerate_v6_fixture` (the SAME content recipe every earlier native
-/// fixture in this file used) directly at the current `FORMAT_VERSION` — no
-/// migration involved on open at all. Same standard query set (including the
-/// `nodes_by_label` counts pinned by `v5_fixture_migrates_to_v6_and_reads`
-/// above) as the migration test, so a regression that only breaks a
-/// freshly-created v6 file (as opposed to one reached via migration) has a
-/// fixture that would catch it.
+/// Task 7 (format v6, now FROZEN by the v7 flip): the native v6 fixture,
+/// written by the generator now named `regenerate_v7_fixture` back when it
+/// still targeted `v6.redb` — same content recipe every native fixture in
+/// this file uses. Since `FORMAT_VERSION` is 7 on this branch, opening this
+/// fixture now takes the `Some(6)` stamp-only migration hop (see
+/// `storage.rs`'s version-dispatch match), not a native open — kept as its
+/// own test (name unchanged) so a regression that only breaks THIS
+/// fixture's specific migration path is still caught here, in addition to
+/// `v6_fixture_migrates_to_v7_and_reads` below.
 #[test]
 fn v6_fixture_opens_and_reads() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v6.redb");
@@ -312,7 +324,107 @@ fn v6_fixture_opens_and_reads() {
     assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
     assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
+}
+
+/// The frozen v6 fixture's migration to v7 (F8's load-bearing migration
+/// test, mirroring `v5_fixture_migrates_to_v6_and_reads` above): opens the
+/// committed `v6.redb` and asserts it lands on `FORMAT_VERSION == 7` with
+/// every standard query — including `search_vector` for the fixture's known
+/// embedding — still seeing exactly the fixture recipe's known corpus. v7
+/// adds no data pass (HNSW graphs build lazily), so this test's real job is
+/// proving the `Some(6)` stamp-only hop runs and nothing else regresses.
+#[test]
+fn v6_fixture_migrates_to_v7_and_reads() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v6.redb");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6.redb");
+    std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(&path, spec).unwrap();
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_vector(&VectorQuery {
+            scopes: scopes.clone(),
+            model: "m1".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            candidates: None,
+        })
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(db.current_seq().unwrap(), 3);
+    assert_eq!(db.format_version(), 7);
+}
+
+/// Task 5 (format v7, F8): the native v7 fixture, written by
+/// `regenerate_v7_fixture` (the SAME content recipe every earlier native
+/// fixture in this file used) directly at the current `FORMAT_VERSION` — no
+/// migration involved on open at all. Same standard query set as the
+/// migration test above, so a regression that only breaks a freshly-created
+/// v7 file (as opposed to one reached via migration) has a fixture that
+/// would catch it.
+#[test]
+fn v7_fixture_opens_and_reads() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v7.redb");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v7.redb");
+    std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(&path, spec).unwrap();
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_vector(&VectorQuery {
+            scopes: scopes.clone(),
+            model: "m1".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            candidates: None,
+        })
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(db.current_seq().unwrap(), 3);
+    assert_eq!(db.format_version(), 7);
 }
 
 #[test]
@@ -374,7 +486,7 @@ fn v1_fixture_opens_and_reads() {
         "v1->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
     drop(db);
     // The second open takes the v4 fast path; migration is idempotent.
     let reopened = Db::open_with(
@@ -430,7 +542,7 @@ fn v2_fixture_opens_and_reads() {
         "v2->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
 }
 
 /// Migrates all the way to v4: the mid-branch `#[ignore]` guard lifted now
@@ -484,7 +596,7 @@ fn v3_fixture_opens_and_reads() {
         "v3->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
 }
 
 /// The load-bearing migration test (Task 7, corpus-purity amendment): a
@@ -550,7 +662,7 @@ fn v3_legacy_fixture_migrates_and_reads() {
         "v3-legacy->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
 }
 
 /// Task 8 (storage-format-v4 plan): the native v4 fixture, written by
@@ -608,5 +720,5 @@ fn v4_fixture_opens_and_reads() {
         "v4->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 6);
+    assert_eq!(db.format_version(), 7);
 }

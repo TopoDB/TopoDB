@@ -1,7 +1,7 @@
-# TopoDB on-disk format (v6)
+# TopoDB on-disk format (v7)
 
 This is the durable contract for a TopoDB redb file. Code wins if it differs
-from this document. Nine fixtures under `crates/topodb/tests/fixtures/` pin
+from this document. Ten fixtures under `crates/topodb/tests/fixtures/` pin
 this contract:
 
 - `v1.redb`, `v2.redb`, `v2-workload.redb` — FROZEN pre-v3 migration corpora,
@@ -29,12 +29,53 @@ this contract:
 - `v5.redb` — the native v5 fixture, FROZEN since the v6 flip (no build on
   this branch can stamp a fresh file at 5), exercised by
   `v5_fixture_migrates_to_v6_and_reads` as the v5 migration-input file.
-- `v6.redb` — the native v6 fixture, and the ONLY fixture this build can
-  actually regenerate (`format_fixture.rs::regenerate_v6_fixture`).
+- `v6.redb` — the native v6 fixture, FROZEN since the v7 flip (no build on
+  this branch can stamp a fresh file at 6), exercised by
+  `v6_fixture_migrates_to_v7_and_reads` (and `v6_fixture_opens_and_reads`,
+  which now also migrates — see `format_fixture.rs`'s doc comment on that
+  test) as the v6 migration-input file.
+- `v7.redb` — the native v7 fixture, and the ONLY fixture this build can
+  actually regenerate (`format_fixture.rs::regenerate_v7_fixture`).
 
 ## Version and migration
 
-`storage::FORMAT_VERSION` is **6**. v6 adds exactly **one new table**,
+`storage::FORMAT_VERSION` is **7**. v7 (F8, HNSW) adds exactly **two derived
+tables** — `HNSW_META`/`HNSW_LINKS` (see "HNSW," below) — plus one META stamp,
+`"hnsw_params"` (postcard `hnsw::HnswParams`). No existing table's layout
+changes. Both new tables are opened unconditionally by every open (harmless
+empty on a pre-v7 file), so the `Some(6)` version-dispatch arm does no data
+pass at all — it only stamps the version; graphs build lazily, either
+threshold-triggered on the write path or via `ensure_hnsw_params`'s reconcile
+(see below), never as a migration-time scan. `"hnsw_params"` itself is stamped
+by `ensure_hnsw_params` (called from `Storage::finish_open`, right after
+`ensure_index_spec`), not by the version-dispatch match — mirroring how v5's
+`"prop_index_norm_version"`/`"fts_analyzer_version"` stamps are handled by
+`ensure_index_spec` rather than a version-match arm.
+
+`ensure_hnsw_params` reconciles the STAMPED HNSW tuning against
+`self.resolved_hnsw` (the params this open resolved from `DbOptions` —
+`None` falls back to `HnswParams::default()`, validated before any IO). This
+is the determinism spine of the whole HNSW feature: after `ensure_hnsw_params`
+returns, the params that GOVERN the database are exactly the stamped ones,
+and the stamped ones are always made equal to `self.resolved_hnsw` before
+returning — there is no way to open a file with one set of params in effect
+while a different set remains stamped. A stamp absent (fresh file, or a file
+freshly migrated from pre-v7 — HNSW is new in v7, so there is nothing to
+reconcile against) is stamped WITHOUT a rebuild. A stamp present and
+DIFFERENT from `self.resolved_hnsw` (a `DbOptions` override changed the
+tuning since the file was last opened) drains BOTH `HNSW_META` and
+`HNSW_LINKS` unconditionally, then, for every distinct `(model, scope)`
+cluster present in `VECTORS` (`hnsw::clusters`, a full-table scan grouping
+consecutive rows sharing the same 8-byte prefix), rebuilds it via
+`hnsw::build_cluster` under the NEW params IF its current vector count meets
+the NEW `build_threshold` — the same threshold gate the live write path uses
+for a fresh cluster — before restamping. `Storage::rebuild_state_from_ops`
+leans on the resulting invariant: it reads the STAMPED params (not
+`self.resolved_hnsw` directly) before replaying, so a full-log replay always
+reproduces the params that actually governed the live graph's history, even
+though by the invariant above the two are always the same value post-open.
+
+v6 adds exactly **one new table**,
 `LABEL_INDEX` (`(label_id, scope_id, node_id) -> slot`, see "Tables," below) —
 a derived index over each node's already-interned label and scope, maintained
 incrementally by `apply_op` (insert on `CreateNode`, remove on `RemoveNode`;
@@ -70,24 +111,28 @@ transaction, committed once at the very end:
 
 | stored version | on open |
 |---|---|
-| absent (brand-new file) | stamp `FORMAT_VERSION` (6) directly — `storage.rs: Storage::open_with_options`, `None` arm |
-| 6 | open directly, no rewrite — `Some(6) => {}` |
-| 5 | `migrate_v6::migrate_v5_to_v6` (one NODES scan, builds `LABEL_INDEX`), stamp 6 — `Some(5)` arm |
-| 4 | `migrate_v6::migrate_v5_to_v6`, stamp 6 directly (this arm jumps straight from 4 to the current `FORMAT_VERSION`, so it must do v6's table work itself rather than falling through to the `Some(5)` arm, which only runs for a file genuinely stamped 5; the PROP_INDEX rebuild still happens separately, in `ensure_index_spec`, via the norm-version check) — `Some(4)` arm |
-| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 6 — `Some(3)` arm |
-| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 6 — `Some(2)` arm, chained in one call |
-| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 6 — `Some(1)` arm, chained in one call |
-| > 6 | `TopoError::UnsupportedFormat { found, supported: 6 }` — `Some(found) if found > FORMAT_VERSION` |
+| absent (brand-new file) | stamp `FORMAT_VERSION` (7) directly — `storage.rs: Storage::open_with_options`, `None` arm; `"hnsw_params"` is stamped separately by `ensure_hnsw_params` |
+| 7 | open directly, no rewrite — `Some(7) => {}` |
+| 6 | stamp 7 directly — no table data pass (`HNSW_META`/`HNSW_LINKS` were already created, empty, by the open block itself; graphs build lazily) — `Some(6)` arm |
+| 5 | `migrate_v6::migrate_v5_to_v6` (one NODES scan, builds `LABEL_INDEX`), stamp 7 — `Some(5)` arm |
+| 4 | `migrate_v6::migrate_v5_to_v6`, stamp 7 directly (this arm jumps straight from 4 to the current `FORMAT_VERSION`, so it must do v6's table work itself rather than falling through to the `Some(5)` arm, which only runs for a file genuinely stamped 5; the PROP_INDEX rebuild still happens separately, in `ensure_index_spec`, via the norm-version check) — `Some(4)` arm |
+| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 7 — `Some(3)` arm |
+| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 7 — `Some(2)` arm, chained in one call |
+| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 7 — `Some(1)` arm, chained in one call |
+| > 7 | `TopoError::UnsupportedFormat { found, supported: 7 }` — `Some(found) if found > FORMAT_VERSION` |
 | anything else (currently only 0, which can't occur since real versions start at 1) | `TopoError::Encoding` — `Some(found)` catch-all arm |
 
-Every arm above except the fast `Some(6) => {}` path calls
+Every arm above except the fast `Some(7) => {}` path calls
 `migrate_v6::migrate_v5_to_v6` — not just the `Some(5)` arm — because arms for
 versions further back stamp `FORMAT_VERSION` directly rather than falling
 through a chain of one-version-at-a-time steps; each must therefore perform
 v6's table work itself. `migrate_v5_to_v6` is idempotent (re-inserting the
 same key/value is a no-op), so calling it unconditionally on every non-fast
 path is safe regardless of how many other migrations ran first in the same
-open.
+open. Every arm's version stamp is written via the `FORMAT_VERSION` constant,
+not a literal — so all of this held true, unedited, across the v6->v7 flip:
+only the `Some(6)`/`Some(7)` arms themselves (and the too-new rejection arm's
+`supported` field) needed source changes.
 
 Because table creation, migration, and the version stamp all happen inside the
 single write transaction `open_with_options` opens at its top and commits once
@@ -224,6 +269,16 @@ Migration rewrites are scoped precisely:
   in this document's history: no dual-write era, no re-encoding of an
   existing table, no key-shape discrimination.
 
+- **v6 → v7** (`Some(6)` arm, `storage.rs`, new this version): stamps the
+  version and nothing else. `HNSW_META`/`HNSW_LINKS` are opened (created,
+  empty) unconditionally by `open_with_options`'s write transaction before
+  the version-dispatch match ever runs, so there is no table to create and no
+  data to scan — HNSW graphs are new in v7 and build lazily, never as part of
+  a migration. The `"hnsw_params"` META stamp is written separately, by
+  `ensure_hnsw_params` (called from `finish_open`, after this transaction has
+  already committed) — see "Version and migration," above. Smaller even than
+  v5→v6: not even one table scan.
+
 Redb free space means the on-disk file size need not shrink even where
 logical row bytes do — e.g. a v1 file's per-node embedded embeddings become
 smaller externalized rows after migration, but the file itself may stay the
@@ -234,7 +289,7 @@ step never run automatically by `open_with`.
 
 ## Tables
 
-`storage.rs: Storage::open_with_options` unconditionally opens **twenty-one**
+`storage.rs: Storage::open_with_options` unconditionally opens **twenty-three**
 tables on every open (verified from its `existing` block, `OPS` through
 `META`) — this is the complete set. `EMBEDDINGS` is deliberately NOT in this
 list (see "Version and migration," above) — it exists only mid-migration on a
@@ -263,6 +318,8 @@ pre-v4 file and is gone by the time the opening write transaction commits.
 | `in_adj` | `[slot:8][edge_type:4][chunk:4]` (16 bytes) | framed adjacency block | `adj.rs: IN_ADJ` |
 | `prop_index` | `[prop_key:4][tag:1][canonical value][slot:8]` | empty (existence-only key) | `prop_index.rs: PROP_INDEX` |
 | `label_index` | `[label_id:4 BE][scope_id:4 BE][node_id:16 BE]` (24 bytes, `storage.rs: label_index_key`) | 8-byte native `u64` node slot (not framed) | `storage.rs: LABEL_INDEX` |
+| `hnsw_meta` | `[model:4 BE][scope:4 BE]` (8 bytes, `hnsw::meta_key`) — one row per built cluster | plain postcard `hnsw::ClusterMeta { format: u8, built: bool, entry_slot: u64, entry_level: u8, graph_len: u64, stale: u64 }` (not framed) | `hnsw.rs: HNSW_META` |
+| `hnsw_links` | `[model:4 BE][scope:4 BE][slot:8 BE][level:1]` (17 bytes, `hnsw::link_key`) | framed postcard `hnsw::LinkRow { tomb: bool, neighbors: Vec<u64> }` | `hnsw.rs: HNSW_LINKS` |
 
 `node_key`/`edge_key` (16-byte BE ULID keys, `storage.rs`) are NOT part of the
 live v4 read/write path — they remain in use only by `migrate.rs`'s frozen
@@ -455,6 +512,70 @@ entirely in `check_or_pin_dim`. This has no on-disk footprint of its own
 reason `EMBEDDINGS` and its old read path are gone: nothing in v4 rebuilds
 or maintains an equivalent RAM structure at all.
 
+**HNSW** (v7, `hnsw.rs`): a deterministic HNSW vector index, one graph per
+`(model, scope)` cluster, built and maintained entirely inside `apply_op` (op
+order = insertion order) so `rebuild_state_from_ops` reproduces the tables
+below exactly — no RNG state, no libm, no wall-clock or thread-scheduling
+dependence anywhere in the module.
+
+- **Level function** (`hnsw::level_for`): integer-geometric, `P(level >= l) =
+  (1/m)^l`, computed from the leading zeros of a `splitmix64` hash of the
+  `NodeId`:
+  ```rust
+  pub(crate) fn level_for(id: NodeId, m: u32, level_cap: u8) -> u8 {
+      let v = id.as_u128();
+      let h = splitmix64(splitmix64((v >> 64) as u64) ^ (v as u64));
+      let bits_per_level = m.trailing_zeros(); // m = 2^bits
+      let level = (h.leading_zeros() / bits_per_level) as u8;
+      level.min(level_cap)
+  }
+  ```
+  Requires `m` to be a power of two (enforced by `HnswParams::validate`).
+  Level is a pure function of `NodeId` and `m` alone — never of insertion
+  order, table state, or anything else — so a slot's level never changes
+  across its lifetime, including across an `ensure_hnsw_params`-triggered
+  rebuild under a DIFFERENT `m` (which necessarily reassigns different
+  levels to every node, deterministically, from the new `m`).
+- **`hnsw_meta` row** (`hnsw::ClusterMeta`, one per built `(model, scope)`
+  cluster — see "Tables," above, for the exact key/value encoding): `format`
+  (currently only `HNSW_META_FORMAT_V0 = 0`; `read_meta` rejects any other
+  byte), `built`, `entry_slot`/`entry_level` (the cluster's current entry
+  point), `graph_len` (count of slots EVER graph-inserted with a non-zero-norm
+  vector — monotonically non-decreasing, never decremented by `tombstone`),
+  `stale` (count of rewire-worthy events — one per newly-tombstoned slot, one
+  per `reinsert_links` rewire — since the last rebuild; reset to `0` only by
+  `build_cluster`, via the dropped-then-recreated meta row).
+- **`hnsw_links` row** (`hnsw::LinkRow`, one per `(model, scope, slot, level)`
+  a slot occupies — see "Tables," above): `tomb` (a removed/zero-norm-
+  re-embedded slot's row stays present with `tomb = true` — "tombs route but
+  don't rank": still expanded during graph traversal so connectivity through
+  it is preserved, but never returned from `search`) and `neighbors`
+  (`Vec<u64>` of slots, bounded to `m0` at level 0 or `m` at every level
+  above, closest-first via cosine distance FROM THE OWNING SLOT).
+- **Tie-break rule**: every ordering decision in the module — candidate pop
+  order in `search_layer`'s priority queues, result-set eviction order,
+  final search output order, neighbor-list truncation in `prune_neighbor` —
+  breaks ties by slot ascending. Combined with the pure `level_for` function
+  above and op-log-ordered construction, this is what makes the whole module
+  reproducible byte-for-byte on replay.
+- **Build trigger**: a cluster with no `hnsw_meta` row is "unbuilt." Each
+  `SetEmbedding` targeting an unbuilt cluster checks `hnsw::
+  cluster_vector_count` (a range-count over `VECTORS`' `(model, scope)`
+  prefix) against `HnswParams::build_threshold`; crossing it triggers
+  `hnsw::build_cluster`, which re-inserts every live, non-zero-norm vector in
+  the cluster (slot-ascending scan order) into a fresh graph — bit-for-bit
+  equivalent to incremental `insert` calls in that same order.
+- **Rebuild trigger**: after every `stale` increment (a tombstone or a
+  rewire), the applier cross-multiplies `meta.stale * rebuild_den >=
+  meta.graph_len * rebuild_num` (avoiding floats) against the cluster's
+  current `HnswParams::rebuild_num`/`rebuild_den`; a true result rebuilds
+  the WHOLE cluster from scratch via `hnsw::build_cluster`, exactly like the
+  build trigger above (which also resets `stale` to `0`, since the dropped
+  meta row starts fresh). A THIRD path also drives `build_cluster`: an
+  `hnsw_params` stamp mismatch at open (`ensure_hnsw_params`, see "Version
+  and migration," above) drains both tables and rebuilds every cluster that
+  still meets the NEW `build_threshold`.
+
 **Postings** (`fts.rs`, chunked layout — v4): a term's postings under one
 scope are split across one or more chunk keys rather than one unbounded row,
 so a single hot term's postings never grow into one value that must be fully
@@ -533,7 +654,13 @@ tables were last built under — absent or mismatched ⇒ same drain + rebuild +
 re-stamp treatment, since postings from a different tokenizer can disagree
 with what this build tokenizes a query into);
 `"next_node_slot"`/`"next_edge_slot"` (8-byte LE `u64`
-monotonic slot counters, `slots.rs`). Legacy Plan-2 keys `"fts_spec"`,
+monotonic slot counters, `slots.rs`); `"hnsw_params"` (v7: postcard
+`hnsw::HnswParams`, the tuning that GOVERNS this database's HNSW graphs —
+absent ⇒ `ensure_hnsw_params` stamps `self.resolved_hnsw` with no rebuild;
+mismatched ⇒ drains `HNSW_META`/`HNSW_LINKS` and rebuilds every cluster
+still meeting the new `build_threshold`, then re-stamps — see "Version and
+migration," above, and "HNSW," above, for the full reconcile). Legacy Plan-2
+keys `"fts_spec"`,
 `"fts_doc_count"`, `"fts_total_len"` are read (and, if present, removed) only
 by `ensure_index_spec` when opening a Plan-2 file (a file with the legacy
 `"fts_spec"` key present — a Plan-1 file has neither `"fts_spec"` nor
@@ -573,9 +700,9 @@ This is deliberate: the op log is self-describing, so replay
 (`Storage::rebuild_state_from_ops`) never depends on what dictionary ids,
 scope ids, or slots happened to be assigned when the log was first written.
 Every other table in this document — dictionaries, the scope registry, slots,
-adjacency, the prop index, the label index, the vector tables, and the FTS
-tables — is *derived* state, reconstructible from `OPS` plus (for v1–v5
-files) a one-time migration.
+adjacency, the prop index, the label index, the vector tables, the HNSW
+tables, and the FTS tables — is *derived* state, reconstructible from `OPS`
+plus (for v1–v5 files) a one-time migration.
 
 ## Corruption contract
 
@@ -592,12 +719,17 @@ vs. `VECTORS` (see "Vectors," above).
 ## Rebuild determinism
 
 `Storage::rebuild_state_from_ops` drains `NODES`, `EDGES`, `VECTOR_DIMS`,
-`VECTORS`, `EMBEDDING_REF`, `DICT`, `SCOPES`, `NODE_SLOTS`, `NODE_IDS`,
-`EDGE_SLOTS`, `EDGE_IDS`, `OUT_ADJ`, `IN_ADJ`, `PROP_INDEX`, `LABEL_INDEX`,
-`POSTINGS`, `FTS_DOCS`, and `FTS_STATS` — every table this document calls
-*derived* — then replays `OPS` from seq 1 through the same `apply_op` the
-normal write path (`apply_batch`) uses, so there is no parallel mutation
-logic to drift out of sync: `LABEL_INDEX` in particular is repopulated
+`VECTORS`, `EMBEDDING_REF`, `HNSW_META`, `HNSW_LINKS`, `DICT`, `SCOPES`,
+`NODE_SLOTS`, `NODE_IDS`, `EDGE_SLOTS`, `EDGE_IDS`, `OUT_ADJ`, `IN_ADJ`,
+`PROP_INDEX`, `LABEL_INDEX`, `POSTINGS`, `FTS_DOCS`, and `FTS_STATS` — every
+table this document calls *derived* — then replays `OPS` from seq 1 through
+the same `apply_op` the normal write path (`apply_batch`) uses, so there is
+no parallel mutation logic to drift out of sync. The HNSW replay specifically
+threads the STAMPED `"hnsw_params"` (read from `META` before anything is
+drained, not `self.resolved_hnsw` directly — see "Version and migration,"
+above, for why replay must use the stamped params rather than whatever this
+particular `Storage` handle's own `DbOptions` happened to resolve to):
+`LABEL_INDEX` in particular is repopulated
 exactly the way `apply_op`'s `CreateNode`/`RemoveNode` arms maintain it
 incrementally on the live write path, not by a separate rebuild-only code
 path. `COUNTERS` is preserved across the rebuild — access statistics
@@ -655,7 +787,7 @@ doc comment in `storage.rs`).
 ## Evolution policy
 
 On-disk serde enum variants (`Op`, `PropValue`, `IndexValue`, ...) are
-append-only. In addition, four plain byte registries are **APPEND-ONLY** —
+append-only. In addition, five plain byte registries are **APPEND-ONLY** —
 an existing value's meaning may never be repurposed, only new values added:
 
 - `dict.rs: DictKind` — `0x00` Label, `0x01` EdgeType, `0x02` PropKey, `0x03`
@@ -667,10 +799,12 @@ an existing value's meaning may never be repurposed, only new values added:
 - `fts.rs: POSTINGS_BLOCK_FORMAT_V0` (v4) — currently the only defined
   chunked-postings block format byte (`0x00`); `decode_posting_block`/
   `posting_block_count` reject any other value.
+- `hnsw.rs: HNSW_META_FORMAT_V0` (v7) — currently the only defined
+  `hnsw_meta` row format byte (`0x00`); `read_meta` rejects any other value.
 
 The op log deliberately retains full strings and no frame so replay stays
 independent of dictionary/scope-registry assignment order (see "The `ops`
 table," above). `Storage::rebuild_state_from_ops` drains and regenerates every
 derived table — dictionaries, the scope registry, slots, adjacency, the prop
-index, the label index, the vector tables, and FTS — while replaying this
-self-describing log (see "Rebuild determinism," above).
+index, the label index, the vector tables, the HNSW tables, and FTS — while
+replaying this self-describing log (see "Rebuild determinism," above).
