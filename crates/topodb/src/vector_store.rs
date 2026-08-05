@@ -350,6 +350,33 @@ pub(crate) fn search_scan(
     let vectors = tx.open_table(VECTORS).map_err(storage_err)?;
     let refs = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
 
+    // `model_id`'s pinned dim (see `storage::check_or_pin_dim`), read once up
+    // front so the graph branch below can skip a whole cluster when the
+    // query's dim doesn't match — mirroring the scan branch's per-vector
+    // `vector.len() != q.vector.len()` skip, which `hnsw::search` cannot do
+    // internally since `cosine` silently zip-truncates mismatched lengths
+    // instead of erroring. `None` (model never embedded) can't match any
+    // built cluster either, so the graph branch treats it the same as a dim
+    // mismatch.
+    let pinned_dim: Option<u32> = {
+        let dims = tx
+            .open_table(crate::storage::VECTOR_DIMS)
+            .map_err(storage_err)?;
+        match dims
+            .get(model_id.to_be_bytes().as_slice())
+            .map_err(storage_err)?
+        {
+            Some(v) => {
+                let bytes: [u8; 4] = v
+                    .value()
+                    .try_into()
+                    .map_err(|_| TopoError::Encoding("bad vector_dims value".into()))?;
+                Some(u32::from_le_bytes(bytes))
+            }
+            None => None,
+        }
+    };
+
     let mut heap: BinaryHeap<Reverse<(OrderedScore, u64)>> = BinaryHeap::new();
 
     if let Some(candidates) = &q.candidates {
@@ -385,8 +412,20 @@ pub(crate) fn search_scan(
             let Some(scope_id) = scope_registry.id_of(scope) else {
                 continue;
             };
-            let built_meta = hnsw::read_meta(hnsw_meta, model_id, scope_id)?.filter(|m| m.built);
-            if let Some(meta_row) = built_meta {
+            let built_meta = hnsw::read_meta(hnsw_meta, model_id, scope_id)?.filter(|m| {
+                // Format headroom, not a real optionality: `build_cluster`
+                // REMOVES a cluster's `HNSW_META` row entirely rather than
+                // ever writing `built: false`, so every row this read can
+                // observe already has `built == true`. Asserted rather than
+                // trusted so a future writer that starts persisting
+                // half-built rows trips here instead of silently reaching
+                // the graph branch below with an unbuilt cluster.
+                debug_assert!(m.built, "HNSW_META row present with built == false");
+                m.built
+            });
+            let dim_matches = pinned_dim == Some(q.vector.len() as u32);
+            let was_built = built_meta.is_some();
+            if let Some(meta_row) = built_meta.filter(|_| dim_matches) {
                 debug_used_graph.store(true, Ordering::SeqCst);
                 let reader = hnsw::GraphReader {
                     vectors: &vectors,
@@ -399,6 +438,14 @@ pub(crate) fn search_scan(
                 for (slot, score) in hits {
                     push_topk(&mut heap, score, slot, q.k);
                 }
+            } else if was_built {
+                // Built cluster but the query's dim doesn't match the
+                // cluster's pinned dim (see `pinned_dim` above) — same `[]`
+                // semantics as the scan branch's per-vector dim skip below,
+                // just applied to the whole cluster since the graph has no
+                // per-vector fallback. `debug_used_graph` is left at its
+                // prior value: no work happened for this scope, so neither
+                // "used graph" nor "used scan" applies to it.
             } else {
                 debug_used_graph.store(false, Ordering::SeqCst);
                 let prefix = vector_prefix(model_id, scope_id);

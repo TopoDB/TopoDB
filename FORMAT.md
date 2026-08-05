@@ -729,6 +729,36 @@ threads the STAMPED `"hnsw_params"` (read from `META` before anything is
 drained, not `self.resolved_hnsw` directly — see "Version and migration,"
 above, for why replay must use the stamped params rather than whatever this
 particular `Storage` handle's own `DbOptions` happened to resolve to):
+
+**HNSW replay is history-dependent, unlike every other derived table here.**
+`FTS_DOCS`/`POSTINGS`, `PROP_INDEX`, `LABEL_INDEX`, and the rest are pure
+functions of the *current* NODES/EDGES/vector state — replaying `OPS` from
+seq 1 always reproduces them byte-identically, full stop. `HNSW_META`/
+`HNSW_LINKS` are not: `hnsw::insert`'s neighbor-selection and pruning depend
+on the graph's INCREMENTAL construction order (which nodes existed, and in
+what state, at the moment each `insert` ran), so replay is byte-identical
+only for a database whose *entire* op history ran, from genesis, under the
+`HnswParams` this replay stamps. Two ordinary events break that condition
+without leaving any op-log trace of having done so: the v6→v7 migration's
+lazy first build (the graph does not exist until some later write crosses
+`build_threshold`, so the tables a v7-migrated file first builds were never
+incrementally constructed across the file's whole history the way a
+build-from-genesis file's are), and an `ensure_hnsw_params` reconcile (a
+params change triggers `hnsw::build_cluster`, a from-scratch bulk rebuild
+under the new params, discarding whatever incremental structure existed
+before). After either event, the FIRST `rebuild_state_from_ops` on that file
+produces a canonical-but-different graph than a hypothetical from-genesis
+replay would have — a real graph, valid and exactly reproducible from that
+point forward, but not necessarily bit-for-bit what an unbroken from-genesis
+history under the stamped params would have built. This is a one-time
+perturbation of the *candidate set* `hnsw::search` approximately explores,
+never of correctness: every score `search` reports is the exact cosine
+distance for the vectors it visits (see "Vectors," above, and `hnsw.rs`'s
+`cosine`/`OrderedScore` — there is no approximation in scoring or in the
+deterministic tie-break ordering), so results are always internally
+consistent and reproducible from a given graph; only which candidates that
+graph makes reachable can differ across the two build histories.
+
 `LABEL_INDEX` in particular is repopulated
 exactly the way `apply_op`'s `CreateNode`/`RemoveNode` arms maintain it
 incrementally on the live write path, not by a separate rebuild-only code

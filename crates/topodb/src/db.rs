@@ -1145,7 +1145,7 @@ impl Db {
     /// touched by the most recent `search_vector`/`search_vector_unbumped`
     /// call's `vector_store::search_scan` routing took the built-graph
     /// branch (`hnsw::search`), `false` if it took the brute-force scan
-    /// branch. Backed by an `AtomicBool` on `Storage`, set unconditionally by
+    /// branch. Backed by an `AtomicBool` on `Inner` (see its field doc), set unconditionally by
     /// BOTH routing branches on every non-candidates scope iteration — never
     /// part of replay state, never read by any production code path. Exists
     /// so tests can pin that a built cluster's search genuinely dispatches

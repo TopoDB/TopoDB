@@ -30,6 +30,16 @@ pub struct HnswParams {
     pub m0: u32,
     pub ef_construction: u32,
     pub level_cap: u8,
+    /// Row count (see `cluster_vector_count`) an unbuilt `(model, scope)`
+    /// cluster must cross before the applier calls `build_cluster`. Two
+    /// traps worth knowing: a cluster whose vectors are ALL zero-norm never
+    /// actually builds (`insert` skips zero-norm rows, see `build_cluster`),
+    /// so once it's crossed the threshold it re-pays the O(cluster) count on
+    /// every subsequent embed forever, since it can never reach "built" and
+    /// trip the count short-circuit; setting this to `u64::MAX` as a
+    /// deliberate opt-out has the identical cost — the cluster can never
+    /// cross it either, so it also re-pays O(cluster) per embed for as long
+    /// as the opt-out stands.
     pub build_threshold: u64,
     pub rebuild_num: u32,
     pub rebuild_den: u32,
@@ -393,13 +403,34 @@ where
         row.neighbors.push(new_slot);
     }
     if row.neighbors.len() > max_m {
-        match read_vector_by_slot(reader.vectors, reader.refs, neighbor_slot)? {
-            Some((_, _, nv)) => {
+        // Mirror `search`'s `seed` closure: only a vector still resolving
+        // into THIS `(reader.model, reader.scope)` cluster is trustworthy to
+        // score with. A cross-model-moved slot's `read_vector_by_slot` call
+        // succeeds but returns the NEW cluster's vector (`put_vector` leaves
+        // `refs[slot]` pointing at wherever the node's embedding currently
+        // lives) — scoring with that would silently rank retained neighbors
+        // by a foreign vector space. Treated as unscoreable, same as a fully
+        // removed slot.
+        let own_vector = match read_vector_by_slot(reader.vectors, reader.refs, neighbor_slot)? {
+            Some((m, s, nv)) if m == reader.model && s == reader.scope => Some(nv),
+            _ => None,
+        };
+        match own_vector {
+            Some(nv) => {
                 let mut scored: Vec<(OrderedScore, u64)> = Vec::with_capacity(row.neighbors.len());
                 for &cand in &row.neighbors {
-                    if let Some((_, _, cv)) =
-                        read_vector_by_slot(reader.vectors, reader.refs, cand)?
+                    let cand_vector = match read_vector_by_slot(reader.vectors, reader.refs, cand)?
                     {
+                        Some((m, s, cv)) if m == reader.model && s == reader.scope => Some(cv),
+                        _ => None,
+                    };
+                    // A cross-model-moved (or fully removed) candidate is
+                    // unscoreable and, unlike `search`'s seed closure (which
+                    // must still ROUTE through an unscoreable member to
+                    // preserve connectivity), prune has no routing duty here
+                    // — it is purely selecting which neighbors to KEEP, so a
+                    // mismatch is simply dropped from the retained set.
+                    if let Some(cv) = cand_vector {
                         if let Some(score) = cosine(&nv, &cv) {
                             scored.push((OrderedScore(score), cand));
                         }
@@ -862,6 +893,17 @@ pub(crate) fn clusters(
 /// `node_ulid` for `level_for` and re-inserting it. Zero-norm rows are
 /// skipped before even resolving their `NodeId` (an equivalent, cheaper
 /// no-op to letting `insert` reject them).
+///
+/// **Memory bound.** The `VECTORS` walk is STREAMED (decode one row, insert
+/// it, drop it, advance) rather than collected into a `Vec<(u64, Vec<f32>)>`
+/// up front — the stale-link-key collect above still buffers (17 bytes/key,
+/// negligible even at scale) since deletion needs the full key set before
+/// any `remove` call, but the far larger per-row `Vec<f32>` embeddings never
+/// are. Residual memory for this function is O(1) in cluster size: one
+/// decoded vector alive at a time plus `insert`'s own O(M * ef_construction)
+/// working set — not O(cluster size), which the old buffered form was
+/// (~1.5 GB transient at 1M rows x 384 dims). See BENCHMARKS.md's v7 section
+/// for what the gate runner should watch as a result.
 #[allow(clippy::too_many_arguments)] // exact signature pinned by the f8 task brief
 pub(crate) fn build_cluster<V, R, VI, NI>(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -904,7 +946,17 @@ where
     vstart.extend_from_slice(&0u64.to_be_bytes());
     let mut vend = vprefix.to_vec();
     vend.extend_from_slice(&u64::MAX.to_be_bytes());
-    let mut rows: Vec<(u64, Vec<f32>)> = Vec::new();
+    // Streamed, not buffered: `VECTORS` is never mutated by this function (or
+    // by `insert`, which only touches `links`/`meta`), so `vectors_iter_
+    // source`'s range iterator and `reader.vectors` — the SAME underlying
+    // table, passed in twice as two shared `&_` borrows by every caller — can
+    // be held live simultaneously. Each row's `(slot, vector)` is decoded,
+    // immediately inserted, and dropped before the next `.next()` call, so
+    // residual memory is O(1) in cluster size: one decoded vector plus
+    // `insert`'s own O(M * ef_construction) working set, never the whole
+    // cluster's `Vec<(u64, Vec<f32>)>` (this replaced an ~1.5 GB transient
+    // buffer at 1M rows x 384 dims — see this fn's doc comment and
+    // BENCHMARKS.md).
     for entry in vectors_iter_source
         .range(vstart.as_slice()..=vend.as_slice())
         .map_err(storage_err)?
@@ -918,10 +970,8 @@ where
         let raw = unframe_value(value_guard.value())?;
         let vector: Vec<f32> =
             postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
-        rows.push((slot, vector));
-    }
-
-    for (slot, vector) in rows {
+        drop(key_guard);
+        drop(value_guard);
         if cosine(&vector, &vector).is_none() {
             continue; // zero-norm: skip before even resolving a NodeId.
         }
