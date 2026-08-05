@@ -43,18 +43,24 @@ enum Intent {
 
 fn scripts() -> impl Strategy<Value = (usize, usize, Vec<Intent>)> {
     let intent = prop_oneof![
-        (any::<usize>(), any::<usize>()).prop_map(|(f, t)| Intent::Edge {
+        1 => (any::<usize>(), any::<usize>()).prop_map(|(f, t)| Intent::Edge {
             from_ix: f,
             to_ix: t
         }),
-        any::<usize>().prop_map(|i| Intent::Close { edge_ix: i }),
-        (any::<usize>(), any::<i64>()).prop_map(|(i, v)| Intent::SetProp { node_ix: i, val: v }),
-        (any::<usize>(), any::<usize>()).prop_map(|(i, w)| Intent::SetText {
+        1 => any::<usize>().prop_map(|i| Intent::Close { edge_ix: i }),
+        1 => (any::<usize>(), any::<i64>()).prop_map(|(i, v)| Intent::SetProp { node_ix: i, val: v }),
+        1 => (any::<usize>(), any::<usize>()).prop_map(|(i, w)| Intent::SetText {
             node_ix: i,
             word_ix: w
         }),
-        any::<usize>().prop_map(|i| Intent::Embed { node_ix: i }),
-        any::<usize>().prop_map(|i| Intent::Remove { node_ix: i }),
+        // Embed is weighted 4x: with hnsw build_threshold 4 in the property
+        // below, a built graph needs >= 4 DISTINCT embedded nodes in one
+        // scoped cluster — at uniform 1/6 weight only a handful of the 64
+        // cases ever crossed it, leaving the hnsw-table parity assertions
+        // exercising mostly-unbuilt clusters. 4x makes built-graph replay
+        // (insert/tombstone/inline-rebuild) a routine part of the sample.
+        4 => any::<usize>().prop_map(|i| Intent::Embed { node_ix: i }),
+        1 => any::<usize>().prop_map(|i| Intent::Remove { node_ix: i }),
     ];
     (
         3usize..10,
