@@ -5,6 +5,7 @@ use crate::counters::AccessStats;
 use crate::dict::{DictKind, Dicts, InternJournal, DICT};
 use crate::error::{open_err, storage_err, TopoError};
 use crate::fts::{doc_text, fts_update};
+use crate::hnsw::{self, HnswParams, HNSW_LINKS, HNSW_META};
 use crate::ids::{EdgeId, NodeId, Scope, ScopeSet};
 use crate::index::IndexSpec;
 use crate::op::Op;
@@ -90,6 +91,14 @@ pub struct Storage {
     pub(crate) spec: Arc<IndexSpec>,
     pub(crate) dicts: RwLock<Dicts>,
     pub(crate) scope_registry: RwLock<ScopeRegistry>,
+    /// The HNSW tuning this storage was opened with — `options.hnsw_params`
+    /// resolved against `HnswParams::default()` and validated (rejecting the
+    /// whole open on an invalid override) by `open_with_options`, BEFORE any
+    /// IO. Read by every write-path call to `apply_op` (via
+    /// `apply_ops_in_txn`/`rebuild_state_from_ops`) as the one source of
+    /// truth for build threshold / m / m0 / ef_construction / rebuild ratio
+    /// — there is no separate per-call override.
+    pub(crate) resolved_hnsw: HnswParams,
 }
 
 impl Storage {
@@ -121,6 +130,13 @@ impl Storage {
         spec: Arc<IndexSpec>,
         options: crate::db::DbOptions,
     ) -> Result<Self, TopoError> {
+        // Resolve + validate BEFORE any IO (per the f8 task brief): an
+        // invalid override must reject the whole open without ever creating
+        // or touching the database file, exactly like `spec.validate()` one
+        // layer up in `Db::open_with_options`.
+        let resolved_hnsw = options.hnsw_params.clone().unwrap_or_default();
+        resolved_hnsw.validate()?;
+
         let mut builder = Database::builder();
         if let Some(bytes) = options.cache_size_bytes {
             builder.set_cache_size(bytes);
@@ -131,6 +147,7 @@ impl Storage {
             spec: spec.clone(),
             dicts: RwLock::new(Dicts::default()),
             scope_registry: RwLock::new(ScopeRegistry::default()),
+            resolved_hnsw,
         };
         // Read-only precheck: the overwhelmingly common open is against a
         // file already at the current format, with every table present and
@@ -166,6 +183,12 @@ impl Storage {
             tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
             tx.open_table(VECTORS).map_err(storage_err)?;
             tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+            // F8: opened unconditionally (harmless pre-v7 — `open_needs_write`
+            // just creates them empty, same as every other table here).
+            // FORMAT_VERSION stays 6 in this task; the v7 flip is a later
+            // task.
+            tx.open_table(HNSW_META).map_err(storage_err)?;
+            tx.open_table(HNSW_LINKS).map_err(storage_err)?;
             tx.open_table(DICT).map_err(storage_err)?;
             tx.open_table(NODE_SLOTS).map_err(storage_err)?;
             tx.open_table(NODE_IDS).map_err(storage_err)?;
@@ -459,7 +482,7 @@ impl Storage {
     /// The tables `open_with_options`'s write transaction opens (and so
     /// creates when absent). `EMBEDDINGS` is deliberately excluded — it is
     /// v3-and-earlier only, and the pre-v4 migration arms open it themselves.
-    fn open_tables() -> [&'static str; 21] {
+    fn open_tables() -> [&'static str; 23] {
         [
             OPS.name(),
             NODES.name(),
@@ -471,6 +494,8 @@ impl Storage {
             VECTOR_DIMS.name(),
             VECTORS.name(),
             EMBEDDING_REF.name(),
+            HNSW_META.name(),
+            HNSW_LINKS.name(),
             DICT.name(),
             NODE_SLOTS.name(),
             NODE_IDS.name(),
@@ -1225,6 +1250,8 @@ impl Storage {
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
                 let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+                let mut hnsw_links = tx.open_table(HNSW_LINKS).map_err(storage_err)?;
+                let mut hnsw_meta = tx.open_table(HNSW_META).map_err(storage_err)?;
                 let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
                 let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
@@ -1301,6 +1328,9 @@ impl Storage {
                         &mut label_index,
                         op,
                         journal,
+                        &mut hnsw_links,
+                        &mut hnsw_meta,
+                        &self.resolved_hnsw,
                     )?;
                     if !matches!(op, Op::RemoveNode { .. }) {
                         let id = match op {
@@ -1912,6 +1942,8 @@ impl Storage {
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
                 let mut embedding_ref = tx.open_table(EMBEDDING_REF).map_err(storage_err)?;
+                let mut hnsw_links = tx.open_table(HNSW_LINKS).map_err(storage_err)?;
+                let mut hnsw_meta = tx.open_table(HNSW_META).map_err(storage_err)?;
                 let mut dict_table = tx.open_table(DICT).map_err(storage_err)?;
                 let mut slot_meta = tx.open_table(META).map_err(storage_err)?;
                 let mut node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
@@ -1953,6 +1985,13 @@ impl Storage {
                 vector_dims.retain(|_, _| false).map_err(storage_err)?;
                 vectors.retain(|_, _| false).map_err(storage_err)?;
                 embedding_ref.retain(|_, _| false).map_err(storage_err)?;
+                // F8: HNSW graph state is entirely derived — drained here and
+                // rebuilt by the very same `apply_op` calls below (through
+                // the same fresh/rewire/threshold-build/ratio-rebuild logic
+                // the live write path uses), exactly like every other
+                // derived table this function drains.
+                hnsw_links.retain(|_, _| false).map_err(storage_err)?;
+                hnsw_meta.retain(|_, _| false).map_err(storage_err)?;
                 dict_table.retain(|_, _| false).map_err(storage_err)?;
                 slot_meta.remove("next_node_slot").map_err(storage_err)?;
                 slot_meta.remove("next_edge_slot").map_err(storage_err)?;
@@ -2029,6 +2068,9 @@ impl Storage {
                         &mut label_index,
                         &op,
                         &mut journal,
+                        &mut hnsw_links,
+                        &mut hnsw_meta,
+                        &self.resolved_hnsw,
                     )?;
                     if !matches!(op, Op::RemoveNode { .. }) {
                         let id = match &op {
@@ -2572,6 +2614,9 @@ fn apply_op(
     label_index: &mut Table<'_, &'static [u8], u64>,
     op: &Op,
     journal: &mut InternJournal,
+    hnsw_links: &mut Table<'_, &'static [u8], &'static [u8]>,
+    hnsw_meta: &mut Table<'_, &'static [u8], &'static [u8]>,
+    hnsw_params: &HnswParams,
 ) -> Result<(), TopoError> {
     match op {
         Op::CreateNode {
@@ -2701,7 +2746,37 @@ fn apply_op(
                 TopoError::Encoding("SetEmbedding: missing node slot after read_node hit".into())
             })?;
             let scope_id = scope_registry.intern(scopes_table, rec.scope, journal)?;
-            vector_store::put_vector(vectors, embedding_ref, model_id, scope_id, slot, vector)
+
+            // F8: read the OLD ref BEFORE `put_vector` overwrites/removes it
+            // — afterward there is no way to recover which (model, scope)
+            // cluster this slot's PRIOR embedding (if any) lived in, and
+            // that's exactly what distinguishes a fresh insert from a
+            // same-cluster rewire from a cross-model move below.
+            let old_ref: Option<(u32, u32)> = match embedding_ref
+                .get(slot_key(slot).as_slice())
+                .map_err(storage_err)?
+            {
+                Some(g) => Some(vector_store::decode_ref(g.value())?),
+                None => None,
+            };
+
+            let () =
+                vector_store::put_vector(vectors, embedding_ref, model_id, scope_id, slot, vector)?;
+
+            apply_hnsw_set_embedding(
+                vectors,
+                embedding_ref,
+                node_ids,
+                hnsw_links,
+                hnsw_meta,
+                hnsw_params,
+                old_ref,
+                model_id,
+                scope_id,
+                slot,
+                *id,
+                vector,
+            )
         }
         Op::RemoveNode { id } => {
             let removed_slot = crate::slots::node_slot(node_slots, *id)?
@@ -2730,8 +2805,35 @@ fn apply_op(
             }
             drop(removed);
 
+            // F8: read the OLD ref BEFORE `remove_vector` deletes it —
+            // afterward there is no way to recover which (model, scope)
+            // cluster (if any) `removed_slot` needs tombstoning in.
+            let old_ref: Option<(u32, u32)> = match embedding_ref
+                .get(slot_key(removed_slot).as_slice())
+                .map_err(storage_err)?
+            {
+                Some(g) => Some(vector_store::decode_ref(g.value())?),
+                None => None,
+            };
+
             // v4: no-op if the node was never embedded.
             vector_store::remove_vector(vectors, embedding_ref, removed_slot)?;
+
+            if let Some((model, scope)) = old_ref {
+                let newly = hnsw::tombstone(hnsw_links, hnsw_meta, model, scope, removed_slot)?;
+                if newly {
+                    maybe_rebuild_cluster(
+                        hnsw_links,
+                        hnsw_meta,
+                        vectors,
+                        embedding_ref,
+                        node_ids,
+                        hnsw_params,
+                        model,
+                        scope,
+                    )?;
+                }
+            }
 
             // Adjacency-assisted cascade (Task 10): the node's own OUT_ADJ and
             // IN_ADJ chunks under `removed_slot` ARE the incident-edge set —
@@ -2923,6 +3025,143 @@ fn apply_op(
             Ok(())
         }
     }
+}
+
+/// HNSW graph maintenance for `Op::SetEmbedding`, called from `apply_op`
+/// AFTER `put_vector` has already overwritten `slot`'s VECTORS/EMBEDDING_REF
+/// rows with `vector`. `old_ref` is the node's PRE-overwrite `(model,
+/// scope)`, captured by the caller BEFORE `put_vector` ran — it's the only
+/// way to tell a fresh insert from a same-cluster re-embed from a
+/// cross-model move, since `put_vector` has already erased that history by
+/// the time this runs.
+///
+/// Decision tree (a pure function of table state — no hidden state, no
+/// randomness, so `rebuild_state_from_ops` reproduces it exactly on
+/// replay):
+/// - `old_ref` present AND its model differs from `model`: the node just
+///   MOVED clusters. Tombstone `slot` in the OLD `(old_model, old_scope)`
+///   cluster first (a no-op if that cluster was never built, or `slot`'s
+///   prior embedding was zero-norm and so never actually entered the
+///   graph — `hnsw::tombstone` handles both gracefully), ratio-check that
+///   cluster if the tombstone was new, then fall through to the fresh-insert
+///   branch below for the NEW `(model, scope)` cluster.
+/// - `slot` already has a level-0 `HNSW_LINKS` row in the TARGET `(model,
+///   scope)` cluster (checked directly, independent of `old_ref` — this
+///   covers same-model re-embeds AND the rare case of a node moving back
+///   into a cluster it was tombstoned out of earlier): `hnsw::reinsert_links`
+///   rewires `slot`'s own out-links in place, then ratio-check.
+/// - Otherwise (slot has never been a member of the target cluster): a
+///   genuinely fresh insert. Built cluster (`HNSW_META` row present) ->
+///   `hnsw::insert`. Unbuilt -> `hnsw::cluster_vector_count` against
+///   `params.build_threshold`; crossing it triggers `hnsw::build_cluster`.
+///
+/// Zero-norm vectors need no special case here: `hnsw::insert` no-ops on one
+/// (fresh-insert branch) and `hnsw::reinsert_links` tombstones `slot`
+/// instead of writing degenerate links (rewire branch) — both already
+/// documented on those functions.
+#[allow(clippy::too_many_arguments)] // one more hnsw-shaped extension of the same table set apply_op already sanctions growth on.
+fn apply_hnsw_set_embedding(
+    vectors: &Table<'_, &'static [u8], &'static [u8]>,
+    embedding_ref: &Table<'_, &'static [u8], &'static [u8]>,
+    node_ids: &Table<'_, &'static [u8], &'static [u8]>,
+    hnsw_links: &mut Table<'_, &'static [u8], &'static [u8]>,
+    hnsw_meta: &mut Table<'_, &'static [u8], &'static [u8]>,
+    params: &HnswParams,
+    old_ref: Option<(u32, u32)>,
+    model: u32,
+    scope: u32,
+    slot: u64,
+    id: NodeId,
+    vector: &[f32],
+) -> Result<(), TopoError> {
+    if let Some((old_model, old_scope)) = old_ref {
+        if old_model != model {
+            let newly = hnsw::tombstone(hnsw_links, hnsw_meta, old_model, old_scope, slot)?;
+            if newly {
+                maybe_rebuild_cluster(
+                    hnsw_links,
+                    hnsw_meta,
+                    vectors,
+                    embedding_ref,
+                    node_ids,
+                    params,
+                    old_model,
+                    old_scope,
+                )?;
+            }
+        }
+    }
+
+    let reader = hnsw::GraphReader {
+        vectors,
+        refs: embedding_ref,
+        model,
+        scope,
+    };
+    let has_existing_row = hnsw::read_links(hnsw_links, model, scope, slot, 0)?.is_some();
+
+    if has_existing_row {
+        hnsw::reinsert_links(hnsw_links, hnsw_meta, &reader, params, slot, vector)?;
+        return maybe_rebuild_cluster(
+            hnsw_links,
+            hnsw_meta,
+            vectors,
+            embedding_ref,
+            node_ids,
+            params,
+            model,
+            scope,
+        );
+    }
+
+    match hnsw::read_meta(hnsw_meta, model, scope)? {
+        Some(_) => {
+            hnsw::insert(hnsw_links, hnsw_meta, &reader, params, slot, id, vector)?;
+        }
+        None => {
+            let count = hnsw::cluster_vector_count(vectors, model, scope)?;
+            if count >= params.build_threshold {
+                hnsw::build_cluster(
+                    hnsw_links, hnsw_meta, vectors, &reader, node_ids, params, model, scope,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Applies the module's integer rebuild-ratio check (`stale * rebuild_den >=
+/// graph_len * rebuild_num`, cross-multiplied to avoid floats — see
+/// `ClusterMeta`'s field doc comment) to `(model, scope)`'s current meta,
+/// rebuilding from scratch via `hnsw::build_cluster` if it fires. A no-op if
+/// the cluster has no meta row (never built). Called after EVERY `stale`
+/// increment (a fresh tombstone or a rewire) — never speculatively.
+#[allow(clippy::too_many_arguments)]
+fn maybe_rebuild_cluster(
+    hnsw_links: &mut Table<'_, &'static [u8], &'static [u8]>,
+    hnsw_meta: &mut Table<'_, &'static [u8], &'static [u8]>,
+    vectors: &Table<'_, &'static [u8], &'static [u8]>,
+    embedding_ref: &Table<'_, &'static [u8], &'static [u8]>,
+    node_ids: &Table<'_, &'static [u8], &'static [u8]>,
+    params: &HnswParams,
+    model: u32,
+    scope: u32,
+) -> Result<(), TopoError> {
+    let Some(meta) = hnsw::read_meta(hnsw_meta, model, scope)? else {
+        return Ok(());
+    };
+    if meta.stale * (params.rebuild_den as u64) >= meta.graph_len * (params.rebuild_num as u64) {
+        let reader = hnsw::GraphReader {
+            vectors,
+            refs: embedding_ref,
+            model,
+            scope,
+        };
+        hnsw::build_cluster(
+            hnsw_links, hnsw_meta, vectors, &reader, node_ids, params, model, scope,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -13,14 +13,18 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
-#[allow(dead_code)]
 pub(crate) const HNSW_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("hnsw_meta");
-#[allow(dead_code)]
 pub(crate) const HNSW_LINKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("hnsw_links");
 pub(crate) const HNSW_META_FORMAT_V0: u8 = 0;
 
+/// Tuning knobs for a database's HNSW graph maintenance (F8). Threaded from
+/// [`crate::db::DbOptions::hnsw_params`] (`None` resolves to `default()` at
+/// open — see `Storage::open_with_options`) and re-exported as
+/// `topodb::HnswParams` (mirroring how `IndexSpec` is exposed) so a host can
+/// tune it, and so tests can open with a tiny `build_threshold` to exercise
+/// graph activation on small corpora without seeding thousands of rows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct HnswParams {
+pub struct HnswParams {
     pub version: u32,
     pub m: u32,
     pub m0: u32,
@@ -47,7 +51,6 @@ impl Default for HnswParams {
 }
 
 impl HnswParams {
-    #[allow(dead_code)]
     pub(crate) fn validate(&self) -> Result<(), TopoError> {
         if self.m < 2 || !self.m.is_power_of_two() {
             return Err(TopoError::Rejected(format!(
@@ -77,6 +80,26 @@ impl HnswParams {
     }
 }
 
+/// One `(model, scope)` cluster's graph header. Field semantics (pinned here
+/// so the ratio check in `storage.rs`'s applier wiring and any future reader
+/// share one definition):
+///
+/// - `graph_len`: the count of slots this cluster has EVER graph-inserted
+///   with a non-zero-norm vector (i.e. every `insert` call that took the
+///   "real" path, not the zero-norm no-op). Monotonically non-decreasing —
+///   it is NEVER decremented on `tombstone` (a tombstoned slot's row stays
+///   counted; only `build_cluster` resets it, by dropping the meta row
+///   entirely and re-deriving from a fresh scan of currently-live `VECTORS`
+///   rows). So `graph_len` is "ever inserted, including currently
+///   tombstoned" — not "currently live".
+/// - `stale`: the count of rewire-worthy events since the last rebuild —
+///   incremented once per `tombstone` call that newly tombstoned a slot, and
+///   once per `reinsert_links` call (a same-cluster re-embed's rewire).
+///   Reset to `0` only by `build_cluster` (via the dropped-then-recreated
+///   meta row). The applier's ratio check compares `stale` against
+///   `graph_len` (`stale/graph_len >= rebuild_num/rebuild_den`) to decide
+///   when a cluster's link structure has accumulated enough dead weight to
+///   rebuild from scratch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ClusterMeta {
     pub format: u8,
@@ -213,7 +236,6 @@ pub(crate) fn write_links(
 /// ReadableTable<..>` cannot be constructed. The generic-struct fallback the
 /// brief names is used instead; callers monomorphize over whatever concrete
 /// `redb::Table`/`redb::ReadOnlyTable` they have open.
-#[allow(dead_code)] // wired up by Task 3's applier
 pub(crate) struct GraphReader<'a, V, R>
 where
     V: ReadableTable<&'static [u8], &'static [u8]>,
@@ -395,7 +417,6 @@ where
 /// `ef_construction` search at each level from `min(level, entry_level)`
 /// down to 0, wiring itself to the closest `M`/`M0` (`M0` at level 0) and
 /// pruning each of those neighbors back down to its own budget.
-#[allow(dead_code)] // wired up by Task 3's applier
 pub(crate) fn insert<V, R>(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
     meta: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -529,13 +550,143 @@ where
     Ok(())
 }
 
+/// Rewires `slot`'s OWN out-links after a same-cluster re-embed (same
+/// `(model, scope)` as before — a genuinely different cluster is a
+/// tombstone-in-the-old-cluster-plus-fresh-`insert`-in-the-new-one,
+/// handled by the caller, not this function). Unlike `insert`, this never
+/// touches any OTHER slot's `LinkRow`: no `prune_neighbor` back-linking, no
+/// neighbor-side budget enforcement — only `slot`'s own row at each level it
+/// already occupies gets a fresh `ef_construction` search and an overwrite.
+///
+/// No-op (no reads even attempted beyond the initial `read_meta`/
+/// `read_links` checks) when:
+/// - the cluster has no `meta` row yet (unbuilt: nothing to rewire), or
+/// - `slot` has no existing level-0 `HNSW_LINKS` row (it was never actually
+///   graph-inserted — e.g. its PRIOR embedding was zero-norm and `insert`
+///   no-op'd on it — so this is really a fresh-insert case; the caller is
+///   expected to have already ruled this out via the same check before
+///   calling, but this function re-checks defensively rather than silently
+///   fabricating a partial row).
+///
+/// A zero-norm `vector` (the NEW embedding) is symmetric with `insert`'s
+/// zero-norm rule but resolves the opposite way: since the slot IS already a
+/// live graph member, it can't simply be skipped — it must stop routing/
+/// ranking, so this delegates to `tombstone` instead of writing degenerate
+/// links.
+///
+/// Every level `0..=own_level` gets rewired, `own_level` being the highest
+/// level `slot` already occupies (discovered by probing `HNSW_LINKS`
+/// upward from level 0 until the first missing row — exactly the
+/// contiguous `0..=level` range `insert` originally wrote). At each level,
+/// `slot` is filtered out of the `search_layer` results before they're used
+/// as the new neighbor list or as next-level `entry_pts`: `slot` already has
+/// rows at every level `insert` would have written, so a naive search can
+/// route straight back to (and even seed on) `slot` itself — most acutely
+/// when `slot` IS the cluster's `entry_slot`, where the very first seed call
+/// would otherwise self-score a trivial `1.0` and short-circuit the search.
+/// Always sets the rewritten row's `tomb` to `false` (a live re-embed is
+/// definitionally live) and bumps `meta.stale` by exactly 1 — a rewire is as
+/// stale-inducing as a tombstone for the module's rebuild-ratio accounting
+/// (see `ClusterMeta`'s field doc comment).
+pub(crate) fn reinsert_links<V, R>(
+    links: &mut Table<'_, &'static [u8], &'static [u8]>,
+    meta: &mut Table<'_, &'static [u8], &'static [u8]>,
+    reader: &GraphReader<'_, V, R>,
+    params: &HnswParams,
+    slot: u64,
+    vector: &[f32],
+) -> Result<(), TopoError>
+where
+    V: ReadableTable<&'static [u8], &'static [u8]>,
+    R: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let Some(cur_meta) = read_meta(meta, reader.model, reader.scope)? else {
+        return Ok(()); // unbuilt cluster: nothing to rewire.
+    };
+    if read_links(links, reader.model, reader.scope, slot, 0)?.is_none() {
+        return Ok(()); // never actually graph-inserted: caller should `insert` instead.
+    }
+
+    if cosine(vector, vector).is_none() {
+        // Zero-norm re-embed: the slot can no longer usefully route or be
+        // routed to, so stop ranking it — same outcome as an explicit
+        // removal, reusing `tombstone` rather than duplicating its logic.
+        tombstone(links, meta, reader.model, reader.scope, slot)?;
+        return Ok(());
+    }
+
+    // Discover the contiguous level range `insert` originally wrote for this
+    // slot (level 0 is already confirmed present above).
+    let mut own_level: u8 = 0;
+    while read_links(links, reader.model, reader.scope, slot, own_level + 1)?.is_some() {
+        own_level += 1;
+    }
+
+    let entry_level = cur_meta.entry_level;
+    let mut entry_slot = cur_meta.entry_slot;
+    // `own_level <= entry_level` always: `level_for` is a pure function of
+    // NodeId, so this slot's level never changes, and `entry_level` only
+    // ever grows to match the highest level any inserted node has reached —
+    // it was already >= `own_level` back when this slot was first inserted.
+    let level = own_level.min(entry_level);
+
+    let mut descend_level = entry_level;
+    while descend_level > level {
+        let hits = search_layer(links, reader, &[entry_slot], vector, 1, descend_level)?;
+        if let Some(&(_, best)) = hits.iter().find(|&&(_, s)| s != slot) {
+            entry_slot = best;
+        }
+        if descend_level == 0 {
+            break;
+        }
+        descend_level -= 1;
+    }
+
+    let mut entry_pts = vec![entry_slot];
+    let mut cur_level = level;
+    loop {
+        let ef_c = params.ef_construction as usize;
+        let candidates = search_layer(links, reader, &entry_pts, vector, ef_c, cur_level)?;
+        let filtered: Vec<(OrderedScore, u64)> =
+            candidates.into_iter().filter(|&(_, s)| s != slot).collect();
+        let max_m = if cur_level == 0 { params.m0 } else { params.m } as usize;
+        let selected: Vec<u64> = filtered.iter().take(max_m).map(|&(_, s)| s).collect();
+
+        write_links(
+            links,
+            reader.model,
+            reader.scope,
+            slot,
+            cur_level,
+            &LinkRow {
+                tomb: false,
+                neighbors: selected,
+            },
+        )?;
+
+        entry_pts = filtered.into_iter().map(|(_, s)| s).collect();
+        if entry_pts.is_empty() {
+            entry_pts = vec![entry_slot];
+        }
+
+        if cur_level == 0 {
+            break;
+        }
+        cur_level -= 1;
+    }
+
+    let mut new_meta = cur_meta;
+    new_meta.stale += 1;
+    write_meta(meta, reader.model, reader.scope, &new_meta)?;
+    Ok(())
+}
+
 /// Marks `slot`'s level-0 link row as tombstoned — `Ok(false)` if the slot
 /// has no level-0 row (never inserted, or already removed from the graph
 /// some other way) or is already tombstoned, `Ok(true)` if this call is the
 /// one that newly tombstoned it. Only flips the flag and bumps `meta.stale`;
 /// the row's `neighbors` (routing structure) are left exactly as they were,
 /// per the module's "tombs route but don't rank" contract.
-#[allow(dead_code)] // wired up by Task 3's applier
 pub(crate) fn tombstone(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
     meta: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -563,6 +714,15 @@ pub(crate) fn tombstone(
 /// up to that many non-tombstoned `(slot, exact cosine)` pairs sorted
 /// `(score desc, slot asc)`. Callers resolve `NodeId`s and apply any further
 /// `(score desc, NodeId asc)` re-sort themselves (`vector.rs`, as today).
+///
+/// A zero-norm `query` yields an EMPTY result by design, not an error:
+/// `search_layer`'s `seed` closure drops every candidate whose `cosine`
+/// score is `None` (the module-wide zero-norm-skip rule shared with
+/// `insert`), and `cosine(query, _)` is `None` for every candidate when
+/// `query` itself has zero norm — so both the greedy descend and the final
+/// level-0 search visit no candidate and `results` stays empty all the way
+/// through. See `zero_norm_query_yields_empty_result` below for the pinned
+/// case.
 #[allow(dead_code)] // wired up by Task 4's read path
 pub(crate) fn search<V, R>(
     links: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -593,6 +753,39 @@ where
         .collect())
 }
 
+/// The number of `VECTORS` rows currently stored under `(model, scope)` —
+/// used by the applier to decide whether an as-yet-unbuilt cluster has just
+/// crossed `HnswParams::build_threshold`. A plain range-count over
+/// `vector_prefix(model, scope)`, so it's O(cluster size) per call; that's
+/// only ever paid PRE-build, and only below the threshold (once a cluster is
+/// built, the applier calls `insert` directly instead of re-counting), so it
+/// stays cheap for every threshold this module ships with (default 1024).
+/// Counts EVERY row in the cluster, including zero-norm ones that will never
+/// actually enter the graph via `insert` — the threshold is about "how big
+/// has this cluster's key space gotten", not "how many nodes would `insert`
+/// accept", mirroring `build_cluster`'s own scan (which also visits
+/// zero-norm rows before skipping them).
+pub(crate) fn cluster_vector_count(
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    model: u32,
+    scope: u32,
+) -> Result<u64, TopoError> {
+    let prefix = vector_prefix(model, scope);
+    let mut start = prefix.to_vec();
+    start.extend_from_slice(&0u64.to_be_bytes());
+    let mut end = prefix.to_vec();
+    end.extend_from_slice(&u64::MAX.to_be_bytes());
+    let mut count = 0u64;
+    for entry in vectors
+        .range(start.as_slice()..=end.as_slice())
+        .map_err(storage_err)?
+    {
+        entry.map_err(storage_err)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Rebuilds the `(model, scope)` graph from scratch: deletes every
 /// `HNSW_LINKS` row under `link_prefix(model, scope)`, drops the cluster's
 /// `meta` row entirely (not merely resets its fields — an ABSENT meta row is
@@ -605,7 +798,6 @@ where
 /// `node_ulid` for `level_for` and re-inserting it. Zero-norm rows are
 /// skipped before even resolving their `NodeId` (an equivalent, cheaper
 /// no-op to letting `insert` reject them).
-#[allow(dead_code)] // wired up by Task 3's rebuild trigger
 #[allow(clippy::too_many_arguments)] // exact signature pinned by the f8 task brief
 pub(crate) fn build_cluster<V, R, VI, NI>(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
@@ -1201,5 +1393,238 @@ mod tests {
             meta_a, meta_b,
             "build_cluster must reproduce identical meta"
         );
+    }
+
+    // -- Task 3 carry-overs: zero-norm query, entry-point tombstone,
+    // reinsert_links ----------------------------------------------------
+
+    #[test]
+    fn zero_norm_query_yields_empty_result() {
+        // Carried from Task 2's review: `search`'s doc comment now states
+        // this is by-design, not an error path — pin it.
+        let dim = 8;
+        let n = 32;
+        let model = 1;
+        let scope = 1;
+        let params = HnswParams::default();
+        let vectors = seed_vectors(n, dim, 0x5EED_0008);
+        let (_dir, db) = open_db();
+        insert_incrementally(&db, model, scope, &vectors, &params);
+
+        let zero_query = vec![0.0f32; dim];
+        let got = search_cluster(&db, model, scope, &zero_query, 16, 5);
+        assert!(
+            got.is_empty(),
+            "a zero-norm query must yield an empty result, not an error or a scored hit"
+        );
+    }
+
+    #[test]
+    fn tombstoning_the_entry_point_still_routes_correctly() {
+        // Carried from Task 2's review: the entry point is the one slot
+        // `search`'s greedy descend ALWAYS starts from — tombstoning it must
+        // not break routing to the rest of the graph, even though the
+        // now-tombstoned entry itself must never appear in results.
+        let dim = 8;
+        let n = 40;
+        let model = 1;
+        let scope = 1;
+        let params = HnswParams::default();
+        let vectors = seed_vectors(n, dim, 0x5EED_0009);
+        let (_dir, db) = open_db();
+        insert_incrementally(&db, model, scope, &vectors, &params);
+
+        let entry_slot = {
+            let tx = db.begin_read().unwrap();
+            let meta_tab = tx.open_table(HNSW_META).unwrap();
+            read_meta(&meta_tab, model, scope)
+                .unwrap()
+                .unwrap()
+                .entry_slot
+        };
+
+        let entries: Vec<(u64, Vec<f32>)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(slot, v)| (slot as u64, v.clone()))
+            .collect();
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut links = tx.open_table(HNSW_LINKS).unwrap();
+            let mut meta = tx.open_table(HNSW_META).unwrap();
+            let newly = tombstone(&mut links, &mut meta, model, scope, entry_slot).unwrap();
+            assert!(newly, "the entry slot must have had a live level-0 row");
+        }
+        tx.commit().unwrap();
+
+        let mut tombstoned = HashSet::new();
+        tombstoned.insert(entry_slot);
+        let query = seed_vectors(1, dim, 0x5EED_000A).remove(0);
+        let (ef, k) = (40usize, 10usize);
+        let want = brute_force(&entries, &tombstoned, &query, ef.max(k));
+        let got = search_cluster(&db, model, scope, &query, ef, k);
+        assert_eq!(
+            got, want,
+            "tombstoning the entry point must still leave the rest of the graph \
+             reachable (search still starts its greedy descend FROM the tombstoned \
+             entry, it just never RANKS it)"
+        );
+        assert!(got.iter().all(|&(slot, _)| slot != entry_slot));
+    }
+
+    #[test]
+    fn reinsert_links_rewires_own_row_without_touching_neighbors() {
+        let dim = 8;
+        let n = 40;
+        let model = 1;
+        let scope = 1;
+        let params = HnswParams::default();
+        let vectors = seed_vectors(n, dim, 0x5EED_000B);
+        let (_dir, db) = open_db();
+        insert_incrementally(&db, model, scope, &vectors, &params);
+
+        // Snapshot every OTHER slot's link rows before the rewire.
+        let target_slot: u64 = 3;
+        let before_meta = {
+            let tx = db.begin_read().unwrap();
+            let meta_tab = tx.open_table(HNSW_META).unwrap();
+            read_meta(&meta_tab, model, scope).unwrap().unwrap()
+        };
+        let before_rows: Vec<(u64, u8, LinkRow)> = {
+            let tx = db.begin_read().unwrap();
+            let links = tx.open_table(HNSW_LINKS).unwrap();
+            collect_link_rows(&links, model, scope)
+                .into_iter()
+                .filter(|(slot, _, _)| *slot != target_slot)
+                .collect()
+        };
+
+        // Re-embed `target_slot` with a fresh vector under the SAME model.
+        let new_vector = seed_vectors(1, dim, 0x5EED_000C).remove(0);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut vtab = tx.open_table(VECTORS).unwrap();
+            let mut rtab = tx.open_table(EMBEDDING_REF).unwrap();
+            put_vector(&mut vtab, &mut rtab, model, scope, target_slot, &new_vector).unwrap();
+            let mut links = tx.open_table(HNSW_LINKS).unwrap();
+            let mut meta = tx.open_table(HNSW_META).unwrap();
+            let reader = GraphReader {
+                vectors: &vtab,
+                refs: &rtab,
+                model,
+                scope,
+            };
+            reinsert_links(
+                &mut links,
+                &mut meta,
+                &reader,
+                &params,
+                target_slot,
+                &new_vector,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let after_meta = {
+            let tx = db.begin_read().unwrap();
+            let meta_tab = tx.open_table(HNSW_META).unwrap();
+            read_meta(&meta_tab, model, scope).unwrap().unwrap()
+        };
+        assert_eq!(
+            after_meta.stale,
+            before_meta.stale + 1,
+            "reinsert_links must bump stale by exactly 1"
+        );
+        assert_eq!(
+            after_meta.graph_len, before_meta.graph_len,
+            "reinsert_links must never touch graph_len"
+        );
+
+        let after_rows: Vec<(u64, u8, LinkRow)> = {
+            let tx = db.begin_read().unwrap();
+            let links = tx.open_table(HNSW_LINKS).unwrap();
+            collect_link_rows(&links, model, scope)
+                .into_iter()
+                .filter(|(slot, _, _)| *slot != target_slot)
+                .collect()
+        };
+        assert_eq!(
+            before_rows, after_rows,
+            "reinsert_links must not touch any OTHER slot's link rows"
+        );
+
+        // The rewired slot's own row(s) must never reference itself.
+        let tx = db.begin_read().unwrap();
+        let links = tx.open_table(HNSW_LINKS).unwrap();
+        let target_rows: Vec<(u64, u8, LinkRow)> = collect_link_rows(&links, model, scope)
+            .into_iter()
+            .filter(|(slot, _, _)| *slot == target_slot)
+            .collect();
+        assert!(!target_rows.is_empty());
+        for (_, _, row) in &target_rows {
+            assert!(!row.tomb, "a live re-embed's row must not be tombstoned");
+            assert!(
+                !row.neighbors.contains(&target_slot),
+                "a slot must never list itself as its own neighbor"
+            );
+        }
+
+        // The re-embedded vector must be exactly what search finds it with.
+        let got = search_cluster(&db, model, scope, &new_vector, 40, 1);
+        assert_eq!(got[0].0, target_slot);
+    }
+
+    #[test]
+    fn reinsert_links_on_unbuilt_cluster_is_a_no_op() {
+        let model = 9;
+        let scope = 9;
+        let params = HnswParams::default();
+        let (_dir, db) = open_db();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut vtab = tx.open_table(VECTORS).unwrap();
+            let mut rtab = tx.open_table(EMBEDDING_REF).unwrap();
+            let mut links = tx.open_table(HNSW_LINKS).unwrap();
+            let mut meta = tx.open_table(HNSW_META).unwrap();
+            let v = vec![1.0f32, 0.0, 0.0, 0.0];
+            put_vector(&mut vtab, &mut rtab, model, scope, 0, &v).unwrap();
+            let reader = GraphReader {
+                vectors: &vtab,
+                refs: &rtab,
+                model,
+                scope,
+            };
+            reinsert_links(&mut links, &mut meta, &reader, &params, 0, &v).unwrap();
+            assert!(
+                read_meta(&meta, model, scope).unwrap().is_none(),
+                "an unbuilt cluster must stay unbuilt after reinsert_links"
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn cluster_vector_count_matches_row_count() {
+        let dim = 4;
+        let model = 1;
+        let scope = 1;
+        let vectors = seed_vectors(5, dim, 0x5EED_000D);
+        let (_dir, db) = open_db();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut vtab = tx.open_table(VECTORS).unwrap();
+            let mut rtab = tx.open_table(EMBEDDING_REF).unwrap();
+            for (slot, v) in vectors.iter().enumerate() {
+                put_vector(&mut vtab, &mut rtab, model, scope, slot as u64, v).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_read().unwrap();
+        let vtab = tx.open_table(VECTORS).unwrap();
+        assert_eq!(cluster_vector_count(&vtab, model, scope).unwrap(), 5);
+        assert_eq!(cluster_vector_count(&vtab, model, 2).unwrap(), 0);
     }
 }

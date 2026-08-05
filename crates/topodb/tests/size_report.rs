@@ -322,6 +322,7 @@ fn ram_report() {
     let path = ram_fixture_path();
     let opts = DbOptions {
         cache_size_bytes: Some(cache_mb * 1024 * 1024),
+        ..Default::default()
     };
     let db = Db::open_with_options(&path, spec(), opts).unwrap();
     let report = db.storage_report().unwrap();
