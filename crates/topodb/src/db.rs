@@ -14,11 +14,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Tuning knobs for [`Db::open_with_options`]. Additive: every field
 /// defaults to `None`, under which redb's own default is used, so a fresh
 /// `DbOptions::default()` behaves identically to `Db::open`/`Db::open_with`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DbOptions {
     /// Threaded straight to `redb::Builder::set_cache_size`. `None` leaves
     /// redb's own default (1 GiB, split 90/10 read/write) in place.
     pub cache_size_bytes: Option<usize>,
+    /// HNSW graph-maintenance tuning (F8): build threshold, `m`/`m0`,
+    /// `ef_construction`, rebuild ratio. `None` resolves to
+    /// `HnswParams::default()` at open (`Storage::open_with_options`),
+    /// validated before any IO — an invalid override rejects the whole
+    /// open rather than silently falling back. `pub(crate)` type kept
+    /// crate-private; re-exported as `topodb::HnswParams` from `lib.rs` so
+    /// tests (and any future host tuning this at open time) can construct
+    /// one without reaching into the crate.
+    pub hnsw_params: Option<crate::hnsw::HnswParams>,
 }
 
 /// One queued `Job::Apply`'s ops paired with the reply channel its submitter
@@ -1109,6 +1118,78 @@ impl Db {
         out.sort_unstable();
         Ok(out)
     }
+
+    /// Test/inspection helper (F8): every `HNSW_META` cluster-header row,
+    /// decoded as `(model, scope, format, built, entry_slot, entry_level,
+    /// graph_len, stale)` — the `ClusterMeta` fields in declaration order,
+    /// with the `(model, scope)` key prefix split out — sorted by `(model,
+    /// scope)`. `#[doc(hidden)]` — see `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_dump_hnsw_meta(&self) -> Result<Vec<HnswMetaDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::hnsw::HNSW_META)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key: [u8; 8] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad hnsw_meta key".into()))?;
+            let model = u32::from_be_bytes(key[0..4].try_into().expect("4-byte slice"));
+            let scope = u32::from_be_bytes(key[4..8].try_into().expect("4-byte slice"));
+            let meta: crate::hnsw::ClusterMeta =
+                postcard::from_bytes(v.value()).map_err(|e| TopoError::Encoding(e.to_string()))?;
+            out.push((
+                model,
+                scope,
+                meta.format,
+                meta.built,
+                meta.entry_slot,
+                meta.entry_level,
+                meta.graph_len,
+                meta.stale,
+            ));
+        }
+        out.sort_by_key(|r| (r.0, r.1));
+        Ok(out)
+    }
+
+    /// Test/inspection helper (F8): every `HNSW_LINKS` row, decoded as
+    /// `(model, scope, slot, level, tomb, neighbors)` from the raw `model BE4
+    /// ++ scope BE4 ++ slot BE8 ++ level` key and framed-postcard `LinkRow`
+    /// value — sorted by that same `(model, scope, slot, level)` tuple, which
+    /// is also on-disk key order. `#[doc(hidden)]` — see `all_edges_between`.
+    #[doc(hidden)]
+    pub fn debug_dump_hnsw_links(&self) -> Result<Vec<HnswLinksDumpRow>, TopoError> {
+        use redb::ReadableTable;
+        let storage = self.storage();
+        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
+        let table = tx
+            .open_table(crate::hnsw::HNSW_LINKS)
+            .map_err(crate::error::storage_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(crate::error::storage_err)? {
+            let (k, v) = entry.map_err(crate::error::storage_err)?;
+            let key: [u8; 17] = k
+                .value()
+                .try_into()
+                .map_err(|_| TopoError::Encoding("bad hnsw_links key".into()))?;
+            let model = u32::from_be_bytes(key[0..4].try_into().expect("4-byte slice"));
+            let scope = u32::from_be_bytes(key[4..8].try_into().expect("4-byte slice"));
+            let slot = u64::from_be_bytes(key[8..16].try_into().expect("8-byte slice"));
+            let level = key[16];
+            let raw = crate::codec::unframe_value(v.value())?;
+            let row: crate::hnsw::LinkRow =
+                postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
+            out.push((model, scope, slot, level, row.tomb, row.neighbors));
+        }
+        out.sort_by_key(|r| (r.0, r.1, r.2, r.3));
+        Ok(out)
+    }
 }
 
 /// One decoded adjacency entry from [`Db::debug_dump_adjacency`]:
@@ -1142,6 +1223,16 @@ pub type VectorDimsDumpRow = (u32, u32);
 /// `(label_id, scope_id, node_id, slot)`.
 #[doc(hidden)]
 pub type LabelIndexDumpRow = (u32, u32, u128, u64);
+
+/// One decoded `HNSW_META` row from [`Db::debug_dump_hnsw_meta`]: `(model,
+/// scope, format, built, entry_slot, entry_level, graph_len, stale)`.
+#[doc(hidden)]
+pub type HnswMetaDumpRow = (u32, u32, u8, bool, u64, u8, u64, u64);
+
+/// One decoded `HNSW_LINKS` row from [`Db::debug_dump_hnsw_links`]: `(model,
+/// scope, slot, level, tomb, neighbors)`.
+#[doc(hidden)]
+pub type HnswLinksDumpRow = (u32, u32, u64, u8, bool, Vec<u64>);
 
 /// The node ids that `validate::prevalidate_edge_scopes` and
 /// `validate::prevalidate_create_node_ids` need pre-batch storage state for:

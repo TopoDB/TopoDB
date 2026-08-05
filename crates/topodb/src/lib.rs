@@ -37,6 +37,7 @@ pub use error::TopoError;
 pub use feed::ChangeEvent;
 pub use fts::analyze;
 pub use fts::{PropRetain, SearchOptions};
+pub use hnsw::HnswParams;
 pub use ids::{EdgeId, NodeId, Scope, ScopeId, ScopeSet};
 pub use index::{IndexSpec, PropIndex};
 pub use op::Op;
