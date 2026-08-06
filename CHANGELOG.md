@@ -40,7 +40,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
   recall to 0.078 on the uniform fixture — connected but not navigable).
   A `version: 1` closest-M stamp mismatches on open and those graphs drain
   and rebuild via the params reconcile; CI-scale recall (2000×32d) moved
-  0.9660 → 0.9820.
+  0.9660 → 0.9820. Graph ops memoize decoded vectors for their own duration
+  (`VecCache` — one insert/rewire/query re-asks for the same slots across
+  levels, selection, and pruning; ~40% of build time was redundant b-tree
+  navigation + postcard decode), measured 1.83× insert throughput at
+  20k×384 with byte-identical graphs.
 - **`SearchOptions.prop_retain`** — a mechanism-only string-prop allowlist (`PropRetain { prop, any_of, absent_as }`): a candidate survives iff its `prop` value (a missing/non-`Str` value reads as `absent_as` when set) is in `any_of`. Filtered before top-k in every text-search path, never access-bumped when dropped, and re-applied post-fusion in `recall` so vector/graph-leg candidates cannot leak past it. The engine names no prop and no vocabulary; empty `prop`/`any_of` are rejected.
 - **`RecallQuery.tombstone_props` / `Db::search_text_live` takes a prop SET** — tombstone filtering generalizes from one prop (`tombstone_prop: Option<String>`) to any number (`tombstone_props: Vec<String>` / `&[&str]`): a candidate is dropped when ANY listed prop holds an `Int` timestamp `<=` the query's effective now. Per-prop semantics unchanged (future marks kept, non-`Int` values ignored, filtered before top-k, never access-bumped). **Breaking for struct-literal construction** of `RecallQuery` and for `search_text_live` callers — pass `vec![prop]` / `&[prop]` for the old behavior.
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
