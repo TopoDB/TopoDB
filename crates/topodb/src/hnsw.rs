@@ -11,7 +11,8 @@ use crate::vector_store::{cosine, read_vector_by_slot, vector_prefix, OrderedSco
 use redb::{ReadableTable, Table, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::rc::Rc;
 
 pub(crate) const HNSW_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("hnsw_meta");
 pub(crate) const HNSW_LINKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("hnsw_links");
@@ -260,6 +261,55 @@ where
     pub scope: u32,
 }
 
+/// Per-graph-op decoded-vector memo over `read_vector_by_slot` + the
+/// cluster check. Profiling the 20k×384 build put ~40% of insert time in
+/// vector fetch (redb b-tree navigation + postcard `Vec<f32>` decode), and
+/// one insert asks for the same slot's vector repeatedly: once per visited
+/// slot per level in `search_layer`, again in `select_neighbors`'s
+/// resolver, and again inside every `prune_neighbor` call (whose candidate
+/// sets overlap heavily). One cache instance lives for ONE graph op
+/// (`insert` / `reinsert_links` / one `search` query) — never across ops,
+/// so a re-embed in a later op can't serve a stale hit, and memory stays
+/// bounded by the op's visited set. Within an op the tables are borrowed
+/// for its whole duration, so point-in-time stability is the already-
+/// guaranteed semantics — the memo changes no value the graph computes,
+/// only how often it is decoded. Negative results (absent slot, wrong
+/// cluster) are cached too: `prune_neighbor` re-asks about the same
+/// unresolvable candidate across calls. The map is lookup-only (never
+/// iterated), per the module's determinism rules; `Rc` because one op is
+/// strictly single-threaded (the applier).
+pub(crate) struct VecCache {
+    map: HashMap<u64, Option<Rc<Vec<f32>>>>,
+}
+
+impl VecCache {
+    pub(crate) fn new() -> Self {
+        VecCache {
+            map: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn get<V, R>(
+        &mut self,
+        reader: &GraphReader<'_, V, R>,
+        slot: u64,
+    ) -> Result<Option<Rc<Vec<f32>>>, TopoError>
+    where
+        V: ReadableTable<&'static [u8], &'static [u8]>,
+        R: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        if let Some(hit) = self.map.get(&slot) {
+            return Ok(hit.clone());
+        }
+        let resolved = match read_vector_by_slot(reader.vectors, reader.refs, slot)? {
+            Some((m, s, v)) if m == reader.model && s == reader.scope => Some(Rc::new(v)),
+            _ => None,
+        };
+        self.map.insert(slot, resolved.clone());
+        Ok(resolved)
+    }
+}
+
 /// The one greedy routine both `insert` and `search` use. Seeds candidates +
 /// results with `entry_pts`, then repeatedly pops the best (highest-cosine)
 /// candidate and expands its `LinkRow.neighbors` at `level`, until the best
@@ -273,6 +323,7 @@ where
 fn search_layer<V, R>(
     links: &impl ReadableTable<&'static [u8], &'static [u8]>,
     reader: &GraphReader<'_, V, R>,
+    cache: &mut VecCache,
     entry_pts: &[u64],
     query: &[f32],
     ef: usize,
@@ -296,6 +347,7 @@ where
     let seed = |visited: &mut HashSet<u64>,
                 candidates: &mut BinaryHeap<(OrderedScore, Reverse<u64>)>,
                 results: &mut BinaryHeap<Reverse<(OrderedScore, Reverse<u64>)>>,
+                cache: &mut VecCache,
                 slot: u64|
      -> Result<(), TopoError> {
         if !visited.insert(slot) {
@@ -318,9 +370,11 @@ where
         // cross-model re-embed's `put_vector` deletes the OLD cluster's
         // `VECTORS` row the same way), or its embedding is zero-norm
         // (`cosine` returns `None`, mirroring `insert`'s zero-norm no-op).
-        let scoreable = match read_vector_by_slot(reader.vectors, reader.refs, slot)? {
-            Some((m, s, v)) if m == reader.model && s == reader.scope => cosine(query, &v),
-            _ => None,
+        // Resolution goes through the op's `VecCache` — same value, decoded
+        // at most once per op.
+        let scoreable = match cache.get(reader, slot)? {
+            Some(v) => cosine(query, &v),
+            None => None,
         };
         match scoreable {
             Some(score) => {
@@ -349,7 +403,7 @@ where
     };
 
     for &slot in entry_pts {
-        seed(&mut visited, &mut candidates, &mut results, slot)?;
+        seed(&mut visited, &mut candidates, &mut results, cache, slot)?;
     }
 
     while let Some(&(cand_score, Reverse(cand_slot))) = candidates.peek() {
@@ -365,7 +419,7 @@ where
             continue;
         };
         for &nbr_slot in &row.neighbors {
-            seed(&mut visited, &mut candidates, &mut results, nbr_slot)?;
+            seed(&mut visited, &mut candidates, &mut results, cache, nbr_slot)?;
         }
     }
 
@@ -404,9 +458,9 @@ fn select_neighbors<F>(
     mut resolve: F,
 ) -> Result<Vec<u64>, TopoError>
 where
-    F: FnMut(u64) -> Result<Option<Vec<f32>>, TopoError>,
+    F: FnMut(u64) -> Result<Option<Rc<Vec<f32>>>, TopoError>,
 {
-    let mut kept: Vec<(u64, Vec<f32>)> = Vec::with_capacity(max_m.min(candidates.len()));
+    let mut kept: Vec<(u64, Rc<Vec<f32>>)> = Vec::with_capacity(max_m.min(candidates.len()));
     let mut pruned: Vec<u64> = Vec::new();
     for &(score, slot) in candidates {
         if kept.len() >= max_m {
@@ -447,6 +501,7 @@ where
 fn prune_neighbor<V, R>(
     links: &mut Table<'_, &'static [u8], &'static [u8]>,
     reader: &GraphReader<'_, V, R>,
+    cache: &mut VecCache,
     neighbor_slot: u64,
     new_slot: u64,
     level: u8,
@@ -467,50 +522,31 @@ where
     if row.neighbors.len() > max_m {
         // Mirror `search`'s `seed` closure: only a vector still resolving
         // into THIS `(reader.model, reader.scope)` cluster is trustworthy to
-        // score with. A cross-model-moved slot's `read_vector_by_slot` call
-        // succeeds but returns the NEW cluster's vector (`put_vector` leaves
-        // `refs[slot]` pointing at wherever the node's embedding currently
-        // lives) — scoring with that would silently rank retained neighbors
-        // by a foreign vector space. Treated as unscoreable, same as a fully
+        // score with (the `VecCache` applies that check on every fill). A
+        // cross-model-moved slot would otherwise score retained neighbors
+        // by a foreign vector space; it resolves to `None`, same as a fully
         // removed slot.
-        let own_vector = match read_vector_by_slot(reader.vectors, reader.refs, neighbor_slot)? {
-            Some((m, s, nv)) if m == reader.model && s == reader.scope => Some(nv),
-            _ => None,
-        };
-        match own_vector {
+        match cache.get(reader, neighbor_slot)? {
             Some(nv) => {
                 let mut scored: Vec<(OrderedScore, u64)> = Vec::with_capacity(row.neighbors.len());
-                let mut resolved: Vec<(u64, Vec<f32>)> = Vec::with_capacity(row.neighbors.len());
                 for &cand in &row.neighbors {
-                    let cand_vector = match read_vector_by_slot(reader.vectors, reader.refs, cand)?
-                    {
-                        Some((m, s, cv)) if m == reader.model && s == reader.scope => Some(cv),
-                        _ => None,
-                    };
                     // A cross-model-moved (or fully removed) candidate is
                     // unscoreable and, unlike `search`'s seed closure (which
                     // must still ROUTE through an unscoreable member to
                     // preserve connectivity), prune has no routing duty here
                     // — it is purely selecting which neighbors to KEEP, so a
                     // mismatch is simply dropped from the retained set.
-                    if let Some(cv) = cand_vector {
+                    if let Some(cv) = cache.get(reader, cand)? {
                         if let Some(score) = cosine(&nv, &cv) {
                             scored.push((OrderedScore(score), cand));
-                            resolved.push((cand, cv));
                         }
                     }
                 }
                 scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
                 // Same heuristic as `insert`, from the NEIGHBOR's own
-                // perspective (`nv` is the "query"); the resolver serves the
-                // vectors read in the scoring loop above (a linear find over
-                // <= max_m + 1 entries), never re-touching the tables.
-                row.neighbors = select_neighbors(&scored, max_m, |s| {
-                    Ok(resolved
-                        .iter()
-                        .find(|&&(cand, _)| cand == s)
-                        .map(|(_, cv)| cv.clone()))
-                })?;
+                // perspective (`nv` is the "query"); every resolve is a
+                // cache hit — the scoring loop above just filled them.
+                row.neighbors = select_neighbors(&scored, max_m, |s| cache.get(reader, s))?;
             }
             None => {
                 // Defensive fallback only: `neighbor_slot` was reached
@@ -562,6 +598,9 @@ where
         return Ok(()); // zero-norm: never enters the graph.
     }
 
+    // One decoded-vector memo for this whole insert: descent, per-level
+    // construction searches, selection, and every prune share it.
+    let mut cache = VecCache::new();
     let level = level_for(id, params.m, params.level_cap);
 
     let cur_meta = match read_meta(meta, reader.model, reader.scope)? {
@@ -605,7 +644,15 @@ where
     // search from; never touches links.
     let mut descend_level = entry_level;
     while descend_level > level {
-        let hits = search_layer(links, reader, &[entry_slot], vector, 1, descend_level)?;
+        let hits = search_layer(
+            links,
+            reader,
+            &mut cache,
+            &[entry_slot],
+            vector,
+            1,
+            descend_level,
+        )?;
         if let Some(&(_, best)) = hits.first() {
             entry_slot = best;
         }
@@ -637,14 +684,11 @@ where
     let mut cur_level = top;
     loop {
         let ef_c = params.ef_construction as usize;
-        let candidates = search_layer(links, reader, &entry_pts, vector, ef_c, cur_level)?;
+        let candidates = search_layer(
+            links, reader, &mut cache, &entry_pts, vector, ef_c, cur_level,
+        )?;
         let max_m = if cur_level == 0 { params.m0 } else { params.m } as usize;
-        let selected = select_neighbors(&candidates, max_m, |s| {
-            Ok(match read_vector_by_slot(reader.vectors, reader.refs, s)? {
-                Some((m, sc, v)) if m == reader.model && sc == reader.scope => Some(v),
-                _ => None,
-            })
-        })?;
+        let selected = select_neighbors(&candidates, max_m, |s| cache.get(reader, s))?;
 
         write_links(
             links,
@@ -658,7 +702,7 @@ where
             },
         )?;
         for &nbr in &selected {
-            prune_neighbor(links, reader, nbr, slot, cur_level, max_m)?;
+            prune_neighbor(links, reader, &mut cache, nbr, slot, cur_level, max_m)?;
         }
 
         entry_pts = candidates.into_iter().map(|(_, s)| s).collect();
@@ -762,9 +806,19 @@ where
     // it was already >= `own_level` back when this slot was first inserted.
     let level = own_level.min(entry_level);
 
+    // One memo for the whole rewire, mirroring `insert`.
+    let mut cache = VecCache::new();
     let mut descend_level = entry_level;
     while descend_level > level {
-        let hits = search_layer(links, reader, &[entry_slot], vector, 1, descend_level)?;
+        let hits = search_layer(
+            links,
+            reader,
+            &mut cache,
+            &[entry_slot],
+            vector,
+            1,
+            descend_level,
+        )?;
         if let Some(&(_, best)) = hits.iter().find(|&&(_, s)| s != slot) {
             entry_slot = best;
         }
@@ -777,16 +831,13 @@ where
     let mut cur_level = level;
     loop {
         let ef_c = params.ef_construction as usize;
-        let candidates = search_layer(links, reader, &entry_pts, vector, ef_c, cur_level)?;
+        let candidates = search_layer(
+            links, reader, &mut cache, &entry_pts, vector, ef_c, cur_level,
+        )?;
         let filtered: Vec<(OrderedScore, u64)> =
             candidates.into_iter().filter(|&(_, s)| s != slot).collect();
         let max_m = if cur_level == 0 { params.m0 } else { params.m } as usize;
-        let selected = select_neighbors(&filtered, max_m, |s| {
-            Ok(match read_vector_by_slot(reader.vectors, reader.refs, s)? {
-                Some((m, sc, v)) if m == reader.model && sc == reader.scope => Some(v),
-                _ => None,
-            })
-        })?;
+        let selected = select_neighbors(&filtered, max_m, |s| cache.get(reader, s))?;
 
         write_links(
             links,
@@ -881,16 +932,28 @@ where
     R: ReadableTable<&'static [u8], &'static [u8]>,
 {
     let ef_eff = ef.max(k);
+    // Per-query memo: the descent and the level-0 sweep revisit slots
+    // (the entry region especially), and each revisit is a full b-tree
+    // get + postcard decode without it.
+    let mut cache = VecCache::new();
     let mut entry_slot = meta_row.entry_slot;
     let mut cur_level = meta_row.entry_level;
     while cur_level > 0 {
-        let hits = search_layer(links, reader, &[entry_slot], query, 1, cur_level)?;
+        let hits = search_layer(
+            links,
+            reader,
+            &mut cache,
+            &[entry_slot],
+            query,
+            1,
+            cur_level,
+        )?;
         if let Some(&(_, best)) = hits.first() {
             entry_slot = best;
         }
         cur_level -= 1;
     }
-    let hits = search_layer(links, reader, &[entry_slot], query, ef_eff, 0)?;
+    let hits = search_layer(links, reader, &mut cache, &[entry_slot], query, ef_eff, 0)?;
     Ok(hits
         .into_iter()
         .map(|(score, slot)| (slot, score.0))
@@ -1849,8 +1912,8 @@ mod tests {
     /// A `select_neighbors` resolver over a plain slot-indexed table.
     fn table_resolver(
         table: &[Vec<f32>],
-    ) -> impl FnMut(u64) -> Result<Option<Vec<f32>>, TopoError> + '_ {
-        move |slot: u64| Ok(table.get(slot as usize).cloned())
+    ) -> impl FnMut(u64) -> Result<Option<Rc<Vec<f32>>>, TopoError> + '_ {
+        move |slot: u64| Ok(table.get(slot as usize).cloned().map(Rc::new))
     }
 
     /// Candidates scored against `query`, in `search_layer`'s output order
@@ -1974,5 +2037,88 @@ mod tests {
         // graphs (built with closest-M) drain + rebuild on open via
         // `ensure_hnsw_params` instead of silently mixing policies.
         assert_eq!(HnswParams::default().version, 2);
+    }
+
+    // -- Insert-throughput: per-graph-op decoded-vector cache ---------------
+
+    #[test]
+    fn vec_cache_matches_direct_reads_and_caches_misses() {
+        // The cache must be a pure memo over `read_vector_by_slot` + the
+        // cluster check: an in-cluster slot resolves to the identical
+        // vector, an out-of-cluster or absent slot resolves to None, and
+        // BOTH outcomes are served from memory on the second ask (pinned
+        // by dropping the underlying rows between the two asks — a cache
+        // that re-reads would see the mutation; the graph-op contract is
+        // point-in-time stability within one op).
+        let model = 1;
+        let scope = 1;
+        let (_dir, db) = open_db();
+        let v0 = unit2(5.0);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut vtab = tx.open_table(VECTORS).unwrap();
+            let mut rtab = tx.open_table(EMBEDDING_REF).unwrap();
+            put_vector(&mut vtab, &mut rtab, model, scope, 0, &v0).unwrap();
+            put_vector(&mut vtab, &mut rtab, 9, 9, 1, &unit2(8.0)).unwrap();
+
+            let reader = GraphReader {
+                vectors: &vtab,
+                refs: &rtab,
+                model,
+                scope,
+            };
+            let mut cache = VecCache::new();
+            assert_eq!(
+                cache.get(&reader, 0).unwrap().as_deref(),
+                Some(&v0),
+                "in-cluster slot resolves to the stored vector"
+            );
+            assert_eq!(
+                cache.get(&reader, 1).unwrap(),
+                None,
+                "cross-cluster slot is unresolvable in this reader's cluster"
+            );
+            assert_eq!(cache.get(&reader, 2).unwrap(), None, "absent slot is None");
+        }
+        tx.commit().unwrap();
+
+        // Second round against tables where slot 0's rows are GONE: hits
+        // must come from the cache, proving no re-read happens.
+        let tx = db.begin_write().unwrap();
+        {
+            let mut vtab = tx.open_table(VECTORS).unwrap();
+            let mut rtab = tx.open_table(EMBEDDING_REF).unwrap();
+            let mut cache = VecCache::new();
+            {
+                let reader = GraphReader {
+                    vectors: &vtab,
+                    refs: &rtab,
+                    model,
+                    scope,
+                };
+                assert_eq!(cache.get(&reader, 0).unwrap().as_deref(), Some(&v0));
+            }
+            crate::vector_store::remove_vector(&mut vtab, &mut rtab, 0).unwrap();
+            {
+                let reader = GraphReader {
+                    vectors: &vtab,
+                    refs: &rtab,
+                    model,
+                    scope,
+                };
+                assert_eq!(
+                    cache.get(&reader, 0).unwrap().as_deref(),
+                    Some(&v0),
+                    "cached hit survives row removal — served from memory"
+                );
+                let mut fresh = VecCache::new();
+                assert_eq!(
+                    fresh.get(&reader, 0).unwrap(),
+                    None,
+                    "a fresh cache sees the removal"
+                );
+            }
+        }
+        tx.commit().unwrap();
     }
 }
