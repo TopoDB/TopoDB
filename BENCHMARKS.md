@@ -624,6 +624,21 @@ distance concentration (both fail — ef tuning is the arc's next lever, only
 after the realistic gate row is green). Insert throughput cost of the
 heuristic is ~1.8× — tracked as its own optimization item.
 
+Insert-throughput follow-up (2026-08-06): profiling put ~40% of build time
+in redundant vector fetch (redb b-tree navigation + postcard decode of the
+same slots across levels, selection, and pruning within one insert), so
+graph ops now memoize decoded vectors for their own duration (`VecCache`,
+per-op — never across ops). Measured on same-graph builds: 20k×384 manifold
+218.7 s → 119.7 s (~1.83×, faster than the closest-M build ever was);
+100k×384 manifold 1451 s → 1084 s (~1.34× — per-insert search breadth grows
+with N, diluting the dedup win); query path unchanged-to-slightly-better.
+
+Measurement hygiene, learned the hard way: the dev machine has 8 GB RAM and
+the 100k fixture is 514 MB — a report run against a partially evicted page
+cache measures DISK, not the graph (observed p95 inflating 8 ms → 45 ms
+run-to-run; `cat` the fixture to /dev/null first, then the numbers
+reproduce). Latency rows in this table are warm-file numbers.
+
 Honesty note on the geometry bracket: the 32-cluster manifold corpus is the
 BENIGN end of realistic (strong cluster separation makes top-10 mostly
 within-cluster, so recall 1.0000 is believable, not too-good-to-be-true),
@@ -650,7 +665,7 @@ TOPODB_VEC_FIXTURE_N=1000000 TOPODB_VEC_DIM=384 cargo test -p topodb --release -
 | # | gate | target | measured | verdict |
 |---:|---|---|---|---|
 | 1 | warm scoped search, 10k×768 k=10, graph (`search_warm_10k_scope_graph`) vs scan baseline (`search_warm_10k_scope_scan_baseline`) | graph ≤ scan; recall cross-check green | v1 closest-M: graph 10.99 ms ≈ scan 11.03 ms (parity). **Re-run pending under params v2** | pending (v2) |
-| 2a | 100k×384 k=10 `vector_search_report`, **manifold** geometry (the realistic recall gate): p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | v2 heuristic, 2026-08-05: **recall@10 = 1.0000**, p95 = 8.38 ms (median 6.60, max 12.42); build 1451 s (~69 inserts/s, resumable in 4 rounds) | **PASS (v2)** |
+| 2a | 100k×384 k=10 `vector_search_report`, **manifold** geometry (the realistic recall gate): p95 latency + recall@10 | recall ≥ 0.95 (hard-asserted by the harness) | v2 heuristic: **recall@10 = 1.0000**, warm p95 8.4–10.3 ms (median ~6.6) across same-graph runs; build 1451 s (~69 inserts/s) pre-cache → **1084 s (~92 inserts/s)** with the decoded-vector cache (2026-08-06) | **PASS (v2)** |
 | 2b | 100k×384 k=10 `vector_search_report`, uniform geometry (stressor: distance-concentration worst case, informational) | record honestly; ≥ 0.95 not expected at ef 64 on this geometry — ef tuning is the next lever | v1 closest-M: recall@10 **0.078 — FAILED**, the trigger for the heuristic-selection change above | stressor |
 | 3 | 1M×384 k=10 `vector_search_report`: p95 ≤ 25 ms, recall@10 ≥ 0.95 (spec acceptance #1) | p95 ≤ 25 ms; recall ≥ 0.95 | **pending — disk-blocked at merge time** | pending |
 | 4 | `SetEmbedding` insert overhead, graph vs scan cluster | measured and published, not hidden | **pending** — derive from `submit_1k_workload` + the fixture-pair build logs on the same run | pending |
