@@ -123,7 +123,9 @@ transaction, committed once at the very end:
 | > 8 | `TopoError::UnsupportedFormat { found, supported: 8 }` — `Some(found) if found > FORMAT_VERSION` |
 | anything else (currently only 0, which can't occur since real versions start at 1) | `TopoError::Encoding` — `Some(found)` catch-all arm |
 
-The `Some(5)` and `Some(4)` arms both call `migrate_v6::migrate_v5_to_v6` —
+Of the arms that don't already reach it through their chained
+`migrate_v4` sequence (the `Some(3)`/`Some(2)`/`Some(1)` rows above), the
+`Some(5)` and `Some(4)` arms call `migrate_v6::migrate_v5_to_v6` directly —
 `Some(4)` because it jumps straight to the current `FORMAT_VERSION` and
 cannot fall through to the `Some(5)` arm above, which only ever runs for a
 file genuinely stamped 5. `Some(6)` needs no such call: a v6-stamped file
