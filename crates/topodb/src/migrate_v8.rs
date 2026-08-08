@@ -26,7 +26,7 @@ pub(crate) fn quantize_vectors(tx: &WriteTransaction) -> Result<(), TopoError> {
                 .map_err(|e| TopoError::Encoding(format!("v8 vectors migration: {e}")))?;
             let (scale, codes) = quant::quantize(&vec);
             let out = postcard::to_allocvec(&(scale, codes))
-                .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                .map_err(|e| TopoError::Encoding(format!("v8 vectors migration: {e}")))?;
             rewrites.push((k.value().to_vec(), frame_value(out)));
         }
     }

@@ -255,7 +255,7 @@ fn unsupported_format_version_errors_at_open() {
     match Db::open(path) {
         Err(TopoError::UnsupportedFormat {
             found: 999,
-            supported: 7,
+            supported: 8,
         }) => {}
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
