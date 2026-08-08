@@ -1,4 +1,4 @@
-# TopoDB on-disk format (v7)
+# TopoDB on-disk format (v8)
 
 This is the durable contract for a TopoDB redb file. Code wins if it differs
 from this document. Ten fixtures under `crates/topodb/tests/fixtures/` pin
@@ -39,7 +39,15 @@ this contract:
 
 ## Version and migration
 
-`storage::FORMAT_VERSION` is **7**. v7 (F8, HNSW) adds exactly **two derived
+`storage::FORMAT_VERSION` is **8**. v8 (F8, SQ8) changes **no table's set or
+keying** — only the `vectors` table's VALUE encoding, from framed postcard
+`Vec<f32>` to framed postcard `(f32, Vec<i8>) = (scale, codes)` — plus the
+`"hnsw_params"` version stamp (2 → 3), since the graph's scoring metric moves
+to integer cosine over the new codes. See "SQ8 quantization," below, for the
+full change; the rest of this section (v7's HNSW tables, v6/v5's additions)
+is retained for its migration-chain detail.
+
+v7 (F8, HNSW) adds exactly **two derived
 tables** — `HNSW_META`/`HNSW_LINKS` (see "HNSW," below) — plus one META stamp,
 `"hnsw_params"` (postcard `hnsw::HnswParams`). No existing table's layout
 changes. Both new tables are opened unconditionally by every open (harmless
@@ -604,6 +612,7 @@ dependence anywhere in the module.
 - **Zero-norm doctrine** survives byte-for-byte: all-zero codes ⟺ zero-norm, zero-norm rows never rank, the equivalence is pinned by tests (see "Determinism & edge cases," below).
 - **User-visible cosine scores** are now quantized (computed from codes, not exact f32). The ops log stores raw `SetEmbedding` ops with exact f32 forever; replay is the source of truth. `NodeRecord.embedding` returns the dequantized vector (≈original magnitudes, re-quantization is idempotent).
 - **`hnsw_params` version** changes from 2 → 3 (v3 = "heuristic selection + SQ8 symmetric-integer cosine"); v2-stamped graphs (the old closest-M selection policy) mismatch on open and are drained and rebuilt by the existing reconcile (see "Version and migration," above).
+- **Migration memory** (`migrate_v8::quantize_vectors`): redb tables cannot be mutated mid-iteration, so the v7→v8 pass collects every `(key, re-encoded value)` pair from one full `VECTORS` scan before writing any of them back — a transient buffer of ~450 MB at the 1M-row × 384-dim tier. Acceptable for a one-time migration pass on the machines this ships to; `hnsw::build_cluster`'s graph rebuild that the same open may trigger is streamed instead (see "Version and migration," above), so it does not compound this cost.
 - **History dependence** (same as v7 HNSW): exact graph sequence and idempotence (`rebuild_state_from_ops` reproduces byte-identical files) hold because graph construction lives inside `apply_op`'s opcode-replay path, with no RNG, wall-clock, or scheduled non-determinism — even when quantized vectors replace exact f32, the replay sequence is the same.
 
 **Postings** (`fts.rs`, chunked layout — v4): a term's postings under one
