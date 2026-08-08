@@ -11,10 +11,23 @@
 //! - every op is IEEE-exact (mul/div/abs/round/sqrt/saturating casts) —
 //!   no libm, bit-stable across platforms; `cosine_q`'s accumulation is
 //!   pure i64 integer math.
-//! - non-finite inputs (unreachable from the live applier, storage.rs:2862;
-//!   possible only in pre-v4-era migrated rows) degrade DETERMINISTICALLY:
-//!   NaN components code to 0 (saturating cast), a non-finite maxabs
-//!   yields the zero vector encoding.
+//! - non-finite inputs (unreachable from the live applier — storage.rs's
+//!   `SetEmbedding` arm rejects them before they ever reach here, currently
+//!   at storage.rs:2903; if the line has drifted, find it by content, the
+//!   "non-finite component" reject — possible only in pre-v4-era migrated
+//!   rows) degrade DETERMINISTICALLY: NaN components code to 0 (saturating
+//!   cast), a non-finite maxabs yields the zero vector encoding.
+//! - denormal-scale edge: when `maxabs` is below ~127/f32::MAX (~3.7e-38),
+//!   `s = 127.0 / maxabs` overflows to `+Inf`; `finite_nonzero * Inf = Inf`
+//!   (sign-adjusted), so EVERY nonzero component's product is `±Inf`, and
+//!   the saturating cast maps that to code `±127` — while an exact-zero
+//!   component's product is `0.0 * Inf = NaN`, which the same saturating
+//!   cast maps to code `0`, same as always. Still deterministic, and the
+//!   zero-norm-iff-input-zero doctrine still holds (an all-denormal vector
+//!   does not code to all-zero), but intra-vector MAGNITUDE structure is
+//!   lost — every nonzero component collapses to the same code magnitude
+//!   regardless of how much smaller it was than `maxabs` — and the applier
+//!   does not reject these inputs (they are finite, merely denormal-small).
 
 pub(crate) fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
     let mut maxabs = 0.0f32;
@@ -89,6 +102,13 @@ mod tests {
         assert!(is_zero(&codes));
         assert_eq!(codes.len(), 5);
         assert!(cosine_q(&codes, &codes).is_none());
+    }
+
+    #[test]
+    fn empty_slice_edge() {
+        assert_eq!(quantize(&[]), (0.0, vec![]));
+        assert!(is_zero(&[]));
+        assert!(cosine_q(&[], &[]).is_none());
     }
 
     #[test]

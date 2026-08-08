@@ -771,11 +771,12 @@ The v7-equivalent per-vector byte count was **not re-measured** — opening
 the old v7 fixture under this v8 binary would migrate it in place
 (`migrate_v8::quantize_vectors`), destroying it as a v7 reference before it
 could be read. Computed instead from the unchanged encoding path
-(`migrate_v8.rs`, `codec::frame_value`): raw `Vec<f32>` postcard is 2 bytes
-(length prefix) + 384×4 = 1536 bytes = 1538 bytes, ≥512 so `frame_value`
-*attempts* LZ4 (`CODEC_LZ4` wins only if it beats 90% of raw); untried
-against the actual v7 bytes, so 1539 bytes (`CODEC_RAW` fallback, 1-byte
-tag) is reported as a computed estimate, not a measured figure. That gives
+(`migrate_v8.rs`, `codec::frame_value`): raw `Vec<f32>` postcard is a 2-byte
+length prefix + 1536 data bytes (384 × 4-byte `f32`) = 1538 bytes, ≥512 so
+`frame_value` *attempts* LZ4 (`CODEC_LZ4` wins only if it beats 90% of raw);
+untried against the actual v7 bytes, so 1539 bytes (1538 + 1-byte
+`CODEC_RAW` fallback tag) is reported as a computed estimate, not a
+measured figure. That gives
 **391 / 1539 ≈ 0.254×, i.e. ~3.9× smaller** for the vectors table alone —
 consistent with the ~4× SQ8 design target.
 
@@ -807,6 +808,16 @@ measured): graph is ~5.3% faster than the honest linear-scan baseline at
 10k×768, similar parity to the v1 closest-M numbers this gate first
 recorded (10.99 ms ≈ 11.03 ms), not a regression from SQ8's added
 quantize/dequantize step.
+
+Honesty note on wall-clock cost, not correctness: this 10k×768-pair
+criterion run took **~30+ minutes wall clock** on this machine — longer than
+naive linear scaling from smaller pairs would suggest. It completed cleanly
+(no errors, no timeout, no retries) and the numbers above are trusted; the
+extra wall-clock cost was not root-caused (candidate causes not
+investigated: criterion's own warm-up/sampling overhead at this problem
+size, thermal throttling over a long run, or something specific to the
+graph-vs-scan pair setup) and is flagged here rather than silently
+absorbed.
 
 ### Honesty notes
 
