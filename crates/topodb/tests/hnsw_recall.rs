@@ -45,33 +45,56 @@ fn seed_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Bit-for-bit the same cosine formula the engine scores with
-/// (`vector_store::cosine` / `differential.rs:279`'s oracle) — copied
-/// verbatim rather than calling into the crate, so this brute-force oracle
-/// can never accidentally share a bug with the code under test.
-fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b) {
+/// Bit-for-bit the same SQ8 quantize + integer-cosine formula the engine
+/// scores with (`quant.rs`'s `quantize`/`cosine_q`) — copied verbatim rather
+/// than calling into the crate, so this brute-force oracle can never
+/// accidentally share a bug with the code under test.
+fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
+    let mut maxabs = 0.0f32;
+    for &x in v {
+        let a = x.abs();
+        if a > maxabs {
+            maxabs = a;
+        }
+    }
+    if maxabs == 0.0 || !maxabs.is_finite() {
+        return (0.0, vec![0i8; v.len()]);
+    }
+    let s = 127.0f32 / maxabs;
+    let codes = v
+        .iter()
+        .map(|&x| ((x * s).round() as i32).clamp(-127, 127) as i8)
+        .collect();
+    (maxabs, codes)
+}
+
+fn cosine_q(a: &[i8], b: &[i8]) -> Option<f32> {
+    let (mut dot, mut na, mut nb) = (0i64, 0i64, 0i64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (x, y) = (i64::from(x), i64::from(y));
         dot += x * y;
         na += x * x;
         nb += y * y;
     }
-    if na == 0.0 || nb == 0.0 {
+    if na == 0 || nb == 0 {
         return None;
     }
-    Some(dot / (na.sqrt() * nb.sqrt()))
+    Some(dot as f32 / ((na as f32).sqrt() * (nb as f32).sqrt()))
 }
 
 /// Brute-force top-`k` node indices (into `vectors`) for `query`, ordered
 /// `(score desc, index asc)` — the same tie-break the engine's `search_vector`
 /// applies after resolving `NodeId`s (index here stands in for creation
 /// order, which is what `NodeId` order collapses to for this fixture's
-/// monotonically-created ids).
+/// monotonically-created ids). Scored via the same-metric oracle: both sides
+/// quantized to SQ8 codes and compared with `cosine_q`, matching what the
+/// engine itself scores the graph with.
 fn brute_force_top_k(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<usize> {
+    let qquery = quantize(query).1;
     let mut scored: Vec<(usize, f32)> = vectors
         .iter()
         .enumerate()
-        .filter_map(|(i, v)| cosine(query, v).map(|s| (i, s)))
+        .filter_map(|(i, v)| cosine_q(&qquery, &quantize(v).1).map(|s| (i, s)))
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     scored.truncate(k);
