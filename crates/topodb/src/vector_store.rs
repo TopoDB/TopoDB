@@ -29,7 +29,7 @@ pub(crate) const VECTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("
 /// Per-node pointer to its current `(model, scope)`: 8-byte BE node slot ->
 /// postcard `(u32, u32)`. Small fixed-size value — not framed; framing exists
 /// to lz4-compress large payloads and a `(u32, u32)` never crosses that
-/// threshold. Lets `put_vector`/`remove_vector`/`read_vector_by_slot` find a
+/// threshold. Lets `put_vector`/`remove_vector`/`read_qvec_by_slot` find a
 /// node's `vectors` row (old or current) in O(1) instead of a scan.
 pub(crate) const EMBEDDING_REF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("embedding_ref");
@@ -69,7 +69,7 @@ fn encode_ref(model: u32, scope: u32) -> Result<Vec<u8>, TopoError> {
 
 /// `pub(crate)` so `db.rs`'s `debug_dump_embedding_ref` seam can decode
 /// `EMBEDDING_REF` rows with the exact same logic `put_vector`/
-/// `remove_vector`/`read_vector_by_slot` use, rather than a second,
+/// `remove_vector`/`read_qvec_by_slot` use, rather than a second,
 /// possibly-drifting decoder.
 pub(crate) fn decode_ref(bytes: &[u8]) -> Result<(u32, u32), TopoError> {
     postcard::from_bytes(bytes).map_err(|e| TopoError::Encoding(e.to_string()))
@@ -187,41 +187,9 @@ pub(crate) fn read_qvec_by_slot(
             Ok(Some((model, scope, scale, codes)))
         }
         None => Err(TopoError::Encoding(
-            "read_vector_by_slot: embedding_ref present but vectors row missing".into(),
+            "read_qvec_by_slot: embedding_ref present but vectors row missing".into(),
         )),
     }
-}
-
-/// TRANSITIONAL (deleted once hnsw.rs/storage.rs move to
-/// `read_qvec_by_slot`): pre-v8 signature, dequantizing on the fly.
-pub(crate) fn read_vector_by_slot(
-    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    slot: u64,
-) -> Result<Option<(u32, u32, Vec<f32>)>, TopoError> {
-    Ok(read_qvec_by_slot(vectors, refs, slot)?
-        .map(|(m, s, scale, codes)| (m, s, crate::quant::dequantize(scale, &codes))))
-}
-
-/// Bit-for-bit the same cosine formula the v3 RAM slab scored with
-/// (`vector.rs`'s old `Slab::top_k`, relocated here for the Task 5 disk read
-/// path): a single accumulation pass over `a.iter().zip(b)`, `None` when
-/// either side's squared-norm accumulator is exactly `0.0` — the zero-norm
-/// skip. Every scored row in [`search_scan`] is routed through this, never a
-/// hand-rolled dot product. `pub(crate)` (not private) because `hnsw.rs`
-/// shares this exact formula for its own scoring/zero-norm detection rather
-/// than duplicating it.
-pub(crate) fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return None;
-    }
-    Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
 /// A total order over `f32` scores via [`f32::total_cmp`] — `f32` isn't
@@ -334,7 +302,7 @@ pub(crate) fn push_topk(
 ///   differential reference model's per-embedding skip. Implemented as a
 ///   skip to match; see the Task 5 report.)
 /// - `q.candidates`, when set, restricts scoring to those `NodeId`s (deduped,
-///   like the old RAM-slab filter) via `read_vector_by_slot`'s O(1)
+///   like the old RAM-slab filter) via `read_qvec_by_slot`'s O(1)
 ///   per-candidate lookup rather than a range scan — the candidates fast
 ///   path.
 ///
@@ -522,7 +490,7 @@ mod tests {
     }
 
     /// Bounded prefix scan over exactly one `(model, scope)` cluster —
-    /// standalone here (rather than reusing `read_vector_by_slot`) because
+    /// standalone here (rather than reusing `read_qvec_by_slot`) because
     /// the whole point is to prove NO ORPHAN rows exist anywhere in that
     /// range, not just that one particular slot resolves correctly.
     fn cluster_rows(
@@ -566,8 +534,9 @@ mod tests {
         assert_eq!((model, scope), (1, 2));
         assert_eq!(scale, 2.0);
         assert_eq!(codes, vec![32i8, -127, 64]);
-        // Compat wrapper returns the dequantized approximation of v.
-        let (_, _, approx) = read_vector_by_slot(&vectors, &refs, 7).unwrap().unwrap();
+        // `dequantize` recovers the approximation of v from the stored
+        // (scale, codes) pair.
+        let approx = crate::quant::dequantize(scale, &codes);
         for (a, b) in approx.iter().zip(&v) {
             assert!((a - b).abs() <= b.abs() * 0.01 + 1e-6, "{a} vs {b}");
         }
@@ -651,7 +620,7 @@ mod tests {
         let tx = db.begin_read().unwrap();
         let vectors = tx.open_table(VECTORS).unwrap();
         let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        assert!(read_vector_by_slot(&vectors, &refs, 7).unwrap().is_none());
+        assert!(read_qvec_by_slot(&vectors, &refs, 7).unwrap().is_none());
 
         // Also a no-op (not an error) on a slot with no ref at all.
         let tx = db.begin_write().unwrap();
@@ -664,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn read_vector_by_slot_never_embedded_is_none() {
+    fn read_qvec_by_slot_never_embedded_is_none() {
         let (_dir, db) = open();
         let tx = db.begin_write().unwrap();
         {
@@ -676,7 +645,7 @@ mod tests {
         let tx = db.begin_read().unwrap();
         let vectors = tx.open_table(VECTORS).unwrap();
         let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        assert!(read_vector_by_slot(&vectors, &refs, 42).unwrap().is_none());
+        assert!(read_qvec_by_slot(&vectors, &refs, 42).unwrap().is_none());
     }
 
     // -- Task 5 Step 1: streaming-heap top-k ≡ sort-and-truncate -----------

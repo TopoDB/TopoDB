@@ -251,7 +251,7 @@ mod tests {
     use crate::slots::{alloc_node_slot, node_slot, NODE_IDS, NODE_SLOTS};
     use crate::state::NodeRecord;
     use crate::storage::{EMBEDDINGS, META, NODES, VECTOR_DIMS};
-    use crate::vector_store::{read_vector_by_slot, EMBEDDING_REF, VECTORS};
+    use crate::vector_store::{read_qvec_by_slot, EMBEDDING_REF, VECTORS};
     use redb::Database;
 
     /// Old (pre-Task-6) single-row postings encode, mirroring the deleted
@@ -377,15 +377,15 @@ mod tests {
         let tx = db.begin_read().unwrap();
         let vectors = tx.open_table(VECTORS).unwrap();
         let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        let (model_id, got_scope, vector) = read_vector_by_slot(&vectors, &refs, slot)
+        let (model_id, got_scope, got_scale, got_codes) = read_qvec_by_slot(&vectors, &refs, slot)
             .unwrap()
             .expect("vectors pass must populate the v4 tables");
         assert_eq!(got_scope, scope_id);
-        // v8: `read_vector_by_slot` dequantizes the SQ8-quantized codes
-        // `put_vector` wrote, so the expected value is
-        // `dequantize(quantize(v))`, not the raw input `v`.
+        // v8: `put_vector` SQ8-quantizes on write, so the expected codes are
+        // `quantize(v)`, not the raw input `v`.
         let (scale, codes) = crate::quant::quantize(&[1.0f32, 2.0, 3.0]);
-        assert_eq!(vector, crate::quant::dequantize(scale, &codes));
+        assert_eq!(got_scale, scale);
+        assert_eq!(got_codes, codes);
         let dict_table = tx.open_table(DICT).unwrap();
         let dicts = Dicts::load_from_table(&dict_table).unwrap();
         assert_eq!(dicts.resolve(DictKind::Model, model_id).unwrap(), "m1");
