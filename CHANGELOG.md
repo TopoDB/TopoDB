@@ -14,6 +14,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### 0.0.13 — TBD
+
+#### Added
+
+- **Format v8: scalar-quantized vectors (SQ8)** — embeddings are stored as signed 8-bit max-abs codes plus scale (~4× smaller vector storage); scoring uses symmetric integer cosine on both scan and HNSW paths, enabling faster inserts and graph builds. Existing files migrate in place on open; HNSW graphs rebuild (params v3). Cosine scores are now computed over quantized codes; `NodeRecord.embedding` returns the dequantized (≈original) vector.
+
 ### 0.0.12 — 2026-07-27
 
 #### Added
