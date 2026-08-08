@@ -20,6 +20,7 @@ mod op;
 mod ppr;
 mod prop_index;
 mod props;
+mod quant;
 mod read;
 mod recall;
 mod scopes;
