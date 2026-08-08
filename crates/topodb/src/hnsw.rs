@@ -6,8 +6,9 @@
 use crate::codec::{frame_value, unframe_value};
 use crate::error::{storage_err, TopoError};
 use crate::ids::NodeId;
+use crate::quant::{cosine_q, is_zero, quantize};
 use crate::slots::node_ulid;
-use crate::vector_store::{cosine, read_vector_by_slot, vector_prefix, OrderedScore};
+use crate::vector_store::{read_qvec_by_slot, vector_prefix, OrderedScore};
 use redb::{ReadableTable, Table, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -51,8 +52,11 @@ impl Default for HnswParams {
         HnswParams {
             // v2: heuristic neighbor selection (keep-pruned-connections)
             // replaced closest-M — a write-side structure change, so v1
-            // graphs drain + rebuild on open via `ensure_hnsw_params`.
-            version: 2,
+            // graphs drain + rebuild on open via `ensure_hnsw_params`. v3:
+            // heuristic selection + SQ8 symmetric-integer cosine; SQ8
+            // changes every score the graph is built from, so pre-v8 graphs
+            // MUST drain+rebuild rather than silently mixing metrics.
+            version: 3,
             m: 16,
             m0: 32,
             ef_construction: 128,
@@ -261,9 +265,9 @@ where
     pub scope: u32,
 }
 
-/// Per-graph-op decoded-vector memo over `read_vector_by_slot` + the
+/// Per-graph-op decoded-codes memo over `read_qvec_by_slot` + the
 /// cluster check. Profiling the 20k×384 build put ~40% of insert time in
-/// vector fetch (redb b-tree navigation + postcard `Vec<f32>` decode), and
+/// vector fetch (redb b-tree navigation + postcard decode), and
 /// one insert asks for the same slot's vector repeatedly: once per visited
 /// slot per level in `search_layer`, again in `select_neighbors`'s
 /// resolver, and again inside every `prune_neighbor` call (whose candidate
@@ -279,7 +283,7 @@ where
 /// iterated), per the module's determinism rules; `Rc` because one op is
 /// strictly single-threaded (the applier).
 pub(crate) struct VecCache {
-    map: HashMap<u64, Option<Rc<Vec<f32>>>>,
+    map: HashMap<u64, Option<Rc<Vec<i8>>>>,
 }
 
 impl VecCache {
@@ -293,7 +297,7 @@ impl VecCache {
         &mut self,
         reader: &GraphReader<'_, V, R>,
         slot: u64,
-    ) -> Result<Option<Rc<Vec<f32>>>, TopoError>
+    ) -> Result<Option<Rc<Vec<i8>>>, TopoError>
     where
         V: ReadableTable<&'static [u8], &'static [u8]>,
         R: ReadableTable<&'static [u8], &'static [u8]>,
@@ -301,8 +305,10 @@ impl VecCache {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(hit.clone());
         }
-        let resolved = match read_vector_by_slot(reader.vectors, reader.refs, slot)? {
-            Some((m, s, v)) if m == reader.model && s == reader.scope => Some(Rc::new(v)),
+        let resolved = match read_qvec_by_slot(reader.vectors, reader.refs, slot)? {
+            Some((m, s, _scale, codes)) if m == reader.model && s == reader.scope => {
+                Some(Rc::new(codes))
+            }
             _ => None,
         };
         self.map.insert(slot, resolved.clone());
@@ -325,7 +331,7 @@ fn search_layer<V, R>(
     reader: &GraphReader<'_, V, R>,
     cache: &mut VecCache,
     entry_pts: &[u64],
-    query: &[f32],
+    query: &[i8],
     ef: usize,
     level: u8,
 ) -> Result<Vec<(OrderedScore, u64)>, TopoError>
@@ -373,7 +379,7 @@ where
         // Resolution goes through the op's `VecCache` — same value, decoded
         // at most once per op.
         let scoreable = match cache.get(reader, slot)? {
-            Some(v) => cosine(query, &v),
+            Some(v) => cosine_q(query, &v),
             None => None,
         };
         match scoreable {
@@ -458,9 +464,9 @@ fn select_neighbors<F>(
     mut resolve: F,
 ) -> Result<Vec<u64>, TopoError>
 where
-    F: FnMut(u64) -> Result<Option<Rc<Vec<f32>>>, TopoError>,
+    F: FnMut(u64) -> Result<Option<Rc<Vec<i8>>>, TopoError>,
 {
-    let mut kept: Vec<(u64, Rc<Vec<f32>>)> = Vec::with_capacity(max_m.min(candidates.len()));
+    let mut kept: Vec<(u64, Rc<Vec<i8>>)> = Vec::with_capacity(max_m.min(candidates.len()));
     let mut pruned: Vec<u64> = Vec::new();
     for &(score, slot) in candidates {
         if kept.len() >= max_m {
@@ -469,7 +475,7 @@ where
         let Some(v) = resolve(slot)? else {
             continue;
         };
-        let diverse = kept.iter().all(|(_, kv)| match cosine(&v, kv) {
+        let diverse = kept.iter().all(|(_, kv)| match cosine_q(&v, kv) {
             Some(sim_to_kept) => OrderedScore(sim_to_kept) < score,
             None => true,
         });
@@ -537,7 +543,7 @@ where
                     // — it is purely selecting which neighbors to KEEP, so a
                     // mismatch is simply dropped from the retained set.
                     if let Some(cv) = cache.get(reader, cand)? {
-                        if let Some(score) = cosine(&nv, &cv) {
+                        if let Some(score) = cosine_q(&nv, &cv) {
                             scored.push((OrderedScore(score), cand));
                         }
                     }
@@ -572,7 +578,7 @@ where
 
 /// Inserts `slot` (with pre-resolved `vector`) into the `(reader.model,
 /// reader.scope)` graph. `id` is used ONLY for `level_for` — never for
-/// ordering. A zero-norm vector (`cosine(vector, vector) == None`) is a
+/// ordering. A zero-norm vector (`is_zero(&quantize(vector).1)`) is a
 /// deliberate no-op: it can never usefully route or be routed to, so it must
 /// never touch `links`/`meta`. First node in an (absent-meta) cluster
 /// bootstraps `meta` directly; every later node greedily descends from the
@@ -594,8 +600,9 @@ where
     V: ReadableTable<&'static [u8], &'static [u8]>,
     R: ReadableTable<&'static [u8], &'static [u8]>,
 {
-    if cosine(vector, vector).is_none() {
-        return Ok(()); // zero-norm: never enters the graph.
+    let (_, qvector) = quantize(vector);
+    if is_zero(&qvector) {
+        return Ok(()); // zero-norm: never enters the graph (all-zero codes ⟺ zero input).
     }
 
     // One decoded-vector memo for this whole insert: descent, per-level
@@ -649,7 +656,7 @@ where
             reader,
             &mut cache,
             &[entry_slot],
-            vector,
+            &qvector,
             1,
             descend_level,
         )?;
@@ -685,7 +692,7 @@ where
     loop {
         let ef_c = params.ef_construction as usize;
         let candidates = search_layer(
-            links, reader, &mut cache, &entry_pts, vector, ef_c, cur_level,
+            links, reader, &mut cache, &entry_pts, &qvector, ef_c, cur_level,
         )?;
         let max_m = if cur_level == 0 { params.m0 } else { params.m } as usize;
         let selected = select_neighbors(&candidates, max_m, |s| cache.get(reader, s))?;
@@ -783,7 +790,8 @@ where
         return Ok(()); // never actually graph-inserted: caller should `insert` instead.
     }
 
-    if cosine(vector, vector).is_none() {
+    let (_, qvector) = quantize(vector);
+    if is_zero(&qvector) {
         // Zero-norm re-embed: the slot can no longer usefully route or be
         // routed to, so stop ranking it — same outcome as an explicit
         // removal, reusing `tombstone` rather than duplicating its logic.
@@ -815,7 +823,7 @@ where
             reader,
             &mut cache,
             &[entry_slot],
-            vector,
+            &qvector,
             1,
             descend_level,
         )?;
@@ -832,7 +840,7 @@ where
     loop {
         let ef_c = params.ef_construction as usize;
         let candidates = search_layer(
-            links, reader, &mut cache, &entry_pts, vector, ef_c, cur_level,
+            links, reader, &mut cache, &entry_pts, &qvector, ef_c, cur_level,
         )?;
         let filtered: Vec<(OrderedScore, u64)> =
             candidates.into_iter().filter(|&(_, s)| s != slot).collect();
@@ -912,9 +920,9 @@ pub(crate) fn ef_search(k: usize) -> usize {
 /// `(score desc, NodeId asc)` re-sort themselves (`vector.rs`, as today).
 ///
 /// A zero-norm `query` yields an EMPTY result by design, not an error:
-/// `search_layer`'s `seed` closure drops every candidate whose `cosine`
+/// `search_layer`'s `seed` closure drops every candidate whose `cosine_q`
 /// score is `None` (the module-wide zero-norm-skip rule shared with
-/// `insert`), and `cosine(query, _)` is `None` for every candidate when
+/// `insert`), and `cosine_q(query, _)` is `None` for every candidate when
 /// `query` itself has zero norm — so both the greedy descend and the final
 /// level-0 search visit no candidate and `results` stays empty all the way
 /// through. See `zero_norm_query_yields_empty_result` below for the pinned
@@ -932,6 +940,7 @@ where
     R: ReadableTable<&'static [u8], &'static [u8]>,
 {
     let ef_eff = ef.max(k);
+    let (_, qquery) = quantize(query);
     // Per-query memo: the descent and the level-0 sweep revisit slots
     // (the entry region especially), and each revisit is a full b-tree
     // get + postcard decode without it.
@@ -944,7 +953,7 @@ where
             reader,
             &mut cache,
             &[entry_slot],
-            query,
+            &qquery,
             1,
             cur_level,
         )?;
@@ -953,7 +962,7 @@ where
         }
         cur_level -= 1;
     }
-    let hits = search_layer(links, reader, &mut cache, &[entry_slot], query, ef_eff, 0)?;
+    let hits = search_layer(links, reader, &mut cache, &[entry_slot], &qquery, ef_eff, 0)?;
     Ok(hits
         .into_iter()
         .map(|(score, slot)| (slot, score.0))
@@ -1114,16 +1123,21 @@ where
             .map_err(|_| TopoError::Encoding("bad vector_key length".into()))?;
         let slot = u64::from_be_bytes(slot_bytes);
         let raw = unframe_value(value_guard.value())?;
-        let vector: Vec<f32> =
+        let (scale, codes): (f32, Vec<i8>) =
             postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
         drop(key_guard);
         drop(value_guard);
-        if cosine(&vector, &vector).is_none() {
+        if is_zero(&codes) {
             continue; // zero-norm: skip before even resolving a NodeId.
         }
         let Some(id) = node_ulid(node_ids, slot)? else {
             continue; // no ULID mapping for this slot: cannot compute level_for.
         };
+        // `insert` takes `vector: &[f32]` and quantizes internally; the
+        // dequantize→quantize round-trip is exact (see quant.rs's doc
+        // comment), so this reproduces the identical `codes` `insert` would
+        // score with.
+        let vector = crate::quant::dequantize(scale, &codes);
         insert(links, meta, reader, params, slot, id, &vector)?;
     }
     Ok(())
@@ -1293,19 +1307,20 @@ mod tests {
     }
 
     /// Brute-force top-k over `entries` (excluding any slot in `tombstoned`),
-    /// scored with the SAME `cosine` HNSW uses, ordered `(score desc via
-    /// `OrderedScore`/`total_cmp`, slot asc)` — the reference oracle
-    /// `insert`+`search` are checked against.
+    /// scored with the SAME `quantize`+`cosine_q` HNSW uses, ordered
+    /// `(score desc via `OrderedScore`/`total_cmp`, slot asc)` — the
+    /// reference oracle `insert`+`search` are checked against.
     fn brute_force(
         entries: &[(u64, Vec<f32>)],
         tombstoned: &HashSet<u64>,
         query: &[f32],
         k: usize,
     ) -> Vec<(u64, f32)> {
+        let (_, qquery) = quantize(query);
         let mut scored: Vec<(u64, f32)> = entries
             .iter()
             .filter(|(slot, _)| !tombstoned.contains(slot))
-            .filter_map(|(slot, v)| cosine(query, v).map(|s| (*slot, s)))
+            .filter_map(|(slot, v)| cosine_q(&qquery, &quantize(v).1).map(|s| (*slot, s)))
             .collect();
         scored.sort_by(|a, b| {
             OrderedScore(b.1)
@@ -1909,20 +1924,21 @@ mod tests {
         vec![r.cos(), r.sin()]
     }
 
-    /// A `select_neighbors` resolver over a plain slot-indexed table.
+    /// A `select_neighbors` resolver over a plain slot-indexed table of
+    /// codes (each entry pre-quantized by the caller).
     fn table_resolver(
-        table: &[Vec<f32>],
-    ) -> impl FnMut(u64) -> Result<Option<Rc<Vec<f32>>>, TopoError> + '_ {
+        table: &[Vec<i8>],
+    ) -> impl FnMut(u64) -> Result<Option<Rc<Vec<i8>>>, TopoError> + '_ {
         move |slot: u64| Ok(table.get(slot as usize).cloned().map(Rc::new))
     }
 
     /// Candidates scored against `query`, in `search_layer`'s output order
     /// (score desc, slot asc) — the exact shape `insert` hands to selection.
-    fn scored_candidates(query: &[f32], table: &[Vec<f32>]) -> Vec<(OrderedScore, u64)> {
+    fn scored_candidates(query: &[i8], table: &[Vec<i8>]) -> Vec<(OrderedScore, u64)> {
         let mut out: Vec<(OrderedScore, u64)> = table
             .iter()
             .enumerate()
-            .map(|(slot, v)| (OrderedScore(cosine(query, v).unwrap()), slot as u64))
+            .map(|(slot, v)| (OrderedScore(cosine_q(query, v).unwrap()), slot as u64))
             .collect();
         out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         out
@@ -1934,8 +1950,11 @@ mod tests {
         // c (-25°) sits alone on the other side. Closest-2 keeps {a, b};
         // the heuristic must prune b (closer to already-kept a than to the
         // query: cos3° > cos8°) and keep the diverse c (cos30° < cos25°).
-        let table = vec![unit2(5.0), unit2(8.0), unit2(-25.0)];
-        let query = unit2(0.0);
+        let table: Vec<Vec<i8>> = [unit2(5.0), unit2(8.0), unit2(-25.0)]
+            .iter()
+            .map(|v| quantize(v).1)
+            .collect();
+        let query = quantize(&unit2(0.0)).1;
         let selected = select_neighbors(
             &scored_candidates(&query, &table),
             2,
@@ -1955,8 +1974,11 @@ mod tests {
         // heuristic keeps {a, c} and prunes both clump members; keep-pruned
         // backfill must then take b (the FIRST pruned in candidate order),
         // not d, and the final row keeps (score desc, slot asc) order.
-        let table = vec![unit2(5.0), unit2(8.0), unit2(10.0), unit2(-25.0)];
-        let query = unit2(0.0);
+        let table: Vec<Vec<i8>> = [unit2(5.0), unit2(8.0), unit2(10.0), unit2(-25.0)]
+            .iter()
+            .map(|v| quantize(v).1)
+            .collect();
+        let query = quantize(&unit2(0.0)).1;
         let selected = select_neighbors(
             &scored_candidates(&query, &table),
             3,
@@ -1976,8 +1998,11 @@ mod tests {
         // order and is kept; the duplicate is pruned (it is exactly as
         // close to the kept copy as anything can be) and only returns via
         // backfill when the budget allows.
-        let table = vec![unit2(5.0), unit2(5.0)];
-        let query = unit2(0.0);
+        let table: Vec<Vec<i8>> = [unit2(5.0), unit2(5.0)]
+            .iter()
+            .map(|v| quantize(v).1)
+            .collect();
+        let query = quantize(&unit2(0.0)).1;
         let selected = select_neighbors(
             &scored_candidates(&query, &table),
             2,
@@ -2035,25 +2060,29 @@ mod tests {
         // Selection policy is write-side graph structure: switching to the
         // heuristic MUST bump the stamped params version so pre-existing
         // graphs (built with closest-M) drain + rebuild on open via
-        // `ensure_hnsw_params` instead of silently mixing policies.
-        assert_eq!(HnswParams::default().version, 2);
+        // `ensure_hnsw_params` instead of silently mixing policies. v3 ==
+        // heuristic selection + SQ8 symmetric-integer cosine; SQ8 changes
+        // every score the graph is built from, so pre-v8 graphs MUST
+        // drain+rebuild rather than silently mixing metrics.
+        assert_eq!(HnswParams::default().version, 3);
     }
 
     // -- Insert-throughput: per-graph-op decoded-vector cache ---------------
 
     #[test]
     fn vec_cache_matches_direct_reads_and_caches_misses() {
-        // The cache must be a pure memo over `read_vector_by_slot` + the
+        // The cache must be a pure memo over `read_qvec_by_slot` + the
         // cluster check: an in-cluster slot resolves to the identical
-        // vector, an out-of-cluster or absent slot resolves to None, and
-        // BOTH outcomes are served from memory on the second ask (pinned
-        // by dropping the underlying rows between the two asks — a cache
-        // that re-reads would see the mutation; the graph-op contract is
-        // point-in-time stability within one op).
+        // quantized codes, an out-of-cluster or absent slot resolves to
+        // None, and BOTH outcomes are served from memory on the second ask
+        // (pinned by dropping the underlying rows between the two asks — a
+        // cache that re-reads would see the mutation; the graph-op contract
+        // is point-in-time stability within one op).
         let model = 1;
         let scope = 1;
         let (_dir, db) = open_db();
         let v0 = unit2(5.0);
+        let codes0 = quantize(&v0).1;
         let tx = db.begin_write().unwrap();
         {
             let mut vtab = tx.open_table(VECTORS).unwrap();
@@ -2070,8 +2099,8 @@ mod tests {
             let mut cache = VecCache::new();
             assert_eq!(
                 cache.get(&reader, 0).unwrap().as_deref(),
-                Some(&v0),
-                "in-cluster slot resolves to the stored vector"
+                Some(&codes0),
+                "in-cluster slot resolves to the stored vector's codes"
             );
             assert_eq!(
                 cache.get(&reader, 1).unwrap(),
@@ -2096,7 +2125,7 @@ mod tests {
                     model,
                     scope,
                 };
-                assert_eq!(cache.get(&reader, 0).unwrap().as_deref(), Some(&v0));
+                assert_eq!(cache.get(&reader, 0).unwrap().as_deref(), Some(&codes0));
             }
             crate::vector_store::remove_vector(&mut vtab, &mut rtab, 0).unwrap();
             {
@@ -2108,7 +2137,7 @@ mod tests {
                 };
                 assert_eq!(
                     cache.get(&reader, 0).unwrap().as_deref(),
-                    Some(&v0),
+                    Some(&codes0),
                     "cached hit survives row removal — served from memory"
                 );
                 let mut fresh = VecCache::new();
