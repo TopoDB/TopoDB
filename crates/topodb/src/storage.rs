@@ -70,7 +70,7 @@ pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::n
 /// makes per-(label,scope) key order = mint-time order.
 pub(crate) const LABEL_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("label_index");
 
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -221,7 +221,16 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(7) => {}
+            Some(8) => {}
+            Some(7) => {
+                // v7 -> v8 quantizes every existing `vectors` row in place
+                // (framed postcard `Vec<f32>` -> `(f32, Vec<i8>)`, see
+                // `migrate_v8.rs`), then stamps the version.
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                crate::migrate_v8::quantize_vectors(&tx)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(6) => {
                 // v6 -> v7 adds exactly two derived tables (HNSW_META,
                 // HNSW_LINKS) that the open block above already created
@@ -231,11 +240,15 @@ impl Storage {
                 // this transaction commits), not here, mirroring how v6's
                 // `LABEL_INDEX` table is created here but v5's `PROP_INDEX`
                 // norm-version stamp is handled by `ensure_index_spec`
-                // instead of a version-match arm. No data pass: HNSW graphs
-                // build lazily (threshold-triggered, on the write path or via
-                // `ensure_hnsw_params`'s reconcile), so there is nothing to
-                // migrate out of an empty table pair. Just the stamp.
+                // instead of a version-match arm. No data pass for v6->v7:
+                // HNSW graphs build lazily (threshold-triggered, on the write
+                // path or via `ensure_hnsw_params`'s reconcile), so there is
+                // nothing to migrate out of an empty table pair. This arm
+                // jumps straight from 6 to the CURRENT `FORMAT_VERSION`, so
+                // it must also do v7->v8's `vectors` quantization pass itself
+                // (see `migrate_v8.rs`) before stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
+                crate::migrate_v8::quantize_vectors(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -247,8 +260,12 @@ impl Storage {
                 // resolution needed — see `migrate_v6.rs`), then a version
                 // stamp. Deliberately far smaller than the v3->v4/v4->v5
                 // hops: no dual-write era, no re-encoding of existing rows.
+                // This arm jumps straight from 5 to the CURRENT
+                // `FORMAT_VERSION`, so it also runs v7->v8's `vectors`
+                // quantization pass (`migrate_v8.rs`) before stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                crate::migrate_v8::quantize_vectors(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -258,14 +275,15 @@ impl Storage {
                 // `prop_index.rs`). The rebuild itself is driven by
                 // `ensure_index_spec` below: its `prop_index_norm_version`
                 // check sees a missing stamp on every pre-v5 file and drains +
-                // rebuilds the index. All this arm does is stamp the version
-                // (after also running the v5->v6 LABEL_INDEX backfill below —
-                // this arm jumps straight from 4 to the CURRENT
-                // `FORMAT_VERSION`, so it must do v6's table work itself
-                // rather than falling through to the `Some(5)` arm above,
-                // which only ever runs for a file genuinely stamped 5).
+                // rebuilds the index. This arm jumps straight from 4 to the
+                // CURRENT `FORMAT_VERSION`, so it must do v6's table work
+                // (LABEL_INDEX backfill) and v7->v8's `vectors` quantization
+                // pass (`migrate_v8.rs`) itself, rather than falling through
+                // to the `Some(5)`/`Some(6)` arms above, which only ever run
+                // for a file genuinely stamped that version — then stamp.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                crate::migrate_v8::quantize_vectors(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -277,6 +295,14 @@ impl Storage {
                 // postings pass below always runs (`postings_already_chunked
                 // = false`). See `migrate_v4`'s module doc comment for the
                 // discrimination rationale.
+                //
+                // No separate `migrate_v8::quantize_vectors` call here: this
+                // arm's `migrate_v3_to_v4` call below writes every `vectors`
+                // row through `vector_store::put_vector`, which already
+                // quantizes (see `migrate_v8.rs`'s module doc) — running the
+                // v7->v8 pass again would re-decode an already-quantized
+                // `(f32, Vec<i8>)` row as `Vec<f32>`, which postcard's lack
+                // of self-description does not guarantee to error on.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 let mut vector_dims = tx.open_table(VECTOR_DIMS).map_err(storage_err)?;
                 let mut vectors = tx.open_table(VECTORS).map_err(storage_err)?;
@@ -305,6 +331,11 @@ impl Storage {
                     .map_err(storage_err)?;
             }
             Some(2) => {
+                // No separate `migrate_v8::quantize_vectors` call here either
+                // — same rationale as the `Some(3)` arm above: the
+                // `migrate_v3_to_v4` call below (chained after
+                // `migrate_v2_to_v3`) writes through the already-quantizing
+                // `put_vector` (see `migrate_v8.rs`'s module doc).
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 let nodes;
                 let embeddings;
@@ -388,6 +419,13 @@ impl Storage {
                     .map_err(storage_err)?;
             }
             Some(1) => {
+                // No separate `migrate_v8::quantize_vectors` call in this arm
+                // either — same rationale as the `Some(3)`/`Some(2)` arms
+                // above: this chain's `migrate_v3_to_v4` call (reached via
+                // v1->v2->v3->v4 below) writes through the already-quantizing
+                // `put_vector` (see `migrate_v8.rs`'s module doc); this arm's
+                // v1->v2 step never touches the `vectors`/`embedding_ref`
+                // tables at all (only the old slot-keyed `EMBEDDINGS`).
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
                 let mut emb = tx.open_table(EMBEDDINGS).map_err(storage_err)?;
@@ -2516,24 +2554,27 @@ pub(crate) fn scope_key(s: Scope) -> [u8; 17] {
 }
 
 /// A node's current embedding by slot, resolved via the v4 `vectors`/
-/// `embedding_ref` join (`vector_store::read_vector_by_slot`) plus a
-/// `DictKind::Model` id -> name resolve — the Task 7 replacement for the old
-/// `EMBEDDINGS`-table direct read. `Ok(None)` covers both "never embedded"
-/// and an unknown model id... except an unknown model id is corruption
-/// (`dicts.resolve` errors loudly), not a miss — a slot that resolves in
-/// `embedding_ref`/`vectors` always carries a model id this same open's
-/// `Dicts` interned, by construction.
+/// `embedding_ref` join (`vector_store::read_qvec_by_slot`, dequantized with
+/// `quant::dequantize` — format v8) plus a `DictKind::Model` id -> name
+/// resolve — the Task 7 replacement for the old `EMBEDDINGS`-table direct
+/// read. `Ok(None)` covers both "never embedded" and an unknown model id...
+/// except an unknown model id is corruption (`dicts.resolve` errors loudly),
+/// not a miss — a slot that resolves in `embedding_ref`/`vectors` always
+/// carries a model id this same open's `Dicts` interned, by construction.
 fn read_embedding_by_slot(
     vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
     refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     dicts: &Dicts,
     slot: u64,
 ) -> Result<Option<(String, Vec<f32>)>, TopoError> {
-    match vector_store::read_vector_by_slot(vectors, refs, slot)? {
+    match vector_store::read_qvec_by_slot(vectors, refs, slot)? {
         None => Ok(None),
-        Some((model_id, _scope_id, vector)) => {
+        Some((model_id, _scope_id, scale, codes)) => {
             let model = dicts.resolve(DictKind::Model, model_id)?;
-            Ok(Some((model.to_string(), vector)))
+            Ok(Some((
+                model.to_string(),
+                crate::quant::dequantize(scale, &codes),
+            )))
         }
     }
 }
@@ -3679,7 +3720,13 @@ mod tests {
         .unwrap();
 
         let rec = s.load_node(id).unwrap().unwrap();
-        assert_eq!(rec.embedding, Some(("m".to_string(), vec![1.0, 2.0, 3.0])));
+        // v8: `load_node` dequantizes SQ8-quantized codes, so the expected
+        // embedding is `dequantize(quantize(v))`, not the raw input `v`.
+        let (scale, codes) = crate::quant::quantize(&[1.0, 2.0, 3.0]);
+        assert_eq!(
+            rec.embedding,
+            Some(("m".to_string(), crate::quant::dequantize(scale, &codes)))
+        );
 
         // Embedding a node that doesn't exist rejects the whole batch.
         let err = s
@@ -4307,9 +4354,12 @@ mod tests {
             4,
         )
         .unwrap();
+        // v8: dequantize(quantize(v)), not the raw input `v` (see
+        // `set_embedding_lands_in_record_and_rejects_missing_node`).
+        let (scale, codes) = crate::quant::quantize(&[9.0, 8.0, 7.0]);
         assert_eq!(
             s.load_node(a).unwrap().unwrap().embedding,
-            Some(("m1".to_string(), vec![9.0, 8.0, 7.0]))
+            Some(("m1".to_string(), crate::quant::dequantize(scale, &codes)))
         );
     }
 
@@ -4641,7 +4691,7 @@ mod tests {
     /// of currently-live nodes that actually carry an embedding (no orphans
     /// left behind by a re-embed or a remove), and every live embedded
     /// node's `read_node`-resolved embedding must round-trip through a
-    /// direct `read_vector_by_slot` call for that same slot.
+    /// direct `read_qvec_by_slot` call (dequantized) for that same slot.
     #[test]
     fn vectors_tables_have_no_orphans_after_200_memory_workload_with_reembeds_and_removes() {
         // Same id scheme as `workload.rs`'s private `memory_id` (duplicated
@@ -4715,8 +4765,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("memory {i} must still carry an embedding"));
             expected_live_embeddings += 1;
 
-            // Round-trip: `read_node`'s resolved embedding must match a
-            // direct `read_vector_by_slot` call for the same slot.
+            // Round-trip: `read_node`'s resolved (dequantized) embedding must
+            // match a direct `read_qvec_by_slot` call for the same slot,
+            // dequantized the same way — both sides go through the exact
+            // same `quant::dequantize`, so equality is still exact.
             let tx = s.db.begin_read().unwrap();
             let node_slots = tx.open_table(NODE_SLOTS).unwrap();
             let slot = crate::slots::node_slot(&node_slots, memory_id(i))
@@ -4724,20 +4776,21 @@ mod tests {
                 .unwrap();
             let vectors = tx.open_table(VECTORS).unwrap();
             let refs = tx.open_table(EMBEDDING_REF).unwrap();
-            let (model_id, _scope_id, raw_vector) =
-                vector_store::read_vector_by_slot(&vectors, &refs, slot)
+            let (model_id, _scope_id, scale, codes) =
+                vector_store::read_qvec_by_slot(&vectors, &refs, slot)
                     .unwrap()
                     .unwrap_or_else(|| panic!("memory {i} (slot {slot}): no vectors row"));
+            let raw_vector = crate::quant::dequantize(scale, &codes);
             let dicts = s.dicts.read().unwrap();
             let resolved_name = dicts.resolve(DictKind::Model, model_id).unwrap();
             assert_eq!(
                 resolved_name.as_str(),
                 model,
-                "memory {i}: model name mismatch between read_node and read_vector_by_slot"
+                "memory {i}: model name mismatch between read_node and read_qvec_by_slot"
             );
             assert_eq!(
                 raw_vector, vector,
-                "memory {i}: vector mismatch between read_node and read_vector_by_slot"
+                "memory {i}: vector mismatch between read_node and read_qvec_by_slot"
             );
         }
 
