@@ -111,28 +111,38 @@ transaction, committed once at the very end:
 
 | stored version | on open |
 |---|---|
-| absent (brand-new file) | stamp `FORMAT_VERSION` (7) directly — `storage.rs: Storage::open_with_options`, `None` arm; `"hnsw_params"` is stamped separately by `ensure_hnsw_params` |
-| 7 | open directly, no rewrite — `Some(7) => {}` |
-| 6 | stamp 7 directly — no table data pass (`HNSW_META`/`HNSW_LINKS` were already created, empty, by the open block itself; graphs build lazily) — `Some(6)` arm |
-| 5 | `migrate_v6::migrate_v5_to_v6` (one NODES scan, builds `LABEL_INDEX`), stamp 7 — `Some(5)` arm |
-| 4 | `migrate_v6::migrate_v5_to_v6`, stamp 7 directly (this arm jumps straight from 4 to the current `FORMAT_VERSION`, so it must do v6's table work itself rather than falling through to the `Some(5)` arm, which only runs for a file genuinely stamped 5; the PROP_INDEX rebuild still happens separately, in `ensure_index_spec`, via the norm-version check) — `Some(4)` arm |
-| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 7 — `Some(3)` arm |
-| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 7 — `Some(2)` arm, chained in one call |
-| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 7 — `Some(1)` arm, chained in one call |
-| > 7 | `TopoError::UnsupportedFormat { found, supported: 7 }` — `Some(found) if found > FORMAT_VERSION` |
+| absent (brand-new file) | stamp `FORMAT_VERSION` (8) directly — `storage.rs: Storage::open_with_options`, `None` arm; `"hnsw_params"` is stamped separately by `ensure_hnsw_params` |
+| 8 | open directly, no rewrite — `Some(8) => {}` |
+| 7 | `migrate_v8::quantize_vectors` (one VECTORS scan, quantizes each vector to signed 8-bit codes), stamp 8 — `Some(7)` arm |
+| 6 | `migrate_v8::quantize_vectors`, stamp 8 — `Some(6)` arm (no LABEL_INDEX work needed: a v6-stamped file already has it) |
+| 5 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(5)` arm |
+| 4 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(4)` arm (jumps straight to current version; must do v6's work itself) |
+| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(3)` arm |
+| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(2)` arm, chained in one call |
+| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(1)` arm, chained in one call |
+| > 8 | `TopoError::UnsupportedFormat { found, supported: 8 }` — `Some(found) if found > FORMAT_VERSION` |
 | anything else (currently only 0, which can't occur since real versions start at 1) | `TopoError::Encoding` — `Some(found)` catch-all arm |
 
-Every arm above except the fast `Some(7) => {}` path calls
-`migrate_v6::migrate_v5_to_v6` — not just the `Some(5)` arm — because arms for
-versions further back stamp `FORMAT_VERSION` directly rather than falling
-through a chain of one-version-at-a-time steps; each must therefore perform
-v6's table work itself. `migrate_v5_to_v6` is idempotent (re-inserting the
-same key/value is a no-op), so calling it unconditionally on every non-fast
-path is safe regardless of how many other migrations ran first in the same
+Of the arms that don't already reach it through their chained
+`migrate_v4` sequence (the `Some(3)`/`Some(2)`/`Some(1)` rows above), the
+`Some(5)` and `Some(4)` arms call `migrate_v6::migrate_v5_to_v6` directly —
+`Some(4)` because it jumps straight to the current `FORMAT_VERSION` and
+cannot fall through to the `Some(5)` arm above, which only ever runs for a
+file genuinely stamped 5. `Some(6)` needs no such call: a v6-stamped file
+already has LABEL_INDEX, so that arm goes straight to `migrate_v8::quantize_vectors`
+and the stamp. `migrate_v5_to_v6` is idempotent (re-inserting the same
+key/value is a no-op), so calling it from either the `Some(5)` or `Some(4)`
+arm is safe regardless of how many other migrations ran first in the same
 open. Every arm's version stamp is written via the `FORMAT_VERSION` constant,
-not a literal — so all of this held true, unedited, across the v6->v7 flip:
-only the `Some(6)`/`Some(7)` arms themselves (and the too-new rejection arm's
-`supported` field) needed source changes.
+not a literal — so most of this held true, unedited, across the v6->v7->v8
+flip: only the `Some(7)`/`Some(8)` arms themselves (and the too-new
+rejection arm's `supported` field) needed source changes for the v6->v7
+bump. The v7->v8 bump instead touched every arm from `Some(4)` through
+`Some(7)`, adding a `migrate_v8::quantize_vectors` call to each — every one
+of those arms already produces a file with f32 `vectors` rows that need
+quantizing. `Some(3)` and `Some(2)` stayed call-free: their `migrate_v4`
+chain re-writes embeddings through the v8 `put_vector`, which quantizes as
+it writes, so there is nothing left for those arms to backfill.
 
 Because table creation, migration, and the version stamp all happen inside the
 single write transaction `open_with_options` opens at its top and commits once
@@ -306,7 +316,7 @@ pre-v4 file and is gone by the time the opening write transaction commits.
 | `fts_docs` | 8-byte BE node slot | plain postcard `u32` token length (not framed) | `storage.rs: FTS_DOCS`, `fts.rs` |
 | `fts_stats` | 4-byte BE scope id | plain postcard `(u64, u64)` = `(doc_count, total_len)` (not framed) | `storage.rs: FTS_STATS`, `fts.rs` |
 | `vector_dims` | 4-byte BE `DictKind::Model` dict id | 4-byte **LE** `u32` dim (not framed) | `storage.rs: VECTOR_DIMS` |
-| `vectors` | `[model:4 BE][scope:4 BE][slot:8 BE]` (16 bytes) | framed postcard `Vec<f32>` | `vector_store.rs: VECTORS` |
+| `vectors` | `[model:4 BE][scope:4 BE][slot:8 BE]` (16 bytes) | framed postcard `(f32, Vec<i8>) = (scale, codes)` | `vector_store.rs: VECTORS` |
 | `embedding_ref` | 8-byte BE node slot | postcard `(u32, u32)` = `(model, scope)` (not framed) | `vector_store.rs: EMBEDDING_REF` |
 | `dict` | `[kind:u8][id:u32 BE]` (5 bytes) | UTF-8 interned string (not framed) | `dict.rs: DICT` |
 | `scopes` | 4-byte BE scope id | 17-byte `scope_key` | `scopes.rs: SCOPES` |
@@ -443,7 +453,7 @@ deleted v3 vector index," below).
   boundedly-scannable range (`vector_store::vector_prefix` bounds that scan).
   Fixed width means no trailing-length check is needed to exclude a longer
   sibling key, unlike `prop_index`'s variable-length keys. Value: framed
-  postcard `Vec<f32>`.
+  postcard `(f32, Vec<i8>) = (scale, codes)` (v8: scalar-quantized).
 - `embedding_ref` key: 8-byte BE node slot (`vector_store::slot_key`). Value:
   postcard `(u32, u32)` = `(model, scope)`, NOT framed — a fixed-size pair
   never crosses the frame's 512-byte lz4-attempt threshold, so wrapping it
@@ -585,6 +595,16 @@ dependence anywhere in the module.
   `hnsw_params` stamp mismatch at open (`ensure_hnsw_params`, see "Version
   and migration," above) drains both tables and rebuilds every cluster that
   still meets the NEW `build_threshold`.
+
+**SQ8 quantization** (v8, `vector_store.rs`/`migrate_v8.rs`): all embeddings are stored as signed 8-bit max-abs scalar-quantized codes (`Vec<i8>`) plus a per-vector scale factor (f32), replacing the v7 `Vec<f32>` entirely. The `vectors` table value changes from framed postcard `Vec<f32>` to framed postcard `(f32, Vec<i8>) = (scale, codes)`, reducing storage by ~4× and enabling integer arithmetic throughout the scoring hot path.
+
+- **Quantization scheme** (`quantize` → `(f32, Vec<i8>)`): every embedding `v` is encoded as `maxabs = max(|v_i|)` (the scale, 4 bytes f32) and codes `code_i = round(v_i * (127.0 / maxabs))` clamped to `[-127, 127]` as `i8`. For zero-norm vectors (`maxabs == 0.0`), scale is `0.0` and all codes are zero. Round-trip dequantization via `code_i * scale / 127.0` recovers codes bit-identically when re-quantized (the max component always maps to ±127, so the all-zero property holds iff the input was exactly zero).
+- **Scoring kernel** (`cosine_q(a: &[i8], b: &[i8]) -> Option<f32>`): fused pass computing `dot += a_i·b_i`, `na += a_i²`, `nb += b_i²` all as **i64** (i32 overflows past dim ≈ 133k; dim is u32-bounded), returning `None` when `na == 0 || nb == 0` (zero-norm skip, same contract as the f32 `cosine`); else `dot as f32 / ((na as f32).sqrt() * (nb as f32).sqrt())` — no libm, hardware sqrt only. The per-vector scale **cancels in cosine** and is never read by scoring; scale storage (decision 6 of the design) exists only for dequantizing user-visible reads.
+- **Graph and scan scoring**: both `hnsw.rs` entry points and `search_scan` quantize their incoming f32 vector once per op, then score via `cosine_q`; the scan path, graph path, and the recall oracle share one metric, so the oracle stays structurally graph-free and grades under the metric the graph actually uses.
+- **Zero-norm doctrine** survives byte-for-byte: all-zero codes ⟺ zero-norm, zero-norm rows never rank, the equivalence is pinned by tests (see "Determinism & edge cases," below).
+- **User-visible cosine scores** are now quantized (computed from codes, not exact f32). The ops log stores raw `SetEmbedding` ops with exact f32 forever; replay is the source of truth. `NodeRecord.embedding` returns the dequantized vector (≈original magnitudes, re-quantization is idempotent).
+- **`hnsw_params` version** changes from 2 → 3 (v3 = "heuristic selection + SQ8 symmetric-integer cosine"); v2-stamped graphs (the old closest-M selection policy) mismatch on open and are drained and rebuilt by the existing reconcile (see "Version and migration," above).
+- **History dependence** (same as v7 HNSW): exact graph sequence and idempotence (`rebuild_state_from_ops` reproduces byte-identical files) hold because graph construction lives inside `apply_op`'s opcode-replay path, with no RNG, wall-clock, or scheduled non-determinism — even when quantized vectors replace exact f32, the replay sequence is the same.
 
 **Postings** (`fts.rs`, chunked layout — v4): a term's postings under one
 scope are split across one or more chunk keys rather than one unbounded row,
