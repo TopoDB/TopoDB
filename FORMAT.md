@@ -34,8 +34,14 @@ this contract:
   `v6_fixture_migrates_to_v7_and_reads` (and `v6_fixture_opens_and_reads`,
   which now also migrates — see `format_fixture.rs`'s doc comment on that
   test) as the v6 migration-input file.
-- `v7.redb` — the native v7 fixture, and the ONLY fixture this build can
-  actually regenerate (`format_fixture.rs::regenerate_v7_fixture`).
+- `v7.redb` — the native v7 fixture, FROZEN since the v8 flip (no build on
+  this branch can stamp a fresh file at 7), exercised by
+  `v7_fixture_opens_and_reads` (now a v7->v8 migration test — see
+  `format_fixture.rs`'s doc comment on that test) as the v7 migration-input
+  file.
+- `v8.redb` — the native v8 fixture, and the ONLY fixture this build can
+  actually regenerate (`format_fixture.rs::regenerate_v8_fixture`),
+  exercised by `v8_fixture_opens_and_reads`.
 
 ## Version and migration
 

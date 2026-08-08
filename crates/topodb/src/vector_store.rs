@@ -195,17 +195,29 @@ pub(crate) fn read_qvec_by_slot(
 /// A total order over `f32` scores via [`f32::total_cmp`] — `f32` isn't
 /// `Ord`, so the heap wraps every score in this newtype.
 ///
-/// **NaN finding:** the write path (`storage.rs::apply_op`'s `SetEmbedding`
-/// arm) never validates finiteness of an embedding's components, so a NaN or
-/// ±Infinity cosine score IS reachable today, exactly as it was under the
-/// old RAM slab. The old merge sort handled this via
-/// `partial_cmp(..).unwrap_or(Equal)`, which silently treats any NaN
-/// comparison as "equal" — not a panic, but not a well-defined order either.
-/// `total_cmp` replicates that "NaN doesn't crash the sort" behavior while
-/// additionally giving it a deterministic total position, which is a strict
-/// improvement, not new validation: a non-finite score still ranks (it is
-/// never rejected). No test exercises a NaN score on either the old or new
-/// path.
+/// **NaN finding (historical, doubly so under v8):** this doc comment
+/// predates two changes that have since retired its original worry. First
+/// (pre-v8, F8 review): the write path (`storage.rs::apply_op`'s
+/// `SetEmbedding` arm) now rejects any non-finite component outright
+/// (currently storage.rs:2903), so a NaN/±Infinity component can no longer
+/// be written by a live applier — only pre-v4-era migrated rows could ever
+/// carry one. Second (format v8, SQ8): scores are no longer f32 dot/sqrt
+/// over raw components — `cosine_q` (`quant.rs`) accumulates in `i64` over
+/// quantized `i8` codes and divides by `sqrt` of two norms that are each
+/// ≥ 1 whenever nonzero, so its `f32` result CANNOT be NaN or ±Infinity by
+/// construction. The one v8 behavioral change worth noting: an all-NaN
+/// query vector quantizes to all-zero codes (NaN components never set
+/// `maxabs`, so `quantize` returns the zero encoding), and `cosine_q`
+/// returns `None` — not a score — against an all-zero side, so the query
+/// yields an EMPTY result rather than reaching this heap at all. Pre-v8,
+/// the old merge sort's `partial_cmp(..).unwrap_or(Equal)` would have let
+/// such a query's NaN scores rank arbitrarily and return rows anyway; the
+/// v8 behavior (empty result) is deliberate and deterministic, a strict
+/// improvement over that arbitrary ordering, not a regression. `total_cmp`
+/// is kept regardless — it's the correct way to give `f32` a total order
+/// for the heap, and a second line of defense should a future scoring path
+/// ever reintroduce a non-finite score. No test exercises a NaN score on
+/// either path, since none is currently reachable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OrderedScore(pub(crate) f32);
 impl Eq for OrderedScore {}

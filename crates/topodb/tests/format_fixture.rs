@@ -112,12 +112,28 @@
 //! `storage.rs::ensure_hnsw_params`. No existing table's layout changes, and
 //! HNSW graphs build lazily (threshold-triggered), so there is no data pass
 //! on migration — every fixture below now migrates/opens to
-//! `FORMAT_VERSION == 7`. `v6.redb` is therefore FROZEN now (a TENTH frozen
-//! fixture, the v6 migration-input file) — no build on this branch can stamp
-//! a fresh file at 6 anymore. Its old generator is repurposed below as
-//! `regenerate_v7_fixture` (same content recipe, targeting `v7.redb`), the
-//! same generator-repurposing move every earlier version flip made.
-//! `v7.redb` is now the ONLY fixture this build can regenerate.
+//! `FORMAT_VERSION == 8` (v7's own hop is stamp-only; see the v8 paragraph
+//! below for the hop that follows it). `v6.redb` is therefore FROZEN now (a
+//! TENTH frozen fixture, the v6 migration-input file) — no build on this
+//! branch can stamp a fresh file at 6 anymore. Its old generator is
+//! repurposed below as `regenerate_v7_fixture` (same content recipe,
+//! targeting `v7.redb`), the same generator-repurposing move every earlier
+//! version flip made — `regenerate_v7_fixture` has since itself been
+//! repurposed again into `regenerate_v8_fixture`, see the v8 paragraph.
+//!
+//! Format v8 (F8 SQ8 tail, T8) changes no table's set or keying — only the
+//! `vectors` table's VALUE encoding, from framed postcard `Vec<f32>` to
+//! framed postcard `(f32, Vec<i8>) = (scale, codes)`, applied migration-time
+//! by `migrate_v8::quantize_vectors`, plus the `"hnsw_params"` stamp's
+//! version bump (2 -> 3, since HNSW scoring moves to integer `cosine_q`
+//! over the new codes) — see `FORMAT.md`'s "SQ8 quantization" section for
+//! the full change. `v7.redb` is therefore FROZEN now (an ELEVENTH frozen
+//! fixture, the v7 migration-input file) — no build on this branch can stamp
+//! a fresh file at 7 anymore. Its old generator (`regenerate_v7_fixture`) is
+//! repurposed below as `regenerate_v8_fixture` (same content recipe,
+//! targeting `v8.redb`), the same generator-repurposing move every earlier
+//! version flip made. `v8.redb` is now the ONLY fixture this build can
+//! regenerate.
 //!
 //! Node/scope ids use `NodeId::from_u128`/`ScopeId::from_u128`
 //! (`#[doc(hidden)]` debug-seam constructors added in `ids.rs` for exactly
@@ -129,18 +145,21 @@
 
 use topodb::*;
 
-/// Regenerate with: cargo test -p topodb --test format_fixture -- --ignored regenerate
+/// Regenerate with: cargo test -p topodb --release --test format_fixture --
+/// --ignored regenerate_v8_fixture --nocapture
 ///
-/// Repurposed from the old `regenerate_v6_fixture` (itself repurposed from
-/// `regenerate_v5_fixture`, itself from the Task 5-era `regenerate_v3_
-/// fixture`): same content recipe, now targeting `v7.redb` — this build's
-/// `FORMAT_VERSION` is 7 everywhere, so `Db::open_with` below stamps a
-/// native v7 file with no migration involved. `v6.redb` is untouched by this
-/// function and stays frozen (see the module doc comment).
+/// Repurposed from the old `regenerate_v7_fixture` (itself repurposed from
+/// `regenerate_v6_fixture`, itself from `regenerate_v5_fixture`, itself from
+/// the Task 5-era `regenerate_v3_fixture`): same content recipe, now
+/// targeting `v8.redb` — this build's `FORMAT_VERSION` is 8 everywhere, so
+/// `Db::open_with` below stamps a native v8 file (vectors already SQ8
+/// quantized on write, `"hnsw_params"` at its v3 stamp) with no migration
+/// involved. `v7.redb` is untouched by this function and stays frozen (see
+/// the module doc comment).
 #[test]
 #[ignore]
-fn regenerate_v7_fixture() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v7.redb");
+fn regenerate_v8_fixture() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v8.redb");
     let _ = std::fs::remove_file(&path);
     let spec = IndexSpec {
         equality: vec![PropIndex {
@@ -203,7 +222,7 @@ fn regenerate_v7_fixture() {
 
     assert!(
         path.exists(),
-        "regenerate_v7_fixture: fixture file was not created at {path:?}"
+        "regenerate_v8_fixture: fixture file was not created at {path:?}"
     );
 }
 
@@ -327,13 +346,16 @@ fn v6_fixture_opens_and_reads() {
     assert_eq!(db.format_version(), 8);
 }
 
-/// The frozen v6 fixture's migration to v7 (F8's load-bearing migration
-/// test, mirroring `v5_fixture_migrates_to_v6_and_reads` above): opens the
-/// committed `v6.redb` and asserts it lands on `FORMAT_VERSION == 7` with
-/// every standard query — including `search_vector` for the fixture's known
-/// embedding — still seeing exactly the fixture recipe's known corpus. v7
-/// adds no data pass (HNSW graphs build lazily), so this test's real job is
-/// proving the `Some(6)` stamp-only hop runs and nothing else regresses.
+/// The frozen v6 fixture's migration all the way to v8 (F8's load-bearing
+/// migration test, mirroring `v5_fixture_migrates_to_v6_and_reads` above):
+/// opens the committed `v6.redb` and asserts it lands on
+/// `FORMAT_VERSION == 8` with every standard query — including
+/// `search_vector` for the fixture's known embedding, now scored via
+/// `cosine_q` over SQ8 codes — still seeing exactly the fixture recipe's
+/// known corpus. v7's own hop adds no data pass (HNSW graphs build lazily),
+/// so this test's real job is proving the `Some(6)` stamp-only hop runs,
+/// followed by v8's `migrate_v8::quantize_vectors` data pass, and nothing
+/// regresses across either.
 #[test]
 fn v6_fixture_migrates_to_v7_and_reads() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v6.redb");
@@ -382,13 +404,21 @@ fn v6_fixture_migrates_to_v7_and_reads() {
     assert!(db.debug_dump_hnsw_links().unwrap().is_empty());
 }
 
-/// Task 5 (format v7, F8): the native v7 fixture, written by
-/// `regenerate_v7_fixture` (the SAME content recipe every earlier native
-/// fixture in this file used) directly at the current `FORMAT_VERSION` — no
-/// migration involved on open at all. Same standard query set as the
-/// migration test above, so a regression that only breaks a freshly-created
-/// v7 file (as opposed to one reached via migration) has a fixture that
-/// would catch it.
+/// The frozen v7 fixture's migration to v8 (F8 SQ8's load-bearing migration
+/// test, mirroring `v6_fixture_migrates_to_v7_and_reads` above): opens the
+/// committed `v7.redb` — written back when `regenerate_v7_fixture` still
+/// targeted `v7.redb` at the then-current `FORMAT_VERSION`, so this fixture
+/// carries genuine pre-SQ8 `Vec<f32>` vector rows going in — and asserts it
+/// lands on `FORMAT_VERSION == 8` with every standard query, including
+/// `search_vector` for the fixture's known embedding, now scored via
+/// `cosine_q` over SQ8 codes rather than raw f32 dot/sqrt. Unlike v7's own
+/// HNSW-table addition, the v7->v8 hop DOES do a data pass
+/// (`migrate_v8::quantize_vectors` rewrites every `vectors` row's VALUE
+/// encoding from `Vec<f32>` to `(scale, Vec<i8>)`), so this test's real job
+/// is proving that pass runs correctly and the fixture's single embedding
+/// still round-trips through quantization well enough for `search_vector`
+/// to find it. See `v8_fixture_opens_and_reads` below for the equivalent
+/// coverage on a fixture that never carried pre-SQ8 rows at all.
 #[test]
 fn v7_fixture_opens_and_reads() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v7.redb");
@@ -434,6 +464,108 @@ fn v7_fixture_opens_and_reads() {
     // `m1` embedding, well under `build_threshold`, so no graph gets built.
     assert!(db.debug_dump_hnsw_meta().unwrap().is_empty());
     assert!(db.debug_dump_hnsw_links().unwrap().is_empty());
+}
+
+/// Verbatim copy of `crate::quant::quantize`/`crate::quant::dequantize`
+/// (format v8 SQ8 kernel) — copied, NOT imported (the module is
+/// `pub(crate)`, unreachable from this external test crate anyway), so this
+/// fixture's expected embedding is computed the same way `differential.rs`'s
+/// oracle computes its expected values: independently of the engine, from
+/// the same documented formula.
+fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
+    let mut maxabs = 0.0f32;
+    for &x in v {
+        let a = x.abs();
+        if a > maxabs {
+            maxabs = a;
+        }
+    }
+    if maxabs == 0.0 || !maxabs.is_finite() {
+        return (0.0, vec![0i8; v.len()]);
+    }
+    let s = 127.0f32 / maxabs;
+    let codes = v
+        .iter()
+        .map(|&x| ((x * s).round() as i32).clamp(-127, 127) as i8)
+        .collect();
+    (maxabs, codes)
+}
+
+fn dequantize(scale: f32, codes: &[i8]) -> Vec<f32> {
+    codes.iter().map(|&c| c as f32 * scale / 127.0).collect()
+}
+
+/// Task 8 (format v8, F8 SQ8 tail): the native v8 fixture, written by
+/// `regenerate_v8_fixture` (the SAME content recipe every earlier native
+/// fixture in this file used) directly at the current `FORMAT_VERSION` — no
+/// migration involved on open at all, unlike `v7_fixture_opens_and_reads`
+/// above (which now migrates a genuine pre-SQ8 file). Same standard query
+/// set, plus a direct check on the stored embedding: `debug_dump_vectors`
+/// returns the table's already-dequantized `Vec<f32>`, which must equal
+/// exactly `dequantize(quantize(v))` for the fixture's known `[1.0, 0.0]`
+/// embedding — not merely "close to" it, since `quantize`/`dequantize` are
+/// IEEE-exact (see `quant.rs`'s module doc) and `1.0`/`0.0` round-trip
+/// through SQ8 with zero error at this scale.
+#[test]
+fn v8_fixture_opens_and_reads() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v8.redb");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v8.redb");
+    std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(&path, spec).unwrap();
+    let scopes = ScopeSet::of(&[ScopeId::from_u128(1)]);
+    assert_eq!(
+        db.nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("ada".into()))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(db.search_text(&scopes, "databases", 10).unwrap().len(), 1);
+    assert_eq!(
+        db.search_vector(&VectorQuery {
+            scopes: scopes.clone(),
+            model: "m1".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            candidates: None,
+        })
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
+    assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
+    assert_eq!(db.current_seq().unwrap(), 3);
+    assert_eq!(db.format_version(), 8);
+    // Same sub-threshold scenario as v7's native test above: one `m1`
+    // embedding, well under `build_threshold`, so no graph gets built.
+    assert!(db.debug_dump_hnsw_meta().unwrap().is_empty());
+    assert!(db.debug_dump_hnsw_links().unwrap().is_empty());
+    // Dequantized-embedding expectation: the fixture's single `vectors` row
+    // must dequantize to EXACTLY what independently quantizing/dequantizing
+    // the recipe's known `[1.0, 0.0]` embedding produces.
+    let rows = db.debug_dump_vectors().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "recipe's known corpus: exactly one embedding"
+    );
+    let (scale, codes) = quantize(&[1.0f32, 0.0]);
+    let expected = dequantize(scale, &codes);
+    assert_eq!(
+        rows[0].3, expected,
+        "stored embedding must dequantize to exactly dequantize(quantize([1.0, 0.0]))"
+    );
 }
 
 #[test]
