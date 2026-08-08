@@ -274,7 +274,7 @@ mod reference {
     /// Verbatim copy of `crate::quant::quantize` (format v8 SQ8 kernel) —
     /// copied, NOT imported, so this oracle can never silently share a bug
     /// with the engine's own quantization; see this module's doc comment.
-    fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
+    pub(crate) fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
         let mut maxabs = 0.0f32;
         for &x in v {
             let a = x.abs();
@@ -308,6 +308,13 @@ mod reference {
             return None;
         }
         Some(dot as f32 / ((na as f32).sqrt() * (nb as f32).sqrt()))
+    }
+
+    /// Verbatim copy of `crate::quant::dequantize` — bit-for-bit the same
+    /// scale-and-divide as the engine, mirrored from quant.rs so the Get
+    /// probe can compute the same dequantized round-trip a v8 read returns.
+    pub(crate) fn dequantize(scale: f32, codes: &[i8]) -> Vec<f32> {
+        codes.iter().map(|&c| c as f32 * scale / 127.0).collect()
     }
 }
 
@@ -368,11 +375,31 @@ fn apply(db: &Db, model: &mut reference::RefModel, ops: Vec<Op>) {
     db.submit(ops).unwrap();
 }
 
+/// Format v8 contract: a read's `embedding` is the DEQUANTIZED SQ8
+/// approximation, not the raw submitted f32 vector — the ops log (and this
+/// reference model's own storage) retains the original f32, but every
+/// `NodeRecord` the engine hands back has gone through the engine's
+/// quantize/dequantize round-trip. Every probe that compares `NodeRecord`s
+/// against the reference model routes the model's expectation through this
+/// same transform, computed via the file's copied kernels, so the
+/// comparison stays an EXACT `==`: both sides are the identical
+/// deterministic function of the submitted vector, and that exactness pins
+/// the round-trip's determinism.
+fn expect_dequantized(mut node: NodeRecord) -> NodeRecord {
+    if let Some((_, vector)) = &node.embedding {
+        let (scale, codes) = reference::quantize(vector);
+        let dequantized = reference::dequantize(scale, &codes);
+        node.embedding.as_mut().unwrap().1 = dequantized;
+    }
+    node
+}
+
 fn assert_equivalent(db: &Db, model: &reference::RefModel, probes: &[Probe]) {
     for probe in probes {
         match probe {
             Probe::Get { id, scopes } => {
-                assert_eq!(db.node(scopes, *id), model.get(*id, scopes), "get {id:?}")
+                let expected = model.get(*id, scopes).map(expect_dequantized);
+                assert_eq!(db.node(scopes, *id), expected, "get {id:?}")
             }
             Probe::Find {
                 scopes,
@@ -382,24 +409,31 @@ fn assert_equivalent(db: &Db, model: &reference::RefModel, probes: &[Probe]) {
             } => {
                 let mut actual = db.nodes_by_prop(scopes, label, prop, value).unwrap();
                 actual.sort_by_key(|node| node.id);
-                assert_eq!(
-                    actual,
-                    model.find_by_prop(scopes, label, prop, value),
-                    "find {label}.{prop}"
-                );
+                let expected: Vec<NodeRecord> = model
+                    .find_by_prop(scopes, label, prop, value)
+                    .into_iter()
+                    .map(expect_dequantized)
+                    .collect();
+                assert_eq!(actual, expected, "find {label}.{prop}");
             }
             Probe::Label { scopes, label } => {
                 let mut actual = db.nodes_by_label(scopes, label);
                 actual.sort_by_key(|node| node.id);
-                assert_eq!(actual, model.find_by_label(scopes, label), "label {label}");
+                let expected: Vec<NodeRecord> = model
+                    .find_by_label(scopes, label)
+                    .into_iter()
+                    .map(expect_dequantized)
+                    .collect();
+                assert_eq!(actual, expected, "label {label}");
             }
             Probe::LabelNewest { scopes, label, k } => {
                 let actual = db.nodes_by_label_newest(scopes, label, *k);
-                assert_eq!(
-                    actual,
-                    model.newest_by_label(scopes, label, *k),
-                    "label-newest {label} k={k}"
-                );
+                let expected: Vec<NodeRecord> = model
+                    .newest_by_label(scopes, label, *k)
+                    .into_iter()
+                    .map(expect_dequantized)
+                    .collect();
+                assert_eq!(actual, expected, "label-newest {label} k={k}");
             }
             Probe::Traverse {
                 id,
