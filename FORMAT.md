@@ -114,7 +114,7 @@ transaction, committed once at the very end:
 | absent (brand-new file) | stamp `FORMAT_VERSION` (8) directly — `storage.rs: Storage::open_with_options`, `None` arm; `"hnsw_params"` is stamped separately by `ensure_hnsw_params` |
 | 8 | open directly, no rewrite — `Some(8) => {}` |
 | 7 | `migrate_v8::quantize_vectors` (one VECTORS scan, quantizes each vector to signed 8-bit codes), stamp 8 — `Some(7)` arm |
-| 6 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(6)` arm |
+| 6 | `migrate_v8::quantize_vectors`, stamp 8 — `Some(6)` arm (no LABEL_INDEX work needed: a v6-stamped file already has it) |
 | 5 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(5)` arm |
 | 4 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(4)` arm (jumps straight to current version; must do v6's work itself) |
 | 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(3)` arm |
@@ -123,17 +123,24 @@ transaction, committed once at the very end:
 | > 8 | `TopoError::UnsupportedFormat { found, supported: 8 }` — `Some(found) if found > FORMAT_VERSION` |
 | anything else (currently only 0, which can't occur since real versions start at 1) | `TopoError::Encoding` — `Some(found)` catch-all arm |
 
-Every arm above except the fast `Some(8) => {}` path calls
-`migrate_v6::migrate_v5_to_v6` — not just the `Some(5)` arm — because arms for
-versions further back stamp `FORMAT_VERSION` directly rather than falling
-through a chain of one-version-at-a-time steps; each must therefore perform
-v6's table work itself. `migrate_v5_to_v6` is idempotent (re-inserting the
-same key/value is a no-op), so calling it unconditionally on every non-fast
-path is safe regardless of how many other migrations ran first in the same
+The `Some(5)` and `Some(4)` arms both call `migrate_v6::migrate_v5_to_v6` —
+`Some(4)` because it jumps straight to the current `FORMAT_VERSION` and
+cannot fall through to the `Some(5)` arm above, which only ever runs for a
+file genuinely stamped 5. `Some(6)` needs no such call: a v6-stamped file
+already has LABEL_INDEX, so that arm goes straight to `migrate_v8::quantize_vectors`
+and the stamp. `migrate_v5_to_v6` is idempotent (re-inserting the same
+key/value is a no-op), so calling it from either the `Some(5)` or `Some(4)`
+arm is safe regardless of how many other migrations ran first in the same
 open. Every arm's version stamp is written via the `FORMAT_VERSION` constant,
-not a literal — so all of this held true, unedited, across the v6->v7->v8 flip:
-only the `Some(7)`/`Some(8)` arms themselves (and the too-new rejection arm's
-`supported` field) needed source changes.
+not a literal — so most of this held true, unedited, across the v6->v7->v8
+flip: only the `Some(7)`/`Some(8)` arms themselves (and the too-new
+rejection arm's `supported` field) needed source changes for the v6->v7
+bump. The v7->v8 bump instead touched every arm from `Some(4)` through
+`Some(7)`, adding a `migrate_v8::quantize_vectors` call to each — every one
+of those arms already produces a file with f32 `vectors` rows that need
+quantizing. `Some(3)` and `Some(2)` stayed call-free: their `migrate_v4`
+chain re-writes embeddings through the v8 `put_vector`, which quantizes as
+it writes, so there is nothing left for those arms to backfill.
 
 Because table creation, migration, and the version stamp all happen inside the
 single write transaction `open_with_options` opens at its top and commits once
