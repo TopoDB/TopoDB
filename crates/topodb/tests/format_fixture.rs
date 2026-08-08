@@ -272,7 +272,7 @@ fn v5_fixture_migrates_to_v6_and_reads() {
         "recipe's known corpus: exactly one Memory node (n2)"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
 }
 
 /// Task 7 (format v6, now FROZEN by the v7 flip): the native v6 fixture,
@@ -324,7 +324,7 @@ fn v6_fixture_opens_and_reads() {
     assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
     assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
 }
 
 /// The frozen v6 fixture's migration to v7 (F8's load-bearing migration
@@ -374,7 +374,7 @@ fn v6_fixture_migrates_to_v7_and_reads() {
     assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
     assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
     // The fixture's single `m1` embedding is below `build_threshold` (HNSW's
     // default is far above 1 vector), so it must stay on the scan path: no
     // graph rows at all, in either table.
@@ -429,7 +429,7 @@ fn v7_fixture_opens_and_reads() {
     assert_eq!(db.nodes_by_label(&scopes, "Entity").len(), 1);
     assert_eq!(db.nodes_by_label(&scopes, "Memory").len(), 1);
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
     // Same sub-threshold scenario as the v6->v7 migration test above: one
     // `m1` embedding, well under `build_threshold`, so no graph gets built.
     assert!(db.debug_dump_hnsw_meta().unwrap().is_empty());
@@ -495,7 +495,7 @@ fn v1_fixture_opens_and_reads() {
         "v1->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
     drop(db);
     // The second open takes the v4 fast path; migration is idempotent.
     let reopened = Db::open_with(
@@ -551,7 +551,7 @@ fn v2_fixture_opens_and_reads() {
         "v2->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
 }
 
 /// Migrates all the way to v4: the mid-branch `#[ignore]` guard lifted now
@@ -605,7 +605,7 @@ fn v3_fixture_opens_and_reads() {
         "v3->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
 }
 
 /// The load-bearing migration test (Task 7, corpus-purity amendment): a
@@ -671,7 +671,7 @@ fn v3_legacy_fixture_migrates_and_reads() {
         "v3-legacy->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
 }
 
 /// Task 8 (storage-format-v4 plan): the native v4 fixture, written by
@@ -729,7 +729,7 @@ fn v4_fixture_opens_and_reads() {
         "v4->v6 migration: LABEL_INDEX must have exactly one row per node (2 total), not be empty"
     );
     assert_eq!(db.current_seq().unwrap(), 3);
-    assert_eq!(db.format_version(), 7);
+    assert_eq!(db.format_version(), 8);
 }
 
 /// F8 review fix: `ensure_hnsw_params` must decode the stored META

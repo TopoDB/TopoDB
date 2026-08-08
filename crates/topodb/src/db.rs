@@ -1041,8 +1041,9 @@ impl Db {
             let scope = u32::from_be_bytes(key[4..8].try_into().expect("4-byte slice"));
             let slot = u64::from_be_bytes(key[8..16].try_into().expect("8-byte slice"));
             let raw = crate::codec::unframe_value(v.value())?;
-            let vector: Vec<f32> = postcard::from_bytes(raw.as_ref())
+            let (scale, codes): (f32, Vec<i8>) = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
+            let vector = crate::quant::dequantize(scale, &codes);
             out.push((model, scope, slot, vector));
         }
         out.sort_by_key(|a| (a.0, a.1, a.2));
