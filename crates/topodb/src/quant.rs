@@ -16,7 +16,6 @@
 //!   NaN components code to 0 (saturating cast), a non-finite maxabs
 //!   yields the zero vector encoding.
 
-#[allow(dead_code)]
 pub(crate) fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
     let mut maxabs = 0.0f32;
     for &x in v {
@@ -41,17 +40,14 @@ pub(crate) fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
     (maxabs, codes)
 }
 
-#[allow(dead_code)]
 pub(crate) fn dequantize(scale: f32, codes: &[i8]) -> Vec<f32> {
     codes.iter().map(|&c| c as f32 * scale / 127.0).collect()
 }
 
-#[allow(dead_code)]
 pub(crate) fn is_zero(codes: &[i8]) -> bool {
     codes.iter().all(|&c| c == 0)
 }
 
-#[allow(dead_code)]
 pub(crate) fn cosine_q(a: &[i8], b: &[i8]) -> Option<f32> {
     let (mut dot, mut na, mut nb) = (0i64, 0i64, 0i64);
     for (&x, &y) in a.iter().zip(b) {

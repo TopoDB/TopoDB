@@ -24,7 +24,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Clustered embedding rows: `vector_key(model, scope, slot)` -> framed
-/// postcard `Vec<f32>`.
+/// postcard `(f32, Vec<i8>) = (scale, codes)` (SQ8 quantized, format v8).
 pub(crate) const VECTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vectors");
 /// Per-node pointer to its current `(model, scope)`: 8-byte BE node slot ->
 /// postcard `(u32, u32)`. Small fixed-size value — not framed; framing exists
@@ -118,7 +118,9 @@ pub(crate) fn put_vector(
             );
         }
     }
-    let raw = postcard::to_allocvec(v).map_err(|e| TopoError::Encoding(e.to_string()))?;
+    let (scale, codes) = crate::quant::quantize(v);
+    let raw =
+        postcard::to_allocvec(&(scale, codes)).map_err(|e| TopoError::Encoding(e.to_string()))?;
     let framed = frame_value(raw);
     vectors
         .insert(vector_key(model, scope, slot).as_slice(), framed.as_slice())
@@ -159,11 +161,15 @@ pub(crate) fn remove_vector(
 /// `storage.rs`'s Task-3 consistency cross-check test and by
 /// [`search_scan`]'s candidates fast path (one O(1) lookup per candidate
 /// instead of a range scan).
-pub(crate) fn read_vector_by_slot(
+// The `(u32, u32, f32, Vec<i8>) = (model, scope, scale, codes)` return shape
+// is a pinned cross-wave interface contract (T4/T5 consume it verbatim,
+// per the F8 task briefs) — not simplified into a named type here.
+#[allow(clippy::type_complexity)]
+pub(crate) fn read_qvec_by_slot(
     vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
     refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     slot: u64,
-) -> Result<Option<(u32, u32, Vec<f32>)>, TopoError> {
+) -> Result<Option<(u32, u32, f32, Vec<i8>)>, TopoError> {
     let rk = slot_key(slot);
     let Some(g) = refs.get(rk.as_slice()).map_err(storage_err)? else {
         return Ok(None);
@@ -176,14 +182,25 @@ pub(crate) fn read_vector_by_slot(
     {
         Some(v) => {
             let raw = unframe_value(v.value())?;
-            let vec: Vec<f32> =
+            let (scale, codes): (f32, Vec<i8>) =
                 postcard::from_bytes(&raw).map_err(|e| TopoError::Encoding(e.to_string()))?;
-            Ok(Some((model, scope, vec)))
+            Ok(Some((model, scope, scale, codes)))
         }
         None => Err(TopoError::Encoding(
             "read_vector_by_slot: embedding_ref present but vectors row missing".into(),
         )),
     }
+}
+
+/// TRANSITIONAL (deleted once hnsw.rs/storage.rs move to
+/// `read_qvec_by_slot`): pre-v8 signature, dequantizing on the fly.
+pub(crate) fn read_vector_by_slot(
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    slot: u64,
+) -> Result<Option<(u32, u32, Vec<f32>)>, TopoError> {
+    Ok(read_qvec_by_slot(vectors, refs, slot)?
+        .map(|(m, s, scale, codes)| (m, s, crate::quant::dequantize(scale, &codes))))
 }
 
 /// Bit-for-bit the same cosine formula the v3 RAM slab scored with
@@ -379,6 +396,14 @@ pub(crate) fn search_scan(
 
     let mut heap: BinaryHeap<Reverse<(OrderedScore, u64)>> = BinaryHeap::new();
 
+    // Quantize the query once. A zero-norm query codes to all-zero, which
+    // `cosine_q` would score `None` against every row — same as the old
+    // `cosine` behavior for a zero-norm query — so short-circuit to `[]`.
+    let (_, qcodes) = crate::quant::quantize(&q.vector);
+    if crate::quant::is_zero(&qcodes) {
+        return Ok(Vec::new());
+    }
+
     if let Some(candidates) = &q.candidates {
         let node_slots = tx.open_table(NODE_SLOTS).map_err(storage_err)?;
         let allowed_scopes: HashSet<u32> = q
@@ -393,17 +418,18 @@ pub(crate) fn search_scan(
             let Some(slot) = node_slot(&node_slots, id)? else {
                 continue;
             };
-            let Some((row_model, row_scope, vector)) = read_vector_by_slot(&vectors, &refs, slot)?
+            let Some((row_model, row_scope, _scale, codes)) =
+                read_qvec_by_slot(&vectors, &refs, slot)?
             else {
                 continue;
             };
             if row_model != model_id || !allowed_scopes.contains(&row_scope) {
                 continue;
             }
-            if vector.len() != q.vector.len() {
+            if codes.len() != q.vector.len() {
                 continue;
             }
-            if let Some(score) = cosine(&vector, &q.vector) {
+            if let Some(score) = crate::quant::cosine_q(&qcodes, &codes) {
                 push_topk(&mut heap, score, slot, q.k);
             }
         }
@@ -464,12 +490,12 @@ pub(crate) fn search_scan(
                         .map_err(|_| TopoError::Encoding("bad vector_key length".into()))?;
                     let slot = u64::from_be_bytes(slot_bytes);
                     let raw = unframe_value(value_guard.value())?;
-                    let vector: Vec<f32> = postcard::from_bytes(&raw)
+                    let (_scale, codes): (f32, Vec<i8>) = postcard::from_bytes(&raw)
                         .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                    if vector.len() != q.vector.len() {
+                    if codes.len() != q.vector.len() {
                         continue;
                     }
-                    if let Some(score) = cosine(&vector, &q.vector) {
+                    if let Some(score) = crate::quant::cosine_q(&qcodes, &codes) {
                         push_topk(&mut heap, score, slot, q.k);
                     }
                 }
@@ -522,20 +548,29 @@ mod tests {
     #[test]
     fn put_read_round_trips() {
         let (_dir, db) = open();
+        let v = vec![0.5f32, -2.0, 1.0];
         let tx = db.begin_write().unwrap();
         {
             let mut vectors = tx.open_table(VECTORS).unwrap();
             let mut refs = tx.open_table(EMBEDDING_REF).unwrap();
-            put_vector(&mut vectors, &mut refs, 1, 2, 7, &[1.0, 2.0, 3.0]).unwrap();
+            put_vector(&mut vectors, &mut refs, 1, 2, 7, &v).unwrap();
         }
         tx.commit().unwrap();
 
         let tx = db.begin_read().unwrap();
         let vectors = tx.open_table(VECTORS).unwrap();
         let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        let (model, scope, vector) = read_vector_by_slot(&vectors, &refs, 7).unwrap().unwrap();
+        let (model, scope, scale, codes) = read_qvec_by_slot(&vectors, &refs, 7)
+            .unwrap()
+            .expect("row present");
         assert_eq!((model, scope), (1, 2));
-        assert_eq!(vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(scale, 2.0);
+        assert_eq!(codes, vec![32i8, -127, 64]);
+        // Compat wrapper returns the dequantized approximation of v.
+        let (_, _, approx) = read_vector_by_slot(&vectors, &refs, 7).unwrap().unwrap();
+        for (a, b) in approx.iter().zip(&v) {
+            assert!((a - b).abs() <= b.abs() * 0.01 + 1e-6, "{a} vs {b}");
+        }
     }
 
     #[test]
@@ -561,9 +596,10 @@ mod tests {
         let tx = db.begin_read().unwrap();
         let vectors = tx.open_table(VECTORS).unwrap();
         let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        let (model, scope, vector) = read_vector_by_slot(&vectors, &refs, 7).unwrap().unwrap();
+        let (model, scope, scale, codes) = read_qvec_by_slot(&vectors, &refs, 7).unwrap().unwrap();
         assert_eq!((model, scope), (1, 2));
-        assert_eq!(vector, vec![9.0, 9.0]);
+        assert_eq!(scale, 9.0);
+        assert_eq!(codes, vec![127i8, 127]); // round(9.0*127.0/9.0)=127 for both
     }
 
     #[test]
@@ -591,9 +627,11 @@ mod tests {
         let tx = db.begin_read().unwrap();
         let vectors = tx.open_table(VECTORS).unwrap();
         let refs = tx.open_table(EMBEDDING_REF).unwrap();
-        let (model, scope, vector) = read_vector_by_slot(&vectors, &refs, 7).unwrap().unwrap();
+        let (model, scope, scale, codes) = read_qvec_by_slot(&vectors, &refs, 7).unwrap().unwrap();
         assert_eq!((model, scope), (5, 2));
-        assert_eq!(vector, vec![3.0, 4.0]);
+        assert_eq!(scale, 4.0);
+        // s = 127/4.0 = 31.75; round(3.0*31.75)=round(95.25)=95; round(4.0*31.75)=127
+        assert_eq!(codes, vec![95i8, 127]);
     }
 
     #[test]

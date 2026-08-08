@@ -201,7 +201,7 @@ mod reference {
                 if vector.len() != query.len() {
                     continue;
                 }
-                if let Some(score) = cosine(vector, query) {
+                if let Some(score) = cosine_q(&quantize(query).1, &quantize(vector).1) {
                     hits.push((*id, score));
                 }
             }
@@ -271,22 +271,43 @@ mod reference {
         }
     }
 
-    /// Bit-for-bit the same formula as `vector::cosine` (single accumulation
-    /// pass over `a.iter().zip(b)`, `None` when either side's squared-norm
-    /// accumulator is exactly `0.0`) — kept identical rather than merely
-    /// equivalent so this oracle can never diverge from the engine by a
-    /// rounding ULP.
-    fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
-        let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-        for (x, y) in a.iter().zip(b) {
+    /// Verbatim copy of `crate::quant::quantize` (format v8 SQ8 kernel) —
+    /// copied, NOT imported, so this oracle can never silently share a bug
+    /// with the engine's own quantization; see this module's doc comment.
+    fn quantize(v: &[f32]) -> (f32, Vec<i8>) {
+        let mut maxabs = 0.0f32;
+        for &x in v {
+            let a = x.abs();
+            if a > maxabs {
+                maxabs = a;
+            }
+        }
+        if maxabs == 0.0 || !maxabs.is_finite() {
+            return (0.0, vec![0i8; v.len()]);
+        }
+        let s = 127.0f32 / maxabs;
+        let codes = v
+            .iter()
+            .map(|&x| ((x * s).round() as i32).clamp(-127, 127) as i8)
+            .collect();
+        (maxabs, codes)
+    }
+
+    /// Verbatim copy of `crate::quant::cosine_q` — bit-for-bit the same
+    /// integer accumulation (i64, per the format-v8 determinism spine) so
+    /// this oracle can never diverge from the engine by a rounding ULP.
+    fn cosine_q(a: &[i8], b: &[i8]) -> Option<f32> {
+        let (mut dot, mut na, mut nb) = (0i64, 0i64, 0i64);
+        for (&x, &y) in a.iter().zip(b) {
+            let (x, y) = (i64::from(x), i64::from(y));
             dot += x * y;
             na += x * x;
             nb += y * y;
         }
-        if na == 0.0 || nb == 0.0 {
+        if na == 0 || nb == 0 {
             return None;
         }
-        Some(dot / (na.sqrt() * nb.sqrt()))
+        Some(dot as f32 / ((na as f32).sqrt() * (nb as f32).sqrt()))
     }
 }
 
