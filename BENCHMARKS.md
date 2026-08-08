@@ -701,3 +701,130 @@ Notes recorded for whoever runs the gates:
   tier's peak-WS measurement above should watch for that ceiling holding
   flat as N grows, not scaling with the fixture size the way it would have
   under the old buffered build.
+
+## v8 (format 8: SQ8 symmetric integer cosine, params v3)
+
+Code landed 2026-08-08 (branch `sq8`, HEAD `06e7369`); measured 2026-08-08 on
+the same 8 GB dev Mac as the v7 section, following its warm-file discipline.
+What changed: every `vectors` row now stores `(scale: f32, codes: Vec<i8>)`
+instead of a raw `Vec<f32>` — symmetric 8-bit quantization, integer cosine
+accumulated in `i64` (dim is only u32-bounded; i32 overflows past dim ≈
+133k), no libm in the scored path. `FORMAT_VERSION` is 8;
+`HnswParams::default().version` is 3 (neighbor-selection heuristic
+unchanged from v2 — only the vector encoding and its scoring path changed).
+A v7 fixture opened under this binary migrates its `vectors` rows in place
+(`migrate_v8::quantize_vectors`), so every row below was measured against a
+fixture *built fresh under v8* — the stale v7-era fixture files this
+machine had cached from the 2026-08-05/06 F8 runs were deleted first, not
+reused, to avoid silently timing a migrated-not-built fixture.
+
+```text
+TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 TOPODB_VEC_GEOMETRY=manifold cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture
+TOPODB_VEC_FIXTURE_N=100000 TOPODB_VEC_DIM=384 TOPODB_VEC_GEOMETRY=manifold cargo test -p topodb --release --test size_report -- --ignored vector_search_report --nocapture
+TOPODB_VEC_FIXTURE_N=20000 TOPODB_VEC_DIM=384 TOPODB_VEC_GEOMETRY=manifold cargo test -p topodb --release --test size_report -- --ignored build_vector_fixture --nocapture
+TOPODB_VEC_FIXTURE_N=20000 TOPODB_VEC_DIM=384 TOPODB_VEC_GEOMETRY=manifold cargo test -p topodb --release --test size_report -- --ignored vector_search_report --nocapture
+cargo bench -p topodb --bench storage -- search_warm_10k_scope
+```
+
+### Build throughput (manifold geometry, 384-dim, params v3+VecCache+SQ8)
+
+| scale | v7 VecCache (f32) | v8 (SQ8) | speedup |
+|---|---:|---:|---:|
+| 20k | 119.7 s (~167/s) | **101.1 s (~198/s)**, one run, `complete=true` | **1.18×** |
+| 100k | 1084 s (~92/s) | **912.0 s (~109.6/s)**, 3 budgeted runs (423.1 s + 420.9 s + 68.0 s), `complete=true` | **1.19×** |
+
+SQ8 buys a further ~1.2× on top of the VecCache win (1.83×/1.34× at
+20k/100k, prior commit) — smaller rows mean less to encode/decode per
+graph op, on top of VecCache's per-op decode dedup. Both are net wins over
+the pre-VecCache f32 baselines (218.7 s / 1451 s).
+
+### Gate 2a (manifold recall, the hard gate) — PASS
+
+| scale | recall@10 | warm p95 | notes |
+|---|---:|---:|---|
+| 20k | 1.0000 | 3.86 ms | single run; min 2.20 / median 2.51 / max 7.66 ms |
+| 100k | 1.0000 (both runs) | 9.42 ms, re-warmed rerun 8.93 ms | v7 baseline band was 8.4–10.3 ms across same-graph runs; both v8 runs land inside it — **no regression, within noise** |
+
+Both 100k runs are recorded per the repo's warm-file honesty convention
+(rerun-once-if-anomalous): 9.42 ms was the first warm run, not implausible
+on its own, but the brief calls for a confirming rerun near a cited
+threshold — the second run (8.93 ms) confirms the first wasn't a fluke and
+sits closer to the v7 median. **Gate: PASS.**
+
+### Size — vector bytes vs whole file (honesty split)
+
+`storage_report`'s `vectors` table, measured directly on the built v8
+fixtures (100k and 20k rows agree exactly on bytes/row, a good determinism
+sanity check):
+
+| scale | file bytes | logical total | `vectors` table (key+value) | bytes/vector |
+|---|---:|---:|---:|---:|
+| 20k | 135,278,592 | 43,160,197 | 8,140,000 | 407 (391 value + 16 key) |
+| 100k | 539,504,640 | 215,800,197 | 40,700,000 | 407 (391 value + 16 key) |
+
+391 bytes/value decomposes exactly as SQ8's encoding predicts: 4 bytes
+(`f32` scale) + 2 bytes (postcard varint length prefix for a 384-element
+`Vec<i8>`) + 384 bytes (codes) + 1 byte (`frame_value`'s `CODEC_RAW` tag,
+since 391 < 512 never triggers the LZ4 path) = 391.
+
+The v7-equivalent per-vector byte count was **not re-measured** — opening
+the old v7 fixture under this v8 binary would migrate it in place
+(`migrate_v8::quantize_vectors`), destroying it as a v7 reference before it
+could be read. Computed instead from the unchanged encoding path
+(`migrate_v8.rs`, `codec::frame_value`): raw `Vec<f32>` postcard is 2 bytes
+(length prefix) + 384×4 = 1536 bytes = 1538 bytes, ≥512 so `frame_value`
+*attempts* LZ4 (`CODEC_LZ4` wins only if it beats 90% of raw); untried
+against the actual v7 bytes, so 1539 bytes (`CODEC_RAW` fallback, 1-byte
+tag) is reported as a computed estimate, not a measured figure. That gives
+**391 / 1539 ≈ 0.254×, i.e. ~3.9× smaller** for the vectors table alone —
+consistent with the ~4× SQ8 design target.
+
+Whole-file bytes are **unchanged**: both the 20k and 100k v8 file sizes
+match the file sizes this same machine recorded for the equivalent v7-era
+fixtures byte-for-byte (135,278,592 and 539,504,640). This is the same
+phenomenon the v2 section above already documented at small scale
+("physical file bytes are unchanged because redb allocator/free-list slack
+dominates") — at 100k rows the `vectors` table is only ~40.7 MB of a 215.8
+MB logical total (~19%) and ~7.5% of the 539.5 MB file; `ops` (the durable
+op log, 163.8 MB logical) and redb's own page/free-list/COW overhead (539.5
+MB file vs 215.8 MB logical, ~2.5×) dominate file size at this workload
+shape, so a ~1.15 MB vectors-table saving (100k row-count level) doesn't
+move the needle on disk. Both numbers are reported per the brief's ask
+rather than only the flattering one.
+
+### Criterion 10k×768 pair (params v3+VecCache+SQ8) — the pending F8 tail item
+
+`search_warm_10k_scope_graph` vs `search_warm_10k_scope_scan_baseline`,
+uniform-random 768-dim, 10k vectors, k=10, 100 samples/bench:
+
+| bench | time (criterion [low, est, high]) |
+|---|---|
+| `search_warm_10k_scope_graph` | 9.8199 ms / **9.9079 ms** / 10.002 ms |
+| `search_warm_10k_scope_scan_baseline` | 10.375 ms / **10.460 ms** / 10.556 ms |
+
+Graph ≤ scan holds (gate 1, previously pending a v2/v3 re-run — now
+measured): graph is ~5.3% faster than the honest linear-scan baseline at
+10k×768, similar parity to the v1 closest-M numbers this gate first
+recorded (10.99 ms ≈ 11.03 ms), not a regression from SQ8's added
+quantize/dequantize step.
+
+### Honesty notes
+
+- Warm-file hygiene carried forward from v7: this machine has 8 GB RAM and
+  the 100k fixture is ~514 MB; a report run against a partially evicted
+  page cache measures disk, not the graph. `cat` the fixture to `/dev/null`
+  before every timed run — every number above followed that discipline.
+- **Scores are quantized from v8 on.** `cosine_q`'s integer accumulation is
+  an approximation of true cosine similarity (8-bit codes lose precision
+  relative to the f32 vectors they're quantized from); recall@10 = 1.0000
+  at both scales shows the approximation doesn't cost recall on this
+  benign, well-separated manifold corpus, but it is not evidence the
+  quantization is lossless for score *magnitudes* or for harder geometries.
+- Gate 2a still awaits its real-embedding re-anchor (F3-linked, noted in
+  the v7 section above): the 32-cluster synthetic manifold is the benign
+  end of "realistic" geometry. A real-embedding corpus should re-run this
+  gate once embeddings are runnable on a dev machine, under SQ8, before
+  gate 2a is treated as fully closed rather than passing-on-synthetic-data.
+- No production code changed for this measurement pass; T8 was gates/bench/
+  docs only. All gates above measured **PASS** — nothing here blocks the
+  v8/SQ8 branch on the numbers gathered.
