@@ -381,7 +381,11 @@ mod tests {
             .unwrap()
             .expect("vectors pass must populate the v4 tables");
         assert_eq!(got_scope, scope_id);
-        assert_eq!(vector, vec![1.0, 2.0, 3.0]);
+        // v8: `read_vector_by_slot` dequantizes the SQ8-quantized codes
+        // `put_vector` wrote, so the expected value is
+        // `dequantize(quantize(v))`, not the raw input `v`.
+        let (scale, codes) = crate::quant::quantize(&[1.0f32, 2.0, 3.0]);
+        assert_eq!(vector, crate::quant::dequantize(scale, &codes));
         let dict_table = tx.open_table(DICT).unwrap();
         let dicts = Dicts::load_from_table(&dict_table).unwrap();
         assert_eq!(dicts.resolve(DictKind::Model, model_id).unwrap(), "m1");
