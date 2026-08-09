@@ -3,6 +3,9 @@
 // task. HARD RULES: exit 0 no matter what; nothing on stdout except the
 // injection payload; self-deadline; never break or delay a dispatch.
 import { renderMemoryLines } from "./render.js";
+import { pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
+import { connectForProject } from "../broker-client.js";
 
 const QUERY_CAP = 1000;
 const CHAR_CAP = 2000;
@@ -53,10 +56,6 @@ export function renderSubagentContext(hits) {
   lines.push("Recall more: search_memories. Store: remember.");
   return lines.join("\n");
 }
-
-import { pathToFileURL } from "node:url";
-import { readFileSync } from "node:fs";
-import { connectForProject } from "../broker-client.js";
 
 const DEADLINE_MS = 2000;
 const K = 5;

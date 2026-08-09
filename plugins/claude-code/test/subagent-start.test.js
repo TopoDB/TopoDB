@@ -1,15 +1,16 @@
-// Unit: task extraction and context rendering. Integration: run the real
+// Unit: task extraction, skip logic, context rendering. Integration: run the real
 // hook script against a real broker backed by the LOCALLY BUILT server
 // (same pattern as session-start.test.js: spawn broker.js with a fake
 // @topodb/topodb-mcp shim that execs the local binary).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
+import { extractTask, skipSet, renderSubagentContext } from "../hooks/subagent-start.js";
 import { connectForProject } from "../broker-client.js";
 import { serverArgs } from "../server-args.js";
 import { socketPathFor } from "../ipc.js";
@@ -21,7 +22,114 @@ const HOOK = path.join(PLUGIN_ROOT, "hooks", "subagent-start.js");
 const BROKER_JS = path.join(PLUGIN_ROOT, "broker.js");
 const LOCAL_SERVER = path.join(REPO, "target", "debug", process.platform === "win32" ? "topodb-mcp.exe" : "topodb-mcp");
 
-// Run the hook with a payload + env via execFileSync, return trimmed stdout.
+// --- Unit tests: extractTask ---
+
+test("extractTask: string content", () => {
+  const transcript = JSON.stringify({ type: "user", message: { role: "user", content: "find the bug" } }) + "\n";
+  assert.equal(extractTask(transcript), "find the bug");
+});
+
+test("extractTask: array-of-text-parts content, flattened", () => {
+  const transcript = JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "text", text: "part 1" }, { type: "text", text: " part 2" }],
+    },
+  }) + "\n";
+  assert.equal(extractTask(transcript), "part 1 part 2");
+});
+
+test("extractTask: caps at 1000 chars", () => {
+  const long = "x".repeat(1500);
+  const transcript = JSON.stringify({ type: "user", message: { role: "user", content: long } }) + "\n";
+  const result = extractTask(transcript);
+  assert.equal(result.length, 1000);
+  assert.match(result, /^x{1000}$/);
+});
+
+test("extractTask: null when no user message / empty / unparseable / whitespace-only", () => {
+  const cases = [
+    null,
+    "",
+    "not json",
+    JSON.stringify({ type: "assistant", message: { role: "assistant", content: "x" } }),
+    JSON.stringify({ type: "user", message: { role: "user", content: "" } }),
+    JSON.stringify({ type: "user", message: { role: "user", content: "   " } }),
+  ];
+  for (const input of cases) {
+    assert.equal(extractTask(input), null, `should return null for: ${input}`);
+  }
+});
+
+// --- Unit tests: skipSet ---
+
+test("skipSet: default skips explore+plan case-insensitively", () => {
+  const set = skipSet({});
+  // Set stores lowercase versions
+  assert.ok(set.has("explore"));
+  assert.ok(set.has("plan"));
+  assert.ok(!set.has("general-purpose"));
+  // Verify the callers need to lowercase before checking (as main() does)
+  assert.ok(set.has(String("EXPLORE").toLowerCase()));
+  assert.ok(set.has(String("PLAN").toLowerCase()));
+});
+
+test("skipSet: env TOPODB_SUBAGENT_SKIP replaces default", () => {
+  const set = skipSet({ TOPODB_SUBAGENT_SKIP: "foo,bar" });
+  assert.ok(set.has("foo"));
+  assert.ok(set.has("bar"));
+  assert.ok(!set.has("explore"));
+});
+
+test("skipSet: empty string → empty set", () => {
+  const set = skipSet({ TOPODB_SUBAGENT_SKIP: "" });
+  assert.equal(set.size, 0);
+});
+
+// --- Unit tests: renderSubagentContext ---
+
+test("renderSubagentContext: empty array → null", () => {
+  assert.equal(renderSubagentContext([]), null);
+});
+
+test("renderSubagentContext: non-Memory label filtered out", () => {
+  const nodes = [{ label: "Entity", props: { content: "entity content" } }];
+  assert.equal(renderSubagentContext(nodes), null);
+});
+
+test("renderSubagentContext: Memory with missing/whitespace content filtered out", () => {
+  const nodes = [
+    { label: "Memory", props: {} },
+    { label: "Memory", props: { content: "" } },
+    { label: "Memory", props: { content: "   " } },
+  ];
+  assert.equal(renderSubagentContext(nodes), null);
+});
+
+test("renderSubagentContext: all nodes filter out → null", () => {
+  const nodes = [
+    { label: "Entity", props: { content: "x" } },
+    { label: "Memory", props: { content: "" } },
+  ];
+  assert.equal(renderSubagentContext(nodes), null);
+});
+
+test("renderSubagentContext: one or more Memory nodes with content → injects header, content, trailer", () => {
+  const nodes = [
+    { label: "Memory", props: { content: "First memory fact" } },
+    { label: "Entity", props: { name: "SomeThing" } },
+    { label: "Memory", props: { content: "Second memory fact" } },
+  ];
+  const out = renderSubagentContext(nodes);
+  assert.ok(out);
+  assert.match(out, /## Relevant project memory/);
+  assert.match(out, /First memory fact/);
+  assert.match(out, /Second memory fact/);
+  assert.match(out, /Recall more: search_memories\. Store: remember\./);
+});
+
+// --- Run the hook with a payload + env via execFileSync, return trimmed stdout.
 function runHook(payload, extraEnv = {}) {
   try {
     return execFileSync(process.execPath, [HOOK], {
