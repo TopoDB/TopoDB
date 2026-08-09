@@ -1788,6 +1788,50 @@ fn remember_edge_type_and_props_land() {
 }
 
 #[test]
+fn remember_positional_content_equals_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let run = |content_args: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope, "remember"];
+        v.extend_from_slice(content_args);
+        v.extend_from_slice(&["--entity", "X"]);
+        let out = bin().args(&v).output().unwrap();
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    // First write via positional, second identical via --content → dedup hit.
+    let a = run(&["the same fact"]);
+    let b = run(&["--content", "the same fact"]);
+    assert_eq!(b["deduplicated"], serde_json::Value::Bool(true));
+    assert_eq!(a["memory_id"], b["memory_id"]);
+}
+
+#[test]
+fn remember_conflicting_content_is_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "remember", "pos", "--content", "flag", "--entity", "X"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2)); // clap conflict
+}
+
+#[test]
+fn remember_missing_content_is_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "remember", "--entity", "X"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--content") || err.contains("positional"), "err: {err}");
+}
+
+#[test]
 fn traverse_as_of_shows_the_past_topology() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");

@@ -112,9 +112,12 @@ pub enum Command {
     /// link. Prints memory_id, per-entity {name,id,created}, edge_ids,
     /// deduplicated, superseded.
     Remember {
-        /// The fact to store (full-text-searchable body).
-        #[arg(long)]
-        content: String,
+        /// The fact to store (full-text-searchable body). Pass it as a
+        /// positional argument, or via --content (not both).
+        content: Option<String>,
+        /// Alias for the positional fact. Conflicts with the positional form.
+        #[arg(long = "content", value_name = "CONTENT", conflicts_with = "content")]
+        content_flag: Option<String>,
         /// Entity name to link the memory to; repeatable, at least one.
         #[arg(long = "entity", required = true)]
         entity: Vec<String>,

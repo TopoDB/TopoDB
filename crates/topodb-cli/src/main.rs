@@ -164,23 +164,34 @@ fn main() {
         ),
         Command::Remember {
             content,
+            content_flag,
             entity,
             edge_type,
             supersedes,
             props,
             kind,
             ..
-        } => remember(
-            &db,
-            write_scope,
-            content,
-            entity,
-            edge_type,
-            supersedes,
-            props.as_deref(),
-            kind,
-            cli.pretty,
-        ),
+        } => {
+            let content = match content.or(content_flag) {
+                Some(c) => c,
+                None => output::fail(
+                    "rejected",
+                    "provide the fact as a positional argument or via --content",
+                    2,
+                ),
+            };
+            remember(
+                &db,
+                write_scope,
+                content,
+                entity,
+                edge_type,
+                supersedes,
+                props.as_deref(),
+                kind,
+                cli.pretty,
+            )
+        }
         Command::Forget { ids, .. } => forget(&db, write_scope, &ids, cli.pretty),
         Command::ObsidianIngest { vault, dry_run, .. } => {
             obsidian_ingest(&db, &vault, write_scope, dry_run, cli.pretty)
