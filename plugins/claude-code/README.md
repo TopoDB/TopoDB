@@ -37,7 +37,9 @@ rather than ever blocking a session:
   2k tokens. No broker running yet (the very first session of a project)
   means no injection; it appears from the next session on. The recall
   injection needs a 0.0.11+ server and the hygiene nudge below needs 0.0.12+;
-  the plugin pins 0.0.14, so both are live (0.0.14 also brings the full F6
+  the plugin pins 0.0.15, so both are live (0.0.15 brings the vector-engine
+  overhaul — deterministic HNSW ANN + SQ8 quantized storage, formats v7+v8,
+  existing DB files migrate in place on first open; 0.0.14 brought the full F6
   memory lifecycle: `forget` tombstones, the `kind` taxonomy on
   remember/search, the `lifecycle_candidates` decay sweep, plus the
   obsidian vault-bridge tools; 0.0.13 had added `as_of` temporal
