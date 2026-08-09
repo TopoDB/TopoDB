@@ -101,13 +101,22 @@ pub fn resolve_db(
     home: Option<&str>,
 ) -> Resolved<PathBuf> {
     if let Some(f) = flag {
-        return Resolved { value: f, source: Source::Flag };
+        return Resolved {
+            value: f,
+            source: Source::Flag,
+        };
     }
     if let Some(e) = env {
-        return Resolved { value: expand_home(&e, home), source: Source::Env };
+        return Resolved {
+            value: expand_home(&e, home),
+            source: Source::Env,
+        };
     }
     if let Some((c, p)) = config {
-        return Resolved { value: expand_home(c, home), source: Source::Config(p.to_path_buf()) };
+        return Resolved {
+            value: expand_home(c, home),
+            source: Source::Config(p.to_path_buf()),
+        };
     }
     Resolved {
         value: expand_home("~/.topodb/memory.redb", home),
@@ -121,22 +130,36 @@ pub fn resolve_scope_str(
     config: Option<(&str, &Path)>,
 ) -> Resolved<String> {
     if let Some(f) = flag {
-        return Resolved { value: f, source: Source::Flag };
+        return Resolved {
+            value: f,
+            source: Source::Flag,
+        };
     }
     if let Some(e) = env {
-        return Resolved { value: e, source: Source::Env };
+        return Resolved {
+            value: e,
+            source: Source::Env,
+        };
     }
     if let Some((c, p)) = config {
-        return Resolved { value: c.to_string(), source: Source::Config(p.to_path_buf()) };
+        return Resolved {
+            value: c.to_string(),
+            source: Source::Config(p.to_path_buf()),
+        };
     }
-    Resolved { value: "shared".to_string(), source: Source::Default }
+    Resolved {
+        value: "shared".to_string(),
+        source: Source::Default,
+    }
 }
 
 fn parse_format(s: &str) -> Result<Format, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "json" => Ok(Format::Json),
         "text" => Ok(Format::Text),
-        other => Err(format!("invalid format {other:?} (expected \"json\" or \"text\")")),
+        other => Err(format!(
+            "invalid format {other:?} (expected \"json\" or \"text\")"
+        )),
     }
 }
 
@@ -147,16 +170,29 @@ pub fn resolve_format(
     is_terminal: bool,
 ) -> Result<Resolved<Format>, String> {
     if let Some(f) = flag {
-        return Ok(Resolved { value: f, source: Source::Flag });
+        return Ok(Resolved {
+            value: f,
+            source: Source::Flag,
+        });
     }
     if let Some(e) = env {
-        return Ok(Resolved { value: parse_format(&e)?, source: Source::Env });
+        return Ok(Resolved {
+            value: parse_format(&e)?,
+            source: Source::Env,
+        });
     }
     if let Some((c, p)) = config {
-        return Ok(Resolved { value: parse_format(c)?, source: Source::Config(p.to_path_buf()) });
+        return Ok(Resolved {
+            value: parse_format(c)?,
+            source: Source::Config(p.to_path_buf()),
+        });
     }
     Ok(Resolved {
-        value: if is_terminal { Format::Text } else { Format::Json },
+        value: if is_terminal {
+            Format::Text
+        } else {
+            Format::Json
+        },
         source: Source::Default,
     })
 }
@@ -178,7 +214,10 @@ mod tests {
     #[test]
     fn parses_known_keys() {
         let d = tempfile::tempdir().unwrap();
-        write(d.path(), "db = \"~/x.redb\"\nscope = \"shared\"\nformat = \"text\"\n");
+        write(
+            d.path(),
+            "db = \"~/x.redb\"\nscope = \"shared\"\nformat = \"text\"\n",
+        );
         let cfg = load_project_config(d.path()).unwrap().unwrap();
         assert_eq!(cfg.db.as_deref(), Some("~/x.redb"));
         assert_eq!(cfg.scope.as_deref(), Some("shared"));
@@ -226,7 +265,10 @@ mod tests {
             expand_home("~/.topodb/memory.redb", Some("/home/x")),
             PathBuf::from("/home/x/.topodb/memory.redb")
         );
-        assert_eq!(expand_home("/abs/p", Some("/home/x")), PathBuf::from("/abs/p"));
+        assert_eq!(
+            expand_home("/abs/p", Some("/home/x")),
+            PathBuf::from("/abs/p")
+        );
         assert_eq!(expand_home("~/p", None), PathBuf::from("~/p"));
     }
 
@@ -234,12 +276,21 @@ mod tests {
     fn db_precedence_flag_over_env_over_config_over_default() {
         let p = PathBuf::from("/cfg/.topodb.toml");
         // flag wins
-        let r = resolve_db(Some("/flag.redb".into()), Some("/env.redb".into()),
-            Some(("/cfg.redb", &p)), Some("/home"));
+        let r = resolve_db(
+            Some("/flag.redb".into()),
+            Some("/env.redb".into()),
+            Some(("/cfg.redb", &p)),
+            Some("/home"),
+        );
         assert_eq!(r.value, PathBuf::from("/flag.redb"));
         assert_eq!(r.source, Source::Flag);
         // env next
-        let r = resolve_db(None, Some("/env.redb".into()), Some(("/cfg.redb", &p)), Some("/home"));
+        let r = resolve_db(
+            None,
+            Some("/env.redb".into()),
+            Some(("/cfg.redb", &p)),
+            Some("/home"),
+        );
         assert_eq!(r.value, PathBuf::from("/env.redb"));
         assert_eq!(r.source, Source::Env);
         // config next (with ~ expansion)
@@ -255,8 +306,14 @@ mod tests {
     #[test]
     fn scope_precedence_and_default_shared() {
         let p = PathBuf::from("/cfg/.topodb.toml");
-        assert_eq!(resolve_scope_str(Some("A".into()), Some("B".into()), Some(("C", &p))).value, "A");
-        assert_eq!(resolve_scope_str(None, Some("B".into()), Some(("C", &p))).value, "B");
+        assert_eq!(
+            resolve_scope_str(Some("A".into()), Some("B".into()), Some(("C", &p))).value,
+            "A"
+        );
+        assert_eq!(
+            resolve_scope_str(None, Some("B".into()), Some(("C", &p))).value,
+            "B"
+        );
         assert_eq!(resolve_scope_str(None, None, Some(("C", &p))).value, "C");
         let d = resolve_scope_str(None, None, None);
         assert_eq!(d.value, "shared");
@@ -265,12 +322,28 @@ mod tests {
 
     #[test]
     fn format_default_is_tty_aware_and_override_wins() {
-        assert_eq!(resolve_format(None, None, None, true).unwrap().value, Format::Text);
-        assert_eq!(resolve_format(None, None, None, false).unwrap().value, Format::Json);
+        assert_eq!(
+            resolve_format(None, None, None, true).unwrap().value,
+            Format::Text
+        );
+        assert_eq!(
+            resolve_format(None, None, None, false).unwrap().value,
+            Format::Json
+        );
         // explicit env overrides a TTY default
-        assert_eq!(resolve_format(None, Some("json".into()), None, true).unwrap().value, Format::Json);
+        assert_eq!(
+            resolve_format(None, Some("json".into()), None, true)
+                .unwrap()
+                .value,
+            Format::Json
+        );
         // flag wins over env
-        assert_eq!(resolve_format(Some(Format::Text), Some("json".into()), None, false).unwrap().value, Format::Text);
+        assert_eq!(
+            resolve_format(Some(Format::Text), Some("json".into()), None, false)
+                .unwrap()
+                .value,
+            Format::Text
+        );
     }
 
     #[test]

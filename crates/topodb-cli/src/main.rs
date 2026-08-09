@@ -27,7 +27,9 @@ fn main() {
         eprintln!("topodb: ignoring unknown key {k:?} in .topodb.toml");
     }
     let cfg_path = cfg.path.clone();
-    let home = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok());
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok());
 
     // db path.
     let db_r = resolve::resolve_db(

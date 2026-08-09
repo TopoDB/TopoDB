@@ -53,8 +53,15 @@ fn bin_home(home: &std::path::Path) -> Command {
 fn db_defaults_to_home_topodb_when_flag_absent() {
     let home = tempfile::tempdir().unwrap();
     let out = bin_home(home.path()).arg("info").output().unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(home.path().join(".topodb/memory.redb").exists(), "default db not created under HOME");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        home.path().join(".topodb/memory.redb").exists(),
+        "default db not created under HOME"
+    );
 }
 
 #[test]
@@ -71,7 +78,10 @@ fn default_db_path_fails_when_home_unset() {
         "should fail with exit code 1, stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!working_dir.path().join("~").exists(), "must not create a literal ~ directory");
+    assert!(
+        !working_dir.path().join("~").exists(),
+        "must not create a literal ~ directory"
+    );
 }
 
 #[test]
@@ -79,7 +89,11 @@ fn db_from_env_var() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("env.redb");
     let out = bin().env("TOPODB_DB", &db).arg("info").output().unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(db.exists());
 }
 
@@ -98,7 +112,11 @@ fn db_and_scope_from_project_config() {
         .arg("info")
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["path"], db.to_str().unwrap());
     assert!(db.exists());
@@ -109,7 +127,8 @@ fn invalid_scope_error_names_its_source() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
     let out = bin()
-        .args(["--db"]).arg(&db)
+        .args(["--db"])
+        .arg(&db)
         .env("TOPODB_SCOPE", "not-a-ulid!")
         .arg("info")
         .output()
@@ -124,7 +143,11 @@ fn malformed_config_is_exit_2_naming_file() {
     let home = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
     std::fs::write(proj.path().join(".topodb.toml"), "db = = =").unwrap();
-    let out = bin_home(home.path()).current_dir(proj.path()).arg("info").output().unwrap();
+    let out = bin_home(home.path())
+        .current_dir(proj.path())
+        .arg("info")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains(".topodb.toml"));
 }
@@ -1815,7 +1838,11 @@ fn remember_positional_content_equals_flag() {
         v.extend_from_slice(content_args);
         v.extend_from_slice(&["--entity", "X"]);
         let out = bin().args(&v).output().unwrap();
-        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
     };
     // First write via positional, second identical via --content → dedup hit.
@@ -1830,7 +1857,16 @@ fn remember_conflicting_content_is_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
     let out = bin()
-        .args(["--db", db.to_str().unwrap(), "remember", "pos", "--content", "flag", "--entity", "X"])
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "remember",
+            "pos",
+            "--content",
+            "flag",
+            "--entity",
+            "X",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2)); // clap conflict
@@ -1846,7 +1882,10 @@ fn remember_missing_content_is_actionable_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--content") || err.contains("positional"), "err: {err}");
+    assert!(
+        err.contains("--content") || err.contains("positional"),
+        "err: {err}"
+    );
 }
 
 #[test]
@@ -2994,14 +3033,43 @@ fn text_format_search_is_plain_lines_not_json() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
     let scope = topodb::ScopeId::new().to_string();
-    bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
-        "remember", "a fact about foxes", "--entity", "Fox"]).output().unwrap();
-    let out = bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
-        "--format", "text", "search", "foxes"]).output().unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            "a fact about foxes",
+            "--entity",
+            "Fox",
+        ])
+        .output()
+        .unwrap();
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "search",
+            "foxes",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("a fact about foxes"), "stdout: {s}");
-    assert!(!s.trim_start().starts_with('['), "text mode must not emit JSON: {s}");
+    assert!(
+        !s.trim_start().starts_with('['),
+        "text mode must not emit JSON: {s}"
+    );
 }
 
 #[test]
@@ -3009,11 +3077,31 @@ fn json_default_unchanged_for_search() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
     let scope = topodb::ScopeId::new().to_string();
-    bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
-        "remember", "a fact about foxes", "--entity", "Fox"]).output().unwrap();
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            "a fact about foxes",
+            "--entity",
+            "Fox",
+        ])
+        .output()
+        .unwrap();
     // No --format, piped (non-TTY) → JSON.
-    let out = bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
-        "search", "foxes"]).output().unwrap();
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "search",
+            "foxes",
+        ])
+        .output()
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v.is_array());
 }
@@ -3023,8 +3111,17 @@ fn empty_search_echoes_scope_to_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
     let scope = topodb::ScopeId::new().to_string();
-    let out = bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
-        "search", "nothing-matches-this"]).output().unwrap();
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "search",
+            "nothing-matches-this",
+        ])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     // stdout is still the parseable empty array.
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -3040,13 +3137,36 @@ fn format_env_flips_piped_output_to_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
     let scope = topodb::ScopeId::new().to_string();
-    bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
-        "remember", "env-driven text mode", "--entity", "E"]).output().unwrap();
-    let out = bin().env("TOPODB_FORMAT", "text")
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "search", "env-driven"])
-        .output().unwrap();
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            "env-driven text mode",
+            "--entity",
+            "E",
+        ])
+        .output()
+        .unwrap();
+    let out = bin()
+        .env("TOPODB_FORMAT", "text")
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "search",
+            "env-driven",
+        ])
+        .output()
+        .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(!s.trim_start().starts_with('['), "TOPODB_FORMAT=text should give text: {s}");
+    assert!(
+        !s.trim_start().starts_with('['),
+        "TOPODB_FORMAT=text should give text: {s}"
+    );
 }
 
 #[test]
@@ -3056,23 +3176,46 @@ fn text_format_get_returns_text_not_json() {
     let scope = topodb::ScopeId::new().to_string();
     // Create a memory
     let out = bin()
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "create-memory", "--content", "test memory"])
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "create-memory",
+            "--content",
+            "test memory",
+        ])
         .output()
         .unwrap();
-    let mem_id = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .unwrap()["id"]
+    let mem_id = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
     // Get with text format
     let out = bin()
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "--format", "text", "get", &mem_id])
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "get",
+            &mem_id,
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains(&mem_id), "output should contain the id: {s}");
-    assert!(!s.trim_start().starts_with('{'), "text format should not start with JSON: {s}");
+    assert!(
+        !s.trim_start().starts_with('{'),
+        "text format should not start with JSON: {s}"
+    );
 }
 
 #[test]
@@ -3082,26 +3225,54 @@ fn text_format_find_returns_text_not_json() {
     let scope = topodb::ScopeId::new().to_string();
     // Create an entity
     let out = bin()
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "create-entity", "--name", "TestEntity"])
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "create-entity",
+            "--name",
+            "TestEntity",
+        ])
         .output()
         .unwrap();
-    let ent_id = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .unwrap()["id"]
+    let ent_id = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
     // Find with text format
     let out = bin()
         .args([
-            "--db", db.to_str().unwrap(), "--scope", &scope, "--format", "text",
-            "find", "--label", "Entity", "--prop", "name", "--value", "TestEntity"
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "find",
+            "--label",
+            "Entity",
+            "--prop",
+            "name",
+            "--value",
+            "TestEntity",
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains(&ent_id), "output should contain the entity id: {s}");
-    assert!(!s.trim_start().starts_with('['), "text format should not start with JSON: {s}");
+    assert!(
+        s.contains(&ent_id),
+        "output should contain the entity id: {s}"
+    );
+    assert!(
+        !s.trim_start().starts_with('['),
+        "text format should not start with JSON: {s}"
+    );
 }
 
 #[test]
@@ -3112,15 +3283,33 @@ fn text_format_remember_returns_text_not_json() {
     // Remember with text format
     let out = bin()
         .args([
-            "--db", db.to_str().unwrap(), "--scope", &scope, "--format", "text",
-            "remember", "a fact to remember", "--entity", "TestEntity"
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "remember",
+            "a fact to remember",
+            "--entity",
+            "TestEntity",
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("remembered"), "text output should contain 'remembered': {s}");
-    assert!(!s.trim_start().starts_with('{'), "text format should not start with JSON: {s}");
+    assert!(
+        s.contains("remembered"),
+        "text output should contain 'remembered': {s}"
+    );
+    assert!(
+        !s.trim_start().starts_with('{'),
+        "text format should not start with JSON: {s}"
+    );
 }
 
 #[test]
@@ -3130,23 +3319,49 @@ fn text_format_forget_returns_text_not_json() {
     let scope = topodb::ScopeId::new().to_string();
     // Create a memory to forget
     let out = bin()
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "create-memory", "--content", "to be forgotten"])
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "create-memory",
+            "--content",
+            "to be forgotten",
+        ])
         .output()
         .unwrap();
-    let mem_id = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .unwrap()["id"]
+    let mem_id = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
     // Forget with text format
     let out = bin()
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "--format", "text", "forget", &mem_id])
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "forget",
+            &mem_id,
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("forgot"), "text output should contain 'forgot': {s}");
-    assert!(!s.trim_start().starts_with('{'), "text format should not start with JSON: {s}");
+    assert!(
+        s.contains("forgot"),
+        "text output should contain 'forgot': {s}"
+    );
+    assert!(
+        !s.trim_start().starts_with('{'),
+        "text format should not start with JSON: {s}"
+    );
 }
 
 #[test]
@@ -3156,18 +3371,46 @@ fn text_format_search_truncation_with_ellipsis() {
     let scope = topodb::ScopeId::new().to_string();
     // Create a memory with long content (>140 chars)
     let long_content = "This is a very long memory content that is intentionally written to be longer than one hundred and forty characters so that the text renderer will truncate it with an ellipsis.";
-    bin().args([
-        "--db", db.to_str().unwrap(), "--scope", &scope,
-        "remember", long_content, "--entity", "LongEntity"
-    ]).output().unwrap();
-    // Search with text format
-    let out = bin()
-        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "--format", "text", "search", "intentionally"])
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            long_content,
+            "--entity",
+            "LongEntity",
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // Search with text format
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "search",
+            "intentionally",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("…"), "truncated text should contain ellipsis: {s}");
+    assert!(
+        s.contains("…"),
+        "truncated text should contain ellipsis: {s}"
+    );
     // The full original content should not appear (it's truncated)
-    assert!(!s.contains("with an ellipsis."), "should not contain the full original end: {s}");
+    assert!(
+        !s.contains("with an ellipsis."),
+        "should not contain the full original end: {s}"
+    );
 }
