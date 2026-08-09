@@ -2431,7 +2431,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Text mode (embedder not Ready, including deliberate off): exhaustive pairwise token containment over the scope (>= 0.7, fixed); the same lexical negation-cue relation check runs, so pairs still split into `duplicate` vs `supersession` (heuristic — lower confidence than the vector split; bands reuse the cosine cutoffs applied to containment, treat as rough). The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
+        description = "Maintenance scan (read-only, advisory): pairs of stored memories that are near-duplicates, most-similar first. Each pair carries a band (likely/possible) and a relation: duplicate (same fact — merge via consolidate_memories) vs supersession (contradiction — supersede the stale side). method reports vector vs text detection (text is lower-confidence). truncated=true means not exhaustive."
     )]
     fn find_duplicate_memories(
         &self,
@@ -2624,7 +2624,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Consolidate a near-duplicate PAIR into one memory: keep one, retire the other. YOU pick which survives (keep) and which is retired (drop) after judging they are the same fact — never let the tool infer it, because near-dup similarity is topical, not factual (a contradicting correction about the same subsystem scores high too). keep inherits drop's unique relationships (so no graph knowledge is lost) and drop is superseded — marked and disconnected — atomically. Pair this with find_duplicate_memories: scan for pairs, judge them, consolidate the true duplicates. Errors unless both are live (non-superseded, non-forgotten) Memory nodes in the write scope and keep != drop."
+        description = "Consolidate a near-duplicate pair: keep survives and inherits drop's unique relationships; drop is superseded — atomically. YOU judge they are the same fact and pick the survivor — near-dup similarity is topical, not factual (a contradicting correction also scores high). Both must be live Memories in the write scope."
     )]
     fn consolidate_memories(
         &self,
@@ -2728,7 +2728,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find memories that are stored but connected to NOTHING — a live memory with no open outgoing edges, so it joined no entity and is reachable only by text/vector search, never by traversal. Usually a bare create_memory that was never linked, or a memory whose only link was later closed. Read-only and advisory: link the orphan to its entities (link/remember) or drop it. Superseded memories are excluded — their edges close on retirement, so they are retired, not orphaned. Oldest first, at most `limit`; `truncated=true` means more orphans exist than were returned."
+        description = "Maintenance scan (read-only, advisory): live memories with no open outgoing edges — linked to nothing, reachable only by search, never traversal. Link each orphan to its entities (link/remember) or drop it. Superseded memories are excluded (retired, not orphaned). Oldest first, at most limit; truncated=true means more exist."
     )]
     fn find_orphan_memories(
         &self,
@@ -2797,7 +2797,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find memories that have gone COLD — not created or recalled within older_than_days (default 30), stalest first. 'Activity' is the later of a memory's creation and its most recent recall (last_accessed_at), so a brand-new memory is never stale and a frequently-recalled one stays fresh; a fact stored long ago and never looked at since is what surfaces. Read-only and advisory: review, then refresh (re-link), keep, or drop. The scan itself does NOT count as a recall — it inspects the recency signal without bumping it. Superseded memories are excluded. Each row carries access_count, last_accessed_at (null if never recalled), and age_days. Stalest first, at most `limit`; truncated=true means more exist."
+        description = "Maintenance scan (read-only, advisory): memories neither created nor recalled within older_than_days (default 30), stalest first. The scan does not bump the recency signal it reads. Rows carry access_count, last_accessed_at (null if never recalled), and age_days; truncated=true means more exist."
     )]
     fn find_stale_memories(
         &self,
@@ -2892,7 +2892,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When the embedder is not Ready (including deliberate off), text-based detection (token containment) runs instead, and the duplicate/supersession split still applies via the lexical negation-cue check (heuristic — lower confidence than vectors). Check `embeddings_enabled` to tell which detection grade produced the counts. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
+        description = "One-call hygiene summary for session start: near-duplicate, orphan, and stale counts with needs_attention and sample rows. Read-only; drill in with find_duplicate/orphan/stale_memories, then act. Pairs split into duplicate_pairs (consolidate) vs supersession_pairs (supersede). embeddings_enabled tells the detection grade; degraded forces needs_attention with degraded_reason. Counts are lower bounds when truncated."
     )]
     fn memory_health(
         &self,
@@ -2979,7 +2979,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting. For looking up an entity by its exact name, prefer labels: [\"Entity\"] (unaffected by the down-weight) over a plain search. kinds filters results by memory kind; a node without a kind prop counts as semantic."
+        description = "Hybrid recall over memory content and entity names: stemmed BM25 + vector + 1-hop graph legs, recency-weighted (fresher wins ties; recency_weight 0 = pure relevance). Missing terms fall back to close prefix/typo matches and learned synonyms expand automatically. Entity hits are down-weighted by default (label_weights: {} disables; exact entity lookup wants labels: [\"Entity\"]). Empty results: retry with different words before concluding nothing is stored, then traverse from the best hit."
     )]
     fn search_memories(
         &self,
@@ -3319,7 +3319,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Surface decay candidates: live memories ranked by kind-aware staleness ((age/half_life)/ln(e+access_count); age since last access, falling back to creation; half-life defaults episodic 14d / semantic 120d / procedural 365d, absent kind counts as semantic). Read-only, deterministic under now_ms, and UNBUMPED — running the sweep does not perturb the access signal it reads. This tool only PROPOSES: nothing is stamped or deleted. YOU review each candidate's evidence and act via forget or consolidate_memories — never forget from staleness alone. For near-duplicates use find_duplicate_memories; this sweep does not detect them."
+        description = "Rank live memories by kind-aware staleness (half-lives: episodic 14d / semantic 120d / procedural 365d; absent kind = semantic). Read-only, unbumped, deterministic under now_ms. PROPOSES only — review each candidate and act via forget or consolidate_memories; never forget from staleness alone. Near-duplicates are find_duplicate_memories' job."
     )]
     fn lifecycle_candidates(
         &self,
