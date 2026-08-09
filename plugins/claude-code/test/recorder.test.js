@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   extractText, tokenize, isUsed, toRetrievalRecord, buildEpisodeBatch,
   appendRetrieval, readState, deleteState, sweepStale, stateFilePath,
+  markCaptured, markNudged,
 } from "../recorder.js";
 
 test("text helpers match pi semantics", () => {
@@ -106,4 +107,30 @@ test("buildEpisodeBatch emits pi's exact vocabulary", () => {
   });
   assert.deepEqual(cmds[4], { op: "link", from: "#1", to: "01A", type: "USED" });
   assert.equal(cmds.length, 5);
+});
+
+test("markCaptured / markNudged set flags without clobbering retrievals", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "rec-"));
+  const sid = "s1";
+  const rec = { tool: "search_memories", query: "q", returned: [{ id: "01A", score: 1 }] };
+  appendRetrieval(dir, sid, rec, new Map([["01A", "content a"]]));
+
+  markCaptured(dir, sid);
+  let state = readState(dir, sid);
+  assert.equal(state.captured, true);
+  assert.equal(state.retrievals.length, 1, "retrievals preserved");
+
+  markNudged(dir, sid);
+  state = readState(dir, sid);
+  assert.equal(state.nudged, true);
+  assert.equal(state.captured, true, "captured preserved");
+  assert.equal(state.retrievals.length, 1);
+});
+
+test("markCaptured / markNudged create state when none exists", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "rec-"));
+  markNudged(dir, "fresh");
+  const state = readState(dir, "fresh");
+  assert.equal(state.nudged, true);
+  assert.deepEqual(state.retrievals, []);
 });

@@ -14,12 +14,19 @@
       {
         "matcher": "mcp__(plugin_topodb_)?topodb__(search_memories|traverse|recent_memories)",
         "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-use.js" }]
+      },
+      {
+        "matcher": "mcp__(plugin_topodb_)?topodb__(remember|create_memory)",
+        "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/mark-captured.js" }]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/session-end.js" }]
       }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/stop-capture.js" }] }
     ]
   }
 }
