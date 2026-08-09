@@ -43,3 +43,49 @@ export function decideNudge({ payload, env, state, toolUses }) {
   if (toolUses < SUBSTANTIVE_MIN_TOOLS) return false;
   return true;
 }
+
+import { pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
+import { readState, markNudged } from "../recorder.js";
+
+const DEADLINE_MS = 1500;
+const NUDGE_TEXT =
+  "This session may have produced durable facts, decisions, or lessons. Before finishing, save anything worth keeping across sessions with the `remember` tool (project scope by default; `shared` if it generalizes), and `supersede` any memory this session made outdated. If nothing durable came out of this session, just stop — do not save trivia or restate what is already in memory.";
+
+function readMaybe(p) {
+  try {
+    return readFileSync(p, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+async function main() {
+  const raw = await new Promise((r) => {
+    let buf = "";
+    process.stdin.on("data", (d) => (buf += d));
+    process.stdin.on("end", () => r(buf));
+  });
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  const dataDir = process.env.CLAUDE_PLUGIN_DATA;
+  const state = dataDir && payload.session_id ? readState(dataDir, payload.session_id) : null;
+  const toolUses = countToolUses(readMaybe(payload.transcript_path));
+  if (!decideNudge({ payload, env: process.env, state, toolUses })) return;
+  markNudged(dataDir, payload.session_id);
+  process.stdout.write(JSON.stringify({ decision: "block", reason: NUDGE_TEXT }));
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const guard = setTimeout(() => process.exit(0), DEADLINE_MS);
+  main()
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(guard);
+      process.exit(0);
+    });
+}
