@@ -104,7 +104,8 @@ fn db_and_scope_from_project_config() {
     let db = proj.path().join("cfg.redb");
     std::fs::write(
         proj.path().join(".topodb.toml"),
-        format!("db = \"{}\"\nscope = \"shared\"\n", db.display()),
+        // TOML literal string: Windows path backslashes must not be parsed as escapes
+        format!("db = '{}'\nscope = \"shared\"\n", db.display()),
     )
     .unwrap();
     let out = bin_home(home.path())
