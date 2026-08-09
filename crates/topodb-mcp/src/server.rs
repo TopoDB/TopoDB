@@ -2269,10 +2269,16 @@ struct SearchVectorsResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SubmitBatchParams {
-    /// A JSON array of high-level commands. Each command's `op` matches an MCP
-    /// tool name (create_memory, create_entity, link, set_node_props,
-    /// remove_node, close_edge, set_embedding); `#N` in an id field refers to
-    /// the id produced by the Nth (earlier) command in the batch.
+    /// A JSON array of high-level commands. Each command's `op` matches an
+    /// MCP tool name; `#N` in an id field refers to the id produced by the
+    /// Nth (earlier, 0-indexed) command. Per-op fields: create_memory
+    /// { content, scope?, props? }; create_entity { name, scope?, props? };
+    /// create_node { label, props?, scope? } — arbitrary label for host-level
+    /// schemas; link { from, to, type, scope?, props?, valid_from? } — note
+    /// from/to/type, NOT the link tool's from_id/to_id/edge_type;
+    /// set_node_props { id, props } (a null value removes that key);
+    /// remove_node { id }; close_edge { id, valid_to? };
+    /// set_embedding { id, model, vector }.
     #[schemars(with = "CommandsSchema")]
     commands: Value,
 }
@@ -3375,7 +3381,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Store a linked fact in ONE call: creates the memory, find-or-creates each named entity, and links memory→entity ('about' by default) — atomically, in a single write batch. This is the preferred way to store anything worth remembering. Use the lower-level create_memory / create_entity / link only when you need the pieces separately: an unlinked note, an entity carrying extra props, or entity↔entity relations (works_at, supersede). Optional kind classifies the memory (episodic | semantic | procedural; omitted reads as semantic); on a dedup hit the existing memory's stored kind wins."
+        description = "Store a linked fact in one atomic call (preferred write path): memory + find-or-create entities + memory→entity links. Use create_memory / create_entity / link only for an unlinked note, extra entity props, or entity↔entity relations. kind: episodic | semantic | procedural (omitted = semantic); on dedup the stored kind wins."
     )]
     fn remember(
         &self,
@@ -3443,7 +3449,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Soft-retire memories you judge not worth keeping: stamps forgotten_at and closes their open edges, atomically. Recall and search stop returning them as of the stamp; history remains (an as_of before the stamp still sees them) and nothing is deleted. Distinct from remember's supersedes — supersede says a fact was REPLACED by a newer one; forget says it never needs to come back. Every id must be a live Memory in the write scope: unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call. YOU decide what is forgotten — never infer it from staleness alone without reviewing the memory."
+        description = "Soft-retire memories: stamps forgotten_at and closes open edges atomically; search stops returning them but history (as_of) remains. Supersede means REPLACED by a newer fact; forget means never needed again. Every id must be a live Memory in the write scope or the whole call rejects. Never forget from staleness alone."
     )]
     fn forget(
         &self,
@@ -3559,7 +3565,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Low-level: store an UNLINKED memory node. Prefer remember, which stores AND links in one atomic call — an unlinked memory can only ever be found by keyword search, never by traversing from the people/projects it concerns. Use this directly only for a deliberately standalone note. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id."
+        description = "Low-level: store an UNLINKED memory node — findable only by keyword search, never by traversing from the entities it concerns. Prefer remember; use this only for a deliberately standalone note. content is the searchable body; props holds scalar metadata. Returns the new node's id."
     )]
     fn create_memory(
         &self,
@@ -3605,7 +3611,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Find-or-create an entity node (person, project, concept). remember calls this resolution for you when storing a fact; call it directly when an entity needs extra props, or to get an id for entity↔entity link calls. The name is matched case- and whitespace-insensitively across the read scopes, the write scope, AND shared — if the entity already exists anywhere visible, its id is returned with created: false and NO duplicate is made (any new props keys are merged; existing keys are never overwritten). Use one canonical name form per entity (prefer the fullest name you know, e.g. 'Drew Powell' over 'Drew') so future mentions keep resolving to the same node."
+        description = "Find-or-create an entity node, name-matched case- and whitespace-insensitively across the read scopes, write scope, AND shared — an existing entity returns its id with created: false, never a duplicate (new prop keys merge; existing keys never overwrite). Use one canonical name form so mentions keep resolving to the same node."
     )]
     fn create_entity(
         &self,
@@ -3662,7 +3668,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Register an alternate name for an existing entity ('Drew' for 'Drew Powell', 'the broker' for 'launch.js'). From then on create_entity, find_by_prop, and search resolve the alias to the canonical entity — use this the moment you learn a second name for something instead of creating a duplicate. Errors if the alias already names a DIFFERENT entity (that's a merge situation; both ids are reported). Idempotent for the same entity. Remove an alias with remove_node on the alias node id."
+        description = "Register an alternate name for an existing entity; create_entity, find_by_prop, and search resolve it to the canonical node — use it the moment you learn a second name instead of creating a duplicate. Errors, reporting both ids, if the alias names a DIFFERENT entity (a merge situation). Remove via remove_node."
     )]
     fn add_alias(
         &self,
@@ -3775,7 +3781,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Teach search a domain equivalence: after add_synonym('auth','login'), searching 'auth' also matches memories that say 'login' (at a discount, so exact matches still win). Bidirectional by default. Use when you learn this project's vocabulary — 'broker' meaning launch.js, 'the engine' meaning crates/topodb. Depth-1 only: synonyms never chain. Remove with remove_node on the synonym node id."
+        description = "Teach search a domain equivalence: after add_synonym('auth','login'), searching 'auth' also matches 'login' at a discount, so exact matches still win. Bidirectional by default; depth-1 only — synonyms never chain. Use for project vocabulary; remove via remove_node on the synonym node id."
     )]
     fn add_synonym(
         &self,
@@ -3855,7 +3861,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Create (or reuse) a typed, time-aware edge between two existing nodes. remember already links memories to their entities — use this for entity↔entity relations ('works_on', 'works_at') and custom memory links. edge_type is normalized (lowercased; spaces/hyphens collapse to '_', so 'Works At' == 'works_at'); reuse existing type names rather than inventing synonyms ('works_at', not also 'employed_by'). Calling link again with the same from/to/type returns the existing open edge (created: false) instead of a duplicate. When the new fact REPLACES the old one for a to-one relation (moved teams, changed employer), pass supersede: true to atomically close the other open same-type edges from this node. Errors if either node doesn't exist. When linking shared-scope nodes, pass scope: 'shared' or the edge is invisible outside this project."
+        description = "Create a typed, time-aware edge between existing nodes — for entity↔entity relations and custom memory links (remember already links memory→entity). Same from/to/type returns the existing open edge (created: false). edge_type normalizes ('Works At' == 'works_at'); reuse existing type names rather than inventing synonyms. When a new fact REPLACES a to-one relation, pass supersede: true to atomically close the other open same-type edges. Linking shared-scope nodes needs scope: 'shared' or the edge is invisible outside this project."
     )]
     fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<Json<LinkResult>, ErrorData> {
         let from = parse_node_id(&p.from_id)?;
@@ -4007,7 +4013,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Set or remove properties on an existing node. In `props`, a null value REMOVES that key; any other scalar sets it. Errors if the node doesn't exist. Returns the committed seq."
+        description = "Set or remove properties on an existing node: in props, a null value REMOVES that key, any other scalar sets it. Errors if the node doesn't exist; returns the committed seq."
     )]
     fn set_node_props(
         &self,
@@ -4021,7 +4027,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Hard-delete a node and cascade-remove its incident edges. Unlike `forget` (soft retirement — history preserved, as_of still sees the node), this erases the node entirely. Errors if the node doesn't exist. Returns the committed seq."
+        description = "Hard-delete a node and cascade-remove its incident edges. Unlike forget (soft retirement — as_of still sees the node), this erases it entirely. Returns the committed seq."
     )]
     fn remove_node(
         &self,
@@ -4033,7 +4039,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Close an open edge, stamping its valid_to — the edge stops being 'currently true' but stays in history. Call this when a linked fact stops holding (left the team, project ended); find the edge id with get_edges. valid_to defaults to now when omitted (recommended). For the common 'X changed to Y' case, prefer link with supersede: true, which closes and re-links atomically. Errors if the edge doesn't exist or is already closed."
+        description = "Close an open edge, stamping valid_to (defaults to now) — no longer currently true, but history keeps it; find the id with get_edges. For 'X changed to Y' prefer link with supersede: true, which closes and re-links atomically. Errors if already closed."
     )]
     fn close_edge(
         &self,
@@ -4053,7 +4059,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq."
+        description = "Attach a host-computed raw embedding vector to an existing node under model; stored as-is for cosine search. Errors if the node is unknown, the vector empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq."
     )]
     fn set_embedding(
         &self,
@@ -4112,7 +4118,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed: `#0` is the first command), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). CAUTION: batch commands are raw writes — batch create_entity ALWAYS creates a new node (no find-or-create) and batch link never dedupes; when the entity or edge might already exist, use the create_entity/link tools instead. Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; create_node { label, props?, scope? } — a node with an arbitrary label (for host-level schemas like episode recording); link { from, to, type, scope?, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
+        description = "Submit a JSON array of command objects atomically — all commit or none; #N in an id field references the Nth earlier command's produced id (0-indexed). CAUTION: raw writes with the batch DSL's own field names (documented on the commands parameter) — batch create_entity ALWAYS creates a new node and batch link never dedupes; when the target might already exist, use the create_entity/link tools instead."
     )]
     fn submit_batch(
         &self,
