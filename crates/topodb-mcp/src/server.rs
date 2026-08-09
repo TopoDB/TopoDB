@@ -2288,7 +2288,7 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, the default READ scope set applied to a read call that omits both scope/scopes, and the embedding subsystem's model name + lifecycle status (off/downloading/ready/failed). Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
+        description = "Report the open database's path, op-log current_seq (the get_changes anchor), default write scope, default read set, and embedding model/status. Call first to confirm wiring. Passing default_scope as a read call's own scope NARROWS that read to one scope — the default read set can be wider."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
@@ -2313,7 +2313,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Fetch one node by its ULID. Call this when you already have a node id (from a previous search, traverse, or create) and need its current label and properties."
+        description = "Fetch one node by its ULID when you already have an id (from search, traverse, or create) and need its current label and properties."
     )]
     fn get_node(
         &self,
@@ -2338,7 +2338,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Look up nodes by an equality-indexed property (e.g. an Entity's name). String values match case- and whitespace-insensitively by default ('drew powell' finds 'Drew Powell'); pass exact: true for a byte-exact match. Call this to resolve a known identifier to a node — for topic/phrase search use search_memories instead. Errors if (label, prop) is not declared in the index spec. Zero rows (not an error) when nothing matches — before concluding an entity is new, also try search_memories with the name, and check the shared scope (scopes: [<project>, \"shared\"])."
+        description = "Look up nodes by an equality-indexed property (e.g. an Entity's name); string values match case- and whitespace-insensitively unless exact: true. Errors if (label, prop) is not in the index spec. Zero rows is not an error — before concluding an entity is new, also try search_memories and the shared scope."
     )]
     fn find_by_prop(
         &self,
@@ -2396,7 +2396,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "The newest memories in the read scopes, most recent first. For orientation ('what was I doing?', session-start context), not search — use search_memories when you know what you're looking for. k defaults to 8 (max 100)."
+        description = "The newest memories in the read scopes, most recent first — session-start orientation ('what was I doing?'), not search; use search_memories when you know what you're looking for. k defaults to 8 (max 100)."
     )]
     fn recent_memories(
         &self,
@@ -3167,7 +3167,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Walk the graph outward from a seed node, following edges up to max_hops. Call this to gather the context AROUND something you already found — related entities, linked memories. Optionally view the graph at a past timestamp via as_of; omit for now. Returns the subgraph (nodes + edges). Combined with remember's supersedes, an as_of before the supersession shows the pre-supersession topology."
+        description = "Walk the graph outward from a seed node up to max_hops and return the subgraph (nodes + edges) — the context around something already found. as_of views past topology (e.g. before a supersession); omit for now."
     )]
     fn traverse(
         &self,
@@ -3232,7 +3232,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Predict missing links: rank the k nodes this node should probably be connected to but isn't — structurally close (many converging paths) and/or semantically similar (embedding cosine), with shared-neighbor evidence. Each suggestion carries `similarity` (raw cosine when found semantically; null when structural-only) and `common_neighbors` as {id, label, name} objects. Optional min_similarity floors the semantic signal (model-dependent; omit by default). Suggestions only: nothing is created — review them and call link for the ones you agree with, choosing the edge type yourself. Empty when the node is unknown in the read scopes."
+        description = "Rank the k nodes this node should probably link to but doesn't — structurally close and/or embedding-similar, with common_neighbors evidence; similarity is null for structural-only hits. Suggestions only: review and call link yourself, choosing the edge type. Empty when the node is unknown in the read scopes."
     )]
     fn suggest_links(
         &self,
@@ -3286,7 +3286,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Read a node's access statistics (count, last-accessed timestamp). Call this when deciding what to consolidate or forget — e.g. finding stale memories. Reading stats does not itself count as an access."
+        description = "Read a node's access count and last-accessed timestamp — evidence for consolidate/forget decisions. Reading stats does not itself count as an access."
     )]
     fn access_stats(
         &self,
@@ -3340,7 +3340,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The db_info tool reports current_seq. Disabled unless the server was started with --allow-unscoped-changes."
+        description = "Replay the op log from a sequence number (inclusive) — the ONE unscoped read, for host-level consolidation/sync; disabled unless started with --allow-unscoped-changes. On Compacted errors re-anchor from current state; db_info reports current_seq."
     )]
     fn get_changes(
         &self,
@@ -3502,11 +3502,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Materialize memories into an Obsidian-format vault as a working set: \
-one note per memory plus entity stubs, wikilinks intact. Select by hybrid-recall query or by \
-entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true. \
-Reads always include the shared scope in addition to the requested one(s), so seeded links \
-match what ingest_vault compares against on re-ingest."
+        description = "Materialize memories into an Obsidian-format vault as a working set: one note per memory plus entity stubs, wikilinks intact. Select by hybrid-recall query or by entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true. Reads include the shared scope, so seeded links match what ingest_vault compares on re-ingest."
     )]
     fn seed_vault(
         &self,
@@ -3937,7 +3933,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "List a node's edges in a given direction (default: outgoing), optionally filtered by target node and/or edge type; open edges only by default. For direction=\"in\", the node is the target and to_id filters sources; to_id filters the far end of each edge, whichever side that is. Optionally view edges at a past timestamp via as_of (omit open_only when passing as_of; as_of already means \"open at that instant\") — use as_of to see edges superseded at that point in time. A future as_of behaves like \"now\". This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
+        description = "List a node's edges (default: outgoing, open only), filterable by far-end node and edge type. as_of shows edges open at that past instant — omit open_only with it. Use this to find the edge id for close_edge and to check what a node already links to; valid_to null means open."
     )]
     fn get_edges(
         &self,
@@ -4075,7 +4071,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Cosine vector search under one model. The query is a raw embedding array (host-computed); TopoDB ranks stored embeddings by cosine similarity. Optionally restrict scoring to a candidate node set (for hybrid recall after a traverse). Errors if k is 0 or the vector is empty."
+        description = "Cosine vector search under one model; the query is a raw host-computed embedding. Optionally restrict scoring to a candidate node set (hybrid recall after a traverse). Errors if k is 0 or the vector is empty."
     )]
     fn search_vectors(
         &self,
