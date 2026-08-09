@@ -10,15 +10,21 @@ use std::path::PathBuf;
     about = "Direct-embedded CLI over a TopoDB database file"
 )]
 pub struct Cli {
-    /// Database file (or TOPODB_DB env).
-    #[arg(long, env = "TOPODB_DB")]
-    pub db: PathBuf,
-    /// Default scope: a ScopeId ULID, or "shared".
-    #[arg(long, default_value = "shared")]
-    pub scope: String,
+    /// Database file. Resolution order: this flag, then TOPODB_DB, then a
+    /// `.topodb.toml` on the path from cwd up, then ~/.topodb/memory.redb.
+    #[arg(long)]
+    pub db: Option<PathBuf>,
+    /// Default scope: a ScopeId ULID, or "shared". Resolution order: this
+    /// flag, then TOPODB_SCOPE, then `.topodb.toml`, then "shared".
+    #[arg(long)]
+    pub scope: Option<String>,
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pub pretty: bool,
+    /// Output format: `json` (machine, the default in a pipe) or `text`
+    /// (human, the default at a terminal). Also read from TOPODB_FORMAT.
+    #[arg(long, value_enum, global = true)]
+    pub format: Option<FormatArg>,
     /// Milliseconds to wait (retrying with backoff) when another process
     /// holds the database file, before failing with kind "busy" / exit 3.
     /// 0 = fail immediately.
@@ -110,9 +116,12 @@ pub enum Command {
     /// link. Prints memory_id, per-entity {name,id,created}, edge_ids,
     /// deduplicated, superseded.
     Remember {
-        /// The fact to store (full-text-searchable body).
-        #[arg(long)]
-        content: String,
+        /// The fact to store (full-text-searchable body). Pass it as a
+        /// positional argument, or via --content (not both).
+        content: Option<String>,
+        /// Alias for the positional fact. Conflicts with the positional form.
+        #[arg(long = "content", value_name = "CONTENT", conflicts_with = "content")]
+        content_flag: Option<String>,
         /// Entity name to link the memory to; repeatable, at least one.
         #[arg(long = "entity", required = true)]
         entity: Vec<String>,
@@ -444,6 +453,21 @@ impl From<DirectionArg> for topodb::Direction {
             DirectionArg::Out => topodb::Direction::Out,
             DirectionArg::In => topodb::Direction::In,
             DirectionArg::Both => topodb::Direction::Both,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum FormatArg {
+    Json,
+    Text,
+}
+
+impl From<FormatArg> for crate::resolve::Format {
+    fn from(f: FormatArg) -> Self {
+        match f {
+            FormatArg::Json => crate::resolve::Format::Json,
+            FormatArg::Text => crate::resolve::Format::Text,
         }
     }
 }

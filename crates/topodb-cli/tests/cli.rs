@@ -2,7 +2,11 @@ use std::io::Write;
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_topodb"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_topodb"));
+    c.env_remove("TOPODB_DB");
+    c.env_remove("TOPODB_SCOPE");
+    c.env_remove("TOPODB_FORMAT");
+    c
 }
 
 #[test]
@@ -36,10 +40,117 @@ fn info_reports_fields_on_fresh_db() {
     assert!(v["format_version"].is_number());
 }
 
+/// A HOME-scoped run: point HOME (and USERPROFILE for Windows) at a tempdir
+/// so the default db path lands there, never the real ~/.topodb.
+fn bin_home(home: &std::path::Path) -> Command {
+    let mut c = bin();
+    c.env("HOME", home);
+    c.env("USERPROFILE", home);
+    c
+}
+
 #[test]
-fn missing_db_flag_is_usage_error_exit_2() {
-    let out = bin().arg("info").output().unwrap();
-    assert_eq!(out.status.code(), Some(2)); // clap usage error
+fn db_defaults_to_home_topodb_when_flag_absent() {
+    let home = tempfile::tempdir().unwrap();
+    let out = bin_home(home.path()).arg("info").output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        home.path().join(".topodb/memory.redb").exists(),
+        "default db not created under HOME"
+    );
+}
+
+#[test]
+fn default_db_path_fails_when_home_unset() {
+    let working_dir = tempfile::tempdir().unwrap();
+    let mut c = bin();
+    c.env_remove("HOME");
+    c.env_remove("USERPROFILE");
+    c.current_dir(working_dir.path()).arg("info");
+    let out = c.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "should fail with exit code 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !working_dir.path().join("~").exists(),
+        "must not create a literal ~ directory"
+    );
+}
+
+#[test]
+fn db_from_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("env.redb");
+    let out = bin().env("TOPODB_DB", &db).arg("info").output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(db.exists());
+}
+
+#[test]
+fn db_and_scope_from_project_config() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let db = proj.path().join("cfg.redb");
+    std::fs::write(
+        proj.path().join(".topodb.toml"),
+        // TOML literal string: Windows path backslashes must not be parsed as escapes
+        format!("db = '{}'\nscope = \"shared\"\n", db.display()),
+    )
+    .unwrap();
+    let out = bin_home(home.path())
+        .current_dir(proj.path())
+        .arg("info")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["path"], db.to_str().unwrap());
+    assert!(db.exists());
+}
+
+#[test]
+fn invalid_scope_error_names_its_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .env("TOPODB_SCOPE", "not-a-ulid!")
+        .arg("info")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("env"), "expected source in error, got: {err}");
+}
+
+#[test]
+fn malformed_config_is_exit_2_naming_file() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join(".topodb.toml"), "db = = =").unwrap();
+    let out = bin_home(home.path())
+        .current_dir(proj.path())
+        .arg("info")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(".topodb.toml"));
 }
 
 #[test]
@@ -1719,6 +1830,66 @@ fn remember_edge_type_and_props_land() {
 }
 
 #[test]
+fn remember_positional_content_equals_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let run = |content_args: &[&str]| {
+        let mut v = vec!["--db", db.to_str().unwrap(), "--scope", &scope, "remember"];
+        v.extend_from_slice(content_args);
+        v.extend_from_slice(&["--entity", "X"]);
+        let out = bin().args(&v).output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    // First write via positional, second identical via --content → dedup hit.
+    let a = run(&["the same fact"]);
+    let b = run(&["--content", "the same fact"]);
+    assert_eq!(b["deduplicated"], serde_json::Value::Bool(true));
+    assert_eq!(a["memory_id"], b["memory_id"]);
+}
+
+#[test]
+fn remember_conflicting_content_is_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "remember",
+            "pos",
+            "--content",
+            "flag",
+            "--entity",
+            "X",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2)); // clap conflict
+}
+
+#[test]
+fn remember_missing_content_is_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db", db.to_str().unwrap(), "remember", "--entity", "X"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--content") || err.contains("positional"),
+        "err: {err}"
+    );
+}
+
+#[test]
 fn traverse_as_of_shows_the_past_topology() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
@@ -2854,4 +3025,393 @@ fn purge_dry_runs_by_default_and_deletes_with_yes() {
         String::from_utf8_lossy(&bad.stderr)
     );
     assert!(all.contains("tombstoned-before"), "{all}");
+}
+
+// --- Task 5: --format flag, text rendering, and empty-read scope-echo ---
+
+#[test]
+fn text_format_search_is_plain_lines_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            "a fact about foxes",
+            "--entity",
+            "Fox",
+        ])
+        .output()
+        .unwrap();
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "search",
+            "foxes",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("a fact about foxes"), "stdout: {s}");
+    assert!(
+        !s.trim_start().starts_with('['),
+        "text mode must not emit JSON: {s}"
+    );
+}
+
+#[test]
+fn json_default_unchanged_for_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            "a fact about foxes",
+            "--entity",
+            "Fox",
+        ])
+        .output()
+        .unwrap();
+    // No --format, piped (non-TTY) → JSON.
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "search",
+            "foxes",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.is_array());
+}
+
+#[test]
+fn empty_search_echoes_scope_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "search",
+            "nothing-matches-this",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // stdout is still the parseable empty array.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v, serde_json::json!([]));
+    // stderr carries the disambiguating echo, including the scope.
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("0 matches"), "stderr: {err}");
+    assert!(err.contains(&scope), "stderr must name the scope: {err}");
+}
+
+#[test]
+fn format_env_flips_piped_output_to_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            "env-driven text mode",
+            "--entity",
+            "E",
+        ])
+        .output()
+        .unwrap();
+    let out = bin()
+        .env("TOPODB_FORMAT", "text")
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "search",
+            "env-driven",
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !s.trim_start().starts_with('['),
+        "TOPODB_FORMAT=text should give text: {s}"
+    );
+}
+
+#[test]
+fn text_format_get_returns_text_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    // Create a memory
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "create-memory",
+            "--content",
+            "test memory",
+        ])
+        .output()
+        .unwrap();
+    let mem_id = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Get with text format
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "get",
+            &mem_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains(&mem_id), "output should contain the id: {s}");
+    assert!(
+        !s.trim_start().starts_with('{'),
+        "text format should not start with JSON: {s}"
+    );
+}
+
+#[test]
+fn text_format_find_returns_text_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    // Create an entity
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "create-entity",
+            "--name",
+            "TestEntity",
+        ])
+        .output()
+        .unwrap();
+    let ent_id = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Find with text format
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "find",
+            "--label",
+            "Entity",
+            "--prop",
+            "name",
+            "--value",
+            "TestEntity",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains(&ent_id),
+        "output should contain the entity id: {s}"
+    );
+    assert!(
+        !s.trim_start().starts_with('['),
+        "text format should not start with JSON: {s}"
+    );
+}
+
+#[test]
+fn text_format_remember_returns_text_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    // Remember with text format
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "remember",
+            "a fact to remember",
+            "--entity",
+            "TestEntity",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("remembered"),
+        "text output should contain 'remembered': {s}"
+    );
+    assert!(
+        !s.trim_start().starts_with('{'),
+        "text format should not start with JSON: {s}"
+    );
+}
+
+#[test]
+fn text_format_forget_returns_text_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    // Create a memory to forget
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "create-memory",
+            "--content",
+            "to be forgotten",
+        ])
+        .output()
+        .unwrap();
+    let mem_id = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Forget with text format
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "forget",
+            &mem_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("forgot"),
+        "text output should contain 'forgot': {s}"
+    );
+    assert!(
+        !s.trim_start().starts_with('{'),
+        "text format should not start with JSON: {s}"
+    );
+}
+
+#[test]
+fn text_format_search_truncation_with_ellipsis() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    // Create a memory with long content (>140 chars)
+    let long_content = "This is a very long memory content that is intentionally written to be longer than one hundred and forty characters so that the text renderer will truncate it with an ellipsis.";
+    bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "remember",
+            long_content,
+            "--entity",
+            "LongEntity",
+        ])
+        .output()
+        .unwrap();
+    // Search with text format
+    let out = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--scope",
+            &scope,
+            "--format",
+            "text",
+            "search",
+            "intentionally",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("…"),
+        "truncated text should contain ellipsis: {s}"
+    );
+    // The full original content should not appear (it's truncated)
+    assert!(
+        !s.contains("with an ellipsis."),
+        "should not contain the full original end: {s}"
+    );
 }

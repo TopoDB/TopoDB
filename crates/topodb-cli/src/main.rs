@@ -1,7 +1,9 @@
 mod cli;
 mod output;
+mod resolve;
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
+use std::path::Path;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -14,13 +16,81 @@ use topodb::{
 fn main() {
     let cli = Cli::parse();
 
-    // Resolve the default scope once, up front: "shared" (case-insensitive)
-    // -> Scope::Shared, a ULID -> Scope::Id, anything else is a caller error
-    // the user can fix -> rejected/2.
-    let default_scope = match topodb_json::resolve_scope(Some(&cli.scope), Scope::Shared) {
-        Ok(s) => s,
+    // Project config (nearest .topodb.toml on the path from cwd up).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let cfg = match resolve::load_project_config(&cwd) {
+        Ok(c) => c,
         Err(e) => output::fail("rejected", &e, 2),
     };
+    let cfg = cfg.unwrap_or_default();
+    for k in &cfg.unknown_keys {
+        eprintln!("topodb: ignoring unknown key {k:?} in .topodb.toml");
+    }
+    let cfg_path = cfg.path.clone();
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok());
+
+    // db path.
+    let db_r = resolve::resolve_db(
+        cli.db.clone(),
+        std::env::var("TOPODB_DB").ok(),
+        cfg.db.as_deref().zip(cfg_path.as_deref()),
+        home.as_deref(),
+    );
+    let db_path = db_r.value;
+
+    // Create the parent directory for the default db path (~/.topodb/memory.redb).
+    // For user-provided paths, let the database engine report errors if the parent doesn't exist.
+    if matches!(db_r.source, resolve::Source::Default) {
+        // Guard against unresolved home directory (HOME/USERPROFILE both unset).
+        if db_path
+            .to_str()
+            .map(|p| p.starts_with("~"))
+            .unwrap_or(false)
+        {
+            output::fail(
+                "internal",
+                "cannot resolve home directory (HOME/USERPROFILE unset) for the default db path",
+                1,
+            );
+        }
+        if let Some(parent) = db_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    output::fail("internal", &format!("creating db directory: {e}"), 1);
+                }
+            }
+        }
+    }
+
+    // scope string → Scope. Errors name the source they came from.
+    let scope_r = resolve::resolve_scope_str(
+        cli.scope.clone(),
+        std::env::var("TOPODB_SCOPE").ok(),
+        cfg.scope.as_deref().zip(cfg_path.as_deref()),
+    );
+    let default_scope = match topodb_json::resolve_scope(Some(&scope_r.value), Scope::Shared) {
+        Ok(s) => s,
+        Err(e) => output::fail(
+            "rejected",
+            &format!("scope from {}: {e}", scope_r.source.label()),
+            2,
+        ),
+    };
+
+    let fmt = match resolve::resolve_format(
+        cli.format.map(Into::into),
+        std::env::var("TOPODB_FORMAT").ok(),
+        cfg.format.as_deref().zip(cfg_path.as_deref()),
+        std::io::stdout().is_terminal(),
+    ) {
+        Ok(r) => r.value,
+        Err(e) => output::fail("rejected", &e, 2),
+    };
+    let text_mode = matches!(fmt, resolve::Format::Text);
+    let scope_display = scope_r.value.clone();
+    let scope_source = scope_r.source.label();
 
     // Open using the file's own persisted index spec — no --spec flag on
     // this CLI. An EXISTING file always inherits its persisted spec exactly
@@ -51,23 +121,23 @@ fn main() {
     };
 
     let db = topodb_json::open_with_busy_retry(cli.lock_wait_ms, || {
-        if cli.db.exists() {
+        if db_path.exists() {
             // Inherit the persisted spec, but silently upgrade a db still on an
             // older STOCK default to the current one (`topodb_json::upgraded_spec`
             // — e.g. adding the (Entity, name) text index); a customized spec is
             // inherited verbatim. Mirrors topodb-mcp's open path exactly.
-            Db::open_stored(&cli.db).and_then(|db| {
+            Db::open_stored(&db_path).and_then(|db| {
                 let persisted = db.index_spec();
                 let upgraded = topodb_json::upgraded_spec(persisted.clone());
                 if upgraded != persisted {
                     drop(db);
-                    Db::open_with(&cli.db, upgraded)
+                    Db::open_with(&db_path, upgraded)
                 } else {
                     Ok(db)
                 }
             })
         } else {
-            Db::open_with(&cli.db, topodb_json::default_spec())
+            Db::open_with(&db_path, topodb_json::default_spec())
         }
     });
     let db = match db {
@@ -76,7 +146,7 @@ fn main() {
             "busy",
             &format!(
                 "another process holds {}; retried for {}ms (tune with --lock-wait-ms / TOPODB_LOCK_WAIT_MS)",
-                cli.db.display(),
+                db_path.display(),
                 cli.lock_wait_ms
             ),
             3,
@@ -85,7 +155,7 @@ fn main() {
     };
 
     match cli.cmd {
-        Command::Info => info(&db, &cli.db, default_scope, cli.pretty),
+        Command::Info => info(&db, &db_path, default_scope, cli.pretty),
         Command::CreateMemory { content, props, .. } => {
             create_memory(&db, write_scope, content, props.as_deref(), cli.pretty)
         }
@@ -121,24 +191,36 @@ fn main() {
         ),
         Command::Remember {
             content,
+            content_flag,
             entity,
             edge_type,
             supersedes,
             props,
             kind,
             ..
-        } => remember(
-            &db,
-            write_scope,
-            content,
-            entity,
-            edge_type,
-            supersedes,
-            props.as_deref(),
-            kind,
-            cli.pretty,
-        ),
-        Command::Forget { ids, .. } => forget(&db, write_scope, &ids, cli.pretty),
+        } => {
+            let content = match content.or(content_flag) {
+                Some(c) => c,
+                None => output::fail(
+                    "rejected",
+                    "provide the fact as a positional argument or via --content",
+                    2,
+                ),
+            };
+            remember(
+                &db,
+                write_scope,
+                content,
+                entity,
+                edge_type,
+                supersedes,
+                props.as_deref(),
+                kind,
+                text_mode,
+                cli.pretty,
+            )
+        }
+        Command::Forget { ids, .. } => forget(&db, write_scope, &ids, text_mode, cli.pretty),
         Command::ObsidianIngest { vault, dry_run, .. } => {
             obsidian_ingest(&db, &vault, write_scope, dry_run, cli.pretty)
         }
@@ -160,7 +242,7 @@ fn main() {
             default_scope,
             cli.pretty,
         ),
-        Command::Get { id } => get(&db, default_scope, &id, cli.pretty),
+        Command::Get { id } => get(&db, default_scope, &id, text_mode, cli.pretty),
         Command::Find {
             label,
             prop,
@@ -173,6 +255,9 @@ fn main() {
             &prop,
             &value,
             normalized,
+            text_mode,
+            &scope_display,
+            &scope_source,
             cli.pretty,
         ),
         Command::Search {
@@ -187,6 +272,9 @@ fn main() {
             k,
             include_superseded,
             &kinds,
+            text_mode,
+            &scope_display,
+            &scope_source,
             cli.pretty,
         ),
         Command::Traverse {
@@ -291,7 +379,7 @@ fn parse_value_arg(value: &str) -> PropValue {
     }
 }
 
-fn get(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
+fn get(db: &Db, scope: Scope, id: &str, text_mode: bool, pretty: bool) -> ! {
     let id = match NodeId::from_str(id) {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid id {id:?}: {e}"), 2),
@@ -307,9 +395,18 @@ fn get(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
         }
         None => serde_json::json!({ "found": false }),
     };
-    output::ok(&value, pretty);
+    let text = match value.get("found").and_then(|f| f.as_bool()) {
+        Some(true) => value.get("node").map(|n| {
+            let id = n.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let label = n.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("{id}  {label}")
+        }),
+        _ => Some("not found".to_string()),
+    };
+    output::render(&value, text, text_mode, pretty);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find(
     db: &Db,
     scope: Scope,
@@ -317,6 +414,9 @@ fn find(
     prop: &str,
     value: &str,
     normalized: bool,
+    text_mode: bool,
+    scope_display: &str,
+    scope_source: &str,
     pretty: bool,
 ) -> ! {
     let pv = parse_value_arg(value);
@@ -334,7 +434,22 @@ fn find(
         Ok(nodes) => nodes,
         Err(e) => output::fail("internal", &e, 1),
     };
-    output::ok(&serde_json::Value::Array(nodes), pretty);
+    if nodes.is_empty() {
+        output::empty_scope_echo(scope_display, scope_source);
+    }
+    let text = Some(
+        nodes
+            .iter()
+            .map(|n| {
+                let id = n.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let label = n.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("{id}  {label}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let value = serde_json::Value::Array(nodes);
+    output::render(&value, text, text_mode, pretty);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,6 +460,9 @@ fn search(
     k: usize,
     include_superseded: bool,
     kinds: &[String],
+    text_mode: bool,
+    scope_display: &str,
+    scope_source: &str,
     pretty: bool,
 ) -> ! {
     let scopes = topodb_json::scope_to_scope_set(scope);
@@ -399,7 +517,29 @@ fn search(
         Ok(out) => out,
         Err(e) => output::fail("internal", &e, 1),
     };
-    output::ok(&serde_json::Value::Array(out), pretty);
+    if out.is_empty() {
+        output::empty_scope_echo(scope_display, scope_source);
+    }
+    let text = Some(
+        out.iter()
+            .map(|hit| {
+                let content = hit["node"]["props"]["content"].as_str().unwrap_or("");
+                let content = if content.chars().count() > 140 {
+                    let mut s: String = content.chars().take(139).collect();
+                    s.push('…');
+                    s
+                } else {
+                    content.to_string()
+                };
+                let id = hit["node"]["id"].as_str().unwrap_or("?");
+                let score = hit["score"].as_f64().unwrap_or(0.0);
+                format!("- [{score:.2}] {content}  {id}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let value = serde_json::Value::Array(out);
+    output::render(&value, text, text_mode, pretty);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -878,6 +1018,7 @@ fn remember(
     supersedes: Vec<String>,
     props: Option<&str>,
     kind: Option<String>,
+    text_mode: bool,
     pretty: bool,
 ) -> ! {
     let extra = parse_props_arg(props);
@@ -921,21 +1062,31 @@ fn remember(
             |e| serde_json::json!({ "name": e.name, "id": e.id.to_string(), "created": e.created }),
         )
         .collect();
-    output::ok(
-        &serde_json::json!({
-            "memory_id": memory_id.to_string(),
-            "deduplicated": deduplicated,
-            "entities": entities,
-            "edge_ids": edge_ids,
-            "superseded": superseded,
-        }),
-        pretty,
-    );
+    let value = serde_json::json!({
+        "memory_id": memory_id.to_string(),
+        "deduplicated": deduplicated,
+        "entities": entities,
+        "edge_ids": edge_ids,
+        "superseded": superseded,
+    });
+    let text = {
+        let id = value["memory_id"].as_str().unwrap_or("?");
+        let mut line = format!("remembered {id}");
+        if value["deduplicated"].as_bool().unwrap_or(false) {
+            line.push_str(" (deduplicated)");
+        }
+        let sup = value["superseded"].as_array().map(|a| a.len()).unwrap_or(0);
+        if sup > 0 {
+            line.push_str(&format!(" superseding {sup}"));
+        }
+        Some(line)
+    };
+    output::render(&value, text, text_mode, pretty);
 }
 
 /// Soft-retire memories: plan via `topodb_json::plan_forget` (strict — any
 /// invalid id rejects the whole call), submit the one batch, echo the ids.
-fn forget(db: &Db, scope: Scope, ids: &[String], pretty: bool) -> ! {
+fn forget(db: &Db, scope: Scope, ids: &[String], text_mode: bool, pretty: bool) -> ! {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -948,7 +1099,13 @@ fn forget(db: &Db, scope: Scope, ids: &[String], pretty: bool) -> ! {
     if let Err(e) = db.submit(ops) {
         output::fail_engine(&e);
     }
-    output::ok(&serde_json::json!({ "forgotten": forgotten }), pretty);
+    let value = serde_json::json!({ "forgotten": forgotten });
+    let ids: Vec<&str> = value["forgotten"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let text = Some(format!("forgot {}: {}", ids.len(), ids.join(" ")));
+    output::render(&value, text, text_mode, pretty);
 }
 
 fn obsidian_ingest(
