@@ -41,6 +41,18 @@ fn main() {
     // Create the parent directory for the default db path (~/.topodb/memory.redb).
     // For user-provided paths, let the database engine report errors if the parent doesn't exist.
     if matches!(db_r.source, resolve::Source::Default) {
+        // Guard against unresolved home directory (HOME/USERPROFILE both unset).
+        if db_path
+            .to_str()
+            .map(|p| p.starts_with("~"))
+            .unwrap_or(false)
+        {
+            output::fail(
+                "internal",
+                "cannot resolve home directory (HOME/USERPROFILE unset) for the default db path",
+                1,
+            );
+        }
         if let Some(parent) = db_path.parent() {
             if !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
