@@ -725,3 +725,131 @@ fn search_text_prop_retain_rejects_empty_prop_and_empty_allowlist() {
         }
     }
 }
+
+/// Three equally-matching memories, all backdated 30 days: kind
+/// "episodic", kind-less (default/semantic bucket), and kind
+/// "procedural". Under the prop-keyed map the decay factors must order
+/// procedural > default > episodic (slowest curve decays least), so the
+/// ranking at equal text relevance is procedural, plain, episodic — the
+/// spec's "episodic decays, semantic stands" invariant.
+#[test]
+fn prop_keyed_half_life_differentiates_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+
+    let mk = |n: u128, kind: Option<&str>| {
+        let mut props = Props::new();
+        props.insert(
+            "content".into(),
+            PropValue::Str("granite quarry report".into()),
+        );
+        if let Some(k) = kind {
+            props.insert("kind".into(), PropValue::Str(k.into()));
+        }
+        Op::CreateNode {
+            id: NodeId::from_u128(ulid_at(now - 30 * DAY_MS, n)),
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }
+    };
+    let episodic_id = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 1));
+    let plain_id = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 2));
+    let procedural_id = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 3));
+    db.submit(vec![
+        mk(1, Some("episodic")),
+        mk(2, None),
+        mk(3, Some("procedural")),
+    ])
+    .unwrap();
+
+    let options = SearchOptions {
+        recency_weight: 0.3,
+        recency_half_life_by_prop: Some(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![
+                ("episodic".into(), 14 * DAY_MS),
+                ("procedural".into(), 365 * DAY_MS),
+            ],
+            default_ms: 120 * DAY_MS,
+        }),
+        now_ms: Some(now),
+        ..SearchOptions::default()
+    };
+    let hits = db
+        .search_text_with(&scopes, "granite quarry", 10, &options)
+        .unwrap();
+    let order: Vec<NodeId> = hits.iter().map(|(n, _)| n.id).collect();
+    assert_eq!(
+        order,
+        vec![procedural_id, plain_id, episodic_id],
+        "factor ordering procedural > default > episodic must decide the tie: {hits:?}"
+    );
+    assert!(
+        hits[0].1 > hits[1].1 && hits[1].1 > hits[2].1,
+        "scores must strictly differ: {hits:?}"
+    );
+}
+
+/// Map validation: with recency active, a non-positive half-life anywhere
+/// in the map — and an empty prop name — must reject loudly.
+#[test]
+fn prop_keyed_half_life_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (_id, op) = memory("basalt", Scope::Id(s));
+    db.submit(vec![op]).unwrap();
+
+    let bad = |map: PropHalfLife| SearchOptions {
+        recency_weight: 0.3,
+        recency_half_life_by_prop: Some(map),
+        ..SearchOptions::default()
+    };
+    for options in [
+        bad(PropHalfLife {
+            prop: "".into(),
+            per_value: vec![],
+            default_ms: 1,
+        }),
+        bad(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![("episodic".into(), 0)],
+            default_ms: 1,
+        }),
+        bad(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![],
+            default_ms: 0,
+        }),
+    ] {
+        let err = db
+            .search_text_with(&scopes, "basalt", 5, &options)
+            .unwrap_err();
+        assert!(
+            matches!(err, TopoError::Rejected(_)),
+            "want Rejected, got {err:?}"
+        );
+    }
+    // Weight 0 ignores the map entirely — even an invalid one is inert,
+    // matching the flat prior's existing weight-gated validation.
+    let inert = SearchOptions {
+        recency_weight: 0.0,
+        recency_half_life_by_prop: Some(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![],
+            default_ms: 0,
+        }),
+        ..SearchOptions::default()
+    };
+    db.search_text_with(&scopes, "basalt", 5, &inert).unwrap();
+}
