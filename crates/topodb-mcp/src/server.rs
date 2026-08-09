@@ -1086,7 +1086,7 @@ struct RecentMemoriesResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FindDuplicateMemoriesParams {
     /// Cosine floor for calling two memories duplicates (0.0–1.0). Defaults to
-    /// the same near-dup floor write-time detection uses (0.80): the default
+    /// the same near-dup floor write-time detection uses (0.68): the default
     /// model scores the same fact in different words ~0.83, unrelated facts well
     /// under 0.5. Raise it for stricter matches, lower to cast a wider (noisier)
     /// net. Ignored in text mode; text mode always uses the fixed token-containment
@@ -2979,7 +2979,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Hybrid recall over memory content and entity names: stemmed BM25 + vector + 1-hop graph legs, recency-weighted (fresher wins ties; recency_weight 0 = pure relevance). Missing terms fall back to close prefix/typo matches and learned synonyms expand automatically. Entity hits are down-weighted by default (label_weights: {} disables; exact entity lookup wants labels: [\"Entity\"]). Empty results: retry with different words before concluding nothing is stored, then traverse from the best hit."
+        description = "Hybrid recall over memory content and entity names: stemmed BM25 + vector (when embeddings are ready) + 1-hop graph legs, recency-weighted (fresher wins ties; recency_weight 0 = pure relevance). Missing terms fall back to close prefix/typo matches and learned synonyms expand automatically. Entity hits are down-weighted by default (label_weights: {} disables; exact entity lookup wants labels: [\"Entity\"]). Empty results: retry with different words before concluding nothing is stored, then traverse from the best hit."
     )]
     fn search_memories(
         &self,
@@ -3668,7 +3668,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Register an alternate name for an existing entity; create_entity, find_by_prop, and search resolve it to the canonical node — use it the moment you learn a second name instead of a duplicate. Idempotent for the same entity; errors if it names a DIFFERENT entity (both ids reported). Remove via remove_node."
+        description = "Register an alternate name for an existing entity; create_entity, find_by_prop, and search resolve it to the canonical node — use it the moment you learn a second name. Idempotent for the same entity; errors if it names a DIFFERENT entity (both ids reported). Remove the alias node with remove_node."
     )]
     fn add_alias(
         &self,

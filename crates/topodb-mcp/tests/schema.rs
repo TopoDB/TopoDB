@@ -475,4 +475,17 @@ fn tool_descriptions_stay_lean() {
         "descriptions over budget — trim them (or justify a new allowlist entry):\n{}",
         over.join("\n")
     );
+
+    // Whole-payload ratchet: descriptions are capped above, but param docs
+    // ship in tools/list too — prose must not migrate one level down.
+    // Recorded at the branch that introduced this guard; may only move DOWN.
+    let payload = serde_json::to_string(&tools).expect("tools serialize");
+    // Measured 75512 bytes on the branch that introduced this guard; ceiling
+    // is that + 5% headroom (79288), rounded up to a clean number.
+    const PAYLOAD_CEILING_BYTES: usize = 80_000;
+    assert!(
+        payload.len() <= PAYLOAD_CEILING_BYTES,
+        "tools/list payload is {} bytes (ceiling {PAYLOAD_CEILING_BYTES}) — trim, don't relocate prose",
+        payload.len()
+    );
 }
