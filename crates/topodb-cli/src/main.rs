@@ -1,5 +1,6 @@
 mod cli;
 mod output;
+mod resolve;
 
 use std::io::Read;
 use std::str::FromStr;
