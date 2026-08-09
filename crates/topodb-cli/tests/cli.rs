@@ -36,10 +36,79 @@ fn info_reports_fields_on_fresh_db() {
     assert!(v["format_version"].is_number());
 }
 
+/// A HOME-scoped run: point HOME (and USERPROFILE for Windows) at a tempdir
+/// so the default db path lands there, never the real ~/.topodb.
+fn bin_home(home: &std::path::Path) -> Command {
+    let mut c = bin();
+    c.env("HOME", home);
+    c.env("USERPROFILE", home);
+    c.env_remove("TOPODB_DB");
+    c.env_remove("TOPODB_SCOPE");
+    c.env_remove("TOPODB_FORMAT");
+    c
+}
+
 #[test]
-fn missing_db_flag_is_usage_error_exit_2() {
-    let out = bin().arg("info").output().unwrap();
-    assert_eq!(out.status.code(), Some(2)); // clap usage error
+fn db_defaults_to_home_topodb_when_flag_absent() {
+    let home = tempfile::tempdir().unwrap();
+    let out = bin_home(home.path()).arg("info").output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(home.path().join(".topodb/memory.redb").exists(), "default db not created under HOME");
+}
+
+#[test]
+fn db_from_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("env.redb");
+    let out = bin().env("TOPODB_DB", &db).arg("info").output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(db.exists());
+}
+
+#[test]
+fn db_and_scope_from_project_config() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let db = proj.path().join("cfg.redb");
+    std::fs::write(
+        proj.path().join(".topodb.toml"),
+        format!("db = \"{}\"\nscope = \"shared\"\n", db.display()),
+    )
+    .unwrap();
+    let out = bin_home(home.path())
+        .current_dir(proj.path())
+        .arg("info")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["path"], db.to_str().unwrap());
+    assert!(db.exists());
+}
+
+#[test]
+fn invalid_scope_error_names_its_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let out = bin()
+        .args(["--db"]).arg(&db)
+        .env("TOPODB_SCOPE", "not-a-ulid!")
+        .arg("info")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("env"), "expected source in error, got: {err}");
+}
+
+#[test]
+fn malformed_config_is_exit_2_naming_file() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join(".topodb.toml"), "db = = =").unwrap();
+    let out = bin_home(home.path()).current_dir(proj.path()).arg("info").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(".topodb.toml"));
 }
 
 #[test]

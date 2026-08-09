@@ -3,6 +3,7 @@ mod output;
 mod resolve;
 
 use std::io::Read;
+use std::path::Path;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -15,12 +16,53 @@ use topodb::{
 fn main() {
     let cli = Cli::parse();
 
-    // Resolve the default scope once, up front: "shared" (case-insensitive)
-    // -> Scope::Shared, a ULID -> Scope::Id, anything else is a caller error
-    // the user can fix -> rejected/2.
-    let default_scope = match topodb_json::resolve_scope(Some(&cli.scope), Scope::Shared) {
-        Ok(s) => s,
+    // Project config (nearest .topodb.toml on the path from cwd up).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let cfg = match resolve::load_project_config(&cwd) {
+        Ok(c) => c,
         Err(e) => output::fail("rejected", &e, 2),
+    };
+    let cfg = cfg.unwrap_or_default();
+    for k in &cfg.unknown_keys {
+        eprintln!("topodb: ignoring unknown key {k:?} in .topodb.toml");
+    }
+    let cfg_path = cfg.path.clone();
+    let home = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok());
+
+    // db path.
+    let db_r = resolve::resolve_db(
+        cli.db.clone(),
+        std::env::var("TOPODB_DB").ok(),
+        cfg.db.as_deref().zip(cfg_path.as_deref()),
+        home.as_deref(),
+    );
+    let db_path = db_r.value;
+
+    // Create the parent directory for the default db path (~/.topodb/memory.redb).
+    // For user-provided paths, let the database engine report errors if the parent doesn't exist.
+    if matches!(db_r.source, resolve::Source::Default) {
+        if let Some(parent) = db_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    output::fail("internal", &format!("creating db directory: {e}"), 1);
+                }
+            }
+        }
+    }
+
+    // scope string → Scope. Errors name the source they came from.
+    let scope_r = resolve::resolve_scope_str(
+        cli.scope.clone(),
+        std::env::var("TOPODB_SCOPE").ok(),
+        cfg.scope.as_deref().zip(cfg_path.as_deref()),
+    );
+    let default_scope = match topodb_json::resolve_scope(Some(&scope_r.value), Scope::Shared) {
+        Ok(s) => s,
+        Err(e) => output::fail(
+            "rejected",
+            &format!("scope from {}: {e}", scope_r.source.label()),
+            2,
+        ),
     };
 
     // Open using the file's own persisted index spec — no --spec flag on
@@ -52,23 +94,23 @@ fn main() {
     };
 
     let db = topodb_json::open_with_busy_retry(cli.lock_wait_ms, || {
-        if cli.db.exists() {
+        if db_path.exists() {
             // Inherit the persisted spec, but silently upgrade a db still on an
             // older STOCK default to the current one (`topodb_json::upgraded_spec`
             // — e.g. adding the (Entity, name) text index); a customized spec is
             // inherited verbatim. Mirrors topodb-mcp's open path exactly.
-            Db::open_stored(&cli.db).and_then(|db| {
+            Db::open_stored(&db_path).and_then(|db| {
                 let persisted = db.index_spec();
                 let upgraded = topodb_json::upgraded_spec(persisted.clone());
                 if upgraded != persisted {
                     drop(db);
-                    Db::open_with(&cli.db, upgraded)
+                    Db::open_with(&db_path, upgraded)
                 } else {
                     Ok(db)
                 }
             })
         } else {
-            Db::open_with(&cli.db, topodb_json::default_spec())
+            Db::open_with(&db_path, topodb_json::default_spec())
         }
     });
     let db = match db {
@@ -77,7 +119,7 @@ fn main() {
             "busy",
             &format!(
                 "another process holds {}; retried for {}ms (tune with --lock-wait-ms / TOPODB_LOCK_WAIT_MS)",
-                cli.db.display(),
+                db_path.display(),
                 cli.lock_wait_ms
             ),
             3,
@@ -86,7 +128,7 @@ fn main() {
     };
 
     match cli.cmd {
-        Command::Info => info(&db, &cli.db, default_scope, cli.pretty),
+        Command::Info => info(&db, &db_path, default_scope, cli.pretty),
         Command::CreateMemory { content, props, .. } => {
             create_memory(&db, write_scope, content, props.as_deref(), cli.pretty)
         }

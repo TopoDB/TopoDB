@@ -10,12 +10,14 @@ use std::path::PathBuf;
     about = "Direct-embedded CLI over a TopoDB database file"
 )]
 pub struct Cli {
-    /// Database file (or TOPODB_DB env).
-    #[arg(long, env = "TOPODB_DB")]
-    pub db: PathBuf,
-    /// Default scope: a ScopeId ULID, or "shared".
-    #[arg(long, default_value = "shared")]
-    pub scope: String,
+    /// Database file. Resolution order: this flag, then TOPODB_DB, then a
+    /// `.topodb.toml` on the path from cwd up, then ~/.topodb/memory.redb.
+    #[arg(long)]
+    pub db: Option<PathBuf>,
+    /// Default scope: a ScopeId ULID, or "shared". Resolution order: this
+    /// flag, then TOPODB_SCOPE, then `.topodb.toml`, then "shared".
+    #[arg(long)]
+    pub scope: Option<String>,
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pub pretty: bool,
