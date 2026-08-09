@@ -1,0 +1,18 @@
+// Shared memory line-builder for the SessionStart and SubagentStart hooks.
+// Returns the header line followed by one bullet per memory, truncated and
+// capped so the running joined block stays within charCap (the header counts
+// toward the cap, matching session-start's original behavior).
+
+export function renderMemoryLines(memories, header, charCap) {
+  const lines = [header];
+  for (const m of memories) {
+    const content = m.content.length > 140 ? `${m.content.slice(0, 139)}…` : m.content;
+    const ents = m.entities.length ? ` [entities: ${m.entities.slice(0, 3).join(", ")}]` : "";
+    const days = Math.floor(m.ageMs / 86400000);
+    const age = days > 0 ? ` (${days}d ago)` : " (today)";
+    const line = `- ${content}${ents}${age}`;
+    if (lines.join("\n").length + line.length > charCap) break;
+    lines.push(line);
+  }
+  return lines;
+}
