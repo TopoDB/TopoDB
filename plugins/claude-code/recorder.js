@@ -11,12 +11,13 @@ export function stateFilePath(dataDir, sessionId) {
   return path.join(dataDir, "episodes", `${String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
 }
 
-export function appendRetrieval(dataDir, sessionId, record, contents) {
+// Read-or-init the session state, apply `fn` to mutate it, and write it back
+// atomically (tmp + rename, retrying the Windows EPERM/EACCES rename race).
+function mutateState(dataDir, sessionId, fn) {
   const file = stateFilePath(dataDir, sessionId);
   mkdirSync(path.dirname(file), { recursive: true });
   const state = readState(dataDir, sessionId) ?? { startedAt: Date.now(), retrievals: [], contents: {} };
-  state.retrievals.push(record);
-  for (const [id, text] of contents) state.contents[id] = text;
+  fn(state);
   // Atomic replace: write to a per-process temp file in the same dir, then
   // rename over the final path. A concurrent PostToolUse racing us can still
   // lose an update (last rename wins), but readers never observe a torn
@@ -44,6 +45,25 @@ export function appendRetrieval(dataDir, sessionId, record, contents) {
       Atomics.wait(sleeper, 0, 0, 5 + attempt * 5);
     }
   }
+}
+
+export function appendRetrieval(dataDir, sessionId, record, contents) {
+  mutateState(dataDir, sessionId, (state) => {
+    state.retrievals.push(record);
+    for (const [id, text] of contents) state.contents[id] = text;
+  });
+}
+
+export function markCaptured(dataDir, sessionId) {
+  mutateState(dataDir, sessionId, (state) => {
+    state.captured = true;
+  });
+}
+
+export function markNudged(dataDir, sessionId) {
+  mutateState(dataDir, sessionId, (state) => {
+    state.nudged = true;
+  });
 }
 
 export function readState(dataDir, sessionId) {
