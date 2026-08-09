@@ -1086,7 +1086,7 @@ struct RecentMemoriesResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FindDuplicateMemoriesParams {
     /// Cosine floor for calling two memories duplicates (0.0–1.0). Defaults to
-    /// the same near-dup floor write-time detection uses (0.80): the default
+    /// the same near-dup floor write-time detection uses (0.68): the default
     /// model scores the same fact in different words ~0.83, unrelated facts well
     /// under 0.5. Raise it for stricter matches, lower to cast a wider (noisier)
     /// net. Ignored in text mode; text mode always uses the fixed token-containment
@@ -2269,10 +2269,16 @@ struct SearchVectorsResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SubmitBatchParams {
-    /// A JSON array of high-level commands. Each command's `op` matches an MCP
-    /// tool name (create_memory, create_entity, link, set_node_props,
-    /// remove_node, close_edge, set_embedding); `#N` in an id field refers to
-    /// the id produced by the Nth (earlier) command in the batch.
+    /// A JSON array of high-level commands. Each command's `op` matches an
+    /// MCP tool name; `#N` in an id field refers to the id produced by the
+    /// Nth (earlier, 0-indexed) command. Per-op fields: create_memory
+    /// { content, scope?, props? }; create_entity { name, scope?, props? };
+    /// create_node { label, props?, scope? } — arbitrary label for host-level
+    /// schemas; link { from, to, type, scope?, props?, valid_from? } — note
+    /// from/to/type, NOT the link tool's from_id/to_id/edge_type;
+    /// set_node_props { id, props } (a null value removes that key);
+    /// remove_node { id }; close_edge { id, valid_to? };
+    /// set_embedding { id, model, vector }.
     #[schemars(with = "CommandsSchema")]
     commands: Value,
 }
@@ -2288,7 +2294,7 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits scope, the default READ scope set applied to a read call that omits both scope/scopes, and the embedding subsystem's model name + lifecycle status (off/downloading/ready/failed). Call this first to confirm the server is wired to the expected database and read set, and to obtain current_seq as the anchor for get_changes. NOTE: the default read set can be WIDER than the default write scope (e.g. --read-scopes project,shared with --scope project) — passing default_scope as a read call's own `scope` NARROWS the read to that one scope, which can be stricter than staying on the defaults."
+        description = "Report the open database's path, op-log current_seq (the get_changes anchor), default write scope, default read set, and embedding model/status. Call first to confirm wiring. Passing default_scope as a read call's own scope NARROWS that read to one scope — the default read set can be wider."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
@@ -2313,7 +2319,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Fetch one node by its ULID. Call this when you already have a node id (from a previous search, traverse, or create) and need its current label and properties."
+        description = "Fetch one node by its ULID when you already have an id (from search, traverse, or create) and need its current label and properties."
     )]
     fn get_node(
         &self,
@@ -2338,7 +2344,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Look up nodes by an equality-indexed property (e.g. an Entity's name). String values match case- and whitespace-insensitively by default ('drew powell' finds 'Drew Powell'); pass exact: true for a byte-exact match. Call this to resolve a known identifier to a node — for topic/phrase search use search_memories instead. Errors if (label, prop) is not declared in the index spec. Zero rows (not an error) when nothing matches — before concluding an entity is new, also try search_memories with the name, and check the shared scope (scopes: [<project>, \"shared\"])."
+        description = "Look up nodes by an equality-indexed property (e.g. an Entity's name); string values match case- and whitespace-insensitively unless exact: true. Errors if (label, prop) is not in the index spec. Zero rows is not an error — before concluding an entity is new, also try search_memories and the shared scope."
     )]
     fn find_by_prop(
         &self,
@@ -2396,7 +2402,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "The newest memories in the read scopes, most recent first. For orientation ('what was I doing?', session-start context), not search — use search_memories when you know what you're looking for. k defaults to 8 (max 100)."
+        description = "The newest memories in the read scopes, most recent first — session-start orientation ('what was I doing?'), not search; use search_memories when you know what you're looking for. k defaults to 8 (max 100)."
     )]
     fn recent_memories(
         &self,
@@ -2425,7 +2431,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find pairs of ALREADY-STORED memories that are near-duplicates, most-similar first. Read-only and advisory. Vector mode (embeddings Ready): detects semantic similarity (cosine >= min_similarity, default 0.70); each pair carries a `band` — `likely` (cosine >= 0.80) or `possible` (0.70-0.80) — and a `relation`: `duplicate` (same fact reworded -> merge with `consolidate_memories`) or `supersession` (the two CONTRADICT — one negates the other, retire the stale side with `supersede`). Text mode (embedder not Ready, including deliberate off): exhaustive pairwise token containment over the scope (>= 0.7, fixed); the same lexical negation-cue relation check runs, so pairs still split into `duplicate` vs `supersession` (heuristic — lower confidence than the vector split; bands reuse the cosine cutoffs applied to containment, treat as rough). The result's `method` field indicates which detection path ran. Capped at `limit` (and the scan at an internal cap); `truncated=true` means not exhaustive."
+        description = "Maintenance scan (read-only, advisory): pairs of stored memories that are near-duplicates, most-similar first. Each pair carries a band (likely/possible) and a relation: duplicate (same fact — merge via consolidate_memories) vs supersession (contradiction — supersede the stale side). method reports vector vs text detection (text is lower-confidence). truncated=true means not exhaustive."
     )]
     fn find_duplicate_memories(
         &self,
@@ -2618,7 +2624,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Consolidate a near-duplicate PAIR into one memory: keep one, retire the other. YOU pick which survives (keep) and which is retired (drop) after judging they are the same fact — never let the tool infer it, because near-dup similarity is topical, not factual (a contradicting correction about the same subsystem scores high too). keep inherits drop's unique relationships (so no graph knowledge is lost) and drop is superseded — marked and disconnected — atomically. Pair this with find_duplicate_memories: scan for pairs, judge them, consolidate the true duplicates. Errors unless both are live (non-superseded, non-forgotten) Memory nodes in the write scope and keep != drop."
+        description = "Consolidate a near-duplicate pair: keep survives and inherits drop's unique relationships; drop is superseded — atomically. YOU judge they are the same fact and pick the survivor — near-dup similarity is topical, not factual (a contradicting correction also scores high). Both must be live Memories in the write scope."
     )]
     fn consolidate_memories(
         &self,
@@ -2722,7 +2728,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find memories that are stored but connected to NOTHING — a live memory with no open outgoing edges, so it joined no entity and is reachable only by text/vector search, never by traversal. Usually a bare create_memory that was never linked, or a memory whose only link was later closed. Read-only and advisory: link the orphan to its entities (link/remember) or drop it. Superseded memories are excluded — their edges close on retirement, so they are retired, not orphaned. Oldest first, at most `limit`; `truncated=true` means more orphans exist than were returned."
+        description = "Maintenance scan (read-only, advisory): live memories with no open outgoing edges — linked to nothing, reachable only by search, never traversal. Link each orphan to its entities (link/remember) or drop it. Superseded memories are excluded (retired, not orphaned). Oldest first, at most limit; truncated=true means more exist."
     )]
     fn find_orphan_memories(
         &self,
@@ -2791,7 +2797,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Maintenance scan: find memories that have gone COLD — not created or recalled within older_than_days (default 30), stalest first. 'Activity' is the later of a memory's creation and its most recent recall (last_accessed_at), so a brand-new memory is never stale and a frequently-recalled one stays fresh; a fact stored long ago and never looked at since is what surfaces. Read-only and advisory: review, then refresh (re-link), keep, or drop. The scan itself does NOT count as a recall — it inspects the recency signal without bumping it. Superseded memories are excluded. Each row carries access_count, last_accessed_at (null if never recalled), and age_days. Stalest first, at most `limit`; truncated=true means more exist."
+        description = "Maintenance scan (read-only, advisory): memories neither created nor recalled within older_than_days (default 30), stalest first. The scan does not bump the recency signal it reads. Rows carry access_count, last_accessed_at (null if never recalled), and age_days; truncated=true means more exist."
     )]
     fn find_stale_memories(
         &self,
@@ -2886,7 +2892,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Memory health check: one call that runs the hygiene scans (near-duplicates, orphans, stale) over the scope and returns a consolidated summary — counts, a `needs_attention` flag, and a few sample rows. The 'what needs tidying in my memory?' orientation read for session start, so an agent doesn't have to remember the separate maintenance tools. Read-only and advisory; drill into any non-zero category with find_duplicate_memories / find_orphan_memories / find_stale_memories, then act. When embeddings are Ready, near-dup pairs (cosine >= 0.80) are split by relation: `duplicate_pairs` (same fact -> consolidate) vs `supersession_pairs` (contradicting facts -> supersede the stale one). When the embedder is not Ready (including deliberate off), text-based detection (token containment) runs instead, and the duplicate/supersession split still applies via the lexical negation-cue check (heuristic — lower confidence than vectors). Check `embeddings_enabled` to tell which detection grade produced the counts. When `degraded` is true (embedder Failed or Downloading), `needs_attention` is forced true and `degraded_reason` explains the state. Counts cap at an internal limit; truncated=true means lower bounds."
+        description = "One-call hygiene summary for session start: near-duplicate, orphan, and stale counts with needs_attention and sample rows. Read-only; drill in with find_duplicate/orphan/stale_memories, then act. Pairs split into duplicate_pairs (consolidate) vs supersession_pairs (supersede). embeddings_enabled tells the detection grade; degraded forces needs_attention with degraded_reason. Counts are lower bounds when truncated."
     )]
     fn memory_health(
         &self,
@@ -2973,7 +2979,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Full-text BM25 search over indexed text (memory content AND entity names), recency-weighted: at equal relevance, fresher memories rank above stale ones (tune with recency_weight, 0 = pure BM25). Terms are stemmed ('databases' matches 'database', 'running' matches 'run') and camelCase identifiers split; a term that matches nothing falls back to close prefix/typo neighbors at a score discount. Learned synonyms (add_synonym) expand queries automatically, and 1-hop linked context is pulled in (graph_boost, default true). If a query returns nothing useful, retry with different words, raise k, or widen scopes before concluding nothing is stored. Then traverse from the best hit to gather its linked context. Results are filtered to Memory and Entity nodes by default (labels param overrides); leg weights (text_weight/vector_weight/graph_weight) and an access-history boost (access_weight, default off) tune ranking. By default, entity hits are down-weighted (label_weights: {\"Entity\": 0.5}), so question-shaped queries surface facts (memories) first; pass label_weights: {} to restore old ranking behavior with no down-weighting. For looking up an entity by its exact name, prefer labels: [\"Entity\"] (unaffected by the down-weight) over a plain search. kinds filters results by memory kind; a node without a kind prop counts as semantic."
+        description = "Hybrid recall over memory content and entity names: stemmed BM25 + vector (when embeddings are ready) + 1-hop graph legs, recency-weighted (fresher wins ties; recency_weight 0 = pure relevance). Missing terms fall back to close prefix/typo matches and learned synonyms expand automatically. Entity hits are down-weighted by default (label_weights: {} disables; exact entity lookup wants labels: [\"Entity\"]). Empty results: retry with different words before concluding nothing is stored, then traverse from the best hit."
     )]
     fn search_memories(
         &self,
@@ -3167,7 +3173,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Walk the graph outward from a seed node, following edges up to max_hops. Call this to gather the context AROUND something you already found — related entities, linked memories. Optionally view the graph at a past timestamp via as_of; omit for now. Returns the subgraph (nodes + edges). Combined with remember's supersedes, an as_of before the supersession shows the pre-supersession topology."
+        description = "Walk the graph outward from a seed node up to max_hops and return the subgraph (nodes + edges) — the context around something already found. as_of views past topology (e.g. before a supersession); omit for now."
     )]
     fn traverse(
         &self,
@@ -3232,7 +3238,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Predict missing links: rank the k nodes this node should probably be connected to but isn't — structurally close (many converging paths) and/or semantically similar (embedding cosine), with shared-neighbor evidence. Each suggestion carries `similarity` (raw cosine when found semantically; null when structural-only) and `common_neighbors` as {id, label, name} objects. Optional min_similarity floors the semantic signal (model-dependent; omit by default). Suggestions only: nothing is created — review them and call link for the ones you agree with, choosing the edge type yourself. Empty when the node is unknown in the read scopes."
+        description = "Rank the k nodes this node should probably link to but doesn't — structurally close and/or embedding-similar, with common_neighbors evidence; similarity is null for structural-only hits. Suggestions only: review and call link yourself, choosing the edge type. Empty when the node is unknown in the read scopes."
     )]
     fn suggest_links(
         &self,
@@ -3286,7 +3292,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Read a node's access statistics (count, last-accessed timestamp). Call this when deciding what to consolidate or forget — e.g. finding stale memories. Reading stats does not itself count as an access."
+        description = "Read a node's access count and last-accessed timestamp — evidence for consolidate/forget decisions. Reading stats does not itself count as an access."
     )]
     fn access_stats(
         &self,
@@ -3313,7 +3319,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Surface decay candidates: live memories ranked by kind-aware staleness ((age/half_life)/ln(e+access_count); age since last access, falling back to creation; half-life defaults episodic 14d / semantic 120d / procedural 365d, absent kind counts as semantic). Read-only, deterministic under now_ms, and UNBUMPED — running the sweep does not perturb the access signal it reads. This tool only PROPOSES: nothing is stamped or deleted. YOU review each candidate's evidence and act via forget or consolidate_memories — never forget from staleness alone. For near-duplicates use find_duplicate_memories; this sweep does not detect them."
+        description = "Rank live memories by kind-aware staleness (half-lives: episodic 14d / semantic 120d / procedural 365d; absent kind = semantic). Read-only, unbumped, deterministic under now_ms. PROPOSES only — review each candidate and act via forget or consolidate_memories; never forget from staleness alone. Near-duplicates are find_duplicate_memories' job."
     )]
     fn lifecycle_candidates(
         &self,
@@ -3340,7 +3346,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Replay the operation log from a sequence number (inclusive). Host-level primitive for consolidation/sync — the ONE unscoped read; the log spans all scopes. Returns ops with their seq numbers; on Compacted errors, re-anchor from current state. The db_info tool reports current_seq. Disabled unless the server was started with --allow-unscoped-changes."
+        description = "Replay the op log from a sequence number (inclusive) — the ONE unscoped read, for host-level consolidation/sync; disabled unless started with --allow-unscoped-changes. On Compacted errors re-anchor from current state; db_info reports current_seq."
     )]
     fn get_changes(
         &self,
@@ -3375,7 +3381,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Store a linked fact in ONE call: creates the memory, find-or-creates each named entity, and links memory→entity ('about' by default) — atomically, in a single write batch. This is the preferred way to store anything worth remembering. Use the lower-level create_memory / create_entity / link only when you need the pieces separately: an unlinked note, an entity carrying extra props, or entity↔entity relations (works_at, supersede). Optional kind classifies the memory (episodic | semantic | procedural; omitted reads as semantic); on a dedup hit the existing memory's stored kind wins."
+        description = "Store a linked fact in one atomic call (preferred write path): memory + find-or-create entities + memory→entity links. Use create_memory / create_entity / link only for an unlinked note, extra entity props, or entity↔entity relations. kind: episodic | semantic | procedural (omitted = semantic); on dedup the stored kind wins."
     )]
     fn remember(
         &self,
@@ -3443,7 +3449,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Soft-retire memories you judge not worth keeping: stamps forgotten_at and closes their open edges, atomically. Recall and search stop returning them as of the stamp; history remains (an as_of before the stamp still sees them) and nothing is deleted. Distinct from remember's supersedes — supersede says a fact was REPLACED by a newer one; forget says it never needs to come back. Every id must be a live Memory in the write scope: unknown, non-Memory, already-forgotten, or already-superseded ids reject the whole call. YOU decide what is forgotten — never infer it from staleness alone without reviewing the memory."
+        description = "Soft-retire memories: stamps forgotten_at and closes open edges atomically; search stops returning them but history (as_of) remains. Supersede means REPLACED by a newer fact; forget means never needed again. Every id must be a live Memory in the write scope or the whole call rejects. Never forget from staleness alone."
     )]
     fn forget(
         &self,
@@ -3502,11 +3508,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Materialize memories into an Obsidian-format vault as a working set: \
-one note per memory plus entity stubs, wikilinks intact. Select by hybrid-recall query or by \
-entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true. \
-Reads always include the shared scope in addition to the requested one(s), so seeded links \
-match what ingest_vault compares against on re-ingest."
+        description = "Materialize memories into an Obsidian-format vault as a working set: one note per memory plus entity stubs, wikilinks intact. Select by hybrid-recall query or by entity neighborhood (exactly one). Never overwrites a differing file unless overwrite=true. Reads include the shared scope, so seeded links match what ingest_vault compares on re-ingest."
     )]
     fn seed_vault(
         &self,
@@ -3563,7 +3565,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Low-level: store an UNLINKED memory node. Prefer remember, which stores AND links in one atomic call — an unlinked memory can only ever be found by keyword search, never by traversing from the people/projects it concerns. Use this directly only for a deliberately standalone note. content becomes the full-text-searchable body; props holds structured metadata (strings/numbers/bools). Returns the new node's id."
+        description = "Low-level: store an UNLINKED memory node — findable only by keyword search, never by traversing from the entities it concerns. Prefer remember; use this only for a deliberately standalone note. content is the searchable body; props holds scalar metadata. Returns the new node's id."
     )]
     fn create_memory(
         &self,
@@ -3609,7 +3611,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Find-or-create an entity node (person, project, concept). remember calls this resolution for you when storing a fact; call it directly when an entity needs extra props, or to get an id for entity↔entity link calls. The name is matched case- and whitespace-insensitively across the read scopes, the write scope, AND shared — if the entity already exists anywhere visible, its id is returned with created: false and NO duplicate is made (any new props keys are merged; existing keys are never overwritten). Use one canonical name form per entity (prefer the fullest name you know, e.g. 'Drew Powell' over 'Drew') so future mentions keep resolving to the same node."
+        description = "Find-or-create an entity node, name-matched case- and whitespace-insensitively across the read scopes, write scope, AND shared — an existing entity returns its id with created: false, never a duplicate (new prop keys merge; existing keys never overwrite). Use one canonical name form so mentions keep resolving to the same node."
     )]
     fn create_entity(
         &self,
@@ -3666,7 +3668,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Register an alternate name for an existing entity ('Drew' for 'Drew Powell', 'the broker' for 'launch.js'). From then on create_entity, find_by_prop, and search resolve the alias to the canonical entity — use this the moment you learn a second name for something instead of creating a duplicate. Errors if the alias already names a DIFFERENT entity (that's a merge situation; both ids are reported). Idempotent for the same entity. Remove an alias with remove_node on the alias node id."
+        description = "Register an alternate name for an existing entity; create_entity, find_by_prop, and search resolve it to the canonical node — use it the moment you learn a second name. Idempotent for the same entity; errors if it names a DIFFERENT entity (both ids reported). Remove the alias node with remove_node."
     )]
     fn add_alias(
         &self,
@@ -3779,7 +3781,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Teach search a domain equivalence: after add_synonym('auth','login'), searching 'auth' also matches memories that say 'login' (at a discount, so exact matches still win). Bidirectional by default. Use when you learn this project's vocabulary — 'broker' meaning launch.js, 'the engine' meaning crates/topodb. Depth-1 only: synonyms never chain. Remove with remove_node on the synonym node id."
+        description = "Teach search a domain equivalence: after add_synonym('auth','login'), searching 'auth' also matches 'login' at a discount, so exact matches still win. Bidirectional by default; depth-1 only — synonyms never chain. Use for project vocabulary; remove via remove_node on the synonym node id."
     )]
     fn add_synonym(
         &self,
@@ -3859,7 +3861,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Create (or reuse) a typed, time-aware edge between two existing nodes. remember already links memories to their entities — use this for entity↔entity relations ('works_on', 'works_at') and custom memory links. edge_type is normalized (lowercased; spaces/hyphens collapse to '_', so 'Works At' == 'works_at'); reuse existing type names rather than inventing synonyms ('works_at', not also 'employed_by'). Calling link again with the same from/to/type returns the existing open edge (created: false) instead of a duplicate. When the new fact REPLACES the old one for a to-one relation (moved teams, changed employer), pass supersede: true to atomically close the other open same-type edges from this node. Errors if either node doesn't exist. When linking shared-scope nodes, pass scope: 'shared' or the edge is invisible outside this project."
+        description = "Create a typed, time-aware edge between existing nodes — for entity↔entity relations and custom memory links (remember already links memory→entity). Same from/to/type returns the existing open edge (created: false). edge_type normalizes ('Works At' == 'works_at'); reuse existing type names rather than inventing synonyms. When a new fact REPLACES a to-one relation, pass supersede: true to atomically close the other open same-type edges. Linking shared-scope nodes needs scope: 'shared' or the edge is invisible outside this project."
     )]
     fn link(&self, Parameters(p): Parameters<LinkParams>) -> Result<Json<LinkResult>, ErrorData> {
         let from = parse_node_id(&p.from_id)?;
@@ -3937,7 +3939,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "List a node's edges in a given direction (default: outgoing), optionally filtered by target node and/or edge type; open edges only by default. For direction=\"in\", the node is the target and to_id filters sources; to_id filters the far end of each edge, whichever side that is. Optionally view edges at a past timestamp via as_of (omit open_only when passing as_of; as_of already means \"open at that instant\") — use as_of to see edges superseded at that point in time. A future as_of behaves like \"now\". This is how you find the edge id to close_edge when a fact stops being true, and how you check what a node is already linked to before adding more. Returns full edge records (id, type, from, to, valid_from, valid_to) — valid_to: null means currently open."
+        description = "List a node's edges (default: outgoing, open only), filterable by far-end node and edge type. as_of shows edges open at that past instant — omit open_only with it. Use this to find the edge id for close_edge and to check what a node already links to; valid_to null means open."
     )]
     fn get_edges(
         &self,
@@ -4011,7 +4013,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Set or remove properties on an existing node. In `props`, a null value REMOVES that key; any other scalar sets it. Errors if the node doesn't exist. Returns the committed seq."
+        description = "Set or remove properties on an existing node: in props, a null value REMOVES that key, any other scalar sets it. Errors if the node doesn't exist; returns the committed seq."
     )]
     fn set_node_props(
         &self,
@@ -4025,7 +4027,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Hard-delete a node and cascade-remove its incident edges. Unlike `forget` (soft retirement — history preserved, as_of still sees the node), this erases the node entirely. Errors if the node doesn't exist. Returns the committed seq."
+        description = "Hard-delete a node and cascade-remove its incident edges. Unlike forget (soft retirement — as_of still sees the node), this erases it entirely. Returns the committed seq."
     )]
     fn remove_node(
         &self,
@@ -4037,7 +4039,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Close an open edge, stamping its valid_to — the edge stops being 'currently true' but stays in history. Call this when a linked fact stops holding (left the team, project ended); find the edge id with get_edges. valid_to defaults to now when omitted (recommended). For the common 'X changed to Y' case, prefer link with supersede: true, which closes and re-links atomically. Errors if the edge doesn't exist or is already closed."
+        description = "Close an open edge, stamping valid_to (defaults to now) — no longer currently true, but history keeps it; find the id with get_edges. For 'X changed to Y' prefer link with supersede: true, which closes and re-links atomically. Errors if already closed."
     )]
     fn close_edge(
         &self,
@@ -4057,7 +4059,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Attach a raw embedding vector to an existing node under `model`. The host computes the vector; TopoDB stores it as-is for cosine search. Errors if the node doesn't exist, the vector is empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq."
+        description = "Attach a host-computed raw embedding vector to an existing node under model; stored as-is for cosine search. Errors if the node is unknown, the vector empty, or its dimension conflicts with the model's existing vectors. Returns the committed seq."
     )]
     fn set_embedding(
         &self,
@@ -4075,7 +4077,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Cosine vector search under one model. The query is a raw embedding array (host-computed); TopoDB ranks stored embeddings by cosine similarity. Optionally restrict scoring to a candidate node set (for hybrid recall after a traverse). Errors if k is 0 or the vector is empty."
+        description = "Cosine vector search under one model; the query is a raw host-computed embedding. Optionally restrict scoring to a candidate node set (hybrid recall after a traverse). Errors if k is 0 or the vector is empty."
     )]
     fn search_vectors(
         &self,
@@ -4116,7 +4118,7 @@ match what ingest_vault compares against on re-ingest."
     }
 
     #[tool(
-        description = "Submit a batch of high-level commands (a JSON array of command objects) atomically — all commit or none. Each command's \"op\" matches a tool name, but field names are the batch DSL's own (not always identical to the tool's param names) — see per-op fields below. `#N` in an id field references the id produced by the Nth earlier command (0-indexed: `#0` is the first command), e.g. create a memory and entity, then link them. Returns the produced ids in order (null for commands that create nothing). CAUTION: batch commands are raw writes — batch create_entity ALWAYS creates a new node (no find-or-create) and batch link never dedupes; when the entity or edge might already exist, use the create_entity/link tools instead. Per-op fields: create_memory { content, scope?, props? }; create_entity { name, scope?, props? }; create_node { label, props?, scope? } — a node with an arbitrary label (for host-level schemas like episode recording); link { from, to, type, scope?, props?, valid_from? } — note link uses from/to/type, NOT the link tool's from_id/to_id/edge_type; set_node_props { id, props } (props value null removes that key); remove_node { id }; close_edge { id, valid_to? }; set_embedding { id, model, vector }."
+        description = "Submit a JSON array of command objects atomically — all commit or none; #N in an id field references the Nth earlier command's produced id (0-indexed). CAUTION: raw writes with the batch DSL's own field names (documented on the commands parameter) — batch create_entity ALWAYS creates a new node and batch link never dedupes; when the target might already exist, use the create_entity/link tools instead."
     )]
     fn submit_batch(
         &self,
@@ -4151,12 +4153,17 @@ impl ServerHandler for TopoServer {
                  find-or-create entities + links); the primitives remain for the exceptions — \
                  create_memory for a deliberately unlinked note, create_entity when an entity \
                  needs extra props, link for entity↔entity relations and supersede: true when \
-                 a to-one fact changes. Recalling well: search_memories stems \
+                 a to-one fact changes. Recalling well: know the exact identifier → \
+                 find_by_prop; otherwise search_memories stems \
                  terms, falls back to close prefix/typo matches, and expands learned \
                  synonyms (add_synonym) automatically — but it can't guess vocabulary it \
                  was never taught, so retry with different words before concluding \
                  nothing is stored — then traverse from the best hit; use \
-                 get_edges to inspect or retire a node's current relations.",
+                 get_edges to inspect or retire a node's current relations. \
+                 Maintenance: memory_health at session start summarizes hygiene; drill into \
+                 non-zero counts with the find_* scans and act via consolidate_memories / \
+                 forget — scans are advisory and never act on their own. Before treating an \
+                 entity as new, check the shared scope too.",
             )
     }
 

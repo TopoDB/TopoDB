@@ -45,6 +45,8 @@ The `--help`/`-h` and `--version`/`-V` flags print to stdout and exit 0.
 `tools/list` reports exactly 31 tools: `db_info`, 15 read tools (`get_changes` included), and
 15 write tools.
 
+> The table below is the long-form reference; the descriptions the server ships in `tools/list` are deliberately terser (see the word-budget guard in tests/schema.rs).
+
 | Tool | Params | Description |
 |---|---|---|
 | `db_info` | — | Report the open database's path, current op-log sequence number, the default WRITE scope applied to a create/link call that omits `scope`, the default READ scope set applied to a read call that omits both `scope`/`scopes`, and an `embeddings: { model, status }` field (`status`: `off`/`downloading`/`ready`/`failed`) reporting the local embedding subsystem's state. Call this first to confirm the server is wired to the expected database and read set, to obtain `current_seq` as the anchor for `get_changes`, and to know whether `search_memories` currently has a vector leg available. |

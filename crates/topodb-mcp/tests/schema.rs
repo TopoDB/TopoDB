@@ -438,3 +438,54 @@ fn search_memories_tuning_params_advertise_bounds() {
     assert_eq!(labels["type"], "array", "{labels}");
     assert_eq!(labels["minItems"], 1, "{labels}");
 }
+
+/// Tool descriptions are context every session pays for. Budget: 50 words
+/// each, with a justified allowlist for tools whose safety caveats need
+/// more. Cross-tool workflow guidance belongs in the server instructions
+/// block (sent once per session), not here.
+#[test]
+fn tool_descriptions_stay_lean() {
+    let (_dir, tools) = tools();
+    // tool → cap. Every entry needs a reason:
+    // - search_memories: empty-result retry guidance + ranking-tuning caveats
+    // - link: supersede semantics + shared-scope visibility caveat
+    // - submit_batch: raw-write caution + #N back-reference rule
+    let allow: std::collections::HashMap<&str, usize> =
+        [("search_memories", 80), ("link", 80), ("submit_batch", 65)]
+            .into_iter()
+            .collect();
+    let mut total = 0usize;
+    let mut over: Vec<String> = Vec::new();
+    for tool in &tools {
+        let name = tool["name"].as_str().expect("tool has a name");
+        let desc = tool["description"].as_str().unwrap_or("");
+        let words = desc.split_whitespace().count();
+        total += words;
+        let cap = allow.get(name).copied().unwrap_or(50);
+        if words > cap {
+            over.push(format!("{name}: {words} words (cap {cap})"));
+        }
+    }
+    eprintln!(
+        "total description words across {} tools: {total}",
+        tools.len()
+    );
+    assert!(
+        over.is_empty(),
+        "descriptions over budget — trim them (or justify a new allowlist entry):\n{}",
+        over.join("\n")
+    );
+
+    // Whole-payload ratchet: descriptions are capped above, but param docs
+    // ship in tools/list too — prose must not migrate one level down.
+    // Recorded at the branch that introduced this guard; may only move DOWN.
+    let payload = serde_json::to_string(&tools).expect("tools serialize");
+    // Measured 75512 bytes on the branch that introduced this guard; ceiling
+    // is that + 5% headroom (79288), rounded up to a clean number.
+    const PAYLOAD_CEILING_BYTES: usize = 80_000;
+    assert!(
+        payload.len() <= PAYLOAD_CEILING_BYTES,
+        "tools/list payload is {} bytes (ceiling {PAYLOAD_CEILING_BYTES}) — trim, don't relocate prose",
+        payload.len()
+    );
+}
