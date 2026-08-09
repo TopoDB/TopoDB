@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### 0.0.12 — 2026-07-27
+### 0.0.13 — 2026-08-08
 
 #### Added
 
@@ -46,6 +46,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
   navigation + postcard decode), measured 1.83× insert throughput at
   20k×384 with byte-identical graphs.
 - **Format v8: scalar-quantized vectors (SQ8)** — embeddings are stored as signed 8-bit max-abs codes plus scale (~4× smaller vector storage); scoring uses symmetric integer cosine on both scan and HNSW paths, enabling faster inserts and graph builds. Existing files migrate in place on open; HNSW graphs rebuild (params v3). Cosine scores are now computed over quantized codes; `NodeRecord.embedding` returns the dequantized (≈original) vector.
+
+### 0.0.12 — 2026-07-27
+
+#### Added
+
 - **`SearchOptions.prop_retain`** — a mechanism-only string-prop allowlist (`PropRetain { prop, any_of, absent_as }`): a candidate survives iff its `prop` value (a missing/non-`Str` value reads as `absent_as` when set) is in `any_of`. Filtered before top-k in every text-search path, never access-bumped when dropped, and re-applied post-fusion in `recall` so vector/graph-leg candidates cannot leak past it. The engine names no prop and no vocabulary; empty `prop`/`any_of` are rejected.
 - **`RecallQuery.tombstone_props` / `Db::search_text_live` takes a prop SET** — tombstone filtering generalizes from one prop (`tombstone_prop: Option<String>`) to any number (`tombstone_props: Vec<String>` / `&[&str]`): a candidate is dropped when ANY listed prop holds an `Int` timestamp `<=` the query's effective now. Per-prop semantics unchanged (future marks kept, non-`Int` values ignored, filtered before top-k, never access-bumped). **Breaking for struct-literal construction** of `RecallQuery` and for `search_text_live` callers — pass `vec![prop]` / `&[prop]` for the old behavior.
 - **`Db::edges_to`** — incoming-edge read mirroring `edges_from`. Scoped listing of a node's incoming edges, filterable by source, edge type, and open-only.
