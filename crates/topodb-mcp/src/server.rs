@@ -3668,7 +3668,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "Register an alternate name for an existing entity; create_entity, find_by_prop, and search resolve it to the canonical node — use it the moment you learn a second name instead of creating a duplicate. Errors, reporting both ids, if the alias names a DIFFERENT entity (a merge situation). Remove via remove_node."
+        description = "Register an alternate name for an existing entity; create_entity, find_by_prop, and search resolve it to the canonical node — use it the moment you learn a second name instead of a duplicate. Idempotent for the same entity; errors if it names a DIFFERENT entity (both ids reported). Remove via remove_node."
     )]
     fn add_alias(
         &self,
@@ -4153,12 +4153,17 @@ impl ServerHandler for TopoServer {
                  find-or-create entities + links); the primitives remain for the exceptions — \
                  create_memory for a deliberately unlinked note, create_entity when an entity \
                  needs extra props, link for entity↔entity relations and supersede: true when \
-                 a to-one fact changes. Recalling well: search_memories stems \
+                 a to-one fact changes. Recalling well: know the exact identifier → \
+                 find_by_prop; otherwise search_memories stems \
                  terms, falls back to close prefix/typo matches, and expands learned \
                  synonyms (add_synonym) automatically — but it can't guess vocabulary it \
                  was never taught, so retry with different words before concluding \
                  nothing is stored — then traverse from the best hit; use \
-                 get_edges to inspect or retire a node's current relations.",
+                 get_edges to inspect or retire a node's current relations. \
+                 Maintenance: memory_health at session start summarizes hygiene; drill into \
+                 non-zero counts with the find_* scans and act via consolidate_memories / \
+                 forget — scans are advisory and never act on their own. Before treating an \
+                 entity as new, check the shared scope too.",
             )
     }
 
