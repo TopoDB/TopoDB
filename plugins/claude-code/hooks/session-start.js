@@ -4,6 +4,7 @@
 // self-deadline (this hook BLOCKS session start); main sessions only.
 import { pathToFileURL } from "node:url";
 import { connectForProject } from "../broker-client.js";
+import { renderMemoryLines } from "./render.js";
 
 const DEADLINE_MS = 2500;
 const K = 10;
@@ -34,16 +35,7 @@ export function renderHealth(health) {
 
 export function renderInjection(memories, healthLine = null) {
   if (!memories.length) return null;
-  const lines = ["## TopoDB memory (this project)"];
-  for (const m of memories) {
-    const content = m.content.length > 140 ? `${m.content.slice(0, 139)}…` : m.content;
-    const ents = m.entities.length ? ` [entities: ${m.entities.slice(0, 3).join(", ")}]` : "";
-    const days = Math.floor(m.ageMs / 86400000);
-    const age = days > 0 ? ` (${days}d ago)` : " (today)";
-    const line = `- ${content}${ents}${age}`;
-    if (lines.join("\n").length + line.length > CHAR_CAP) break;
-    lines.push(line);
-  }
+  const lines = renderMemoryLines(memories, "## TopoDB memory (this project)", CHAR_CAP);
   if (healthLine) lines.push(healthLine);
   lines.push("Deeper recall: search_memories / traverse. Store: remember.");
   return lines.join("\n");
