@@ -2968,3 +2968,65 @@ fn purge_dry_runs_by_default_and_deletes_with_yes() {
     );
     assert!(all.contains("tombstoned-before"), "{all}");
 }
+
+// --- Task 5: --format flag, text rendering, and empty-read scope-echo ---
+
+#[test]
+fn text_format_search_is_plain_lines_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
+        "remember", "a fact about foxes", "--entity", "Fox"]).output().unwrap();
+    let out = bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
+        "--format", "text", "search", "foxes"]).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("a fact about foxes"), "stdout: {s}");
+    assert!(!s.trim_start().starts_with('['), "text mode must not emit JSON: {s}");
+}
+
+#[test]
+fn json_default_unchanged_for_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
+        "remember", "a fact about foxes", "--entity", "Fox"]).output().unwrap();
+    // No --format, piped (non-TTY) → JSON.
+    let out = bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
+        "search", "foxes"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.is_array());
+}
+
+#[test]
+fn empty_search_echoes_scope_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let out = bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
+        "search", "nothing-matches-this"]).output().unwrap();
+    assert!(out.status.success());
+    // stdout is still the parseable empty array.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v, serde_json::json!([]));
+    // stderr carries the disambiguating echo, including the scope.
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("0 matches"), "stderr: {err}");
+    assert!(err.contains(&scope), "stderr must name the scope: {err}");
+}
+
+#[test]
+fn format_env_flips_piped_output_to_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    bin().args(["--db", db.to_str().unwrap(), "--scope", &scope,
+        "remember", "env-driven text mode", "--entity", "E"]).output().unwrap();
+    let out = bin().env("TOPODB_FORMAT", "text")
+        .args(["--db", db.to_str().unwrap(), "--scope", &scope, "search", "env-driven"])
+        .output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.trim_start().starts_with('['), "TOPODB_FORMAT=text should give text: {s}");
+}

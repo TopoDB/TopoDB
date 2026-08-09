@@ -21,6 +21,10 @@ pub struct Cli {
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pub pretty: bool,
+    /// Output format: `json` (machine, the default in a pipe) or `text`
+    /// (human, the default at a terminal). Also read from TOPODB_FORMAT.
+    #[arg(long, value_enum, global = true)]
+    pub format: Option<FormatArg>,
     /// Milliseconds to wait (retrying with backoff) when another process
     /// holds the database file, before failing with kind "busy" / exit 3.
     /// 0 = fail immediately.
@@ -449,6 +453,21 @@ impl From<DirectionArg> for topodb::Direction {
             DirectionArg::Out => topodb::Direction::Out,
             DirectionArg::In => topodb::Direction::In,
             DirectionArg::Both => topodb::Direction::Both,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum FormatArg {
+    Json,
+    Text,
+}
+
+impl From<FormatArg> for crate::resolve::Format {
+    fn from(f: FormatArg) -> Self {
+        match f {
+            FormatArg::Json => crate::resolve::Format::Json,
+            FormatArg::Text => crate::resolve::Format::Text,
         }
     }
 }

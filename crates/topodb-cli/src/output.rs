@@ -52,3 +52,22 @@ pub fn fail_engine(e: &topodb::TopoError) -> ! {
         _ => fail("internal", &e.to_string(), 1),
     }
 }
+
+/// Emit either the text form (when `text_mode` and a text rendering exists)
+/// or the JSON value. `text` is `None` for commands without a text renderer,
+/// which fall back to JSON even in text mode. Never returns.
+pub fn render(json: &Value, text: Option<String>, text_mode: bool, pretty: bool) -> ! {
+    if text_mode {
+        if let Some(t) = text {
+            println!("{t}");
+            std::process::exit(0);
+        }
+    }
+    ok(json, pretty)
+}
+
+/// One-line stderr note disambiguating "empty result" from "wrong scope"
+/// (fixes D1). Printed only for empty reads; stdout is untouched.
+pub fn empty_scope_echo(scope: &str, source: &str) {
+    eprintln!("topodb: 0 matches in scope {scope} (source: {source})");
+}
