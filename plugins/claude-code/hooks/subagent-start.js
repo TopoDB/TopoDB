@@ -94,7 +94,7 @@ async function main() {
   const client = await connectForProject({ projectDir, dataDir });
   if (!client) return;
   try {
-    const res = await client.call("search_memories", { query: task, k: K }, SEARCH_TIMEOUT_MS);
+    const res = await client.call("search_memories", { query: task, k: K, labels: ["Memory"] }, SEARCH_TIMEOUT_MS);
     const hits = Array.isArray(res?.hits) ? res.hits.map(h => h?.node).filter(Boolean) : [];
     const out = renderSubagentContext(hits);
     if (out) {
