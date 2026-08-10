@@ -853,3 +853,100 @@ fn prop_keyed_half_life_validates() {
     };
     db.search_text_with(&scopes, "basalt", 5, &inert).unwrap();
 }
+
+/// D2 (IMPROVEMENTS.md): a short, stale, term-dense episodic memory
+/// outranked the long fresh comprehensive one under pure BM25 (length
+/// normalization). The kind-aware default prior must flip that ordering —
+/// and weight 0 must restore it. The test first ASSERTS the BM25
+/// precondition so it can't silently pass by failing to reproduce D2.
+#[test]
+fn kind_aware_default_fixes_d2_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+
+    // Stale episodic: short and term-dense (high BM25 for "next topodb").
+    let stale_id = NodeId::from_u128(ulid_at(now - 50 * DAY_MS, 1));
+    let mut stale_props = Props::new();
+    stale_props.insert(
+        "content".into(),
+        PropValue::Str("topodb next index ship release".into()),
+    );
+    stale_props.insert("kind".into(), PropValue::Str("episodic".into()));
+    // Fresh comprehensive: long, terms diluted (lower BM25), no kind
+    // (semantic bucket).
+    let mut fresh_props = Props::new();
+    fresh_props.insert(
+        "content".into(),
+        PropValue::Str("what is next for topodb: ranking system surface prior work cleanup".into()),
+    );
+    let fresh_id = NodeId::from_u128(ulid_at(now, 2));
+    db.submit(vec![
+        Op::CreateNode {
+            id: stale_id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: stale_props,
+        },
+        Op::CreateNode {
+            id: fresh_id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: fresh_props,
+        },
+    ])
+    .unwrap();
+
+    let kind_map = || PropHalfLife {
+        prop: "kind".into(),
+        per_value: vec![
+            ("episodic".into(), 14 * DAY_MS),
+            ("procedural".into(), 365 * DAY_MS),
+        ],
+        default_ms: 120 * DAY_MS,
+    };
+    let flat = SearchOptions {
+        recency_weight: 0.0,
+        now_ms: Some(now),
+        ..SearchOptions::default()
+    };
+    let kind_aware = SearchOptions {
+        recency_weight: 0.3,
+        recency_half_life_by_prop: Some(kind_map()),
+        now_ms: Some(now),
+        ..SearchOptions::default()
+    };
+
+    // Precondition: pure BM25 reproduces D2 (stale first). At defaults the
+    // factor ratio is bounded by 1/(1-w) ≈ 1.43x, so the BM25 gap must be
+    // real but under ~1.4x — if this assert fails, lengthen the fresh
+    // content (dilute further) or shorten the stale one; do NOT weaken the
+    // kind-aware asserts below.
+    let bm25 = db
+        .search_text_with(&scopes, "next topodb", 10, &flat)
+        .unwrap();
+    assert_eq!(
+        bm25[0].0.id, stale_id,
+        "precondition: BM25 must rank the stale memory first"
+    );
+    assert!(
+        bm25[0].1 / bm25[1].1 < 1.4,
+        "precondition: BM25 gap must be recoverable: {bm25:?}"
+    );
+
+    // The kind-aware default flips it; weight 0 restores it (asserted above).
+    let fixed = db
+        .search_text_with(&scopes, "next topodb", 10, &kind_aware)
+        .unwrap();
+    assert_eq!(
+        fixed[0].0.id, fresh_id,
+        "kind-aware default must surface the fresh memory: {fixed:?}"
+    );
+}
