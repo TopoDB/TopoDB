@@ -701,6 +701,20 @@ fn validate_as_of(v: Option<i64>) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// `time_axis` string -> `TimeAxis`: omitted/"valid" -> `Valid`, "recorded"
+/// -> `Recorded`, anything else -> invalid_params naming the two accepted
+/// values.
+fn parse_time_axis(v: Option<&str>) -> Result<TimeAxis, ErrorData> {
+    match v {
+        None | Some("valid") => Ok(TimeAxis::Valid),
+        Some("recorded") => Ok(TimeAxis::Recorded),
+        Some(other) => Err(ErrorData::invalid_params(
+            format!("time_axis must be \"valid\" or \"recorded\" (got {other:?})"),
+            None,
+        )),
+    }
+}
+
 /// Host display-name convention for evidence rendering: the `name` prop
 /// (Entity/Alias), else the first 80 CHARACTERS of `content` (Memory,
 /// char-boundary safe, `…` when truncated), else null. The engine
@@ -1386,6 +1400,13 @@ struct TraverseParams {
     /// View the graph at a past Unix-millisecond instant. Omitted = now.
     #[serde(default)]
     as_of: Option<i64>,
+    /// Which time axis `as_of` gates hops on: `"valid"` (default) is world
+    /// time — was the edge true then; `"recorded"` is belief time — what we
+    /// had WRITTEN by then. A late-recorded fact (backdated `valid_from`) is
+    /// present on the valid axis but absent on the recorded axis until the
+    /// write actually happened.
+    #[serde(default)]
+    time_axis: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1985,6 +2006,13 @@ struct GetEdgesParams {
     /// edge, whichever side that is.
     #[serde(default = "get_edges_default_direction")]
     direction: DirectionParam,
+    /// Which time axis `as_of` gates on: `"valid"` (default) is world time —
+    /// was the edge true then; `"recorded"` is belief time — what we had
+    /// WRITTEN by then. A late-recorded fact (backdated `valid_from`) is
+    /// present on the valid axis but absent on the recorded axis until the
+    /// write actually happened.
+    #[serde(default)]
+    time_axis: Option<String>,
 }
 
 fn get_edges_default_direction() -> DirectionParam {
@@ -3101,6 +3129,7 @@ impl TopoServer {
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<Json<TraverseResult>, ErrorData> {
         validate_as_of(p.as_of)?;
+        let time_axis = parse_time_axis(p.time_axis.as_deref())?;
         // `seed_ids` (non-empty) wins over `seed_id`; at least one is required.
         let seed_strs: Vec<String> = match p.seed_ids {
             Some(ids) if !ids.is_empty() => ids,
@@ -3142,7 +3171,7 @@ impl TopoServer {
             edge_types,
             direction: p.direction.into(),
             as_of: p.as_of,
-            time_axis: TimeAxis::Valid,
+            time_axis,
         };
         // `traverse` opens a redb read transaction and walks on-disk chunked
         // adjacency (v3), so — like `search_text` — it can fail with
@@ -3949,6 +3978,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // Validate as_of timestamp FIRST (so as_of: 0 gets the timestamp error,
         // not the exclusivity one).
         validate_as_of(p.as_of)?;
+        let time_axis = parse_time_axis(p.time_axis.as_deref())?;
 
         // Check mutually exclusive parameters: as_of and open_only cannot both
         // be specified. When as_of is present, omit open_only entirely.
@@ -3977,12 +4007,12 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
 
         let fetch_from = |t: Option<&str>| {
             self.db
-                .edges_from(&scope_set, from, to, t, open_only_to_use, TimeAxis::Valid)
+                .edges_from(&scope_set, from, to, t, open_only_to_use, time_axis)
                 .map_err(classify_topo_error)
         };
         let fetch_to = |t: Option<&str>| {
             self.db
-                .edges_to(&scope_set, from, to, t, open_only_to_use, TimeAxis::Valid)
+                .edges_to(&scope_set, from, to, t, open_only_to_use, time_axis)
                 .map_err(classify_topo_error)
         };
         let edge_type = p.edge_type.as_deref();
@@ -4000,9 +4030,14 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         edges.dedup_by_key(|e| e.id);
 
         // If as_of is set, filter edges to only those live at that timestamp
-        // (inclusive lower bound, exclusive upper bound: valid_from <= t < valid_to).
+        // on the requested axis (inclusive lower bound, exclusive upper
+        // bound): valid axis gates on valid_from/valid_to (world time),
+        // recorded axis gates on recorded_at/superseded_at (belief time).
         if let Some(timestamp) = p.as_of {
-            edges.retain(|e| convert::edge_live_at(e, timestamp));
+            match time_axis {
+                TimeAxis::Valid => edges.retain(|e| convert::edge_live_at(e, timestamp)),
+                TimeAxis::Recorded => edges.retain(|e| convert::edge_believed_at(e, timestamp)),
+            }
         }
 
         let edges = edges

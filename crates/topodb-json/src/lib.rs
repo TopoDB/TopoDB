@@ -471,8 +471,11 @@ pub fn node_to_json(n: &NodeRecord) -> Result<Value, String> {
 
 /// An `EdgeRecord` → JSON: `id`/`from`/`to` as ULID strings, `type` for `ty`
 /// (JSON-friendlier than the Rust keyword-adjacent field name), `scope` per
-/// [`scope_to_json`], `props` per [`props_to_json`], and the temporal bounds
-/// `valid_from`/`valid_to` (`valid_to` is `null` while the edge is open).
+/// [`scope_to_json`], `props` per [`props_to_json`], the world-time bounds
+/// `valid_from`/`valid_to` (`valid_to` is `null` while the edge is open), and
+/// the belief-axis bounds `recorded_at`/`superseded_at` (`superseded_at` is
+/// `null` while the edge is open on that axis) — see [`edge_live_at`] and
+/// [`edge_believed_at`].
 pub fn edge_to_json(e: &EdgeRecord) -> Result<Value, String> {
     let mut map = Map::new();
     map.insert("id".into(), Value::String(e.id.to_string()));
@@ -485,6 +488,14 @@ pub fn edge_to_json(e: &EdgeRecord) -> Result<Value, String> {
     map.insert(
         "valid_to".into(),
         match e.valid_to {
+            Some(t) => Value::Number(t.into()),
+            None => Value::Null,
+        },
+    );
+    map.insert("recorded_at".into(), Value::Number(e.recorded_at.into()));
+    map.insert(
+        "superseded_at".into(),
+        match e.superseded_at {
             Some(t) => Value::Number(t.into()),
             None => Value::Null,
         },
@@ -845,6 +856,8 @@ mod tests {
         assert_eq!(j["type"], Value::String("ABOUT".into()));
         assert_eq!(j["valid_from"], serde_json::json!(1_000));
         assert_eq!(j["valid_to"], Value::Null);
+        assert_eq!(j["recorded_at"], serde_json::json!(1_000));
+        assert_eq!(j["superseded_at"], Value::Null);
     }
 
     #[test]
@@ -918,8 +931,10 @@ mod tests {
     fn edge_to_json_closed_edge_has_numeric_valid_to() {
         let mut e = sample_edge(Scope::Shared, NodeId::new(), NodeId::new());
         e.valid_to = Some(2_000);
+        e.superseded_at = Some(2_500);
         let j = edge_to_json(&e).unwrap();
         assert_eq!(j["valid_to"], serde_json::json!(2_000));
+        assert_eq!(j["superseded_at"], serde_json::json!(2_500));
     }
 
     #[test]

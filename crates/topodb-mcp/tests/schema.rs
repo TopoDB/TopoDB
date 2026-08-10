@@ -485,7 +485,12 @@ fn tool_descriptions_stay_lean() {
     // ~500 bytes of margin. May only move DOWN — or up ONLY alongside a
     // deliberate capability addition whose param docs justify it, stated
     // here in a comment.
-    const PAYLOAD_CEILING_BYTES: usize = 79_000;
+    //
+    // Re-based for bi-temporal edges: time_axis param docs + two edge JSON
+    // fields — a new queryable axis is deliberate capability growth, not
+    // prose drift. Measured 79488 bytes; ceiling re-based to that + ~500
+    // bytes of margin, rounded up.
+    const PAYLOAD_CEILING_BYTES: usize = 80_000;
     assert!(
         payload.len() <= PAYLOAD_CEILING_BYTES,
         "tools/list payload is {} bytes (ceiling {PAYLOAD_CEILING_BYTES}) — trim, don't relocate prose",
