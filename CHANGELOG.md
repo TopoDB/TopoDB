@@ -14,6 +14,36 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Added
+
+- **Bi-temporal edges** — `EdgeRecord` gains `recorded_at: i64` /
+  `superseded_at: Option<i64>` (BELIEF time: when the edge was
+  written/stopped being believed; stamped by the engine, never
+  caller-settable), alongside `valid_from`/`valid_to` which are now
+  documented as pure WORLD time (link/close_edge overrides unchanged).
+- **`TimeAxis`** (`Valid` | `Recorded`, default `Valid`) on
+  `TraversalQuery.time_axis` and as a new parameter of
+  `Db::edges_from`/`edges_to` — `Recorded` answers "what did we believe at
+  t"; a late-recorded fact (backdated `valid_from`) differs between axes.
+  The `Valid` axis is behavior-identical to pre-v9 `as_of`.
+
+#### Changed
+
+- **Format v9 (ONE-WAY, in place): back up before first open.** Opening a
+  v8-or-older file rewrites every EDGES row (postcard is positional) and
+  every stored CreateEdge/CloseEdge op, backfilling the belief axis by the
+  copy rule `recorded_at := valid_from`, `superseded_at := valid_to` —
+  exact for every edge that was never explicitly backdated, an
+  approximation for backdated ones. Runs in one transaction (crash-safe:
+  nothing persists until commit).
+- **`EdgeRecord` gains two public fields** (BREAKING for full struct
+  literals without `..`-spread, same caveat as `SearchOptions` in 0.0.14).
+- **`Op::CreateEdge` / `Op::CloseEdge` gain trailing optional fields**;
+  stored logs are rewritten by the v9 migration so one canonical op shape
+  decodes everything. `get_changes` output carries the new fields.
+
 ### 0.0.14 — 2026-08-10
 
 #### Added
@@ -375,6 +405,14 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### Unreleased
+
+#### Added
+
+- **`edge_believed_at`** — the belief-axis (recorded) liveness predicate,
+  twin of `edge_live_at`; `edge_to_json` output gains `recorded_at`
+  (number) and `superseded_at` (number|null).
+
 ### 0.0.11 — 2026-08-10
 
 #### Added
@@ -533,6 +571,15 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### Unreleased
+
+#### Added
+
+- **`time_axis` on `get_edges` / `traverse`** — `"valid"` (default,
+  unchanged behavior) or `"recorded"` ("what did we believe at as_of");
+  edge results carry `recorded_at` / `superseded_at`. Payload ceiling
+  re-based to 80,000 bytes for the new axis docs (measured 79,488).
 
 ### 0.0.16 — 2026-08-10
 
@@ -1122,6 +1169,14 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 ---
 
 ## `topodb-cli`
+
+### Unreleased
+
+#### Added
+
+- **`--time-axis <valid|recorded>`** on `get-edges` and `traverse`
+  (default valid, unchanged); `link` documents `--valid-from` as the
+  world-time override; edge output carries the belief-axis fields.
 
 ### 0.0.11 — 2026-08-10
 

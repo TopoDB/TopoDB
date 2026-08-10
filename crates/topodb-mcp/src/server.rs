@@ -4201,7 +4201,11 @@ impl ServerHandler for TopoServer {
                  time-boxed: created_after/created_before params, or a date phrase in \
                  the query (\"before 2026-08\", \"last week\") rewritten automatically — \
                  applied_time_filter reports what ran; use get_edges to inspect or retire \
-                 a node's current relations. Maintenance: memory_health at session start \
+                 a node's current relations. Edges carry two time axes — valid_from/valid_to \
+                 (true in the world; link/close accept overrides) and recorded_at/superseded_at \
+                 (when it was believed; never settable). time_axis: \"recorded\" on \
+                 get_edges/traverse answers \"what did we believe then\" — late-recorded \
+                 facts differ between axes. Maintenance: memory_health at session start \
                  summarizes hygiene; drill into \
                  non-zero counts with the find_* scans and act via consolidate_memories / \
                  forget — scans are advisory and never act on their own. Before treating an \
