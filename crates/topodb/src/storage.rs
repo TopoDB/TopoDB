@@ -70,7 +70,7 @@ pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::n
 /// makes per-(label,scope) key order = mint-time order.
 pub(crate) const LABEL_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("label_index");
 
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -221,13 +221,30 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(8) => {}
+            Some(9) => {}
+            Some(8) => {
+                // v8 -> v9 rewrites every EDGES row (V3 -> V4 copy-rule
+                // backfill: `recorded_at := valid_from`, `superseded_at :=
+                // valid_to`) and every stored `CreateEdge`/`CloseEdge` op
+                // (belief axis backfilled the same way; every other op
+                // variant re-encoded verbatim) — see `migrate_v9.rs`'s
+                // module doc comment for why the OPS half is load-bearing,
+                // not cosmetic.
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(7) => {
                 // v7 -> v8 quantizes every existing `vectors` row in place
                 // (framed postcard `Vec<f32>` -> `(f32, Vec<i8>)`, see
-                // `migrate_v8.rs`), then stamps the version.
+                // `migrate_v8.rs`), then stamps the version. This arm jumps
+                // straight from 7 to the CURRENT `FORMAT_VERSION`, so it
+                // must also run v8->v9's `migrate_v9::bitemporalize` pass
+                // (`migrate_v9.rs`) before stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -245,10 +262,12 @@ impl Storage {
                 // path or via `ensure_hnsw_params`'s reconcile), so there is
                 // nothing to migrate out of an empty table pair. This arm
                 // jumps straight from 6 to the CURRENT `FORMAT_VERSION`, so
-                // it must also do v7->v8's `vectors` quantization pass itself
-                // (see `migrate_v8.rs`) before stamping.
+                // it must also do v7->v8's `vectors` quantization pass
+                // (see `migrate_v8.rs`) and v8->v9's `migrate_v9::
+                // bitemporalize` pass (`migrate_v9.rs`) before stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -262,10 +281,13 @@ impl Storage {
                 // hops: no dual-write era, no re-encoding of existing rows.
                 // This arm jumps straight from 5 to the CURRENT
                 // `FORMAT_VERSION`, so it also runs v7->v8's `vectors`
-                // quantization pass (`migrate_v8.rs`) before stamping.
+                // quantization pass (`migrate_v8.rs`) and v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) before
+                // stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -277,13 +299,16 @@ impl Storage {
                 // check sees a missing stamp on every pre-v5 file and drains +
                 // rebuilds the index. This arm jumps straight from 4 to the
                 // CURRENT `FORMAT_VERSION`, so it must do v6's table work
-                // (LABEL_INDEX backfill) and v7->v8's `vectors` quantization
-                // pass (`migrate_v8.rs`) itself, rather than falling through
-                // to the `Some(5)`/`Some(6)` arms above, which only ever run
-                // for a file genuinely stamped that version — then stamp.
+                // (LABEL_INDEX backfill), v7->v8's `vectors` quantization
+                // pass (`migrate_v8.rs`) and v8->v9's `migrate_v9::
+                // bitemporalize` pass (`migrate_v9.rs`) itself, rather than
+                // falling through to the `Some(5)`/`Some(6)` arms above,
+                // which only ever run for a file genuinely stamped that
+                // version — then stamp.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -327,6 +352,13 @@ impl Storage {
                 } // `nodes`/`embeddings` guards drop here, before delete_table.
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                // This arm jumps straight from 3 to the CURRENT
+                // `FORMAT_VERSION`, so it must also run v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) before
+                // stamping — unlike the `vectors` quantization pass above,
+                // it is unaffected by the v3->v4 dual-write distinction (it
+                // only touches EDGES/OPS).
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -415,6 +447,12 @@ impl Storage {
                 drop(embeddings);
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                // This arm jumps straight from 2 to the CURRENT
+                // `FORMAT_VERSION`, so it must also run v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) — the
+                // EDGES rows `migrate_v2_to_v3` just wrote are V3-shaped,
+                // exactly what `bitemporalize` expects going in.
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -517,6 +555,11 @@ impl Storage {
                 drop(embeddings);
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                // This arm jumps straight from 1 to the CURRENT
+                // `FORMAT_VERSION`, so it must also run v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) — same
+                // rationale as the `Some(2)` arm's identical comment.
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }

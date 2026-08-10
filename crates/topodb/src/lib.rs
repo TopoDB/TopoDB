@@ -17,6 +17,7 @@ mod migrate_v3;
 mod migrate_v4;
 mod migrate_v6;
 mod migrate_v8;
+mod migrate_v9;
 mod op;
 mod ppr;
 mod prop_index;
