@@ -151,6 +151,39 @@ fn access_weight_plumbs_through() {
     assert_eq!(hits[0]["node"]["id"], mem["id"]);
 }
 
+/// Kind-aware recency is the default; explicit recency_half_life_days
+/// switches to a flat prior; weight 0 disables. All three must be accepted,
+/// and out-of-range values still reject. (Ranking correctness under aging
+/// is engine-tested — MCP tests cannot backdate ULIDs.)
+#[test]
+fn recency_param_combinations_plumb_through() {
+    let (_dir, mut server) = fresh_server();
+    server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "obsidian flow patterns", "entities": ["obsidian"], "kind": "episodic" }),
+        DEFAULT_TIMEOUT,
+    );
+    for params in [
+        serde_json::json!({ "query": "obsidian", "k": 5 }), // kind-aware default
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_half_life_days": 30.0 }), // explicit flat
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_weight": 0.0 }), // disabled
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_weight": 0.0,
+                            "recency_half_life_days": 30.0 }), // both: inert, still valid
+    ] {
+        let res = server.call_tool_ok("search_memories", params, DEFAULT_TIMEOUT);
+        assert!(
+            !res["hits"].as_array().unwrap().is_empty(),
+            "memory must surface: {res}"
+        );
+    }
+    let resp = server.call_tool(
+        "search_memories",
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_half_life_days": 0.0 }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+}
+
 /// The alias→entity edge must let a query that matches ONLY the alias's name
 /// still surface the canonical entity — pulled in via `graph_boost`'s 1-hop
 /// traversal from the alias node (a preliminary-fusion seed) — while the
