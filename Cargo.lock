@@ -3324,6 +3324,7 @@ dependencies = [
 name = "topodb-json"
 version = "0.0.10"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
