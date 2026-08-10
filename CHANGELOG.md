@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.14 — 2026-08-10
 
 #### Added
 
@@ -375,7 +375,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
-### Unreleased
+### 0.0.11 — 2026-08-10
 
 #### Added
 
@@ -534,7 +534,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
-### Unreleased
+### 0.0.16 — 2026-08-10
 
 #### Added
 
@@ -1123,7 +1123,7 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `topodb-cli`
 
-### Unreleased
+### 0.0.11 — 2026-08-10
 
 #### Added
 
