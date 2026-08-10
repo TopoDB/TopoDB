@@ -370,6 +370,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`dup` module** — the duplicate/supersession classifier
+  (`containment_of_sets`, `tokens`, `dup_band`, `text_dup_band`,
+  `dup_relation`, `is_supersession`, plus the calibrated near-duplicate
+  threshold constants) is now public here instead of private inside
+  `topodb-mcp`, so `topodb-cli` can run the same text-mode classification
+  without an embedder.
 - `memory_kind_half_life()` — canonical kind→half-life map for ranking,
   built from the lifecycle constants (episodic 14d / semantic 120d /
   procedural 365d; semantic is the default bucket).
@@ -516,8 +522,23 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Added
+
+- **`link.conflicts`** — after a write that did not pass `supersede: true`,
+  `link`'s result lists OTHER open same-type edges from the same node
+  (`{edge_id, to, valid_from}`), omitted when empty. Advisory only — no
+  edge is closed or altered by this scan.
+- **`remember.check_conflicts` + `remember.supersession_candidates`** — a
+  new `check_conflicts` param (default `true`) gates `remember`'s existing
+  write-time near-duplicate probe; the result gains a leaner
+  `supersession_candidates` field (`{memory_id, relation, score}`) derived
+  from the same probe as `near_duplicates`, omitted when empty or when
+  `check_conflicts` is `false`. No new search is added.
+
 #### Changed
 
+- **`check_conflicts: false` also suppresses the existing `near_duplicates` field**
+  (both derive from the same probe).
 - **`search_memories` recency is kind-aware by default** — episodic memories
   decay faster, procedural slower, semantic (and unstamped) in between;
   previously every memory used the same flat half-life. Pass an explicit
@@ -1085,6 +1106,14 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
   tune or disable (`--recency-weight 0`) the recency prior; passing
   `--recency-half-life-days` switches from the kind-aware default to a flat
   half-life over all kinds.
+- **`link` / `remember` conflict parity** — `link`'s JSON output gains a
+  `conflicts` field (other open same-type edges from the same node,
+  omitted when empty); `remember`'s JSON output gains a
+  `supersession_candidates` field (text-mode duplicate/supersession
+  classification against existing memories — the CLI has no embedder, so
+  this always runs in text mode), omitted when empty or on a dedup hit.
+  Note: CLI `link` does not reuse identical edges, so `conflicts` may
+  include the just-linked target (MCP reuses and never reports it).
 
 #### Changed
 
