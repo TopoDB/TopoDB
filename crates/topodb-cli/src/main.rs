@@ -1008,7 +1008,7 @@ fn link(
     let op = Op::CreateEdge {
         id,
         scope,
-        ty: ty.into(),
+        ty: ty.clone().into(),
         from,
         to,
         props,
@@ -1017,7 +1017,25 @@ fn link(
     if let Err(e) = db.submit(vec![op]) {
         output::fail_engine(&e);
     }
-    output::ok(&serde_json::json!({ "id": id.to_string() }), pretty);
+    let write_set = topodb_json::scope_to_scope_set(scope);
+    let conflicts: Vec<serde_json::Value> = db
+        .edges_from(&write_set, from, None, Some(&ty), true)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.id != id)
+        .map(|e| {
+            serde_json::json!({
+                "edge_id": e.id.to_string(),
+                "to": e.to.to_string(),
+                "valid_from": e.valid_from,
+            })
+        })
+        .collect();
+    let mut value = serde_json::json!({ "id": id.to_string() });
+    if !conflicts.is_empty() {
+        value["conflicts"] = serde_json::Value::Array(conflicts);
+    }
+    output::ok(&value, pretty);
 }
 
 /// Composed store+link (see the spec): plan via the shared
@@ -1060,6 +1078,7 @@ fn remember(
         ops,
         memory_id,
         deduplicated,
+        new_memory,
         entities,
         edge_ids,
         superseded,
@@ -1070,19 +1089,62 @@ fn remember(
             output::fail_engine(&e);
         }
     }
+    let supersession_candidates: Vec<serde_json::Value> = match &new_memory {
+        Some(content) => {
+            let scope_set = topodb_json::scope_to_scope_set(scope);
+            let content_tokens = topodb_json::tokens(content);
+            db.search_text_unbumped(&scope_set, content, topodb_json::TEXT_NEAR_DUP_CANDIDATES)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(n, _)| {
+                    if n.label != topodb_json::MEMORY_LABEL
+                        || topodb_json::MEMORY_TOMBSTONE_PROPS
+                            .iter()
+                            .any(|p| n.props.contains_key(*p))
+                        || n.id == memory_id
+                    {
+                        return None;
+                    }
+                    let existing = match n.props.get(topodb_json::MEMORY_CONTENT_PROP) {
+                        Some(PropValue::Str(c)) => c.clone(),
+                        _ => return None,
+                    };
+                    let existing_tokens = topodb_json::tokens(&existing);
+                    let containment =
+                        topodb_json::containment_of_sets(&content_tokens, &existing_tokens);
+                    if containment >= topodb_json::TEXT_NEAR_DUP_CONTAINMENT {
+                        Some((n.id.to_string(), existing, containment))
+                    } else {
+                        None
+                    }
+                })
+                .map(|(id, existing, containment)| {
+                    serde_json::json!({
+                        "memory_id": id,
+                        "relation": topodb_json::dup_relation(content, &existing),
+                        "score": containment,
+                    })
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
     let entities: Vec<serde_json::Value> = entities
         .into_iter()
         .map(
             |e| serde_json::json!({ "name": e.name, "id": e.id.to_string(), "created": e.created }),
         )
         .collect();
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "memory_id": memory_id.to_string(),
         "deduplicated": deduplicated,
         "entities": entities,
         "edge_ids": edge_ids,
         "superseded": superseded,
     });
+    if !supersession_candidates.is_empty() {
+        value["supersession_candidates"] = serde_json::Value::Array(supersession_candidates);
+    }
     let text = {
         let id = value["memory_id"].as_str().unwrap_or("?");
         let mut line = format!("remembered {id}");

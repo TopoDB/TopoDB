@@ -19,6 +19,13 @@ pub use compose::{
     ComposeError, PlannedEntity, RememberPlan, RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
 };
 
+mod dup;
+pub use dup::{
+    containment_of_sets, dup_band, dup_relation, is_supersession, text_dup_band, tokens,
+    NEAR_DUP_K, NEAR_DUP_REVIEW, NEAR_DUP_THRESHOLD, TEXT_BAND_MIN_TOKENS,
+    TEXT_NEAR_DUP_CANDIDATES, TEXT_NEAR_DUP_CONTAINMENT,
+};
+
 mod lifecycle;
 pub use lifecycle::{
     lifecycle_candidates, memory_kind_half_life, plan_purge, staleness, LifecycleCandidate,

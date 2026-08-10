@@ -3514,3 +3514,112 @@ fn search_recency_flags_plumb_and_validate() {
          kind-aware default (score {score_omitted})"
     );
 }
+
+#[test]
+fn link_reports_conflicts_with_other_open_same_type_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+
+    let mk_entity = |name: &str| -> String {
+        let out = bin()
+            .args(["--db"])
+            .arg(&db)
+            .args(["create-entity", "--name", name])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    };
+
+    let a = mk_entity("Drew Powell");
+    let x = mk_entity("Anthropic");
+    let y = mk_entity("TopoDB");
+
+    let first = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["link", "--from", &a, "--to", &x, "--type", "works_at"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_v: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let first_id = first_v["id"].as_str().unwrap().to_string();
+    assert!(first_v.get("conflicts").is_none(), "{first_v}");
+
+    let second = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["link", "--from", &a, "--to", &y, "--type", "works_at"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_v: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let conflicts = second_v["conflicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected conflicts on: {second_v}"));
+    assert_eq!(conflicts.len(), 1, "conflicts: {conflicts:?}");
+    assert_eq!(conflicts[0]["edge_id"].as_str().unwrap(), first_id);
+    assert_eq!(conflicts[0]["to"].as_str().unwrap(), x);
+}
+
+#[test]
+fn remember_prints_supersession_candidates_for_a_contradicting_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+
+    let first = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "remember",
+            "TopoDB stores its data in redb",
+            "--entity",
+            "TopoDB",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_v: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let first_id = first_v["memory_id"].as_str().unwrap().to_string();
+
+    let second = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "remember",
+            "TopoDB now stores its data in sled, not redb",
+            "--entity",
+            "TopoDB",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_v: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let candidates = second_v["supersession_candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected supersession_candidates on: {second_v}"));
+    assert_eq!(candidates.len(), 1, "candidates: {candidates:?}");
+    assert_eq!(candidates[0]["memory_id"].as_str().unwrap(), first_id);
+    assert_eq!(candidates[0]["relation"].as_str().unwrap(), "supersession");
+}
