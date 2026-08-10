@@ -25,8 +25,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props, RecallQuery,
-    Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
+    CreatedRange, Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props,
+    RecallQuery, Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
@@ -1275,6 +1275,13 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     kinds: Option<Vec<String>>,
+    /// ISO date: "2026-08-01" (inclusive), "2026-08", or "2026".
+    /// Inverted ranges rejected.
+    #[serde(default)]
+    created_after: Option<String>,
+    /// ISO date: exclusive upper bound. "2026-08-01" excludes that day.
+    #[serde(default)]
+    created_before: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1288,10 +1295,36 @@ struct SearchHit {
     score: f32,
 }
 
+/// The created-time filter a `search_memories` call actually ran with —
+/// reported so a caller (especially one whose query gets rewritten in the
+/// next task) can see what constrained the hits.
+#[derive(Debug, Serialize, JsonSchema)]
+struct AppliedTimeFilter {
+    /// Inclusive lower bound on creation time, ms since epoch UTC.
+    /// Absent = unbounded below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<i64>,
+    /// Exclusive upper bound on creation time, ms since epoch UTC.
+    /// Absent = unbounded above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<i64>,
+    /// "params" — explicit created_after/created_before; "rewrite" — a
+    /// temporal phrase in the query triggered the deterministic rewriter.
+    source: String,
+    /// The exact phrase the rewriter lifted out of the query; only present
+    /// when source is "rewrite".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_phrase: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct SearchMemoriesResult {
     /// Up to `k` hits, ranked by descending relevance.
     hits: Vec<SearchHit>,
+    /// Present only when a created-time filter ran (explicit params, or a
+    /// rewritten temporal phrase); absent = unfiltered search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applied_time_filter: Option<AppliedTimeFilter>,
 }
 
 /// Wire form of `topodb::Direction` for the `traverse` tool's `direction`
@@ -2812,6 +2845,43 @@ impl TopoServer {
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        // Explicit created-time bounds (ISO → UTC ms, same resolution rules
+        // as the temporal rewriter). A bad string is a caller bug, rejected
+        // before any search runs.
+        let parse_bound = |field: &str, s: &str| {
+            convert::parse_iso_instant(s).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("{field}: {s:?} is not an ISO date (try 2026-08-01)"),
+                    None,
+                )
+            })
+        };
+        let after_ms = p
+            .created_after
+            .as_deref()
+            .map(|s| parse_bound("created_after", s))
+            .transpose()?;
+        let before_ms = p
+            .created_before
+            .as_deref()
+            .map(|s| parse_bound("created_before", s))
+            .transpose()?;
+        let (created_range, applied_time_filter) = if after_ms.is_some() || before_ms.is_some() {
+            (
+                Some(CreatedRange {
+                    after_ms,
+                    before_ms,
+                }),
+                Some(AppliedTimeFilter {
+                    after: after_ms,
+                    before: before_ms,
+                    source: "params".to_string(),
+                    matched_phrase: None,
+                }),
+            )
+        } else {
+            (None, None)
+        };
         // Resolve synonyms per query word. Lookup key is the ANALYZED
         // (stemmed) form via topodb::analyze, matching how add_synonym
         // stores terms — so "logins" finds a synonym stored for "login".
@@ -2896,7 +2966,7 @@ impl TopoServer {
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
             prop_retain,
-            created_range: None,
+            created_range,
         };
 
         // Process label_weights: convert from JSON map to Vec<(String, f32)>.
@@ -3003,7 +3073,10 @@ impl TopoServer {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
-        Ok(Json(SearchMemoriesResult { hits }))
+        Ok(Json(SearchMemoriesResult {
+            hits,
+            applied_time_filter,
+        }))
     }
 
     #[tool(
