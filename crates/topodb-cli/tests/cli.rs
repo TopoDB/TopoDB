@@ -3629,3 +3629,220 @@ fn remember_prints_supersession_candidates_for_a_contradicting_pair() {
     assert_eq!(candidates[0]["memory_id"].as_str().unwrap(), first_id);
     assert_eq!(candidates[0]["relation"].as_str().unwrap(), "supersession");
 }
+
+// --- Task 7 & 8: Temporal recall in CLI search ---
+
+/// --created-after/--created-before plumb into SearchOptions.created_range
+/// and print the applied-time-filter stderr note (source: params); bad
+/// dates and inverted ranges reject with exit 2.
+#[test]
+fn search_created_range_flags_filter_and_echo() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "--scope",
+            &scope,
+            "remember",
+            "--content",
+            "basalt columns along the west shore",
+            "--entity",
+            "Geology",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "remember: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let search = |extra: &[&str]| {
+        let mut c = bin();
+        c.args(["--db"])
+            .arg(&db)
+            .args(["--scope", &scope, "search", "basalt"]);
+        c.args(extra);
+        c.output().unwrap()
+    };
+    let hits = |out: &std::process::Output| -> usize {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    // No flags: no time-filter note (guard against an always-on echo).
+    let out = search(&[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits(&out), 1);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("time filter"));
+
+    // after a past date: the just-created memory is in range; note names
+    // the bound as given and the source.
+    let out = search(&["--created-after", "2020-01-01"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits(&out), 1);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("time filter"), "stderr: {err}");
+    assert!(err.contains("after 2020-01-01"), "stderr: {err}");
+    assert!(err.contains("source: params"), "stderr: {err}");
+
+    // strictly before a past date: out of range — 0 hits on stdout, note
+    // still printed (alongside the D1 scope echo; both are stderr lines).
+    let out = search(&["--created-before", "2020-01-01"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits(&out), 0);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("before 2020-01-01"), "stderr: {err}");
+    assert!(err.contains("source: params"), "stderr: {err}");
+
+    // Inverted range: the engine's CreatedRange validation rejects (the
+    // message text is owned by the engine task — assert only the code).
+    let out = search(&[
+        "--created-after",
+        "2030-01-01",
+        "--created-before",
+        "2020-01-01",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Unparseable date: CLI-side rejected, message names the flag.
+    let out = search(&["--created-after", "not-a-date"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("created-after"));
+}
+
+/// Temporal rewrite is default-on: a date phrase in the query becomes a
+/// created-range filter on the residual text (stderr notes source:
+/// rewrite); --no-temporal-rewrite searches the query untouched; explicit
+/// --created-* flags win over the rewriter; a phrase with no parseable
+/// date never triggers.
+#[test]
+fn search_temporal_rewrite_and_opt_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "--scope",
+            &scope,
+            "remember",
+            "--content",
+            "crater rim mapped by the orbital survey",
+            "--entity",
+            "Mapping",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "remember: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let search = |query: &str, extra: &[&str]| {
+        let mut c = bin();
+        c.args(["--db"])
+            .arg(&db)
+            .args(["--scope", &scope, "search", query]);
+        c.args(extra);
+        c.output().unwrap()
+    };
+    let hits = |out: &std::process::Output| -> usize {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    // Rewrite, filter excludes: memory created today is not before 2020,
+    // so the residual "crater rim" search returns 0 under the filter.
+    let out = search("crater rim before 2020-01-01", &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits(&out), 0);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("time filter"), "stderr: {err}");
+    assert!(err.contains("before 2020-01-01"), "stderr: {err}");
+    assert!(err.contains("source: rewrite"), "stderr: {err}");
+
+    // Rewrite, filter keeps: the residual is what gets searched and the
+    // in-range memory comes back.
+    let out = search("crater rim before 2030-01-01", &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits(&out), 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("source: rewrite"));
+
+    // Opt-out: the SAME query untouched — BM25 matches "crater rim" in the
+    // full text, so hits DIFFER from the rewrite case (spec e2e #4), and
+    // no time-filter note is printed.
+    let out = search("crater rim before 2020-01-01", &["--no-temporal-rewrite"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        hits(&out) >= 1,
+        "untouched query must still match on its text terms"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("time filter"));
+
+    // Explicit flags beat the rewriter: source is params, never rewrite,
+    // and the full (unrewritten) query is searched under the flag's range.
+    let out = search(
+        "crater rim before 2020-01-01",
+        &["--created-after", "2020-01-01"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(hits(&out) >= 1);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("source: params"), "stderr: {err}");
+    assert!(!err.contains("source: rewrite"), "stderr: {err}");
+
+    // Conservative parser through the CLI: no parseable date → no rewrite.
+    let out = search("crater rim before the migration", &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits(&out), 1);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("time filter"));
+}

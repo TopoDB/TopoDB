@@ -267,6 +267,8 @@ fn main() {
             kinds,
             recency_weight,
             recency_half_life_days,
+            created_after,
+            created_before,
         } => search(
             &db,
             default_scope,
@@ -276,6 +278,8 @@ fn main() {
             &kinds,
             recency_weight,
             recency_half_life_days,
+            created_after,
+            created_before,
             text_mode,
             &scope_display,
             &scope_source,
@@ -466,6 +470,8 @@ fn search(
     kinds: &[String],
     recency_weight: f32,
     recency_half_life_days: Option<f64>,
+    created_after: Option<String>,
+    created_before: Option<String>,
     text_mode: bool,
     scope_display: &str,
     scope_source: &str,
@@ -488,7 +494,46 @@ fn search(
             absent_as: Some(topodb_json::MEMORY_KIND_DEFAULT.to_string()),
         })
     };
+
+    // Created-time filter (explicit flags; Task 8 adds the rewriter
+    // branch with the same precedence as MCP search_memories). Applied
+    // filters are echoed to stderr so operators see what ran.
+    let (mut after_ms, mut before_ms) = (None, None);
+    let mut filter_note: Option<(String, &str)> = None;
+    if created_after.is_some() || created_before.is_some() {
+        let parse = |flag: &str, s: &str| {
+            topodb_json::parse_iso_instant(s).unwrap_or_else(|| {
+                output::fail(
+                    "rejected",
+                    &format!("parsing --{flag}: {s:?} is not an ISO date (try 2026-08-01)"),
+                    2,
+                )
+            })
+        };
+        after_ms = created_after.as_deref().map(|s| parse("created-after", s));
+        before_ms = created_before
+            .as_deref()
+            .map(|s| parse("created-before", s));
+        let mut parts = Vec::new();
+        if let Some(s) = &created_after {
+            parts.push(format!("after {s}"));
+        }
+        if let Some(s) = &created_before {
+            parts.push(format!("before {s}"));
+        }
+        filter_note = Some((parts.join(" "), "params"));
+    }
+    if let Some((desc, source)) = &filter_note {
+        output::time_filter_echo(desc, source);
+    }
+
     let options = topodb::SearchOptions {
+        created_range: (after_ms.is_some() || before_ms.is_some()).then_some(
+            topodb::CreatedRange {
+                after_ms,
+                before_ms,
+            },
+        ),
         prop_retain,
         recency_weight,
         recency_half_life_ms: recency_half_life_days
