@@ -22,10 +22,11 @@ pub struct EdgeRecord {
     pub props: Props,
     pub valid_from: i64,
     pub valid_to: Option<i64>,
-    /// Belief axis: when this edge's CURRENT state (its `valid_from`, or its
-    /// `valid_to` if closed) was recorded — the write instant, never the
-    /// world time. Set once at create and immutable thereafter for the
-    /// create fact; distinct from `valid_from`/`valid_to` (the world axis),
+    /// Belief axis: when the edge's CREATION was recorded — the write
+    /// instant, never the world time. Set once at create and immutable
+    /// thereafter (`apply_op` never rewrites it, including when the edge is
+    /// later closed — that event has its own belief-axis field,
+    /// `superseded_at`, below); distinct from `valid_from` (the world axis),
     /// which the caller may backdate.
     pub recorded_at: i64,
     /// Belief axis for the close: when we LEARNED the edge ended, as opposed

@@ -99,7 +99,7 @@ pub(crate) fn migrate_v1_to_v2(
             valid_from: old.valid_from,
             valid_to: old.valid_to,
             // v1 predates the belief axis: same copy rule used throughout
-            // (apply_op's pre-v9-op fallback, edge_from_disk_v3).
+            // (apply_op's pre-v9-op fallback, migrate_v9::bitemporalize).
             recorded_at: old.valid_from,
             superseded_at: old.valid_to,
         };

@@ -1977,10 +1977,13 @@ struct GetEdgesParams {
     /// edges stored under the raw un-normalized form are matched too).
     #[serde(default)]
     edge_type: Option<String>,
-    /// Only currently-open edges (no `valid_to`). Defaults to true when `as_of`
-    /// is absent — the common case is finding the open edge that a changed fact
-    /// should close. OMIT this field entirely when passing `as_of` (mutually
-    /// exclusive; `as_of` already means "open at that instant").
+    /// Only currently-open edges: no `valid_to` on the `"valid"` time axis
+    /// (the default), or no `superseded_at` on the `"recorded"` axis — see
+    /// `time_axis`, below, for which one applies. Defaults to true when
+    /// `as_of` is absent — the common case is finding the open edge that a
+    /// changed fact should close. OMIT this field entirely when passing
+    /// `as_of` (mutually exclusive; `as_of` already means "open at that
+    /// instant").
     #[serde(default)]
     open_only: Option<bool>,
     /// Scope to read in: `"shared"` or a scope ULID. Defaults to the
@@ -1996,8 +1999,11 @@ struct GetEdgesParams {
     scopes: Option<Vec<String>>,
     /// Only edges live at this Unix-ms instant (a past Unix-millisecond
     /// timestamp). Mutually exclusive with `open_only` — omit `open_only` when
-    /// passing `as_of`. A future `as_of` behaves like "now". Filters edges to
-    /// those with `valid_from <= t < valid_to` (open edges have no `valid_to`).
+    /// passing `as_of`. A future `as_of` behaves like "now". On the default
+    /// `"valid"` time axis, filters edges to those with `valid_from <= t <
+    /// valid_to` (open edges have no `valid_to`); on the `"recorded"` axis
+    /// (see `time_axis`, below), the same interval check runs against
+    /// `recorded_at`/`superseded_at` instead.
     #[serde(default)]
     as_of: Option<i64>,
     /// Direction to follow: `"out"` (from_id is source, default), `"in"`

@@ -275,12 +275,16 @@ pub enum Command {
         edge_type: Option<String>,
         /// Only edges currently open (default true); pass false to include closed
         /// edges (full history). Mutually exclusive with `--as-of` — omit this flag
-        /// when passing `--as-of`.
+        /// when passing `--as-of`. "Open" means no `valid_to` on the default
+        /// `--time-axis valid`, or no `superseded_at` on `--time-axis recorded`.
         #[arg(long, value_name = "true|false")]
         open_only: Option<bool>,
         /// View edges as they were at this Unix-millisecond instant: only edges
         /// live at that time. Mutually exclusive with `--open-only` — omit
         /// `--open-only` when passing `--as-of`. Must be a positive timestamp.
+        /// On the default `--time-axis valid` this checks `valid_from <= t <
+        /// valid_to`; on `--time-axis recorded` the same check runs against
+        /// `recorded_at`/`superseded_at` instead.
         #[arg(long)]
         as_of: Option<i64>,
         /// Which direction to follow: `out` (from node → target, default),

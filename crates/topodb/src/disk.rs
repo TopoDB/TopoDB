@@ -11,16 +11,23 @@
 //!   in the live crate reads v2 rows through this frozen shape —
 //!   `migrate_v3.rs` decodes v2 rows through its OWN frozen
 //!   `NodeRecordDiskV2`/`EdgeRecordDiskV2` twins instead.
-//! - `NodeRecordDiskV3`/`EdgeRecordDiskV3` (+ `*_v3` functions): `NodeRecordDiskV3`
-//!   remains the LIVE v3 node-table shape (v3 spec §3): `scope` is the
-//!   interned `u32` scope-registry id. `EdgeRecordDiskV3` is RETAINED but no
-//!   longer written by the live path — `migrate_v3.rs`'s v2->v3 re-keying
-//!   still produces it, and the (upcoming) v3->v4 migration decodes it.
+//! - `NodeRecordDiskV3` (+ `node_to_disk_v3`/`node_from_disk_v3`) remains the
+//!   LIVE node-table shape (v3 spec §3, unchanged since): `scope` is the
+//!   interned `u32` scope-registry id.
+//! - `EdgeRecordDiskV3` (+ `edge_to_disk_v3`) is RETAINED as an ENCODE-only
+//!   shape — `migrate_v3.rs`'s v2->v3 re-keying still produces it — and as
+//!   the frozen DECODE shape `migrate_v9.rs`'s v8->v9 migration reads
+//!   directly (into `EdgeRecordDiskV4`, never via an intermediate
+//!   `EdgeRecord`). It is no longer written by the live write path and has
+//!   no live decode function of its own: `edge_from_disk_v3` was deleted
+//!   once Task 2 (v9, bi-temporal edges) landed and confirmed
+//!   `migrate_v9.rs` had no need for it.
 //! - `EdgeRecordDiskV4` (+ `edge_to_disk_v4`/`edge_from_disk_v4`) is the LIVE
-//!   v4 edge-table shape: v3 plus the belief axis (`recorded_at`,
+//!   v9 edge-table shape: v3 plus the belief axis (`recorded_at`,
 //!   `superseded_at`), appended last (postcard is positional). This is what
-//!   `storage.rs`'s EDGES read/write paths (`put_edge`/`read_edge_by_slot`)
-//!   use. Nodes have no belief axis, so `NodeRecordDiskV3` has no v4 twin.
+//!   `storage.rs`'s EDGES read/write paths (`put_edge`/`read_edge_by_slot`/
+//!   `all_edges`) use. Nodes have no belief axis, so `NodeRecordDiskV3` has
+//!   no v4 twin.
 use crate::dict::{DictKind, Dicts, InternJournal};
 use crate::error::TopoError;
 use crate::ids::{EdgeId, NodeId, Scope};
@@ -179,50 +186,6 @@ pub(crate) fn edge_to_disk_v3(
         valid_to: r.valid_to,
     })
 }
-/// Resolves `r.from`/`r.to` slots back to ULIDs via `node_ids`. A miss is
-/// `TopoError::Encoding` — every edge row's endpoints must have a live
-/// NODE_IDS entry for as long as the edge row itself exists.
-///
-/// v3 rows predate the belief axis: `recorded_at`/`superseded_at` are
-/// derived from `valid_from`/`valid_to` — the SAME copy rule `apply_op`
-/// uses for a pre-v9 op missing those fields, and the migration (Task 2)
-/// must use for v3->v4.
-///
-/// Currently unreferenced within this crate: `storage.rs`'s live EDGES
-/// read paths (`read_edge_by_slot`/`all_edges`) both moved to
-/// `edge_from_disk_v4` in this same change, so nothing decodes a v3 row
-/// through this function yet. Retained (not deleted) because Task 2's
-/// v3->v4 migration is the intended caller — `#[allow(dead_code)]` until
-/// that lands, since CI runs `-D warnings`.
-#[allow(dead_code)]
-pub(crate) fn edge_from_disk_v3(
-    r: EdgeRecordDiskV3,
-    d: &Dicts,
-    scopes: &ScopeRegistry,
-    node_ids: &impl ReadableTable<&'static [u8], &'static [u8]>,
-) -> Result<EdgeRecord, TopoError> {
-    let mut p = crate::props::Props::new();
-    for (k, v) in r.props {
-        p.insert(d.resolve(DictKind::PropKey, k)?.to_string(), v);
-    }
-    let from = crate::slots::node_ulid(node_ids, r.from)?
-        .ok_or_else(|| TopoError::Encoding("edge_from_disk_v3: missing from ulid".into()))?;
-    let to = crate::slots::node_ulid(node_ids, r.to)?
-        .ok_or_else(|| TopoError::Encoding("edge_from_disk_v3: missing to ulid".into()))?;
-    Ok(EdgeRecord {
-        id: r.id,
-        scope: scopes.resolve(r.scope)?,
-        ty: d.resolve(DictKind::EdgeType, r.ty)?,
-        from,
-        to,
-        props: p,
-        valid_from: r.valid_from,
-        valid_to: r.valid_to,
-        recorded_at: r.valid_from,
-        superseded_at: r.valid_to,
-    })
-}
-
 // ---- v4 live record-table shape (belief axis: recorded_at/superseded_at) ----
 
 /// LIVE v4 EDGES row shape: v3 (`EdgeRecordDiskV3`) plus the two belief-axis
@@ -279,7 +242,8 @@ pub(crate) fn edge_to_disk_v4(
     })
 }
 /// Resolves `r.from`/`r.to` slots back to ULIDs via `node_ids`, same miss
-/// semantics as `edge_from_disk_v3`.
+/// semantics as `node_from_disk_v3` (a missing ULID is `TopoError::Encoding`,
+/// never a silent default).
 pub(crate) fn edge_from_disk_v4(
     r: EdgeRecordDiskV4,
     d: &Dicts,

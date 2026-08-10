@@ -77,7 +77,7 @@ pub(crate) fn decode_v2_edge(bytes: &[u8], dicts: &Dicts) -> Result<EdgeRecord, 
         valid_from: disk.valid_from,
         valid_to: disk.valid_to,
         // v2 predates the belief axis: same copy rule as apply_op's
-        // pre-v9-op fallback and edge_from_disk_v3.
+        // pre-v9-op fallback and migrate_v9::bitemporalize.
         recorded_at: disk.valid_from,
         superseded_at: disk.valid_to,
     })

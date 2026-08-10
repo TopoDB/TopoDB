@@ -123,6 +123,44 @@ fn get_edges_as_of_july_valid_axis_present() {
     );
 }
 
+/// Review follow-up (final whole-branch review, Minor #4): CLI already has
+/// the "explicit default == implicit default" case
+/// (`crates/topodb-cli/tests/cli.rs`'s `get_edges_time_axis_default_valid_and_belief_fields_present`/
+/// `get_edges_time_axis_valid_as_of_july_present` pair); MCP had no case for
+/// an explicit `"time_axis": "valid"` before this test. Low risk
+/// (`server.rs` maps `None | Some("valid")` identically), but the suites
+/// should be symmetric where the surfaces are.
+#[test]
+fn get_edges_as_of_july_explicit_valid_axis_matches_implicit_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut server, a_id, _x_id, edge_id) = setup_backdated_edge(&dir);
+
+    let implicit = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": a_id, "as_of": JULY }),
+        DEFAULT_TIMEOUT,
+    );
+    let explicit = server.call_tool_ok(
+        "get_edges",
+        serde_json::json!({ "from_id": a_id, "as_of": JULY, "time_axis": "valid" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        implicit, explicit,
+        "omitting time_axis must match explicit \"valid\" byte-for-byte"
+    );
+    let ids: Vec<&str> = explicit["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&edge_id.as_str()),
+        "explicit valid-axis as_of=JULY should see the edge (JUNE <= JULY): {explicit:?}"
+    );
+}
+
 #[test]
 fn get_edges_as_of_july_recorded_axis_absent() {
     let dir = tempfile::tempdir().unwrap();

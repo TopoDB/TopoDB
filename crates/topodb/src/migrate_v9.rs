@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 /// wire, only ordinal tags). Never edit this to track the live `Op` enum —
 /// it must stay byte-compatible with pre-v9 logs forever, the same
 /// "frozen decode twin" discipline `disk.rs` documents for
-/// `EdgeRecordDiskV3`/`edge_from_disk_v3`.
+/// `EdgeRecordDiskV3`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum OpDiskV8 {
     CreateNode {

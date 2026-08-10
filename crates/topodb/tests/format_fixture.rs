@@ -145,15 +145,37 @@
 //! file at 8 anymore, AND it has no edge rows to exercise the copy-rule
 //! backfill against. `v8_fixture_migrates_to_v9_and_reads` below documents
 //! this gap explicitly and asserts the strongest available coverage (version
-//! and standard queries); the copy-rule backfill itself is exercised by
-//! `migrate_v9.rs`'s own unit tests plus this file's native
-//! `v9_fixture_opens_and_reads`/`regenerate_v9_fixture`, whose recipe adds
-//! one open backdated edge and one closed edge specifically so the NEXT
-//! format bump has real edge coverage to migrate. `regenerate_v8_fixture` is
-//! repurposed below as `regenerate_v9_fixture` (same base content recipe
-//! plus the two new edges, targeting `v9.redb`), the same generator-
-//! repurposing move every earlier version flip made. `v9.redb` is now the
-//! ONLY fixture this build can regenerate.
+//! and standard queries).
+//!
+//! `v8-edges.redb` is a THIRTEENTH frozen fixture, added post-review (final
+//! whole-branch review, Important #2) to close that exact gap on a REAL
+//! `Db::open` migration rather than only `migrate_v9.rs`'s bare-`redb::
+//! Database` unit tests: a genuine pre-v9 file, generated from the a8a7d6e
+//! tree (the last commit before the belief axis existed), containing one
+//! open edge backdated in world time (`valid_from` 1_000) but written for
+//! real at instant 5_000, and one create-then-close edge pair (`valid_from`
+//! 2_000, `valid_to` 9_000, no backdating). Because a pre-v9 op/row has
+//! nowhere to persist a write instant distinct from `valid_from`/`valid_to`,
+//! the backdated edge's TRUE write instant (5_000) is unrecoverable by the
+//! time the v9 migration ever sees the file — the copy rule can only ever
+//! produce `recorded_at := valid_from` (1_000), which is why this fixture is
+//! the concrete, load-bearing example of the copy rule's documented
+//! backdated-edge approximation (see `FORMAT.md`'s v9 section and
+//! `migrate_v9.rs`'s module doc comment). Never regenerable by this build
+//! (no build on this branch can stamp a fresh file at 8 with the pre-v9 op
+//! shape anymore) — recovered once by the review, frozen from here on, same
+//! doctrine as `v3-legacy.redb`. `v8_edges_fixture_migrates_to_v9_and_reads`
+//! below exercises it.
+//!
+//! The copy-rule backfill itself is exercised by `migrate_v9.rs`'s own unit
+//! tests, `v8_edges_fixture_migrates_to_v9_and_reads` below, plus this
+//! file's native `v9_fixture_opens_and_reads`/`regenerate_v9_fixture`, whose
+//! recipe adds one open backdated edge and one closed edge specifically so
+//! the NEXT format bump has real edge coverage to migrate.
+//! `regenerate_v8_fixture` is repurposed below as `regenerate_v9_fixture`
+//! (same base content recipe plus the two new edges, targeting `v9.redb`),
+//! the same generator-repurposing move every earlier version flip made.
+//! `v9.redb` is now the ONLY fixture this build can regenerate.
 //!
 //! Node/scope ids use `NodeId::from_u128`/`ScopeId::from_u128`
 //! (`#[doc(hidden)]` debug-seam constructors added in `ids.rs` for exactly
@@ -591,11 +613,14 @@ fn dequantize(scale: f32, codes: &[i8]) -> Vec<f32> {
 /// correctly). The copy-rule backfill itself — field values, not just
 /// "doesn't crash" — is covered by `migrate_v9.rs`'s own unit tests
 /// (`bitemporalize_backfills_edges_and_rewrites_ops_in_place`, decoding a
-/// hand-built V3 row against exact expected V4 output) and by this file's
-/// native `v9_fixture_opens_and_reads` below, whose recipe carries a real
-/// open backdated edge and a real closed edge specifically so later
-/// migrations (and this one, retroactively, via the unit tests) have
-/// concrete edge content to check against.
+/// hand-built V3 row against exact expected V4 output), by this file's
+/// native `v9_fixture_opens_and_reads` below (whose recipe carries a real
+/// open backdated edge and a real closed edge), and — the strongest of the
+/// three, because it is a real `Db::open` migration over a genuinely
+/// pre-v9 file rather than a hand-built `redb::Database` or a native write
+/// — `v8_edges_fixture_migrates_to_v9_and_reads` below, added post-review
+/// specifically to close this gap (see the module doc comment on
+/// `v8-edges.redb`).
 #[test]
 fn v8_fixture_migrates_to_v9_and_reads() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v8.redb");
@@ -662,6 +687,187 @@ fn v8_fixture_migrates_to_v9_and_reads() {
         db.debug_dump_edges().is_empty(),
         "v8.redb's recipe has no edges — the v8->v9 EDGES pass has nothing to backfill here"
     );
+}
+
+/// Final whole-branch review, Important #2: migrates a REAL edge-bearing
+/// pre-v9 file (`v8-edges.redb` — see the module doc comment) through the
+/// actual `Db::open` path and checks the copy-rule backfill's exact field
+/// values on both stored edges, that the rewritten OPS rows decode cleanly
+/// through the change feed (`ops_since`, direction-2 in `migrate_v9.rs`'s
+/// module doc comment — the failure mode a bare-`redb::Database` unit test
+/// cannot exercise, since it never touches a real `Db::open`), and that
+/// `open_only` × `TimeAxis::Recorded` — untested everywhere else in the
+/// suite before this fixture landed (see the review's Minor #3) — gates on
+/// the belief axis rather than the world axis.
+///
+/// Fixture contents (recovered from the a8a7d6e tree, pre-belief-axis):
+/// - `e1` (`about`, n1 -> n2): world-time open and backdated (`valid_from`
+///   1_000), but genuinely WRITTEN at instant 5_000 via `submit_at` on that
+///   older build. A pre-v9 `CreateEdge` op has no field to carry a write
+///   instant distinct from `valid_from`, so that 5_000 is unrecoverable by
+///   migration time — the copy rule can only produce `recorded_at :=
+///   valid_from` (1_000). This is the concrete backdated-edge approximation
+///   FORMAT.md's v9 section documents: the migrated `recorded_at` (1_000)
+///   provably does NOT equal the edge's true historical write instant
+///   (5_000), yet it is exactly what the copy rule is defined to produce.
+/// - `e2` (`cites`, n2 -> n1): created at instant 2_000 (`valid_from`
+///   defaults to it, no backdating) then closed at instant 9_000
+///   (`valid_to` likewise defaults) — the common case where the copy rule's
+///   backfill is EXACT, not approximate, because world time and write time
+///   never diverged in the first place.
+#[test]
+fn v8_edges_fixture_migrates_to_v9_and_reads() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v8-edges.redb");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v8-edges.redb");
+    std::fs::copy(&src, &path).unwrap(); // never open the committed file read-write
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![],
+    };
+    let db = Db::open_with(&path, spec).unwrap();
+    assert_eq!(db.format_version(), 9);
+
+    let s = ScopeId::from_u128(1);
+    let scopes = ScopeSet::of(&[s]);
+    let n1 = NodeId::from_u128(10);
+    let n2 = NodeId::from_u128(11);
+    let e1 = EdgeId::from_u128(20);
+    let e2 = EdgeId::from_u128(21);
+
+    // ---- EDGES backfill, exact field values on both edges ----
+    let edges = db.debug_dump_edges();
+    assert_eq!(edges.len(), 2, "fixture's known corpus: exactly two edges");
+
+    let edge1 = edges
+        .iter()
+        .find(|e| e.id == e1)
+        .expect("e1 must be present");
+    assert_eq!(edge1.from, n1);
+    assert_eq!(edge1.to, n2);
+    assert_eq!(edge1.valid_from, 1_000);
+    assert_eq!(edge1.valid_to, None, "e1 is open");
+    assert_eq!(
+        edge1.recorded_at, 1_000,
+        "copy rule: recorded_at := valid_from — the backdated-edge \
+         approximation, NOT e1's true write instant (5_000), which a \
+         pre-v9 op had nowhere to persist"
+    );
+    assert_eq!(edge1.superseded_at, None, "e1 was never closed");
+
+    let edge2 = edges
+        .iter()
+        .find(|e| e.id == e2)
+        .expect("e2 must be present");
+    assert_eq!(edge2.from, n2);
+    assert_eq!(edge2.to, n1);
+    assert_eq!(edge2.valid_from, 2_000);
+    assert_eq!(edge2.valid_to, Some(9_000));
+    assert_eq!(
+        edge2.recorded_at, 2_000,
+        "copy rule: recorded_at := valid_from — exact here, since e2 was \
+         never backdated"
+    );
+    assert_eq!(
+        edge2.superseded_at,
+        Some(9_000),
+        "copy rule: superseded_at := valid_to — exact here, since e2's \
+         close was never backdated either"
+    );
+
+    // ---- OPS rewrite: migrated ops decode cleanly through the change feed ----
+    // (direction-2 in `migrate_v9.rs`'s module doc comment: a v9-stamped
+    // file whose OPS rows were NOT actually rewritten fails this decode the
+    // moment it hits an old-shaped CreateEdge/CloseEdge entry.)
+    let changes = db.ops_since(1).unwrap();
+    let mut saw_create_e1 = false;
+    let mut saw_create_e2 = false;
+    let mut saw_close_e2 = false;
+    for change in &changes {
+        match change.op.as_ref() {
+            Op::CreateEdge {
+                id,
+                valid_from,
+                recorded_at,
+                ..
+            } if *id == e1 => {
+                assert_eq!(*valid_from, Some(1_000));
+                assert_eq!(
+                    *recorded_at,
+                    Some(1_000),
+                    "migrated CreateEdge op must carry the same copy-rule \
+                     recorded_at as the EDGES row"
+                );
+                saw_create_e1 = true;
+            }
+            Op::CreateEdge {
+                id,
+                valid_from,
+                recorded_at,
+                ..
+            } if *id == e2 => {
+                assert_eq!(*valid_from, Some(2_000));
+                assert_eq!(*recorded_at, Some(2_000));
+                saw_create_e2 = true;
+            }
+            Op::CloseEdge {
+                id,
+                valid_to,
+                superseded_at,
+            } if *id == e2 => {
+                assert_eq!(*valid_to, Some(9_000));
+                assert_eq!(*superseded_at, Some(9_000));
+                saw_close_e2 = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_create_e1,
+        "migrated CreateEdge(e1) missing from change feed"
+    );
+    assert!(
+        saw_create_e2,
+        "migrated CreateEdge(e2) missing from change feed"
+    );
+    assert!(
+        saw_close_e2,
+        "migrated CloseEdge(e2) missing from change feed"
+    );
+
+    // ---- open_only x TimeAxis::Recorded ----
+    // e1 has no superseded_at (never closed) so it must still show under
+    // open_only on the Recorded axis; e2 has superseded_at = Some(9_000) so
+    // it must be gated out — the Recorded-axis open-set uses
+    // superseded_at.is_none(), NOT valid_to.is_none() (see db.rs:748-751).
+    let recorded_open_from_n1 = db
+        .edges_from(&scopes, n1, None, None, true, TimeAxis::Recorded)
+        .unwrap();
+    assert_eq!(
+        recorded_open_from_n1.len(),
+        1,
+        "e1 (superseded_at = None) must be open under TimeAxis::Recorded"
+    );
+    assert_eq!(recorded_open_from_n1[0].id, e1);
+
+    let recorded_open_from_n2 = db
+        .edges_from(&scopes, n2, None, None, true, TimeAxis::Recorded)
+        .unwrap();
+    assert!(
+        recorded_open_from_n2.is_empty(),
+        "e2 (superseded_at = Some(9_000)) must NOT be open under TimeAxis::Recorded"
+    );
+
+    // Same open_only query on TimeAxis::Valid must agree for this fixture
+    // (valid_to and superseded_at coincide on both edges here — see
+    // FORMAT.md's v9 section), confirming the two axes really do take
+    // structurally different code paths to the same answer, not that one is
+    // silently ignored.
+    let valid_open_from_n1 = db
+        .edges_from(&scopes, n1, None, None, true, TimeAxis::Valid)
+        .unwrap();
+    assert_eq!(valid_open_from_n1.len(), 1);
+    assert_eq!(valid_open_from_n1[0].id, e1);
 }
 
 /// Task 2 (bi-temporal edges): the native v9 fixture, written by
