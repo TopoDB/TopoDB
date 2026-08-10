@@ -36,6 +36,9 @@ pub use lifecycle::{
 mod retry;
 pub use retry::open_with_busy_retry;
 
+mod temporal;
+pub use temporal::{parse_iso_instant, parse_temporal_query, TemporalRewrite};
+
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::str::FromStr;
