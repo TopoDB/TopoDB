@@ -480,9 +480,12 @@ fn tool_descriptions_stay_lean() {
     // ship in tools/list too — prose must not migrate one level down.
     // Recorded at the branch that introduced this guard; may only move DOWN.
     let payload = serde_json::to_string(&tools).expect("tools serialize");
-    // Measured 75512 bytes on the branch that introduced this guard; ceiling
-    // is that + 5% headroom (79288), rounded up to a clean number.
-    const PAYLOAD_CEILING_BYTES: usize = 80_000;
+    // Measured 78496 bytes after the temporal-recall branch (which also
+    // dedupe-trimmed the 7x scopes param doc); ceiling re-based to that +
+    // ~500 bytes of margin. May only move DOWN — or up ONLY alongside a
+    // deliberate capability addition whose param docs justify it, stated
+    // here in a comment.
+    const PAYLOAD_CEILING_BYTES: usize = 79_000;
     assert!(
         payload.len() <= PAYLOAD_CEILING_BYTES,
         "tools/list payload is {} bytes (ceiling {PAYLOAD_CEILING_BYTES}) — trim, don't relocate prose",

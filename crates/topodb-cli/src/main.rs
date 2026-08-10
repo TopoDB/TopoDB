@@ -542,7 +542,7 @@ fn search(
         }
     }
     if let Some((desc, source)) = &filter_note {
-        output::time_filter_echo(desc, source);
+        output::time_filter_echo(desc, source, after_ms, before_ms);
     }
 
     let options = topodb::SearchOptions {

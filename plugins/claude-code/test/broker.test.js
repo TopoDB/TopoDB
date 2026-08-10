@@ -45,7 +45,9 @@ const PLUGIN_ROOT = path.join(HERE, "..");
 const LAUNCH_JS = path.join(PLUGIN_ROOT, "launch.js");
 const BROKER_JS = path.join(PLUGIN_ROOT, "broker.js");
 
-const DEFAULT_RPC_TIMEOUT_MS = 8000;
+// Windows CI runners are slow enough that broker handshakes have blown the
+// 8s deadline twice on unrelated PRs (#56's flake family) — triple it there.
+const DEFAULT_RPC_TIMEOUT_MS = process.platform === "win32" ? 24000 : 8000;
 
 // --- test plumbing -----------------------------------------------------
 
@@ -828,7 +830,7 @@ test("broker_idle_exits_and_releases_the_lock", async () => {
     // Bounded poll for the lock's release. Prove it the same way a second
     // Claude Code window's server would notice it: open the db directly with
     // a plain topodb-mcp, no broker involved.
-    const deadline = Date.now() + 8000;
+    const deadline = Date.now() + DEFAULT_RPC_TIMEOUT_MS;
     let opened = false;
     let lastErr;
     while (Date.now() < deadline && !opened) {
@@ -1046,7 +1048,7 @@ test("broker_stops_accepting_connections_once_idle_exit_begins", async () => {
     await killAndWaitForExit(session);
     session = null;
 
-    const deadline = Date.now() + 8000;
+    const deadline = Date.now() + DEFAULT_RPC_TIMEOUT_MS;
     let sawCloseLog = false;
     while (Date.now() < deadline && !sawCloseLog) {
       try {

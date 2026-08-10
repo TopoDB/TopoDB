@@ -74,7 +74,58 @@ pub fn empty_scope_echo(scope: &str, source: &str) {
 
 /// One-line stderr note naming an applied created-time filter — the CLI
 /// twin of the MCP result's `applied_time_filter`. Printed whenever a
-/// filter ran, explicit or rewritten; stdout is untouched.
-pub fn time_filter_echo(desc: &str, source: &str) {
-    eprintln!("topodb: time filter: {desc} (source: {source})");
+/// filter ran, explicit or rewritten; stdout is untouched. The resolved
+/// UTC interval is rendered too, so relative phrases ("last week") show
+/// the window that actually ran.
+pub fn time_filter_echo(desc: &str, source: &str, after_ms: Option<i64>, before_ms: Option<i64>) {
+    let bound = |ms: Option<i64>| ms.map_or("..".to_string(), iso_utc);
+    eprintln!(
+        "topodb: time filter: {desc} = [{}, {}) (source: {source})",
+        bound(after_ms),
+        bound(before_ms),
+    );
+}
+
+/// Render epoch ms as a compact UTC ISO instant (date only when the time
+/// is exactly midnight). Inverse of the Hinnant `days_from_civil` used by
+/// the parser — no chrono dependency for one stderr line.
+fn iso_utc(ms: i64) -> String {
+    const DAY_MS: i64 = 86_400_000;
+    let days = ms.div_euclid(DAY_MS);
+    let rem = ms.rem_euclid(DAY_MS);
+    // Hinnant civil_from_days (valid for the parser's 1970–2099 range).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    if rem == 0 {
+        format!("{y:04}-{m:02}-{d:02}")
+    } else {
+        let (h, min, s) = (rem / 3_600_000, (rem / 60_000) % 60, (rem / 1000) % 60);
+        format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iso_utc;
+
+    /// Anchors reuse the parser test suite's hand-derived constants.
+    #[test]
+    fn iso_utc_matches_the_parser_anchors() {
+        assert_eq!(iso_utc(1_785_542_400_000), "2026-08-01");
+        assert_eq!(iso_utc(1_767_225_600_000), "2026-01-01");
+        assert_eq!(
+            iso_utc(1_785_542_400_000 + 55_800_000),
+            "2026-08-01T15:30:00Z"
+        );
+        // Leap day 2028-02-29 (day 21243 since the epoch).
+        assert_eq!(iso_utc(21_243 * 86_400_000), "2028-02-29");
+    }
 }

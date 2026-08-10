@@ -162,3 +162,43 @@ fn check_conflicts_false_skips_the_probe_even_for_a_contradicting_pair() {
     // Advisory invariant: the write still succeeded.
     assert!(second["memory_id"].as_str().is_some());
 }
+
+/// create_memory mirrors remember's gate + projection (no supersedes param,
+/// so no self-supersede filter is involved).
+#[test]
+fn create_memory_has_the_same_conflict_parity() {
+    let (_dir, mut server) = fresh_server();
+    let first = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "TopoDB stores its data in redb" }),
+        DEFAULT_TIMEOUT,
+    );
+    let first_id = first["id"].as_str().unwrap().to_string();
+
+    let second = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({ "content": "TopoDB now stores its data in sled, not redb" }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(second["id"].as_str().is_some());
+    let candidates = second["supersession_candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected supersession_candidates on: {second}"));
+    assert_eq!(candidates[0]["memory_id"].as_str().unwrap(), first_id);
+    assert_eq!(candidates[0]["relation"].as_str().unwrap(), "supersession");
+
+    let opted_out = server.call_tool_ok(
+        "create_memory",
+        serde_json::json!({
+            "content": "TopoDB stores its data in redb again actually",
+            "check_conflicts": false,
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(opted_out["id"].as_str().is_some());
+    assert!(
+        opted_out.get("supersession_candidates").is_none(),
+        "{opted_out}"
+    );
+    assert!(opted_out["near_duplicates"].as_array().unwrap().is_empty());
+}

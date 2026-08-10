@@ -1246,16 +1246,11 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(range(min = 0.0, max = 1.0))]
     access_weight: f32,
-    /// Post-fusion multipliers for node labels (default: {"Entity": 0.5}).
-    /// For each label, multiply its matching nodes' scores by the given factor
-    /// (0.0-10.0). Omitted (null) defaults to {"Entity": 0.5} — entity hits are
-    /// down-weighted so that question-shaped queries surface facts (memories)
-    /// first. For looking up an entity by its exact name, prefer labels: ["Entity"]
-    /// (unaffected by the down-weight) over a plain search. Pass `{}` explicitly
-    /// to disable the down-weight (old behavior). Label matching is case-sensitive
-    /// ("Entity", not "entity"); unknown labels validate but no-op. Factors must be
-    /// finite JSON numbers in the range 0.0-10.0; invalid labels or out-of-range
-    /// values are rejected with invalid_params.
+    /// Post-fusion score multipliers by label, factors 0.0-10.0 (finite;
+    /// out-of-range rejected). Omitted = {"Entity": 0.5} — entity hits
+    /// down-weighted so facts surface first (exact entity lookup: prefer
+    /// labels: ["Entity"], unaffected). Pass {} to disable. Case-sensitive
+    /// label names; unknown labels no-op.
     #[serde(default)]
     label_weights: Option<serde_json::Map<String, Value>>,
     /// Only return hits of these memory kinds: "episodic" | "semantic" |
@@ -1623,16 +1618,13 @@ struct RememberResult {
     /// ULIDs actually marked superseded by this call (a subset of the
     /// requested `supersedes` — an already-superseded id is not re-marked).
     superseded: Vec<String>,
-    /// Existing memories semantically close to the one just stored (advisory —
-    /// nothing was merged). Uses vector-based detection when embeddings are Ready,
-    /// falls back to text-based (token containment) detection otherwise. Empty on a
-    /// dedup hit. Also empty when `check_conflicts` is false. See `NearDuplicate`.
-    /// See `supersession_candidates` for the leaner classified projection.
+    /// Existing memories semantically close to the one just stored (advisory;
+    /// vector when embeddings Ready, else token containment). Empty on dedup
+    /// or `check_conflicts: false`. See `supersession_candidates`.
     near_duplicates: Vec<NearDuplicate>,
-    /// Existing memories that may need `supersedes` next time (this call did
-    /// NOT do that automatically) — a leaner, spec-stable projection of
-    /// `near_duplicates` gated by `check_conflicts`. Omitted when empty or
-    /// when `check_conflicts` was false.
+    /// Existing memories that may need `supersedes` next time (NOT done
+    /// automatically) — the classified projection of `near_duplicates`.
+    /// Omitted when empty or opted out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     supersession_candidates: Vec<SupersessionCandidate>,
 }
@@ -1742,6 +1734,10 @@ struct SeedVaultResult {
 struct CreateMemoryParams {
     /// The memory's full-text-searchable body.
     content: String,
+    /// Default true: probe for near-duplicate/contradicting memories
+    /// (advisory fields). False skips the probe; the write is unaffected.
+    #[serde(default = "default_true")]
+    check_conflicts: bool,
     /// Structured metadata merged into the node's props (string/number/bool
     /// values). Must not include a `content` key — that key is set from the
     /// `content` param above; a collision is rejected rather than silently
@@ -1818,12 +1814,13 @@ struct CreateResult {
     /// True if an identical memory already existed in the write scope and was
     /// returned instead of creating a duplicate.
     deduplicated: bool,
-    /// Existing memories semantically close to the one just stored (advisory —
-    /// nothing was merged). Uses vector-based detection when embeddings are Ready,
-    /// falls back to text-based (token containment) detection otherwise. Consider
-    /// whether a hit is actually the same fact and, if so, `supersedes` or
-    /// `remove_node` the redundant one. Empty on a dedup hit.
+    /// Existing memories semantically close to the one just stored (advisory;
+    /// vector when embeddings Ready, else token containment). Empty on dedup
+    /// or `check_conflicts: false`. See `supersession_candidates`.
     near_duplicates: Vec<NearDuplicate>,
+    /// Classified projection of `near_duplicates`, as on `remember`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    supersession_candidates: Vec<SupersessionCandidate>,
 }
 
 /// A semantically-similar existing memory surfaced to the caller. Advisory:
@@ -3523,6 +3520,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
                 id: existing.to_string(),
                 deduplicated: true,
                 near_duplicates: Vec::new(),
+                supersession_candidates: Vec::new(),
             }));
         }
         let id = NodeId::new();
@@ -3530,7 +3528,21 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // duplicates (advisory) and is stored on the node. `None` when the
         // embedder isn't Ready — no semantic signal then.
         let embedding = self.embedder.embed(&p.content);
-        let near_duplicates = self.near_duplicates(scope, &p.content, embedding.as_deref());
+        // Same gate + projection as `remember`; no self-supersede filter is
+        // needed here because create_memory has no `supersedes` param.
+        let near_duplicates = if p.check_conflicts {
+            self.near_duplicates(scope, &p.content, embedding.as_deref())
+        } else {
+            Vec::new()
+        };
+        let supersession_candidates = near_duplicates
+            .iter()
+            .map(|nd| SupersessionCandidate {
+                memory_id: nd.id.to_string(),
+                relation: nd.relation.clone(),
+                score: nd.similarity,
+            })
+            .collect();
         let mut ops = vec![Op::CreateNode {
             id,
             scope,
@@ -3549,6 +3561,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
             id: id.to_string(),
             deduplicated: false,
             near_duplicates,
+            supersession_candidates,
         }))
     }
 
