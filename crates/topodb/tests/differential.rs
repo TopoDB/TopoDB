@@ -79,7 +79,9 @@ mod reference {
                     to,
                     props,
                     valid_from,
+                    recorded_at,
                 } => {
+                    let valid_from = valid_from.expect("test ops are resolved");
                     self.edges.insert(
                         *id,
                         EdgeRecord {
@@ -89,14 +91,24 @@ mod reference {
                             from: *from,
                             to: *to,
                             props: props.clone(),
-                            valid_from: valid_from.expect("test ops are resolved"),
+                            valid_from,
                             valid_to: None,
+                            // Mirrors apply_op's pre-v9-op fallback.
+                            recorded_at: recorded_at.unwrap_or(valid_from),
+                            superseded_at: None,
                         },
                     );
                 }
-                Op::CloseEdge { id, valid_to } => {
+                Op::CloseEdge {
+                    id,
+                    valid_to,
+                    superseded_at,
+                } => {
                     if let Some(edge) = self.edges.get_mut(id) {
                         edge.valid_to = *valid_to;
+                        // Mirrors apply_op's pre-v9-op fallback.
+                        edge.superseded_at =
+                            Some(superseded_at.unwrap_or_else(|| valid_to.expect("resolved")));
                     }
                 }
             }
@@ -450,6 +462,7 @@ fn assert_equivalent(db: &Db, model: &reference::RefModel, probes: &[Probe]) {
                         edge_types: None,
                         direction: *direction,
                         as_of: Some(*as_of),
+                        time_axis: TimeAxis::Valid,
                     })
                     .unwrap();
                 let actual_nodes = actual
@@ -533,6 +546,7 @@ fn reference_model_matches_v2_engine_on_generated_workloads() {
             vec![Op::CloseEdge {
                 id,
                 valid_to: Some(closed_at),
+                superseded_at: None,
             }],
         );
     }

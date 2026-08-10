@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
-use topodb::{Db, EdgeId, NodeId, NodeRecord, Op, PropValue, Props, Scope, ScopeSet, TopoError};
+use topodb::{
+    Db, EdgeId, NodeId, NodeRecord, Op, PropValue, Props, Scope, ScopeSet, TimeAxis, TopoError,
+};
 
 use crate::{
     merge_required_prop, normalize_edge_type, scopes_to_scope_set, ALIAS_EDGE_TYPE, ALIAS_LABEL,
@@ -134,7 +136,14 @@ pub fn resolve_entities_by_name(
         Err(e) => return Err(e),
     };
     for alias in aliases {
-        for edge in db.edges_from(scopes, alias.id, None, Some(ALIAS_EDGE_TYPE), true)? {
+        for edge in db.edges_from(
+            scopes,
+            alias.id,
+            None,
+            Some(ALIAS_EDGE_TYPE),
+            true,
+            TimeAxis::Valid,
+        )? {
             if let Some(canonical) = db.node(scopes, edge.to) {
                 if canonical.label == ENTITY_LABEL {
                     out.push(canonical);
@@ -240,10 +249,11 @@ pub fn plan_supersede(
             Some(PropValue::Int(now_ms)),
         );
         ops.push(Op::SetNodeProps { id, props });
-        for e in db.edges_from(&scope_set, id, None, None, true)? {
+        for e in db.edges_from(&scope_set, id, None, None, true, TimeAxis::Valid)? {
             ops.push(Op::CloseEdge {
                 id: e.id,
                 valid_to: None,
+                superseded_at: None,
             });
         }
         marked.push(id.to_string());
@@ -304,10 +314,11 @@ pub fn plan_forget(
             Some(PropValue::Int(now_ms)),
         );
         ops.push(Op::SetNodeProps { id, props });
-        for e in db.edges_from(&scope_set, id, None, None, true)? {
+        for e in db.edges_from(&scope_set, id, None, None, true, TimeAxis::Valid)? {
             ops.push(Op::CloseEdge {
                 id: e.id,
                 valid_to: None,
+                superseded_at: None,
             });
         }
         forgotten.push(id.to_string());
@@ -478,10 +489,17 @@ pub fn plan_remember(
     // On a dedup hit, entities already linked keep their edge.
     let already_linked: HashMap<NodeId, EdgeId> = if deduplicated {
         let scope_set = scopes_to_scope_set(&[write_scope]);
-        db.edges_from(&scope_set, memory_id, None, Some(ty.as_str()), true)?
-            .into_iter()
-            .map(|e| (e.to, e.id))
-            .collect()
+        db.edges_from(
+            &scope_set,
+            memory_id,
+            None,
+            Some(ty.as_str()),
+            true,
+            TimeAxis::Valid,
+        )?
+        .into_iter()
+        .map(|e| (e.to, e.id))
+        .collect()
     } else {
         HashMap::new()
     };
@@ -506,6 +524,7 @@ pub fn plan_remember(
                     to: r.id,
                     props: Props::new(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 id.to_string()
             }

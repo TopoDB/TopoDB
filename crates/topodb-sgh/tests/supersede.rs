@@ -1,5 +1,6 @@
 use topodb::{
-    Db, Direction, EdgeRecord, NodeId, Op, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
+    Db, Direction, EdgeRecord, NodeId, Op, Props, Scope, ScopeId, ScopeSet, TimeAxis,
+    TraversalQuery,
 };
 use topodb_sgh::store::supersede::{link_superseding, link_superseding_with};
 use topodb_sgh::store::SghError;
@@ -33,6 +34,7 @@ fn open_edges(db: &Db, scopes: &ScopeSet, from: NodeId, ty: &str, as_of: i64) ->
             edge_types: Some(vec![ty.into()]),
             direction: Direction::Out,
             as_of: Some(as_of),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     sg.edges.into_iter().filter(|e| e.from == from).collect()

@@ -250,6 +250,13 @@ pub enum Command {
         /// as_of behaves like "now". Omitted = now.
         #[arg(long)]
         as_of: Option<i64>,
+        /// Which time axis `--as-of` gates hops on: `valid` (default) is
+        /// world time — was the edge true then; `recorded` is belief time —
+        /// what we had WRITTEN by then. A late-recorded fact (backdated
+        /// `--valid-from`) is present on the valid axis but absent on the
+        /// recorded axis until the write actually happened.
+        #[arg(long = "time-axis", value_enum, default_value_t = TimeAxisArg::Valid)]
+        time_axis: TimeAxisArg,
     },
     /// List edges from a source node, with optional time-travel (as_of) and
     /// history access (open_only). Defaults to currently-open edges when neither
@@ -268,12 +275,16 @@ pub enum Command {
         edge_type: Option<String>,
         /// Only edges currently open (default true); pass false to include closed
         /// edges (full history). Mutually exclusive with `--as-of` — omit this flag
-        /// when passing `--as-of`.
+        /// when passing `--as-of`. "Open" means no `valid_to` on the default
+        /// `--time-axis valid`, or no `superseded_at` on `--time-axis recorded`.
         #[arg(long, value_name = "true|false")]
         open_only: Option<bool>,
         /// View edges as they were at this Unix-millisecond instant: only edges
         /// live at that time. Mutually exclusive with `--open-only` — omit
         /// `--open-only` when passing `--as-of`. Must be a positive timestamp.
+        /// On the default `--time-axis valid` this checks `valid_from <= t <
+        /// valid_to`; on `--time-axis recorded` the same check runs against
+        /// `recorded_at`/`superseded_at` instead.
         #[arg(long)]
         as_of: Option<i64>,
         /// Which direction to follow: `out` (from node → target, default),
@@ -282,6 +293,13 @@ pub enum Command {
         /// `--to` filters the far end of each edge, whichever side that is.
         #[arg(long, value_enum, default_value_t = DirectionArg::Out)]
         direction: DirectionArg,
+        /// Which time axis `--as-of` gates on: `valid` (default) is world
+        /// time — was the edge true then; `recorded` is belief time — what
+        /// we had WRITTEN by then. A late-recorded fact (backdated
+        /// `--valid-from`) is present on the valid axis but absent on the
+        /// recorded axis until the write actually happened.
+        #[arg(long = "time-axis", value_enum, default_value_t = TimeAxisArg::Valid)]
+        time_axis: TimeAxisArg,
     },
     /// Read a node's access statistics (count, last-accessed timestamp).
     /// `{"found":false}` (exit 0) if the node doesn't exist or is out of the
@@ -470,6 +488,25 @@ pub enum DirectionArg {
     In,
     #[default]
     Both,
+}
+
+/// Wire form of `topodb::TimeAxis` for `--time-axis`: `valid` (default) is
+/// world time — was the edge true then; `recorded` is belief time — what we
+/// had WRITTEN by then. Matches the MCP server's `time_axis` vocabulary.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default)]
+pub enum TimeAxisArg {
+    #[default]
+    Valid,
+    Recorded,
+}
+
+impl From<TimeAxisArg> for topodb::TimeAxis {
+    fn from(a: TimeAxisArg) -> Self {
+        match a {
+            TimeAxisArg::Valid => topodb::TimeAxis::Valid,
+            TimeAxisArg::Recorded => topodb::TimeAxis::Recorded,
+        }
+    }
 }
 
 impl From<DirectionArg> for topodb::Direction {

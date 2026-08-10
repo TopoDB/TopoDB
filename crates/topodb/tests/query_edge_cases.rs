@@ -99,6 +99,7 @@ fn query(scopes: ScopeSet, seeds: Vec<NodeId>, max_hops: u8) -> TraversalQuery {
         edge_types: None,
         direction: Direction::Out,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     }
 }
 

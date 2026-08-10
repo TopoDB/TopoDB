@@ -11,7 +11,7 @@ use std::thread;
 use topodb::workload::{batches, WorkloadSpec};
 use topodb::{
     Db, DbOptions, Direction, HnswParams, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope,
-    ScopeId, ScopeSet, TraversalQuery, VectorQuery,
+    ScopeId, ScopeSet, TimeAxis, TraversalQuery, VectorQuery,
 };
 fn spec() -> IndexSpec {
     IndexSpec {
@@ -261,6 +261,7 @@ fn traverse_warm(c: &mut Criterion) {
         edge_types: None,
         direction: Direction::Both,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     };
     let sanity = db.traverse(&q).unwrap();
     assert!(
@@ -282,6 +283,7 @@ fn traverse_cold(c: &mut Criterion) {
         edge_types: None,
         direction: Direction::Both,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     };
     // Each iteration pays a full cold open, an order of magnitude more
     // expensive than the warm in-process traversal above — a smaller sample

@@ -1,7 +1,7 @@
 //! Per-note ingest planner.
 
 use crate::NoteInput;
-use topodb::{Db, NodeId, Op, PropValue, Scope, ScopeSet};
+use topodb::{Db, NodeId, Op, PropValue, Scope, ScopeSet, TimeAxis};
 use topodb_json::{
     entity_dedup_key, existing_memory, json_to_props, memory_props, normalize_content,
     plan_remember, plan_supersede, ComposeError, RememberRequest, ENTITY_LABEL,
@@ -194,7 +194,7 @@ fn unchanged(
         return Ok(false);
     }
     // Entity links: open out-edges → Entity names, compared as dedup keys.
-    let edges = db.edges_from(lookup, node.id, None, None, true)?;
+    let edges = db.edges_from(lookup, node.id, None, None, true, TimeAxis::Valid)?;
     let mut stored_ents = std::collections::BTreeSet::new();
     for e in edges {
         if let Some(n) = db.node(lookup, e.to) {

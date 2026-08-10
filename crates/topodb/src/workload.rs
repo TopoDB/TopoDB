@@ -92,6 +92,12 @@ pub fn batches(spec: &WorkloadSpec) -> Vec<Vec<Op>> {
             to: entity_id(r.below(entities)),
             props: BTreeMap::new(),
             valid_from: at,
+            // `resolve_op` always overwrites this with the wall clock on
+            // submit (`differential.rs`'s oracle submits via `db.submit`,
+            // never `submit_at`), so any value here is discarded — `None`
+            // makes that explicit rather than implying a deterministic
+            // belief time the workload doesn't actually control.
+            recorded_at: None,
         });
         e += 1;
         if r.below(2) == 0 {
@@ -103,6 +109,12 @@ pub fn batches(spec: &WorkloadSpec) -> Vec<Vec<Op>> {
                 to: entity_id(r.below(entities)),
                 props: BTreeMap::new(),
                 valid_from: at,
+                // `resolve_op` always overwrites this with the wall clock on
+                // submit (`differential.rs`'s oracle submits via `db.submit`,
+                // never `submit_at`), so any value here is discarded — `None`
+                // makes that explicit rather than implying a deterministic
+                // belief time the workload doesn't actually control.
+                recorded_at: None,
             });
             e += 1;
         }
@@ -115,6 +127,12 @@ pub fn batches(spec: &WorkloadSpec) -> Vec<Vec<Op>> {
                 to: memory_id(i - 1),
                 props: BTreeMap::new(),
                 valid_from: at,
+                // `resolve_op` always overwrites this with the wall clock on
+                // submit (`differential.rs`'s oracle submits via `db.submit`,
+                // never `submit_at`), so any value here is discarded — `None`
+                // makes that explicit rather than implying a deterministic
+                // belief time the workload doesn't actually control.
+                recorded_at: None,
             });
             e += 1;
         }

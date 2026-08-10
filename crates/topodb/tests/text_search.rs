@@ -92,6 +92,7 @@ fn rejected_batch_leaves_postings_untouched_and_rebuild_restores_them() {
             Op::CloseEdge {
                 id: EdgeId::new(),
                 valid_to: None,
+                superseded_at: None,
             },
         ])
         .unwrap_err();

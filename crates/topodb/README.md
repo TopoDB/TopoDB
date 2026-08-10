@@ -16,7 +16,7 @@ stable; pin exact versions.
 ```rust,no_run
 use topodb::{
     Db, Direction, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, ScopeId,
-    ScopeSet, TraversalQuery, VectorQuery,
+    ScopeSet, TimeAxis, TraversalQuery, VectorQuery,
 };
 
 fn main() -> Result<(), topodb::TopoError> {
@@ -56,6 +56,7 @@ fn main() -> Result<(), topodb::TopoError> {
             to: b,
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         },
         // Embeddings are host-computed and submitted as ops (engine, not policy).
         Op::SetEmbedding { id: a, model: "my-embedder".into(), vector: vec![0.1, 0.2, 0.3] },
@@ -84,6 +85,7 @@ fn main() -> Result<(), topodb::TopoError> {
         edge_types: None,
         direction: Direction::Out,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     })?;
     Ok(())
 }

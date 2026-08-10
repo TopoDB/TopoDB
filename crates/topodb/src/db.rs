@@ -668,6 +668,12 @@ impl Db {
     /// — the discovery step `traverse` is too coarse for. A missing `from`
     /// slot (never existed, or removed) yields an empty result, not an error.
     /// Does not bump access counters — no node record is returned.
+    ///
+    /// `axis` picks what `open_only` means: `Valid` (unchanged) gates on the
+    /// adjacency entry's `valid_to` — the hot path, no extra fetch. `Recorded`
+    /// gates on the fetched record's `superseded_at` instead — nearly free
+    /// here since every candidate already needs a full-record fetch for the
+    /// result.
     pub fn edges_from(
         &self,
         scopes: &ScopeSet,
@@ -675,6 +681,7 @@ impl Db {
         to: Option<NodeId>,
         ty: Option<&str>,
         open_only: bool,
+        axis: crate::read::TimeAxis,
     ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
         let storage = self.storage();
         let dicts = storage.dicts.read().expect("dict lock poisoned");
@@ -720,7 +727,11 @@ impl Db {
             if to_slot.is_some_and(|slot| entry.target != slot) {
                 continue;
             }
-            if open_only && entry.valid_to.is_some() {
+            // Valid axis: gate on the adjacency entry before the fetch (hot
+            // path, byte-unchanged). Recorded axis: the entry doesn't carry
+            // `superseded_at`, so defer the open-only gate to the fetched
+            // record below.
+            if open_only && axis == crate::read::TimeAxis::Valid && entry.valid_to.is_some() {
                 continue;
             }
             let entry_scope = scope_registry.resolve(entry.scope)?;
@@ -734,6 +745,12 @@ impl Db {
                 &node_ids,
                 entry.edge,
             )? {
+                if open_only
+                    && axis == crate::read::TimeAxis::Recorded
+                    && rec.superseded_at.is_some()
+                {
+                    continue;
+                }
                 out.push(rec);
             }
         }
@@ -757,6 +774,8 @@ impl Db {
     /// `traverse` uses for `Direction::In`). A missing `to` slot (never
     /// existed, or removed) yields an empty result, not an error.
     /// Does not bump access counters — no node record is returned.
+    ///
+    /// `axis` picks what `open_only` means: see `edges_from`.
     pub fn edges_to(
         &self,
         scopes: &ScopeSet,
@@ -764,6 +783,7 @@ impl Db {
         from: Option<NodeId>,
         ty: Option<&str>,
         open_only: bool,
+        axis: crate::read::TimeAxis,
     ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
         let storage = self.storage();
         let dicts = storage.dicts.read().expect("dict lock poisoned");
@@ -809,7 +829,7 @@ impl Db {
             if from_slot.is_some_and(|slot| entry.target != slot) {
                 continue;
             }
-            if open_only && entry.valid_to.is_some() {
+            if open_only && axis == crate::read::TimeAxis::Valid && entry.valid_to.is_some() {
                 continue;
             }
             let entry_scope = scope_registry.resolve(entry.scope)?;
@@ -823,6 +843,12 @@ impl Db {
                 &node_ids,
                 entry.edge,
             )? {
+                if open_only
+                    && axis == crate::read::TimeAxis::Recorded
+                    && rec.superseded_at.is_some()
+                {
+                    continue;
+                }
                 out.push(rec);
             }
         }

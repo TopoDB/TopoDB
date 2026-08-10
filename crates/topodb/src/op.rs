@@ -28,9 +28,7 @@ pub enum Op {
     },
     /// Hard delete; applier also removes incident edges (deterministic:
     /// derived from state built by prior ops).
-    RemoveNode {
-        id: NodeId,
-    },
+    RemoveNode { id: NodeId },
     CreateEdge {
         id: EdgeId,
         scope: Scope,
@@ -40,9 +38,17 @@ pub enum Op {
         props: Props,
         /// ALWAYS Some(...) once stored (applier resolves).
         valid_from: Option<i64>,
+        /// Belief time; ALWAYS Some(write instant) once stored — resolve
+        /// overwrites caller input. Absent in pre-v9 log entries; apply
+        /// derives valid_from.
+        recorded_at: Option<i64>,
     },
     CloseEdge {
         id: EdgeId,
         valid_to: Option<i64>,
+        /// Belief time; ALWAYS Some(write instant) once stored — resolve
+        /// overwrites caller input. Absent in pre-v9 log entries; apply
+        /// derives valid_to.
+        superseded_at: Option<i64>,
     },
 }

@@ -4,6 +4,7 @@
 //! spec: graph-native data, engine mechanics, host policy).
 
 use crate::ids::NodeId;
+use crate::read::TimeAxis;
 
 /// Standard RRF constant — dampens the head so one leg's #1 can't drown
 /// out consistent mid-rank agreement across legs.
@@ -338,6 +339,7 @@ impl Db {
                     edge_types: None,
                     direction: crate::Direction::Both,
                     as_of: q.options.now_ms,
+                    time_axis: TimeAxis::Valid,
                 })?;
                 let scored = crate::ppr::ppr_over_subgraph(&sg, &seeds);
                 let mut by_id: std::collections::HashMap<crate::NodeId, NodeRecord> =

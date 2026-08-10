@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
     CreatedRange, Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props,
-    RecallQuery, Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
+    RecallQuery, Scope, ScopeSet, SearchOptions, TimeAxis, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
@@ -404,12 +404,13 @@ impl TopoServer {
             ops.push(Op::SetNodeProps { id, props });
             for e in self
                 .db
-                .edges_from(&scope_set, id, None, None, true)
+                .edges_from(&scope_set, id, None, None, true, TimeAxis::Valid)
                 .map_err(classify_topo_error)?
             {
                 ops.push(Op::CloseEdge {
                     id: e.id,
                     valid_to: None,
+                    superseded_at: None,
                 });
             }
             marked.push(id.to_string());
@@ -698,6 +699,20 @@ fn validate_as_of(v: Option<i64>) -> Result<(), ErrorData> {
         }
     }
     Ok(())
+}
+
+/// `time_axis` string -> `TimeAxis`: omitted/"valid" -> `Valid`, "recorded"
+/// -> `Recorded`, anything else -> invalid_params naming the two accepted
+/// values.
+fn parse_time_axis(v: Option<&str>) -> Result<TimeAxis, ErrorData> {
+    match v {
+        None | Some("valid") => Ok(TimeAxis::Valid),
+        Some("recorded") => Ok(TimeAxis::Recorded),
+        Some(other) => Err(ErrorData::invalid_params(
+            format!("time_axis must be \"valid\" or \"recorded\" (got {other:?})"),
+            None,
+        )),
+    }
 }
 
 /// Host display-name convention for evidence rendering: the `name` prop
@@ -1385,6 +1400,13 @@ struct TraverseParams {
     /// View the graph at a past Unix-millisecond instant. Omitted = now.
     #[serde(default)]
     as_of: Option<i64>,
+    /// Which time axis `as_of` gates hops on: `"valid"` (default) is world
+    /// time — was the edge true then; `"recorded"` is belief time — what we
+    /// had WRITTEN by then. A late-recorded fact (backdated `valid_from`) is
+    /// present on the valid axis but absent on the recorded axis until the
+    /// write actually happened.
+    #[serde(default)]
+    time_axis: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1955,10 +1977,13 @@ struct GetEdgesParams {
     /// edges stored under the raw un-normalized form are matched too).
     #[serde(default)]
     edge_type: Option<String>,
-    /// Only currently-open edges (no `valid_to`). Defaults to true when `as_of`
-    /// is absent — the common case is finding the open edge that a changed fact
-    /// should close. OMIT this field entirely when passing `as_of` (mutually
-    /// exclusive; `as_of` already means "open at that instant").
+    /// Only currently-open edges: no `valid_to` on the `"valid"` time axis
+    /// (the default), or no `superseded_at` on the `"recorded"` axis — see
+    /// `time_axis`, below, for which one applies. Defaults to true when
+    /// `as_of` is absent — the common case is finding the open edge that a
+    /// changed fact should close. OMIT this field entirely when passing
+    /// `as_of` (mutually exclusive; `as_of` already means "open at that
+    /// instant").
     #[serde(default)]
     open_only: Option<bool>,
     /// Scope to read in: `"shared"` or a scope ULID. Defaults to the
@@ -1974,8 +1999,11 @@ struct GetEdgesParams {
     scopes: Option<Vec<String>>,
     /// Only edges live at this Unix-ms instant (a past Unix-millisecond
     /// timestamp). Mutually exclusive with `open_only` — omit `open_only` when
-    /// passing `as_of`. A future `as_of` behaves like "now". Filters edges to
-    /// those with `valid_from <= t < valid_to` (open edges have no `valid_to`).
+    /// passing `as_of`. A future `as_of` behaves like "now". On the default
+    /// `"valid"` time axis, filters edges to those with `valid_from <= t <
+    /// valid_to` (open edges have no `valid_to`); on the `"recorded"` axis
+    /// (see `time_axis`, below), the same interval check runs against
+    /// `recorded_at`/`superseded_at` instead.
     #[serde(default)]
     as_of: Option<i64>,
     /// Direction to follow: `"out"` (from_id is source, default), `"in"`
@@ -1984,6 +2012,13 @@ struct GetEdgesParams {
     /// edge, whichever side that is.
     #[serde(default = "get_edges_default_direction")]
     direction: DirectionParam,
+    /// Which time axis `as_of` gates on: `"valid"` (default) is world time —
+    /// was the edge true then; `"recorded"` is belief time — what we had
+    /// WRITTEN by then. A late-recorded fact (backdated `valid_from`) is
+    /// present on the valid axis but absent on the recorded axis until the
+    /// write actually happened.
+    #[serde(default)]
+    time_axis: Option<String>,
 }
 
 fn get_edges_default_direction() -> DirectionParam {
@@ -2524,7 +2559,7 @@ impl TopoServer {
         // never stacks a duplicate edge.
         let mut have: std::collections::BTreeSet<(NodeId, String)> = self
             .db
-            .edges_from(&write_set, keep, None, None, true)
+            .edges_from(&write_set, keep, None, None, true, TimeAxis::Valid)
             .map_err(classify_topo_error)?
             .into_iter()
             .map(|e| (e.to, e.ty.to_string()))
@@ -2534,7 +2569,7 @@ impl TopoServer {
         let mut transferred: Vec<TransferredEdge> = Vec::new();
         for e in self
             .db
-            .edges_from(&write_set, drop, None, None, true)
+            .edges_from(&write_set, drop, None, None, true, TimeAxis::Valid)
             .map_err(classify_topo_error)?
         {
             // Never point keep at itself or at the node being retired.
@@ -2557,6 +2592,7 @@ impl TopoServer {
                     to: e.to,
                     props: e.props,
                     valid_from: None,
+                    recorded_at: None,
                 });
             }
         }
@@ -2617,7 +2653,7 @@ impl TopoServer {
             scanned += 1;
             let open = self
                 .db
-                .edges_from(scope_set, n.id, None, None, true)
+                .edges_from(scope_set, n.id, None, None, true, TimeAxis::Valid)
                 .map_err(classify_topo_error)?;
             if !open.is_empty() {
                 continue;
@@ -3099,6 +3135,7 @@ impl TopoServer {
         Parameters(p): Parameters<TraverseParams>,
     ) -> Result<Json<TraverseResult>, ErrorData> {
         validate_as_of(p.as_of)?;
+        let time_axis = parse_time_axis(p.time_axis.as_deref())?;
         // `seed_ids` (non-empty) wins over `seed_id`; at least one is required.
         let seed_strs: Vec<String> = match p.seed_ids {
             Some(ids) if !ids.is_empty() => ids,
@@ -3140,6 +3177,7 @@ impl TopoServer {
             edge_types,
             direction: p.direction.into(),
             as_of: p.as_of,
+            time_axis,
         };
         // `traverse` opens a redb read transaction and walks on-disk chunked
         // adjacency (v3), so — like `search_text` — it can fail with
@@ -3690,6 +3728,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
                     Some(entity_id),
                     Some(ALIAS_EDGE_TYPE),
                     true,
+                    TimeAxis::Valid,
                 )
                 .map_err(classify_topo_error)?;
             if !edges.is_empty() {
@@ -3725,6 +3764,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
                 to: entity_id,
                 props: Props::new(),
                 valid_from: None,
+                recorded_at: None,
             },
         ];
         ops.extend(embed);
@@ -3840,7 +3880,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // possible.
         let existing = self
             .db
-            .edges_from(&write_set, from, Some(to), Some(&ty), true)
+            .edges_from(&write_set, from, Some(to), Some(&ty), true, TimeAxis::Valid)
             .map_err(classify_topo_error)?;
 
         let mut ops: Vec<Op> = Vec::new();
@@ -3848,12 +3888,13 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         if p.supersede {
             let open_same_ty = self
                 .db
-                .edges_from(&write_set, from, None, Some(&ty), true)
+                .edges_from(&write_set, from, None, Some(&ty), true, TimeAxis::Valid)
                 .map_err(classify_topo_error)?;
             for e in open_same_ty.iter().filter(|e| e.to != to) {
                 ops.push(Op::CloseEdge {
                     id: e.id,
                     valid_to: None,
+                    superseded_at: None,
                 });
                 superseded.push(e.id.to_string());
             }
@@ -3887,6 +3928,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
             to,
             props,
             valid_from: p.valid_from,
+            recorded_at: None,
         });
         // One submit: the closes and the create commit atomically — a
         // supersede can never close the old fact and then fail to record the
@@ -3916,7 +3958,10 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         ty: &str,
         just_written: EdgeId,
     ) -> Vec<LinkConflict> {
-        let Ok(open) = self.db.edges_from(scopes, from, None, Some(ty), true) else {
+        let Ok(open) = self
+            .db
+            .edges_from(scopes, from, None, Some(ty), true, TimeAxis::Valid)
+        else {
             return Vec::new();
         };
         open.into_iter()
@@ -3939,6 +3984,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // Validate as_of timestamp FIRST (so as_of: 0 gets the timestamp error,
         // not the exclusivity one).
         validate_as_of(p.as_of)?;
+        let time_axis = parse_time_axis(p.time_axis.as_deref())?;
 
         // Check mutually exclusive parameters: as_of and open_only cannot both
         // be specified. When as_of is present, omit open_only entirely.
@@ -3967,12 +4013,12 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
 
         let fetch_from = |t: Option<&str>| {
             self.db
-                .edges_from(&scope_set, from, to, t, open_only_to_use)
+                .edges_from(&scope_set, from, to, t, open_only_to_use, time_axis)
                 .map_err(classify_topo_error)
         };
         let fetch_to = |t: Option<&str>| {
             self.db
-                .edges_to(&scope_set, from, to, t, open_only_to_use)
+                .edges_to(&scope_set, from, to, t, open_only_to_use, time_axis)
                 .map_err(classify_topo_error)
         };
         let edge_type = p.edge_type.as_deref();
@@ -3990,9 +4036,14 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         edges.dedup_by_key(|e| e.id);
 
         // If as_of is set, filter edges to only those live at that timestamp
-        // (inclusive lower bound, exclusive upper bound: valid_from <= t < valid_to).
+        // on the requested axis (inclusive lower bound, exclusive upper
+        // bound): valid axis gates on valid_from/valid_to (world time),
+        // recorded axis gates on recorded_at/superseded_at (belief time).
         if let Some(timestamp) = p.as_of {
-            edges.retain(|e| convert::edge_live_at(e, timestamp));
+            match time_axis {
+                TimeAxis::Valid => edges.retain(|e| convert::edge_live_at(e, timestamp)),
+                TimeAxis::Recorded => edges.retain(|e| convert::edge_believed_at(e, timestamp)),
+            }
         }
 
         let edges = edges
@@ -4045,6 +4096,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         let seq = self.submit_seq(vec![Op::CloseEdge {
             id,
             valid_to: p.valid_to,
+            superseded_at: None,
         }])?;
         Ok(Json(SeqResult { seq }))
     }
@@ -4155,7 +4207,11 @@ impl ServerHandler for TopoServer {
                  time-boxed: created_after/created_before params, or a date phrase in \
                  the query (\"before 2026-08\", \"last week\") rewritten automatically — \
                  applied_time_filter reports what ran; use get_edges to inspect or retire \
-                 a node's current relations. Maintenance: memory_health at session start \
+                 a node's current relations. Edges carry two time axes — valid_from/valid_to \
+                 (true in the world; link/close accept overrides) and recorded_at/superseded_at \
+                 (when it was believed; never settable). time_axis: \"recorded\" on \
+                 get_edges/traverse answers \"what did we believe then\" — late-recorded \
+                 facts differ between axes. Maintenance: memory_health at session start \
                  summarizes hygiene; drill into \
                  non-zero counts with the find_* scans and act via consolidate_memories / \
                  forget — scans are advisory and never act on their own. Before treating an \

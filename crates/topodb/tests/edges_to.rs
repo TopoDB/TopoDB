@@ -28,6 +28,7 @@ fn edge(ty: &str, scope: Scope, from: NodeId, to: NodeId) -> (EdgeId, Op) {
             to,
             props: Props::new(),
             valid_from: None,
+            recorded_at: None,
         },
     )
 }
@@ -53,7 +54,9 @@ fn edges_to_filters_by_source_type_and_openness() {
     db.submit(vec![op1, op2, op3]).unwrap();
 
     // No filters: return e1 and e2 (pointing TO b), not e3, oldest first (by edge id).
-    let all = db.edges_to(&scopes, b, None, None, false).unwrap();
+    let all = db
+        .edges_to(&scopes, b, None, None, false, TimeAxis::Valid)
+        .unwrap();
     assert_eq!(all.len(), 2);
     assert!(all.windows(2).all(|w| w[0].id <= w[1].id));
     let all_ids: Vec<EdgeId> = all.iter().map(|e| e.id).collect();
@@ -62,7 +65,7 @@ fn edges_to_filters_by_source_type_and_openness() {
 
     // Type filter: only "works_at" edges pointing to b.
     let works: Vec<EdgeId> = db
-        .edges_to(&scopes, b, None, Some("works_at"), false)
+        .edges_to(&scopes, b, None, Some("works_at"), false, TimeAxis::Valid)
         .unwrap()
         .iter()
         .map(|e| e.id)
@@ -72,7 +75,7 @@ fn edges_to_filters_by_source_type_and_openness() {
 
     // Source filter: only edges from A pointing to B.
     let from_a: Vec<EdgeId> = db
-        .edges_to(&scopes, b, Some(a), None, false)
+        .edges_to(&scopes, b, Some(a), None, false, TimeAxis::Valid)
         .unwrap()
         .iter()
         .map(|e| e.id)
@@ -82,7 +85,14 @@ fn edges_to_filters_by_source_type_and_openness() {
 
     // Both filters: only works_at edges from A to B.
     let narrow = db
-        .edges_to(&scopes, b, Some(a), Some("works_at"), false)
+        .edges_to(
+            &scopes,
+            b,
+            Some(a),
+            Some("works_at"),
+            false,
+            TimeAxis::Valid,
+        )
         .unwrap();
     assert_eq!(narrow.len(), 1);
     assert_eq!(narrow[0].id, e1);
@@ -91,26 +101,38 @@ fn edges_to_filters_by_source_type_and_openness() {
     db.submit(vec![Op::CloseEdge {
         id: e1,
         valid_to: None,
+        superseded_at: None,
     }])
     .unwrap();
-    let open_to_b = db.edges_to(&scopes, b, None, None, true).unwrap();
+    let open_to_b = db
+        .edges_to(&scopes, b, None, None, true, TimeAxis::Valid)
+        .unwrap();
     assert_eq!(open_to_b.len(), 1);
     assert_eq!(open_to_b[0].id, e2);
     assert_eq!(
-        db.edges_to(&scopes, b, None, None, false).unwrap().len(),
+        db.edges_to(&scopes, b, None, None, false, TimeAxis::Valid)
+            .unwrap()
+            .len(),
         2,
         "closed edges stay listed when open_only is false"
     );
 
     // An unknown type matches nothing (not everything).
     assert!(db
-        .edges_to(&scopes, b, None, Some("never_written"), false)
+        .edges_to(
+            &scopes,
+            b,
+            None,
+            Some("never_written"),
+            false,
+            TimeAxis::Valid
+        )
         .unwrap()
         .is_empty());
 
     // A never-created `to` node yields empty, not an error.
     assert!(db
-        .edges_to(&scopes, NodeId::new(), None, None, false)
+        .edges_to(&scopes, NodeId::new(), None, None, false, TimeAxis::Valid)
         .unwrap()
         .is_empty());
 }
@@ -130,7 +152,7 @@ fn edges_to_gates_on_edge_scope() {
 
     // In scope: visible.
     let hits = db
-        .edges_to(&ScopeSet::of(&[s]), b, None, None, true)
+        .edges_to(&ScopeSet::of(&[s]), b, None, None, true, TimeAxis::Valid)
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, e);
@@ -138,7 +160,14 @@ fn edges_to_gates_on_edge_scope() {
     // A reader whose scope set doesn't include the edge's scope sees nothing
     // — there is no unscoped read.
     assert!(db
-        .edges_to(&ScopeSet::of(&[ScopeId::new()]), b, None, None, true)
+        .edges_to(
+            &ScopeSet::of(&[ScopeId::new()]),
+            b,
+            None,
+            None,
+            true,
+            TimeAxis::Valid
+        )
         .unwrap()
         .is_empty());
 }

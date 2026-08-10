@@ -70,7 +70,7 @@ pub(crate) const VECTOR_DIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::n
 /// makes per-(label,scope) key order = mint-time order.
 pub(crate) const LABEL_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("label_index");
 
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Stable logical table-byte measurement (redb page and free-list overhead excluded).
 #[derive(Debug, Clone)]
@@ -221,13 +221,30 @@ impl Storage {
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
-            Some(8) => {}
+            Some(9) => {}
+            Some(8) => {
+                // v8 -> v9 rewrites every EDGES row (V3 -> V4 copy-rule
+                // backfill: `recorded_at := valid_from`, `superseded_at :=
+                // valid_to`) and every stored `CreateEdge`/`CloseEdge` op
+                // (belief axis backfilled the same way; every other op
+                // variant re-encoded verbatim) — see `migrate_v9.rs`'s
+                // module doc comment for why the OPS half is load-bearing,
+                // not cosmetic.
+                let mut meta = tx.open_table(META).map_err(storage_err)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
+                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                    .map_err(storage_err)?;
+            }
             Some(7) => {
                 // v7 -> v8 quantizes every existing `vectors` row in place
                 // (framed postcard `Vec<f32>` -> `(f32, Vec<i8>)`, see
-                // `migrate_v8.rs`), then stamps the version.
+                // `migrate_v8.rs`), then stamps the version. This arm jumps
+                // straight from 7 to the CURRENT `FORMAT_VERSION`, so it
+                // must also run v8->v9's `migrate_v9::bitemporalize` pass
+                // (`migrate_v9.rs`) before stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -245,10 +262,12 @@ impl Storage {
                 // path or via `ensure_hnsw_params`'s reconcile), so there is
                 // nothing to migrate out of an empty table pair. This arm
                 // jumps straight from 6 to the CURRENT `FORMAT_VERSION`, so
-                // it must also do v7->v8's `vectors` quantization pass itself
-                // (see `migrate_v8.rs`) before stamping.
+                // it must also do v7->v8's `vectors` quantization pass
+                // (see `migrate_v8.rs`) and v8->v9's `migrate_v9::
+                // bitemporalize` pass (`migrate_v9.rs`) before stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -262,10 +281,13 @@ impl Storage {
                 // hops: no dual-write era, no re-encoding of existing rows.
                 // This arm jumps straight from 5 to the CURRENT
                 // `FORMAT_VERSION`, so it also runs v7->v8's `vectors`
-                // quantization pass (`migrate_v8.rs`) before stamping.
+                // quantization pass (`migrate_v8.rs`) and v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) before
+                // stamping.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -277,13 +299,16 @@ impl Storage {
                 // check sees a missing stamp on every pre-v5 file and drains +
                 // rebuilds the index. This arm jumps straight from 4 to the
                 // CURRENT `FORMAT_VERSION`, so it must do v6's table work
-                // (LABEL_INDEX backfill) and v7->v8's `vectors` quantization
-                // pass (`migrate_v8.rs`) itself, rather than falling through
-                // to the `Some(5)`/`Some(6)` arms above, which only ever run
-                // for a file genuinely stamped that version — then stamp.
+                // (LABEL_INDEX backfill), v7->v8's `vectors` quantization
+                // pass (`migrate_v8.rs`) and v8->v9's `migrate_v9::
+                // bitemporalize` pass (`migrate_v9.rs`) itself, rather than
+                // falling through to the `Some(5)`/`Some(6)` arms above,
+                // which only ever run for a file genuinely stamped that
+                // version — then stamp.
                 let mut meta = tx.open_table(META).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
                 crate::migrate_v8::quantize_vectors(&tx)?;
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -327,6 +352,13 @@ impl Storage {
                 } // `nodes`/`embeddings` guards drop here, before delete_table.
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                // This arm jumps straight from 3 to the CURRENT
+                // `FORMAT_VERSION`, so it must also run v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) before
+                // stamping — unlike the `vectors` quantization pass above,
+                // it is unaffected by the v3->v4 dual-write distinction (it
+                // only touches EDGES/OPS).
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -415,6 +447,12 @@ impl Storage {
                 drop(embeddings);
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                // This arm jumps straight from 2 to the CURRENT
+                // `FORMAT_VERSION`, so it must also run v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) — the
+                // EDGES rows `migrate_v2_to_v3` just wrote are V3-shaped,
+                // exactly what `bitemporalize` expects going in.
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -517,6 +555,11 @@ impl Storage {
                 drop(embeddings);
                 tx.delete_table(EMBEDDINGS).map_err(storage_err)?;
                 crate::migrate_v6::migrate_v5_to_v6(&tx)?;
+                // This arm jumps straight from 1 to the CURRENT
+                // `FORMAT_VERSION`, so it must also run v8->v9's
+                // `migrate_v9::bitemporalize` pass (`migrate_v9.rs`) — same
+                // rationale as the `Some(2)` arm's identical comment.
+                crate::migrate_v9::bitemporalize(&tx)?;
                 meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                     .map_err(storage_err)?;
             }
@@ -1978,7 +2021,7 @@ impl Storage {
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            out.push(crate::disk::edge_from_disk_v3(
+            out.push(crate::disk::edge_from_disk_v4(
                 disk, &dicts, &scopes, &node_ids,
             )?);
         }
@@ -2381,6 +2424,7 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
             to,
             props,
             valid_from,
+            recorded_at: _,
         } => Op::CreateEdge {
             id,
             scope,
@@ -2389,10 +2433,20 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
             to,
             props,
             valid_from: Some(valid_from.unwrap_or(now_ms)),
+            // Belief time is ALWAYS the write instant — unconditionally
+            // overwritten, unlike valid_from, which honors a caller override.
+            recorded_at: Some(now_ms),
         },
-        Op::CloseEdge { id, valid_to } => Op::CloseEdge {
+        Op::CloseEdge {
+            id,
+            valid_to,
+            superseded_at: _,
+        } => Op::CloseEdge {
             id,
             valid_to: Some(valid_to.unwrap_or(now_ms)),
+            // Belief time is ALWAYS the operation instant — unconditionally
+            // overwritten, unlike valid_to, which honors a caller override.
+            superseded_at: Some(now_ms),
         },
         other => other,
     }
@@ -2650,7 +2704,7 @@ pub(crate) fn read_edge_by_slot(
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            Ok(Some(crate::disk::edge_from_disk_v3(
+            Ok(Some(crate::disk::edge_from_disk_v4(
                 disk, dicts, scopes, node_ids,
             )?))
         }
@@ -2726,7 +2780,7 @@ fn put_edge(
 ) -> Result<(), TopoError> {
     let slot = crate::slots::edge_slot(edge_slots, rec.id)?
         .ok_or_else(|| TopoError::Encoding("put_edge: missing edge slot".into()))?;
-    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk_v3(
+    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk_v4(
         rec,
         dict,
         dicts,
@@ -3096,6 +3150,7 @@ fn apply_op(
             to,
             props,
             valid_from,
+            recorded_at,
         } => {
             let from_rec = read_node(
                 nodes,
@@ -3141,6 +3196,8 @@ fn apply_op(
             // already-seen scopes; `put_edge` below re-interns the same scope
             // internally, also a no-op.
             let scope_id = scope_registry.intern(scopes_table, *scope, journal)?;
+            let valid_from_resolved = valid_from
+                .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)");
             let rec = EdgeRecord {
                 id: *id,
                 scope: *scope,
@@ -3148,9 +3205,12 @@ fn apply_op(
                 from: *from,
                 to: *to,
                 props: props.clone(),
-                valid_from: valid_from
-                    .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)"),
+                valid_from: valid_from_resolved,
                 valid_to: None,
+                // Pre-v9 log fallback: an op without recorded_at derives it
+                // from valid_from — MUST match the migration copy rule.
+                recorded_at: recorded_at.unwrap_or(valid_from_resolved),
+                superseded_at: None,
             };
             put_edge(
                 edges,
@@ -3184,7 +3244,11 @@ fn apply_op(
                 },
             )
         }
-        Op::CloseEdge { id, valid_to } => {
+        Op::CloseEdge {
+            id,
+            valid_to,
+            superseded_at,
+        } => {
             let mut rec = read_edge(edges, dicts, scope_registry, edge_slots, node_ids, *id)?
                 .ok_or_else(|| TopoError::Rejected(format!("CloseEdge: edge {id:?} not found")))?;
             if rec.valid_to.is_some() {
@@ -3192,10 +3256,12 @@ fn apply_op(
                     "CloseEdge: edge {id:?} already closed"
                 )));
             }
-            rec.valid_to = Some(
-                valid_to
-                    .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)"),
-            );
+            let valid_to_resolved = valid_to
+                .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)");
+            rec.valid_to = Some(valid_to_resolved);
+            // Pre-v9 log fallback: an op without superseded_at derives it
+            // from valid_to — MUST match the migration copy rule.
+            rec.superseded_at = Some(superseded_at.unwrap_or(valid_to_resolved));
             put_edge(
                 edges,
                 dict,
@@ -3777,6 +3843,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: Some(0),
+                    recorded_at: None,
                 },
             ],
             0,
@@ -3844,6 +3911,7 @@ mod tests {
                 vec![Op::CloseEdge {
                     id: ghost_edge,
                     valid_to: None,
+                    superseded_at: None,
                 }],
                 0,
             )
@@ -3953,6 +4021,7 @@ mod tests {
                     to: leaf,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 e
             })
@@ -3969,6 +4038,7 @@ mod tests {
                     to: leaf,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 e
             })
@@ -3984,6 +4054,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 e
             })
@@ -4104,6 +4175,7 @@ mod tests {
                     to: a,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
                 Op::CreateEdge {
                     id: ab_edge,
@@ -4113,6 +4185,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,

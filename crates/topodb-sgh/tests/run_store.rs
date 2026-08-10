@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use topodb::{Db, Op, PropValue, Scope, ScopeId, ScopeSet};
+use topodb::{Db, Op, PropValue, Scope, ScopeId, ScopeSet, TimeAxis};
 use topodb_sgh::schema::validate::validate;
 use topodb_sgh::schema::Graph;
 use topodb_sgh::store::run::{NodeState, RunStore};
@@ -215,7 +215,14 @@ fn revisions_round_trip_and_supersede() {
     };
     let scopes = ScopeSet::of(&[scope_id]);
     let all = db
-        .edges_from(&scopes, s.run_node(), None, Some(EDGE_REVISION_OF), false)
+        .edges_from(
+            &scopes,
+            s.run_node(),
+            None,
+            Some(EDGE_REVISION_OF),
+            false,
+            TimeAxis::Valid,
+        )
         .unwrap();
     assert_eq!(
         all.len(),

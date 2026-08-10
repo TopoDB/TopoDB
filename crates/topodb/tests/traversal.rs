@@ -44,6 +44,7 @@ fn fixture() -> Fixture {
                 to: b,
                 props: Default::default(),
                 valid_from: None,
+                recorded_at: None,
             },
             Op::CreateEdge {
                 id: e2,
@@ -53,6 +54,7 @@ fn fixture() -> Fixture {
                 to: c,
                 props: Default::default(),
                 valid_from: None,
+                recorded_at: None,
             },
         ],
         100,
@@ -62,6 +64,7 @@ fn fixture() -> Fixture {
         vec![Op::CloseEdge {
             id: e2,
             valid_to: None,
+            superseded_at: None,
         }],
         200,
     )
@@ -88,6 +91,7 @@ fn two_hop_reaches_shared_entity_now_excludes_closed_edge() {
             edge_types: None,
             direction: Direction::Out,
             as_of: None,
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     let ids: Vec<_> = sub.nodes.iter().map(|n| n.id).collect();
@@ -110,6 +114,7 @@ fn as_of_150_sees_the_since_closed_edge() {
             edge_types: None,
             direction: Direction::Out,
             as_of: Some(150),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert!(
@@ -130,6 +135,7 @@ fn scope_excluded_traversal_stops_at_boundary() {
             edge_types: None,
             direction: Direction::Out,
             as_of: Some(150),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert_eq!(
@@ -149,6 +155,7 @@ fn hop_cap_enforced() {
         edge_types: None,
         direction: Direction::Out,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     };
     assert!(matches!(f.db.traverse(&q), Err(TopoError::Rejected(_))));
 }
@@ -163,6 +170,7 @@ fn max_hops_zero_is_rejected() {
         edge_types: None,
         direction: Direction::Out,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     };
     assert!(matches!(f.db.traverse(&q), Err(TopoError::Rejected(_))));
 }
@@ -182,6 +190,7 @@ fn direction_in_traverses_backwards() {
             edge_types: None,
             direction: Direction::In,
             as_of: Some(150),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     let ids: Vec<_> = sub.nodes.iter().map(|n| n.id).collect();
@@ -206,6 +215,7 @@ fn direction_both_dedups_nodes_and_edges() {
             edge_types: None,
             direction: Direction::Both,
             as_of: Some(150),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert_eq!(sub.nodes.len(), 3, "a, b, c each exactly once");
@@ -238,6 +248,7 @@ fn edge_types_filter_excludes_other_types() {
             edge_types: Some(vec!["ABOUT".into()]),
             direction: Direction::Out,
             as_of: Some(150),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     let ids: Vec<_> = sub.nodes.iter().map(|n| n.id).collect();
@@ -267,6 +278,7 @@ fn temporal_boundaries_inclusive_from_exclusive_to() {
             edge_types: None,
             direction: Direction::Out,
             as_of: Some(100),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert!(
@@ -281,6 +293,7 @@ fn temporal_boundaries_inclusive_from_exclusive_to() {
             edge_types: None,
             direction: Direction::Out,
             as_of: Some(200),
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert!(

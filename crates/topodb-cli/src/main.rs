@@ -9,8 +9,8 @@ use std::str::FromStr;
 use clap::Parser;
 use cli::{Cli, Command};
 use topodb::{
-    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery,
-    VectorQuery,
+    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
+    TraversalQuery, VectorQuery,
 };
 
 fn main() {
@@ -293,6 +293,7 @@ fn main() {
             direction,
             edge_type,
             as_of,
+            time_axis,
         } => traverse(
             &db,
             default_scope,
@@ -301,6 +302,7 @@ fn main() {
             direction.into(),
             edge_type,
             as_of,
+            time_axis.into(),
             cli.pretty,
         ),
         Command::GetEdges {
@@ -310,6 +312,7 @@ fn main() {
             open_only,
             as_of,
             direction,
+            time_axis,
         } => get_edges(
             &db,
             default_scope,
@@ -319,6 +322,7 @@ fn main() {
             open_only,
             as_of,
             direction,
+            time_axis.into(),
             cli.pretty,
         ),
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
@@ -628,6 +632,7 @@ fn traverse(
     direction: Direction,
     edge_type: Vec<String>,
     as_of: Option<i64>,
+    time_axis: TimeAxis,
     pretty: bool,
 ) -> ! {
     let seed = match NodeId::from_str(seed) {
@@ -661,6 +666,7 @@ fn traverse(
         edge_types,
         direction,
         as_of,
+        time_axis,
     };
     let sg = match db.traverse(&query) {
         Ok(sg) => sg,
@@ -708,6 +714,7 @@ fn get_edges(
     open_only: Option<bool>,
     as_of: Option<i64>,
     direction: cli::DirectionArg,
+    time_axis: TimeAxis,
     pretty: bool,
 ) -> ! {
     // Validate as_of timestamp first (so as_of: 0 gets the timestamp error,
@@ -756,8 +763,10 @@ fn get_edges(
         open_only.unwrap_or(true)
     };
 
-    let fetch_from = |t: Option<&str>| db.edges_from(&scopes, from_id, to_id, t, open_only_to_use);
-    let fetch_to = |t: Option<&str>| db.edges_to(&scopes, from_id, to_id, t, open_only_to_use);
+    let fetch_from =
+        |t: Option<&str>| db.edges_from(&scopes, from_id, to_id, t, open_only_to_use, time_axis);
+    let fetch_to =
+        |t: Option<&str>| db.edges_to(&scopes, from_id, to_id, t, open_only_to_use, time_axis);
     let mut edges = match direction {
         cli::DirectionArg::Out => fetch_typed(edge_type, fetch_from),
         cli::DirectionArg::In => fetch_typed(edge_type, fetch_to),
@@ -771,10 +780,15 @@ fn get_edges(
     edges.sort_by_key(|e| e.id);
     edges.dedup_by_key(|e| e.id);
 
-    // If as_of is set, filter edges to only those live at that timestamp
-    // (inclusive lower bound, exclusive upper bound: valid_from <= t < valid_to).
+    // If as_of is set, filter edges to only those live at that timestamp on
+    // the requested axis (inclusive lower bound, exclusive upper bound):
+    // valid axis gates on valid_from/valid_to (world time), recorded axis
+    // gates on recorded_at/superseded_at (belief time).
     if let Some(timestamp) = as_of {
-        edges.retain(|e| topodb_json::edge_live_at(e, timestamp));
+        match time_axis {
+            TimeAxis::Valid => edges.retain(|e| topodb_json::edge_live_at(e, timestamp)),
+            TimeAxis::Recorded => edges.retain(|e| topodb_json::edge_believed_at(e, timestamp)),
+        }
     }
 
     let edges: Vec<serde_json::Value> = match edges
@@ -1076,13 +1090,14 @@ fn link(
         to,
         props,
         valid_from,
+        recorded_at: None,
     };
     if let Err(e) = db.submit(vec![op]) {
         output::fail_engine(&e);
     }
     let write_set = topodb_json::scope_to_scope_set(scope);
     let conflicts: Vec<serde_json::Value> = db
-        .edges_from(&write_set, from, None, Some(&ty), true)
+        .edges_from(&write_set, from, None, Some(&ty), true, TimeAxis::Valid)
         .unwrap_or_default()
         .into_iter()
         .filter(|e| e.id != id)
@@ -1349,7 +1364,11 @@ fn close_edge(db: &Db, id: &str, valid_to: Option<i64>, pretty: bool) -> ! {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid edge id {id:?}: {e}"), 2),
     };
-    let applied = match db.submit(vec![Op::CloseEdge { id, valid_to }]) {
+    let applied = match db.submit(vec![Op::CloseEdge {
+        id,
+        valid_to,
+        superseded_at: None,
+    }]) {
         Ok(a) => a,
         Err(e) => output::fail_engine(&e),
     };

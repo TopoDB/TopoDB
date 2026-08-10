@@ -154,6 +154,8 @@ mod tests {
             props: Default::default(),
             valid_from: 0,
             valid_to: None,
+            recorded_at: 0,
+            superseded_at: None,
         }
     }
 

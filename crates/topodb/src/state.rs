@@ -22,6 +22,17 @@ pub struct EdgeRecord {
     pub props: Props,
     pub valid_from: i64,
     pub valid_to: Option<i64>,
+    /// Belief axis: when the edge's CREATION was recorded — the write
+    /// instant, never the world time. Set once at create and immutable
+    /// thereafter (`apply_op` never rewrites it, including when the edge is
+    /// later closed — that event has its own belief-axis field,
+    /// `superseded_at`, below); distinct from `valid_from` (the world axis),
+    /// which the caller may backdate.
+    pub recorded_at: i64,
+    /// Belief axis for the close: when we LEARNED the edge ended, as opposed
+    /// to `valid_to` (when it actually ended in the world). `None` while the
+    /// edge is open.
+    pub superseded_at: Option<i64>,
 }
 
 #[cfg(test)]
@@ -64,6 +75,7 @@ mod tests {
                         to: b,
                         props: Default::default(),
                         valid_from: None,
+                        recorded_at: None,
                     },
                 ],
                 1_000,
@@ -107,6 +119,7 @@ mod tests {
                         to: b,
                         props: Default::default(),
                         valid_from: None,
+                        recorded_at: None,
                     },
                 ],
                 0,
@@ -139,6 +152,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,
@@ -173,6 +187,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,
@@ -219,6 +234,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,
@@ -253,6 +269,7 @@ mod tests {
                         to: b,
                         props: Default::default(),
                         valid_from: None,
+                        recorded_at: None,
                     },
                 ],
                 0,
@@ -272,6 +289,7 @@ mod tests {
                 vec![Op::CloseEdge {
                     id: EdgeId::new(),
                     valid_to: None,
+                    superseded_at: None,
                 }],
                 0,
             )
@@ -311,6 +329,7 @@ mod tests {
                     to: y,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,
@@ -352,6 +371,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,
@@ -361,6 +381,7 @@ mod tests {
             vec![Op::CloseEdge {
                 id: e,
                 valid_to: None,
+                superseded_at: None,
             }],
             1,
         )
@@ -370,6 +391,7 @@ mod tests {
                 vec![Op::CloseEdge {
                     id: e,
                     valid_to: None,
+                    superseded_at: None,
                 }],
                 2,
             )

@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use topodb::{
-    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TraversalQuery,
+    Db, Direction, EdgeId, NodeId, Op, PropValue, Props, Scope, ScopeId, ScopeSet, TimeAxis,
+    TraversalQuery,
 };
 
 use super::supersede::{link_superseding, link_superseding_with};
@@ -193,6 +194,7 @@ impl RunStore {
                 to: run_node,
                 props: Props::new(),
                 valid_from: Some(now_ms),
+                recorded_at: None,
             });
             for need in &n.needs {
                 ops.push(Op::CreateEdge {
@@ -203,6 +205,7 @@ impl RunStore {
                     to: store.nodes[need],
                     props: Props::new(),
                     valid_from: Some(now_ms),
+                    recorded_at: None,
                 });
             }
         }
@@ -495,6 +498,7 @@ impl RunStore {
             edge_types: Some(vec![EDGE_HAS_STATE.into()]),
             direction: Direction::Out,
             as_of: Some(i64::MAX - 1),
+            time_axis: TimeAxis::Valid,
         })?;
         let open: Vec<_> = sg.edges.iter().filter(|e| e.from == from).collect();
         let edge = open
@@ -522,6 +526,7 @@ impl RunStore {
             edge_types: Some(vec![EDGE_HAS_STATE.into()]),
             direction: Direction::Out,
             as_of: Some(as_of),
+            time_axis: TimeAxis::Valid,
         };
         let sub = self.db.traverse(&q)?;
         for rec in sub.nodes.iter() {
@@ -579,6 +584,7 @@ impl RunStore {
             edge_types: Some(vec![EDGE_PRODUCED.into()]),
             direction: Direction::Out,
             as_of: Some(i64::MAX - 1),
+            time_axis: TimeAxis::Valid,
         };
         let sub = self.db.traverse(&q)?;
         let open: Vec<_> = sub.edges.iter().filter(|e| e.from == node).collect();
@@ -624,6 +630,7 @@ impl RunStore {
                     to: node,
                     props: Props::new(),
                     valid_from: Some(now_ms),
+                    recorded_at: None,
                 },
             ],
             now_ms,
@@ -649,6 +656,7 @@ impl RunStore {
             edge_types: Some(vec![EDGE_ATTEMPT_OF.into()]),
             direction: Direction::In,
             as_of: Some(i64::MAX - 1),
+            time_axis: TimeAxis::Valid,
         };
         let sub = self.db.traverse(&q)?;
         let mut out = Vec::new();
@@ -712,6 +720,7 @@ impl RunStore {
             None,
             Some(EDGE_REVISION_OF),
             true,
+            TimeAxis::Valid,
         )?;
 
         let Some(edge) = open.first() else {

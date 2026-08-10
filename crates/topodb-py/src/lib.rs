@@ -180,7 +180,16 @@ impl TopoDB {
         let from_id = convert::parse_node_id(py, from_)?;
         let to_id = to.map(|s| convert::parse_node_id(py, s)).transpose()?;
         let edges = py
-            .allow_threads(|| db.edges_from(&set, from_id, to_id, r#type, open_only))
+            .allow_threads(|| {
+                db.edges_from(
+                    &set,
+                    from_id,
+                    to_id,
+                    r#type,
+                    open_only,
+                    topodb::TimeAxis::Valid,
+                )
+            })
             .map_err(|e| errors::to_py(py, e))?;
         convert::edges_to_py(py, edges)
     }
@@ -224,6 +233,7 @@ impl TopoDB {
             edge_types: edge_types.map(|ts| ts.into_iter().map(Into::into).collect()),
             direction: convert::parse_direction(py, direction)?,
             as_of,
+            time_axis: topodb::TimeAxis::Valid,
         };
         let sg = py
             .allow_threads(|| db.traverse(&q))

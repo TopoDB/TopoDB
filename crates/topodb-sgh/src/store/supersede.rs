@@ -1,4 +1,4 @@
-use topodb::{Db, Direction, EdgeId, NodeId, Op, Props, Scope, ScopeSet, TraversalQuery};
+use topodb::{Db, Direction, EdgeId, NodeId, Op, Props, Scope, ScopeSet, TimeAxis, TraversalQuery};
 
 use super::SghError;
 
@@ -117,6 +117,7 @@ pub fn link_superseding_with(
             edge_types: Some(vec![ty.into()]),
             direction: Direction::Out,
             as_of: Some(now_ms),
+            time_axis: TimeAxis::Valid,
         })?;
         // No `.filter(|e| e.from == from)` here: `sg.edges` is already exactly
         // the edges traversed outward, 1 hop, from the single seed `from`
@@ -142,6 +143,7 @@ pub fn link_superseding_with(
         ops.extend(open.iter().map(|e| Op::CloseEdge {
             id: e.id,
             valid_to: Some(now_ms),
+            superseded_at: None,
         }));
 
         let new_id = EdgeId::new();
@@ -153,6 +155,7 @@ pub fn link_superseding_with(
             to,
             props: Props::new(),
             valid_from: Some(now_ms),
+            recorded_at: None,
         });
 
         match db.submit_at(ops, now_ms) {

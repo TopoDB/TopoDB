@@ -1,8 +1,8 @@
-# TopoDB on-disk format (v8)
+# TopoDB on-disk format (v9)
 
 This is the durable contract for a TopoDB redb file. Code wins if it differs
-from this document. Ten fixtures under `crates/topodb/tests/fixtures/` pin
-this contract:
+from this document. Thirteen fixtures under `crates/topodb/tests/fixtures/`
+pin this contract:
 
 - `v1.redb`, `v2.redb`, `v2-workload.redb` — FROZEN pre-v3 migration corpora,
   none regenerable by this build and none may be deleted or byte-modified
@@ -39,13 +39,40 @@ this contract:
   `v7_fixture_opens_and_reads` (now a v7->v8 migration test — see
   `format_fixture.rs`'s doc comment on that test) as the v7 migration-input
   file.
-- `v8.redb` — the native v8 fixture, and the ONLY fixture this build can
-  actually regenerate (`format_fixture.rs::regenerate_v8_fixture`),
-  exercised by `v8_fixture_opens_and_reads`.
+- `v8.redb` — the native v8 fixture, FROZEN since the v9 flip (no build on
+  this branch can stamp a fresh file at 8 anymore), exercised by
+  `v8_fixture_migrates_to_v9_and_reads` as the v8 migration-input file. Its
+  recipe carries no edges at all, so it cannot exercise the v9 migration's
+  EDGES copy-rule backfill — see `v8-edges.redb`, below, for the fixture
+  that closes that gap.
+- `v8-edges.redb` — a FROZEN, genuinely pre-v9 file recovered from the
+  `a8a7d6e` tree (the commit immediately before the belief axis existed),
+  containing one open, world-time-backdated edge and one create-then-close
+  edge pair with their stored ops — the one corpus that proves the v9
+  migration's EDGES/OPS copy-rule backfill over real, previously-written
+  bytes rather than a hand-built `redb::Database` (`migrate_v9.rs`'s unit
+  tests) or a native v9 write (`v9.redb`, below). Added post-merge-review
+  (the final whole-branch review's Important #2); never regenerable by this
+  build, same doctrine as `v3-legacy.redb`. Exercised by
+  `v8_edges_fixture_migrates_to_v9_and_reads`.
+- `v9.redb` — the native v9 fixture, and the ONLY fixture this build can
+  actually regenerate (`format_fixture.rs::regenerate_v9_fixture`), carrying
+  one open backdated edge and one create-then-close edge pair so a *future*
+  format bump inherits real edge coverage the way `v8.redb` did not.
+  Exercised by `v9_fixture_opens_and_reads`.
 
 ## Version and migration
 
-`storage::FORMAT_VERSION` is **8**. v8 (F8, SQ8) changes **no table's set or
+`storage::FORMAT_VERSION` is **9**. v9 (bi-temporal edges) changes **no
+table's set or keying** — it rewrites, in place, every EDGES row's VALUE
+(`EdgeRecordDiskV3` → `EdgeRecordDiskV4`, appending two belief-axis fields,
+`recorded_at`/`superseded_at`) and every stored `Op::CreateEdge`/
+`Op::CloseEdge` row in `OPS` (same two fields appended to those variants).
+See "Bi-temporal edges," below, for the full change; the rest of this
+section (v8's SQ8 quantization, v7's HNSW tables, v6/v5's additions) is
+retained for its migration-chain detail.
+
+v8 (F8, SQ8) changes **no table's set or
 keying** — only the `vectors` table's VALUE encoding, from framed postcard
 `Vec<f32>` to framed postcard `(f32, Vec<i8>) = (scale, codes)` — plus the
 `"hnsw_params"` version stamp (2 → 3), since the graph's scoring metric moves
@@ -125,17 +152,28 @@ transaction, committed once at the very end:
 
 | stored version | on open |
 |---|---|
-| absent (brand-new file) | stamp `FORMAT_VERSION` (8) directly — `storage.rs: Storage::open_with_options`, `None` arm; `"hnsw_params"` is stamped separately by `ensure_hnsw_params` |
-| 8 | open directly, no rewrite — `Some(8) => {}` |
-| 7 | `migrate_v8::quantize_vectors` (one VECTORS scan, quantizes each vector to signed 8-bit codes), stamp 8 — `Some(7)` arm |
-| 6 | `migrate_v8::quantize_vectors`, stamp 8 — `Some(6)` arm (no LABEL_INDEX work needed: a v6-stamped file already has it) |
-| 5 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(5)` arm |
-| 4 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, stamp 8 — `Some(4)` arm (jumps straight to current version; must do v6's work itself) |
-| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(3)` arm |
-| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(2)` arm, chained in one call |
-| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, stamp 8 — `Some(1)` arm, chained in one call |
-| > 8 | `TopoError::UnsupportedFormat { found, supported: 8 }` — `Some(found) if found > FORMAT_VERSION` |
+| absent (brand-new file) | stamp `FORMAT_VERSION` (9) directly — `storage.rs: Storage::open_with_options`, `None` arm; `"hnsw_params"` is stamped separately by `ensure_hnsw_params` |
+| 9 | open directly, no rewrite — `Some(9) => {}` |
+| 8 | `migrate_v9::bitemporalize` (EDGES + OPS copy-rule backfill), stamp 9 — `Some(8)` arm |
+| 7 | `migrate_v8::quantize_vectors` (one VECTORS scan, quantizes each vector to signed 8-bit codes), then `migrate_v9::bitemporalize`, stamp 9 — `Some(7)` arm |
+| 6 | `migrate_v8::quantize_vectors`, then `migrate_v9::bitemporalize`, stamp 9 — `Some(6)` arm (no LABEL_INDEX work needed: a v6-stamped file already has it) |
+| 5 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, then `migrate_v9::bitemporalize`, stamp 9 — `Some(5)` arm |
+| 4 | `migrate_v6::migrate_v5_to_v6`, then `migrate_v8::quantize_vectors`, then `migrate_v9::bitemporalize`, stamp 9 — `Some(4)` arm (jumps straight to current version; must do v6's work itself) |
+| 3 | `migrate_v4::migrate_v3_to_v4` (postings pass runs: `postings_already_chunked = false`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, then `migrate_v9::bitemporalize`, stamp 9 — `Some(3)` arm |
+| 2 | `migrate_v3::migrate_v2_to_v3` (now also dual-writes `vectors`/`embedding_ref` as it walks each migrated node), immediately followed in the SAME open by `migrate_v4::migrate_v3_to_v4` (postings pass skipped: `postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, then `migrate_v9::bitemporalize`, stamp 9 — `Some(2)` arm, chained in one call |
+| 1 | `migrate::migrate_v1_to_v2` (stamps 2), then `migrate_v3::migrate_v2_to_v3`, then `migrate_v4::migrate_v3_to_v4` (`postings_already_chunked = true`), then `delete_table(EMBEDDINGS)`, `migrate_v6::migrate_v5_to_v6`, then `migrate_v9::bitemporalize`, stamp 9 — `Some(1)` arm, chained in one call |
+| > 9 | `TopoError::UnsupportedFormat { found, supported: 9 }` — `Some(found) if found > FORMAT_VERSION` |
 | anything else (currently only 0, which can't occur since real versions start at 1) | `TopoError::Encoding` — `Some(found)` catch-all arm |
+
+Every arm now ends its data-pass sequence by calling `migrate_v9::
+bitemporalize` unconditionally before stamping — mirroring exactly how the
+v7→v8 bump added `migrate_v8::quantize_vectors` to every arm from `Some(4)`
+through `Some(7)`. This is safe regardless of how many other migrations ran
+first in the same open: `bitemporalize` only ever sees the CURRENT-shaped
+EDGES/OPS rows the chain above it produces (`EdgeRecordDiskV3`-shaped EDGES
+rows and pre-v9 `Op::CreateEdge`/`Op::CloseEdge`-shaped OPS rows — see
+"Bi-temporal edges," below, for why every arm's *inputs* are guaranteed to
+be that shape and never a mix).
 
 Of the arms that don't already reach it through their chained
 `migrate_v4` sequence (the `Some(3)`/`Some(2)`/`Some(1)` rows above), the
@@ -157,6 +195,19 @@ of those arms already produces a file with f32 `vectors` rows that need
 quantizing. `Some(3)` and `Some(2)` stayed call-free: their `migrate_v4`
 chain re-writes embeddings through the v8 `put_vector`, which quantizes as
 it writes, so there is nothing left for those arms to backfill.
+
+The v8->v9 bump breaks that pattern: unlike quantization, which only some
+arms needed (the ones that hadn't already rewritten `vectors` through a
+quantizing write path), EVERY arm from `Some(1)` through `Some(8)` adds a
+`migrate_v9::bitemporalize` call, because nothing upstream of it in ANY
+chain ever rewrites EDGES or OPS — `migrate_v3_to_v4`'s two passes touch
+`EMBEDDINGS`/`vectors`/`POSTINGS` only, `migrate_v5_to_v6` touches only
+`NODES`/`LABEL_INDEX`, and `migrate_v8::quantize_vectors` touches only
+`vectors`. So every arm's EDGES/OPS rows are guaranteed to still be
+whatever pre-v9 shape they started the open at (`EdgeRecordDiskV3`, and
+pre-v9 `Op::CreateEdge`/`Op::CloseEdge`) by the time `bitemporalize` finally
+runs — there is no arm where a mid-chain step could have handed it a
+mixed or already-migrated shape.
 
 Because table creation, migration, and the version stamp all happen inside the
 single write transaction `open_with_options` opens at its top and commits once
@@ -303,6 +354,13 @@ Migration rewrites are scoped precisely:
   already committed) — see "Version and migration," above. Smaller even than
   v5→v6: not even one table scan.
 
+- **v7 → v8** and **v8 → v9** are each a genuine data-rewrite pass, not a
+  stamp-only hop — documented in their own sections below rather than as
+  bullets here, the same way v4→v5/v5→v6/v6→v7's stamp-only-or-single-scan
+  hops are the ones documented inline above: see "SQ8 quantization" for
+  v7→v8 (`migrate_v8::quantize_vectors`) and "Bi-temporal edges" for v8→v9
+  (`migrate_v9::bitemporalize`).
+
 Redb free space means the on-disk file size need not shrink even where
 logical row bytes do — e.g. a v1 file's per-node embedded embeddings become
 smaller externalized rows after migration, but the file itself may stay the
@@ -324,7 +382,7 @@ pre-v4 file and is gone by the time the opening write transaction commits.
 | `ops` | u64 sequence (native redb `u64` key type — LE bytes, but ordered numerically by redb's own `Key::compare`, not lexicographically) | raw postcard `Op` (never interned or framed) | `storage.rs: OPS` |
 | `meta` | UTF-8 string | key-specific bytes (see below) | `storage.rs: META` |
 | `nodes` | 8-byte BE node slot | framed postcard `disk::NodeRecordDiskV3` | `storage.rs: NODES` |
-| `edges` | 8-byte BE edge slot | framed postcard `disk::EdgeRecordDiskV3` | `storage.rs: EDGES` |
+| `edges` | 8-byte BE edge slot | framed postcard `disk::EdgeRecordDiskV4` | `storage.rs: EDGES` |
 | `counters` | 8-byte BE node slot | plain postcard `counters::AccessStats` (not framed) | `storage.rs: COUNTERS` |
 | `postings` | `[scope_id:4 BE][term UTF-8][chunk:4 BE]` (chunked, v4) | framed `[block_format:u8][count varint]` then `count` `(slot_delta, tf)` varint pairs | `storage.rs: POSTINGS`, `fts.rs` |
 | `fts_docs` | 8-byte BE node slot | plain postcard `u32` token length (not framed) | `storage.rs: FTS_DOCS`, `fts.rs` |
@@ -621,6 +679,116 @@ dependence anywhere in the module.
 - **Migration memory** (`migrate_v8::quantize_vectors`): redb tables cannot be mutated mid-iteration, so the v7→v8 pass collects every `(key, re-encoded value)` pair from one full `VECTORS` scan before writing any of them back — a transient buffer of ~450 MB at the 1M-row × 384-dim tier. Acceptable for a one-time migration pass on the machines this ships to; `hnsw::build_cluster`'s graph rebuild that the same open may trigger is streamed instead (see "Version and migration," above), so it does not compound this cost.
 - **History dependence** (same as v7 HNSW): exact graph sequence and idempotence (`rebuild_state_from_ops` reproduces byte-identical files) hold because graph construction lives inside `apply_op`'s opcode-replay path, with no RNG, wall-clock, or scheduled non-determinism — even when quantized vectors replace exact f32, the replay sequence is the same.
 
+**Bi-temporal edges** (v9, `disk.rs`/`migrate_v9.rs`/`state.rs`): every edge
+now carries a second time axis — *belief* time (when the engine learned a
+fact), alongside the existing *world* (valid) time a caller may backdate.
+`EdgeRecordDiskV3` gains two fields, appended LAST (postcard is positional —
+see "Records," above, for the same discipline applied to the v3→v4 cutover),
+becoming `EdgeRecordDiskV4`:
+
+```rust
+pub(crate) struct EdgeRecordDiskV4 {
+    pub id: EdgeId,
+    pub scope: u32,
+    pub ty: u32,
+    pub from: u64,
+    pub to: u64,
+    pub props: BTreeMap<u32, PropValue>,
+    pub valid_from: i64,          // world axis (unchanged from V3)
+    pub valid_to: Option<i64>,    // world axis (unchanged from V3)
+    pub recorded_at: i64,         // NEW — belief axis: when the create was learned
+    pub superseded_at: Option<i64>, // NEW — belief axis: when the close was learned
+}
+```
+
+The `edges` table's row (see "Tables," above — that row now reads
+`EdgeRecordDiskV4`, not `EdgeRecordDiskV3`) is the only table whose value
+shape changes; no table's key or set changes. `Op::CreateEdge` and
+`Op::CloseEdge` (`op.rs`) gain the identical two fields (`recorded_at` on
+`CreateEdge`, `superseded_at` on `CloseEdge`), since `OPS` rows are raw
+postcard `Op` values with no version gate — see "The `ops` table," above —
+so a pre-v9 op shape left un-rewritten would fail to decode the moment
+replay or the change feed reached it (this is exactly why the OPS rewrite
+below is real data motion, not a cosmetic stamp).
+
+- **Write-path semantics**: `resolve_op` stamps `recorded_at`/
+  `superseded_at` unconditionally from the wall clock (`Some(now_ms)`, no
+  `unwrap_or`) on every live write surface — batch DSL, sgh, CLI, MCP, both
+  language bindings — so belief time is never caller-settable through any
+  op payload; `valid_from`/`valid_to` keep their existing `unwrap_or(now_ms)`
+  backdating behavior. The one exception is `submit_at`/bindings' `now_ms`
+  parameter, an explicitly test/backdating-oriented in-process host API
+  (`db.rs`), not exposed by MCP.
+- **Migration** (`migrate_v9::bitemporalize`, called from every version-
+  dispatch arm — see "Version and migration," above): drains and rewrites
+  both `EDGES` and `OPS` in place, inside the SAME single write transaction
+  every other arm's data passes already run in (see "Version and
+  migration"'s single-commit crash-safety argument, above — a crash or kill
+  before that one `tx.commit()` leaves the file at exactly its prior
+  on-disk version, `EDGES` and `OPS` rewritten together or not at all; there
+  is no observable state with one table migrated and not the other).
+  - *EDGES pass*: one full `EDGES` scan, decoding each row as
+    `EdgeRecordDiskV3` and re-encoding as `EdgeRecordDiskV4` with the copy
+    rule below, same collect-then-write-back shape `migrate_v8::
+    quantize_vectors` uses (redb tables cannot be mutated mid-iteration).
+  - *OPS pass*: one full `OPS` scan, decoding each row against a frozen
+    `OpDiskV8` twin (the pre-Task-1 `Op` shape, byte-compatible with every
+    pre-v9 log forever — same "frozen decode twin" discipline `disk.rs`
+    documents for `EdgeRecordDiskV3`). `CreateNode`/`SetNodeProps`/
+    `SetEmbedding`/`RemoveNode` pass through unchanged, just re-encoded
+    under the current `Op`; `CreateEdge`/`CloseEdge` gain their belief-axis
+    field via the same copy rule.
+  - **The copy rule**: `recorded_at := valid_from`, `superseded_at :=
+    valid_to`. Exact for every edge that was never explicitly backdated —
+    the common case, where the write instant and the world-time instant are
+    the same moment. **Approximate for an edge that WAS backdated**: a
+    pre-v9 `CreateEdge`/`CloseEdge` op (and the `EDGES` row it produced) has
+    no field that can carry a write instant distinct from `valid_from`/
+    `valid_to`, so if a caller ever backdated an edge before v9 existed
+    (`valid_from` set to something earlier than the real write instant), the
+    TRUE write instant is unrecoverable by the time migration runs — the
+    copy rule can only ever reproduce `recorded_at := valid_from`, which
+    silently understates how late the fact was actually learned. This is a
+    one-time, one-directional information loss inherent to the pre-v9 format
+    itself, not a migration bug: nothing pre-v9 ever recorded the true value,
+    so there is nothing more precise to copy forward. Pinned by
+    `crates/topodb/tests/fixtures/v8-edges.redb`
+    (`v8_edges_fixture_migrates_to_v9_and_reads` in `format_fixture.rs`), a
+    genuinely pre-v9 file whose one open edge was backdated at generation
+    time (`valid_from` 1_000, written at instant 5_000 via `submit_at` on
+    a pre-belief-axis build) — after migration its `recorded_at` is 1_000,
+    demonstrably NOT its true historical write instant, exactly as this
+    approximation predicts. The same fixture's second edge (created then
+    closed with no backdating) demonstrates the copy rule's EXACT case for
+    comparison.
+  - **Migration memory** (same tradeoff `migrate_v8::quantize_vectors`
+    documents just above, but doubled): `bitemporalize` makes TWO
+    collect-then-write-back passes — one over `EDGES`, one over `OPS` — each
+    holding its whole table's decoded `Vec<(key, value)>` in RAM before
+    writing anything back, because redb tables cannot be mutated
+    mid-iteration. `OPS` is typically the largest table in a real database
+    (every historical write, not just current state), so this is the
+    costlier of the two passes. Rough estimate at a 1M-edge / 10M-op file:
+    `EDGES` ~150–200 MB transient, `OPS` ~1 GB+ transient, plus redb's own
+    single-transaction dirty-page set on top. Not a defect — same shape as
+    the shipped v8 precedent above, and chunking the passes would forfeit
+    the single-transaction crash-safety this section leads with (a future
+    change may make the transient buffer smaller per pass, but must not
+    split either pass across more than one commit) — documented here so the
+    number is known rather than a surprise at the 1M-row tier.
+- **Read-path semantics** (`state.rs: EdgeRecord`, `db.rs`): `recorded_at`
+  is when the edge's CREATION was learned (immutable once set — `apply_op`
+  never rewrites it, even when the edge is later closed); `superseded_at` is
+  when the edge's CLOSE was learned, `None` while open. `TimeAxis::Recorded`
+  (`read.rs`) reads the graph as of what was BELIEVED at a given instant,
+  using `recorded_at`/`superseded_at` in place of `valid_from`/`valid_to`
+  wherever `TimeAxis::Valid` (the default, and the only axis that existed
+  before v9) would use the world-time pair — including inside `open_only`,
+  which is axis-aware: under `Recorded`, "open" means `superseded_at.
+  is_none()`, not `valid_to.is_none()`. Both axes use the same `[lower,
+  upper)` interval convention (a row is visible at `as_of = t` when its
+  lower bound `<= t` and its upper bound is `None` or `> t`).
+
 **Postings** (`fts.rs`, chunked layout — v4): a term's postings under one
 scope are split across one or more chunk keys rather than one unbounded row,
 so a single hot term's postings never grow into one value that must be fully
@@ -715,21 +883,36 @@ them.
 ## Records
 
 `disk::NodeRecordDiskV3 { id: NodeId, scope: u32, label: u32, props:
-BTreeMap<u32, PropValue> }` and `disk::EdgeRecordDiskV3 { id: EdgeId, scope:
-u32, ty: u32, from: u64, to: u64, props: BTreeMap<u32, PropValue>, valid_from:
-i64, valid_to: Option<i64> }` are the live record-table shapes (`disk.rs`,
-unchanged by the v4 cutover — still named with a `V3` suffix, since the row
-shape itself didn't change, only where a node's embedding lives): `scope` is
-the interned `ScopeRegistry` id, edge `from`/`to` are node **slots** (not
-ULIDs), and label/edge-type/prop-key strings are `Dicts`-interned `u32`s.
-Each row still carries its own ULID `id` — even though the table is
-slot-keyed — so no extra table hop is needed to answer "what ULID is this
-row." `disk::node_to_disk_v3`/`node_from_disk_v3` and
-`edge_to_disk_v3`/`edge_from_disk_v3` convert to/from the public,
-string-carrying `state::NodeRecord`/`EdgeRecord`, which are unchanged by the
-v4 cutover. `disk::NodeRecordDisk`/`EdgeRecordDisk` (no `V3` suffix) are a
-SEPARATE, frozen v2 ULID-keyed encode shape kept only because `migrate.rs`'s
-v1→v2 step calls them; nothing in the live path reads or writes them.
+BTreeMap<u32, PropValue> }` is the live node-table shape (`disk.rs`,
+unchanged since v3 — still named with a `V3` suffix, since the row shape
+itself has never changed, only where a node's embedding lives): `scope` is
+the interned `ScopeRegistry` id, and label/prop-key strings are
+`Dicts`-interned `u32`s. Each row still carries its own ULID `id` — even
+though the table is slot-keyed — so no extra table hop is needed to answer
+"what ULID is this row." `disk::node_to_disk_v3`/`node_from_disk_v3` convert
+to/from the public, string-carrying `state::NodeRecord`.
+
+`disk::EdgeRecordDiskV4 { id: EdgeId, scope: u32, ty: u32, from: u64, to:
+u64, props: BTreeMap<u32, PropValue>, valid_from: i64, valid_to:
+Option<i64>, recorded_at: i64, superseded_at: Option<i64> }` is the LIVE
+edge-table shape as of v9 (see "Bi-temporal edges," above, for the full
+belief-axis change) — `edge_to_disk_v4`/`edge_from_disk_v4` convert to/from
+`state::EdgeRecord`, and are what `storage.rs`'s live EDGES read/write paths
+(`put_edge`/`read_edge_by_slot`/`all_edges`) use exclusively.
+`disk::EdgeRecordDiskV3` (the v3-through-v8 edge shape, without the belief
+axis) is no longer live — it is retained only as the frozen decode target
+`migrate_v3.rs`'s v2→v3 re-keying still produces and `migrate_v9.rs`'s
+v8→v9 migration decodes from; nothing on the live read/write path
+constructs or consumes it anymore, and `edge_from_disk_v3` (the v3→
+`EdgeRecord` decode function, as opposed to the still-live `edge_to_disk_v3`
+encoder `migrate_v3.rs` calls) has been deleted outright rather than kept
+as unreferenced dead code, since `migrate_v9.rs` decodes `EdgeRecordDiskV3`
+directly into `EdgeRecordDiskV4` without ever constructing an `EdgeRecord`
+partway through.
+
+`disk::NodeRecordDisk`/`EdgeRecordDisk` (no `V3` suffix) are a SEPARATE,
+frozen v2 ULID-keyed encode shape kept only because `migrate.rs`'s v1→v2
+step calls them; nothing in the live path reads or writes them.
 
 Node disk rows carry no embedding, same as v3: `storage.rs: read_node`/
 `read_node_by_slot` join the node's current embedding back onto the record

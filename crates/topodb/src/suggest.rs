@@ -6,7 +6,7 @@ use crate::db::Db;
 use crate::error::TopoError;
 use crate::ids::{NodeId, ScopeSet};
 use crate::ppr::{ppr_over_subgraph, SUGGEST_HOPS, WEIGHT_SEMANTIC, WEIGHT_STRUCTURAL};
-use crate::read::{Direction, TraversalQuery};
+use crate::read::{Direction, TimeAxis, TraversalQuery};
 use crate::recall::{leg_depth, rrf_fuse};
 use crate::state::NodeRecord;
 use crate::vector::VectorQuery;
@@ -86,6 +86,7 @@ impl Db {
             edge_types: None,
             direction: Direction::Both,
             as_of: q.as_of,
+            time_axis: TimeAxis::Valid,
         })?;
         let excluded: HashSet<NodeId> = one_hop.nodes.iter().map(|n| n.id).collect();
 
@@ -97,6 +98,7 @@ impl Db {
             edge_types: None,
             direction: Direction::Both,
             as_of: q.as_of,
+            time_axis: TimeAxis::Valid,
         })?;
         let scored = ppr_over_subgraph(&sg, &[(q.node, 1.0)]);
         let mut records: HashMap<NodeId, NodeRecord> =
@@ -172,6 +174,7 @@ impl Db {
                 edge_types: None,
                 direction: Direction::Both,
                 as_of: q.as_of,
+                time_axis: TimeAxis::Valid,
             })?;
             let mut common: Vec<NodeId> = cand_hop
                 .nodes

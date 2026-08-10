@@ -38,7 +38,8 @@ fn rejected_batches_and_reads_produce_no_events() {
     assert!(db
         .submit(vec![Op::CloseEdge {
             id: EdgeId::new(),
-            valid_to: None
+            valid_to: None,
+            superseded_at: None
         }])
         .is_err());
     // A read:
@@ -255,7 +256,7 @@ fn unsupported_format_version_errors_at_open() {
     match Db::open(path) {
         Err(TopoError::UnsupportedFormat {
             found: 999,
-            supported: 8,
+            supported: 9,
         }) => {}
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }

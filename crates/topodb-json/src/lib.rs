@@ -471,8 +471,11 @@ pub fn node_to_json(n: &NodeRecord) -> Result<Value, String> {
 
 /// An `EdgeRecord` → JSON: `id`/`from`/`to` as ULID strings, `type` for `ty`
 /// (JSON-friendlier than the Rust keyword-adjacent field name), `scope` per
-/// [`scope_to_json`], `props` per [`props_to_json`], and the temporal bounds
-/// `valid_from`/`valid_to` (`valid_to` is `null` while the edge is open).
+/// [`scope_to_json`], `props` per [`props_to_json`], the world-time bounds
+/// `valid_from`/`valid_to` (`valid_to` is `null` while the edge is open), and
+/// the belief-axis bounds `recorded_at`/`superseded_at` (`superseded_at` is
+/// `null` while the edge is open on that axis) — see [`edge_live_at`] and
+/// [`edge_believed_at`].
 pub fn edge_to_json(e: &EdgeRecord) -> Result<Value, String> {
     let mut map = Map::new();
     map.insert("id".into(), Value::String(e.id.to_string()));
@@ -485,6 +488,14 @@ pub fn edge_to_json(e: &EdgeRecord) -> Result<Value, String> {
     map.insert(
         "valid_to".into(),
         match e.valid_to {
+            Some(t) => Value::Number(t.into()),
+            None => Value::Null,
+        },
+    );
+    map.insert("recorded_at".into(), Value::Number(e.recorded_at.into()));
+    map.insert(
+        "superseded_at".into(),
+        match e.superseded_at {
             Some(t) => Value::Number(t.into()),
             None => Value::Null,
         },
@@ -502,6 +513,17 @@ pub fn edge_to_json(e: &EdgeRecord) -> Result<Value, String> {
 /// liveness semantics across all frontends.
 pub fn edge_live_at(e: &EdgeRecord, t: i64) -> bool {
     e.valid_from <= t && e.valid_to.is_none_or(|vt| vt > t)
+}
+
+/// Determine whether an edge was "believed" (recorded/present, belief axis)
+/// at a given Unix-ms timestamp. Mirrors [`edge_live_at`]'s shape exactly,
+/// but over the belief-axis fields: inclusive lower bound (`recorded_at <=
+/// t`), exclusive upper bound (`superseded_at > t`). An edge recorded after
+/// `t` is invisible here regardless of its world-time validity — that's the
+/// whole point of the recorded axis. Edges never superseded (`None`) are
+/// treated as still-believed indefinitely.
+pub fn edge_believed_at(e: &EdgeRecord, t: i64) -> bool {
+    e.recorded_at <= t && e.superseded_at.is_none_or(|st| st > t)
 }
 
 /// A `Subgraph` → `{"nodes": [...], "edges": [...]}`, each element per
@@ -795,6 +817,8 @@ mod tests {
             props: Props::new(),
             valid_from: 1_000,
             valid_to: None,
+            recorded_at: 1_000,
+            superseded_at: None,
         }
     }
 
@@ -832,14 +856,85 @@ mod tests {
         assert_eq!(j["type"], Value::String("ABOUT".into()));
         assert_eq!(j["valid_from"], serde_json::json!(1_000));
         assert_eq!(j["valid_to"], Value::Null);
+        assert_eq!(j["recorded_at"], serde_json::json!(1_000));
+        assert_eq!(j["superseded_at"], Value::Null);
+    }
+
+    #[test]
+    fn edge_live_at_gates_on_valid_axis_inclusive_lower_exclusive_upper() {
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let mut e = sample_edge(Scope::Shared, a, b);
+        e.valid_from = 1_000;
+        e.valid_to = Some(2_000);
+        assert!(!edge_live_at(&e, 999), "before valid_from: not live");
+        assert!(edge_live_at(&e, 1_000), "at valid_from: live (inclusive)");
+        assert!(edge_live_at(&e, 1_999), "just before valid_to: live");
+        assert!(
+            !edge_live_at(&e, 2_000),
+            "at valid_to: not live (exclusive)"
+        );
+        e.valid_to = None;
+        assert!(edge_live_at(&e, i64::MAX), "open valid_to: eternally live");
+    }
+
+    #[test]
+    fn edge_believed_at_gates_on_recorded_axis_inclusive_lower_exclusive_upper() {
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let mut e = sample_edge(Scope::Shared, a, b);
+        e.recorded_at = 1_000;
+        e.superseded_at = Some(2_000);
+        assert!(
+            !edge_believed_at(&e, 999),
+            "before recorded_at: not believed"
+        );
+        assert!(
+            edge_believed_at(&e, 1_000),
+            "at recorded_at: believed (inclusive)"
+        );
+        assert!(
+            edge_believed_at(&e, 1_999),
+            "just before superseded_at: believed"
+        );
+        assert!(
+            !edge_believed_at(&e, 2_000),
+            "at superseded_at: not believed (exclusive)"
+        );
+        e.superseded_at = None;
+        assert!(
+            edge_believed_at(&e, i64::MAX),
+            "never superseded: believed indefinitely"
+        );
+    }
+
+    /// A late-recorded fact: valid_from backdated well before recorded_at.
+    /// The two axes must diverge — this is the whole point of the recorded
+    /// axis (mirrors the engine-level scenario in edges_bitemporal.rs).
+    #[test]
+    fn edge_live_at_and_edge_believed_at_diverge_for_a_late_recorded_fact() {
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let mut e = sample_edge(Scope::Shared, a, b);
+        e.valid_from = 1_000; // world: true starting at 1_000
+        e.recorded_at = 5_000; // belief: not written until 5_000
+        e.superseded_at = None;
+        let t = 3_000; // between valid_from and recorded_at
+        assert!(edge_live_at(&e, t), "valid axis: world truth already held");
+        assert!(
+            !edge_believed_at(&e, t),
+            "recorded axis: not yet written at t"
+        );
     }
 
     #[test]
     fn edge_to_json_closed_edge_has_numeric_valid_to() {
         let mut e = sample_edge(Scope::Shared, NodeId::new(), NodeId::new());
         e.valid_to = Some(2_000);
+        e.superseded_at = Some(2_500);
         let j = edge_to_json(&e).unwrap();
         assert_eq!(j["valid_to"], serde_json::json!(2_000));
+        assert_eq!(j["superseded_at"], serde_json::json!(2_500));
     }
 
     #[test]

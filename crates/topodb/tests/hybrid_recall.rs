@@ -178,6 +178,7 @@ fn build_fixture() -> Fixture {
             to,
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         });
     }
     db.submit(edge_ops).unwrap();
@@ -206,6 +207,7 @@ fn traverse_then_vector_and_text_recall_fuse_with_best_match_first() {
             edge_types: None,
             direction: Direction::Out,
             as_of: None,
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     let candidate_ids: Vec<NodeId> = sub.nodes.iter().map(|n| n.id).collect();

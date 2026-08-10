@@ -28,6 +28,7 @@ fn edge(ty: &str, scope: Scope, from: NodeId, to: NodeId) -> (EdgeId, Op) {
             to,
             props: Props::new(),
             valid_from: None,
+            recorded_at: None,
         },
     )
 }
@@ -51,13 +52,15 @@ fn edges_from_filters_by_target_type_and_openness() {
     db.submit(vec![op1, op2, op3]).unwrap();
 
     // No filters: all three, oldest first (by edge id).
-    let all = db.edges_from(&scopes, a, None, None, false).unwrap();
+    let all = db
+        .edges_from(&scopes, a, None, None, false, TimeAxis::Valid)
+        .unwrap();
     assert_eq!(all.len(), 3);
     assert!(all.windows(2).all(|w| w[0].id <= w[1].id));
 
     // Type filter.
     let works: Vec<EdgeId> = db
-        .edges_from(&scopes, a, None, Some("works_at"), false)
+        .edges_from(&scopes, a, None, Some("works_at"), false, TimeAxis::Valid)
         .unwrap()
         .iter()
         .map(|e| e.id)
@@ -67,7 +70,7 @@ fn edges_from_filters_by_target_type_and_openness() {
 
     // Target filter.
     let to_b: Vec<EdgeId> = db
-        .edges_from(&scopes, a, Some(b), None, false)
+        .edges_from(&scopes, a, Some(b), None, false, TimeAxis::Valid)
         .unwrap()
         .iter()
         .map(|e| e.id)
@@ -77,7 +80,14 @@ fn edges_from_filters_by_target_type_and_openness() {
 
     // Both filters.
     let narrow = db
-        .edges_from(&scopes, a, Some(b), Some("works_at"), false)
+        .edges_from(
+            &scopes,
+            a,
+            Some(b),
+            Some("works_at"),
+            false,
+            TimeAxis::Valid,
+        )
         .unwrap();
     assert_eq!(narrow.len(), 1);
     assert_eq!(narrow[0].id, e_ab_works);
@@ -86,15 +96,16 @@ fn edges_from_filters_by_target_type_and_openness() {
     db.submit(vec![Op::CloseEdge {
         id: e_ab_works,
         valid_to: None,
+        superseded_at: None,
     }])
     .unwrap();
     let open_works = db
-        .edges_from(&scopes, a, None, Some("works_at"), true)
+        .edges_from(&scopes, a, None, Some("works_at"), true, TimeAxis::Valid)
         .unwrap();
     assert_eq!(open_works.len(), 1);
     assert_eq!(open_works[0].id, e_ac_works);
     assert_eq!(
-        db.edges_from(&scopes, a, None, Some("works_at"), false)
+        db.edges_from(&scopes, a, None, Some("works_at"), false, TimeAxis::Valid)
             .unwrap()
             .len(),
         2,
@@ -103,13 +114,20 @@ fn edges_from_filters_by_target_type_and_openness() {
 
     // An unknown type matches nothing (not everything).
     assert!(db
-        .edges_from(&scopes, a, None, Some("never_written"), false)
+        .edges_from(
+            &scopes,
+            a,
+            None,
+            Some("never_written"),
+            false,
+            TimeAxis::Valid
+        )
         .unwrap()
         .is_empty());
 
     // A never-created `from` node yields empty, not an error.
     assert!(db
-        .edges_from(&scopes, NodeId::new(), None, None, false)
+        .edges_from(&scopes, NodeId::new(), None, None, false, TimeAxis::Valid)
         .unwrap()
         .is_empty());
 }
@@ -129,7 +147,7 @@ fn edges_from_gates_on_edge_scope() {
 
     // In scope: visible.
     let hits = db
-        .edges_from(&ScopeSet::of(&[s]), a, None, None, true)
+        .edges_from(&ScopeSet::of(&[s]), a, None, None, true, TimeAxis::Valid)
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, e);
@@ -137,7 +155,14 @@ fn edges_from_gates_on_edge_scope() {
     // A reader whose scope set doesn't include the edge's scope sees nothing
     // — there is no unscoped read.
     assert!(db
-        .edges_from(&ScopeSet::of(&[ScopeId::new()]), a, None, None, true)
+        .edges_from(
+            &ScopeSet::of(&[ScopeId::new()]),
+            a,
+            None,
+            None,
+            true,
+            TimeAxis::Valid
+        )
         .unwrap()
         .is_empty());
 }
