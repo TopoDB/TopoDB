@@ -196,3 +196,150 @@ fn inverted_range_is_rejected_not_silently_empty() {
     );
     expect_tool_error(&resp);
 }
+
+#[test]
+fn rewrite_strips_the_phrase_and_applies_the_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = server_with_memory(
+        &dir,
+        "rewrite.redb",
+        "the redb storage layer uses copy-on-write",
+    );
+
+    // "since <far past>" keeps a memory minted now; the echo names the
+    // rewrite and the exact phrase it consumed.
+    let r = server.call_tool_ok(
+        "search_memories",
+        json!({ "query": "redb since 2000-01-01", "k": 5, "fuzzy": false }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        hit_count(&r),
+        1,
+        "the in-range memory survives the rewritten search: {r:#?}"
+    );
+    let f = r
+        .get("applied_time_filter")
+        .unwrap_or_else(|| panic!("an applied rewrite must be surfaced: {r:#?}"));
+    assert_eq!(f["source"], "rewrite", "filter: {f:#?}");
+    assert_eq!(f["matched_phrase"], "since 2000-01-01", "filter: {f:#?}");
+    assert_eq!(f["after"], json!(PAST_MS), "filter: {f:#?}");
+    assert!(
+        f.get("before").is_none(),
+        "'since' sets only a lower bound: {f:#?}"
+    );
+
+    // "before <far past>" drops it: the parsed range really filters, it is
+    // not merely echoed.
+    let r = server.call_tool_ok(
+        "search_memories",
+        json!({ "query": "redb before 2000-01-01", "k": 5, "fuzzy": false }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(hit_count(&r), 0, "nothing here predates 2000: {r:#?}");
+    let f = r
+        .get("applied_time_filter")
+        .unwrap_or_else(|| panic!("the rewrite is surfaced on the 0-hit path too: {r:#?}"));
+    assert_eq!(f["source"], "rewrite", "filter: {f:#?}");
+    assert_eq!(f["matched_phrase"], "before 2000-01-01", "filter: {f:#?}");
+    assert_eq!(f["before"], json!(PAST_MS), "filter: {f:#?}");
+    assert!(
+        f.get("after").is_none(),
+        "'before' sets only an upper bound: {f:#?}"
+    );
+}
+
+#[test]
+fn rewrite_searches_the_residual_not_the_full_string() {
+    let dir = tempfile::tempdir().unwrap();
+    // The seeded CONTENT contains the date words. A server that searched the
+    // full query string would match it on "since"/"2000"/"01"; only a
+    // genuinely stripped residual returns nothing. fuzzy: false keeps the
+    // nonsense residual from borrowing prefix/typo neighbors.
+    let mut server = server_with_memory(
+        &dir,
+        "residual.redb",
+        "migration window since 2000-01-01 approved",
+    );
+
+    let r = server.call_tool_ok(
+        "search_memories",
+        json!({ "query": "xyzzyqux since 2000-01-01", "k": 5, "fuzzy": false }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(
+        hit_count(&r),
+        0,
+        "residual 'xyzzyqux' matches nothing — a hit here means the temporal phrase was searched instead of stripped: {r:#?}"
+    );
+    let f = r
+        .get("applied_time_filter")
+        .unwrap_or_else(|| panic!("the rewrite still ran and must be echoed: {r:#?}"));
+    assert_eq!(f["source"], "rewrite", "filter: {f:#?}");
+
+    // Opt-out: with temporal_rewrite false the SAME query is taken literally —
+    // the date words are search terms again (they match the seeded content)
+    // and no filter is applied or echoed.
+    let r = server.call_tool_ok(
+        "search_memories",
+        json!({
+            "query": "xyzzyqux since 2000-01-01",
+            "k": 5,
+            "fuzzy": false,
+            "temporal_rewrite": false
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(
+        hit_count(&r) >= 1,
+        "rewrite off: the date words are plain terms and match the content: {r:#?}"
+    );
+    assert!(
+        r.get("applied_time_filter").is_none(),
+        "rewrite off: no filter applied, key omitted: {r:#?}"
+    );
+}
+
+#[test]
+fn explicit_params_take_precedence_and_disable_the_rewriter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = server_with_memory(
+        &dir,
+        "precedence.redb",
+        "the redb storage layer uses copy-on-write",
+    );
+
+    // The query carries a parseable phrase, but an explicit bound is present:
+    // the rewriter must NOT run. Proof: no after bound appears (the phrase
+    // would have contributed one) and matched_phrase is absent.
+    let r = server.call_tool_ok(
+        "search_memories",
+        json!({
+            "query": "redb since 2000-01-01",
+            "k": 5,
+            "fuzzy": false,
+            "created_before": FUTURE
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(
+        hit_count(&r) >= 1,
+        "the memory is inside the explicit bound and 'redb' still matches: {r:#?}"
+    );
+    let f = r
+        .get("applied_time_filter")
+        .unwrap_or_else(|| panic!("explicit param must be echoed: {r:#?}"));
+    assert_eq!(
+        f["source"], "params",
+        "explicit bounds win over the rewriter: {f:#?}"
+    );
+    assert_eq!(f["before"], json!(FUTURE_MS), "filter: {f:#?}");
+    assert!(
+        f.get("after").is_none(),
+        "'since 2000-01-01' must NOT have been parsed into an after bound: {f:#?}"
+    );
+    assert!(
+        f.get("matched_phrase").is_none(),
+        "the rewriter did not run, so no phrase was consumed: {f:#?}"
+    );
+}
