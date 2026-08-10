@@ -94,7 +94,15 @@ async function main() {
   const client = await connectForProject({ projectDir, dataDir });
   if (!client) return;
   try {
-    const res = await client.call("search_memories", { query: task, k: K, labels: ["Memory"] }, SEARCH_TIMEOUT_MS);
+    // temporal_rewrite: false — this query is machine-built from raw prompt text,
+    // not a human temporal question. A dated plan path in the task (e.g.
+    // "docs/.../2026-08-09-foo.md") would otherwise time-box this priming
+    // search to that single day and silently return nothing.
+    const res = await client.call(
+      "search_memories",
+      { query: task, k: K, labels: ["Memory"], temporal_rewrite: false },
+      SEARCH_TIMEOUT_MS,
+    );
     const hits = Array.isArray(res?.hits) ? res.hits.map(h => h?.node).filter(Boolean) : [];
     const out = renderSubagentContext(hits);
     if (out) {

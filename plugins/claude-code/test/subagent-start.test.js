@@ -232,8 +232,14 @@ test(
       await seeder.call("remember", { content: "the widget parser lives in widget.rs", entities: ["Widget"] });
       seeder.close();
 
-      // Run the hook with a transcript that queries for that content
-      const { dir: _pd, t: transcript } = tmpTranscript("where does the widget parser live");
+      // Run the hook with a transcript that queries for that content. The
+      // dated plan path is load-bearing: task prompts routinely contain
+      // dated filenames, and the hook must pass temporal_rewrite: false so
+      // the date does NOT become a created-time filter that empties the
+      // priming search (whole-branch review finding C1).
+      const { dir: _pd, t: transcript } = tmpTranscript(
+        "implement docs/superpowers/plans/2026-08-09-widget.md — where does the widget parser live",
+      );
       const out = await runHook(
         { agent_id: "a1", agent_type: "general-purpose", cwd: projectDir, transcript_path: transcript },
         { CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: projectDir },

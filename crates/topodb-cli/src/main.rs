@@ -509,7 +509,10 @@ fn search(
             topodb_json::parse_iso_instant(s).unwrap_or_else(|| {
                 output::fail(
                     "rejected",
-                    &format!("parsing --{flag}: {s:?} is not an ISO date (try 2026-08-01)"),
+                    &format!(
+                        "parsing --{flag}: {s:?} is not an ISO date or UTC datetime \
+                         (try 2026-08-01 or 2026-08-01T15:30:00Z)"
+                    ),
                     2,
                 )
             })

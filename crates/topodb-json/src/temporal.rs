@@ -242,6 +242,14 @@ pub fn parse_temporal_query(query: &str, now_ms: i64) -> Option<TemporalRewrite>
             // A pure temporal phrase is not a searchable query.
             return None;
         }
+        if !residual.contains(|c: char| c.is_ascii_alphanumeric()) {
+            // A residual with no analyzable tokens (e.g. "!!!") would be
+            // REJECTED by the engine's tokenizer — before the rewriter
+            // existed the date words themselves were searchable, so
+            // rewriting here would turn a working query into an error.
+            // Pass the original through unrewritten instead.
+            return None;
+        }
         return Some(TemporalRewrite {
             residual_query: residual,
             after_ms,
@@ -252,19 +260,37 @@ pub fn parse_temporal_query(query: &str, now_ms: i64) -> Option<TemporalRewrite>
     None
 }
 
-/// Resolve an explicit ISO date bound — `2026-08-01`, `2026-08`, or `2026`
-/// — to the UTC ms start of its period (day/month/year). `None` for
-/// anything else. Shared by the MCP `created_after`/`created_before`
-/// params and the CLI `--created-*` flags so explicit bounds and the
-/// rewriter resolve dates identically.
+/// Resolve an explicit ISO bound to UTC ms. Accepts a date — `2026-08-01`,
+/// `2026-08`, or `2026`, resolving to the start of its period — or a UTC
+/// datetime `YYYY-MM-DDTHH:MM[:SS]` with an optional trailing `Z`,
+/// resolving to that exact instant (non-UTC offsets and fractional seconds
+/// are rejected: a bound silently shifted by timezone math would be worse
+/// than an error). `None` for anything else. Shared by the MCP
+/// `created_after`/`created_before` params and the CLI `--created-*` flags
+/// so explicit bounds and the rewriter resolve dates identically; the
+/// rewriter itself matches dates only — a datetime inside prose does not
+/// trigger a rewrite.
 pub fn parse_iso_instant(s: &str) -> Option<i64> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"^\s*(19[7-9]\d|20\d{2})(?:-(\d{2})(?:-(\d{2}))?)?\s*$")
-            .expect("static temporal pattern")
+        Regex::new(
+            r"^\s*(19[7-9]\d|20\d{2})(?:-(\d{2})(?:-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?Z?)?)?)?\s*$",
+        )
+        .expect("static temporal pattern")
     });
     let caps = re.captures(s)?;
-    DateSpec::read(&caps, 1).map(DateSpec::start_ms)
+    let date_ms = DateSpec::read(&caps, 1).map(DateSpec::start_ms)?;
+    match (caps.get(4), caps.get(5)) {
+        (Some(h), Some(m)) => {
+            let (h, m): (i64, i64) = (h.as_str().parse().ok()?, m.as_str().parse().ok()?);
+            let sec: i64 = caps.get(6).map_or(Some(0), |x| x.as_str().parse().ok())?;
+            if h > 23 || m > 59 || sec > 59 {
+                return None;
+            }
+            Some(date_ms + (h * 3600 + m * 60 + sec) * 1000)
+        }
+        _ => Some(date_ms),
+    }
 }
 
 #[cfg(test)]
@@ -439,6 +465,44 @@ mod tests {
         for bad in ["not-a-date", "08/01/2026", "", "2026-13-01", "8080"] {
             assert_eq!(parse_iso_instant(bad), None, "for {bad:?}");
         }
+    }
+
+    #[test]
+    fn parse_iso_instant_accepts_utc_datetimes() {
+        // Midnight datetime == the bare date.
+        assert_eq!(
+            parse_iso_instant("2026-08-01T00:00:00Z"),
+            parse_iso_instant("2026-08-01"),
+        );
+        // 15:30:00 = 55_800_000 ms into the day; Z optional; seconds optional.
+        assert_eq!(
+            parse_iso_instant("2026-08-01T15:30:00Z"),
+            Some(1_785_542_400_000 + 55_800_000),
+        );
+        assert_eq!(
+            parse_iso_instant("2026-08-01T15:30"),
+            Some(1_785_542_400_000 + 55_800_000),
+        );
+        // Non-UTC offsets, fractional seconds, out-of-range fields, and a
+        // time without a full date are all rejected, not silently shifted.
+        for bad in [
+            "2026-08-01T15:30:00+02:00",
+            "2026-08-01T15:30:00.5Z",
+            "2026-08-01T24:00",
+            "2026-08-01T15:61",
+            "2026-08T15:30",
+        ] {
+            assert_eq!(parse_iso_instant(bad), None, "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn unanalyzable_residual_passes_through_unrewritten() {
+        // "!!!" survives phrase-stripping as the residual but contains no
+        // tokenizable term — the engine would reject it. The rewriter must
+        // step aside so the original query still searches (the date words
+        // themselves are searchable terms).
+        assert_eq!(parse_temporal_query("!!! since 2026-01-01", NOW_MS), None);
     }
 
     #[test]

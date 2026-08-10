@@ -555,6 +555,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Changed
 
+- **`search_memories` queries containing date phrases are now time-filtered by
+  default** (`temporal_rewrite` defaults to `true`) — pass
+  `temporal_rewrite: false` for verbatim search. Machine-constructed queries
+  built from prompt text should always pass `false` (the plugin's
+  subagent-priming hook does).
 - **`search_memories` tool description trimmed** — the 7× duplicated `scopes`
   param doc consolidated.
 - **`check_conflicts: false` also suppresses the existing `near_duplicates` field**

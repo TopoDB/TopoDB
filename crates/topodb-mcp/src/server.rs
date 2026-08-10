@@ -1267,11 +1267,12 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     kinds: Option<Vec<String>>,
-    /// ISO date: "2026-08-01" (inclusive), "2026-08", or "2026".
-    /// Inverted ranges rejected.
+    /// ISO date or UTC datetime: "2026-08-01" (inclusive), "2026-08",
+    /// "2026", or "2026-08-01T15:30:00Z". Inverted ranges rejected.
     #[serde(default)]
     created_after: Option<String>,
-    /// ISO date: exclusive upper bound. "2026-08-01" excludes that day.
+    /// ISO date or UTC datetime: exclusive upper bound. "2026-08-01"
+    /// excludes that day.
     #[serde(default)]
     created_before: Option<String>,
     /// Default true: parse date phrases ("before 2026-08") to filters;
@@ -2842,7 +2843,10 @@ impl TopoServer {
         let parse_bound = |field: &str, s: &str| {
             convert::parse_iso_instant(s).ok_or_else(|| {
                 ErrorData::invalid_params(
-                    format!("{field}: {s:?} is not an ISO date (try 2026-08-01)"),
+                    format!(
+                        "{field}: {s:?} is not an ISO date or UTC datetime \
+                         (try 2026-08-01 or 2026-08-01T15:30:00Z)"
+                    ),
                     None,
                 )
             })

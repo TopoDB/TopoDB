@@ -214,9 +214,10 @@ pub enum Command {
         #[arg(long = "recency-half-life-days")]
         recency_half_life_days: Option<f64>,
         /// Only memories created at/after this time: an ISO date
-        /// (`2026-08-01`, `2026-08`, `2026`). Dates resolve to the UTC
-        /// start of the day/month/year (inclusive). Passing either
-        /// --created-* flag disables the temporal rewrite.
+        /// (`2026-08-01`, `2026-08`, `2026`) or UTC datetime
+        /// (`2026-08-01T15:30:00Z`). Dates resolve to the UTC start of
+        /// the day/month/year (inclusive). Passing either --created-*
+        /// flag disables the temporal rewrite.
         #[arg(long = "created-after")]
         created_after: Option<String>,
         /// Only memories created strictly BEFORE this time; same forms,
