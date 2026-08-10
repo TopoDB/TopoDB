@@ -1777,6 +1777,12 @@ struct RememberParams {
     /// existing memory — the stored kind wins.
     #[serde(default)]
     kind: Option<String>,
+    /// Run the write-time conflict probe (semantic/text near-duplicate scan
+    /// against existing memories) and populate `supersession_candidates`.
+    /// Default true; pass false to skip it (saves the extra search) when the
+    /// caller doesn't need the signal.
+    #[serde(default = "default_true")]
+    check_conflicts: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1812,6 +1818,12 @@ struct RememberResult {
     /// falls back to text-based (token containment) detection otherwise. Empty on a
     /// dedup hit. See `NearDuplicate`.
     near_duplicates: Vec<NearDuplicate>,
+    /// Existing memories that may need `supersedes` next time (this call did
+    /// NOT do that automatically) — a leaner, spec-stable projection of
+    /// `near_duplicates` gated by `check_conflicts`. Omitted when empty or
+    /// when `check_conflicts` was false.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    supersession_candidates: Vec<SupersessionCandidate>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2025,6 +2037,19 @@ struct NearDuplicate {
     /// Method used to detect the similarity: `"vector"` when embedder is Ready,
     /// `"text"` when using token containment text fallback.
     method: String,
+}
+
+/// A leaner view of a near-duplicate hit, for callers that just want the id,
+/// the classified relation, and a score to act on.
+#[derive(Debug, Serialize, JsonSchema)]
+struct SupersessionCandidate {
+    /// ULID of the existing memory.
+    memory_id: String,
+    /// `"duplicate"` or `"supersession"` — see `NearDuplicate::relation`.
+    relation: String,
+    /// Same scale as `NearDuplicate::similarity` (cosine or containment,
+    /// not comparable across methods).
+    score: f32,
 }
 
 /// Result of a find-or-create write (`create_entity`).
@@ -3439,7 +3464,9 @@ impl TopoServer {
         let mut near_duplicates = Vec::new();
         if let Some(content) = plan.new_memory.as_deref() {
             let embedding = self.embedder.embed(content);
-            near_duplicates = self.near_duplicates(scope, content, embedding.as_deref());
+            if p.check_conflicts {
+                near_duplicates = self.near_duplicates(scope, content, embedding.as_deref());
+            }
             if let Some(vector) = embedding {
                 plan.ops.push(Op::SetEmbedding {
                     id: plan.memory_id,
@@ -3454,6 +3481,14 @@ impl TopoServer {
         if !plan.ops.is_empty() {
             self.submit_write(plan.ops)?;
         }
+        let supersession_candidates = near_duplicates
+            .iter()
+            .map(|nd| SupersessionCandidate {
+                memory_id: nd.id.clone(),
+                relation: nd.relation.clone(),
+                score: nd.similarity,
+            })
+            .collect();
         Ok(Json(RememberResult {
             memory_id: plan.memory_id.to_string(),
             entities: plan
@@ -3469,6 +3504,7 @@ impl TopoServer {
             deduplicated: plan.deduplicated,
             superseded: plan.superseded,
             near_duplicates,
+            supersession_candidates,
         }))
     }
 
