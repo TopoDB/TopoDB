@@ -410,6 +410,7 @@ impl TopoServer {
                 ops.push(Op::CloseEdge {
                     id: e.id,
                     valid_to: None,
+                    superseded_at: None,
                 });
             }
             marked.push(id.to_string());
@@ -2557,6 +2558,7 @@ impl TopoServer {
                     to: e.to,
                     props: e.props,
                     valid_from: None,
+                    recorded_at: None,
                 });
             }
         }
@@ -3725,6 +3727,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
                 to: entity_id,
                 props: Props::new(),
                 valid_from: None,
+                recorded_at: None,
             },
         ];
         ops.extend(embed);
@@ -3854,6 +3857,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
                 ops.push(Op::CloseEdge {
                     id: e.id,
                     valid_to: None,
+                    superseded_at: None,
                 });
                 superseded.push(e.id.to_string());
             }
@@ -3887,6 +3891,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
             to,
             props,
             valid_from: p.valid_from,
+            recorded_at: None,
         });
         // One submit: the closes and the create commit atomically — a
         // supersede can never close the old fact and then fail to record the
@@ -4045,6 +4050,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         let seq = self.submit_seq(vec![Op::CloseEdge {
             id,
             valid_to: p.valid_to,
+            superseded_at: None,
         }])?;
         Ok(Json(SeqResult { seq }))
     }

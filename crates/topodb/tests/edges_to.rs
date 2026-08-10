@@ -28,6 +28,7 @@ fn edge(ty: &str, scope: Scope, from: NodeId, to: NodeId) -> (EdgeId, Op) {
             to,
             props: Props::new(),
             valid_from: None,
+            recorded_at: None,
         },
     )
 }
@@ -91,6 +92,7 @@ fn edges_to_filters_by_source_type_and_openness() {
     db.submit(vec![Op::CloseEdge {
         id: e1,
         valid_to: None,
+        superseded_at: None,
     }])
     .unwrap();
     let open_to_b = db.edges_to(&scopes, b, None, None, true).unwrap();

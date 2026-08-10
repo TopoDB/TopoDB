@@ -27,6 +27,7 @@ fn mk_edge(scope: Scope, from: NodeId, to: NodeId) -> Op {
         to,
         props: Default::default(),
         valid_from: None,
+        recorded_at: None,
     }
 }
 
@@ -251,6 +252,7 @@ fn a_closed_edge_no_longer_blocks_the_suggestion() {
         to: f.b,
         props: Default::default(),
         valid_from: None,
+        recorded_at: None,
     }])
     .unwrap();
     // While a—b is live, b is a 1-hop neighbor — never suggested.
@@ -259,6 +261,7 @@ fn a_closed_edge_no_longer_blocks_the_suggestion() {
     f.db.submit(vec![Op::CloseEdge {
         id: eid,
         valid_to: None,
+        superseded_at: None,
     }])
     .unwrap();
     let out = f.db.suggest_links(&q(&f.scopes, f.a, 10)).unwrap();

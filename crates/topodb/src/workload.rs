@@ -92,6 +92,7 @@ pub fn batches(spec: &WorkloadSpec) -> Vec<Vec<Op>> {
             to: entity_id(r.below(entities)),
             props: BTreeMap::new(),
             valid_from: at,
+            recorded_at: at,
         });
         e += 1;
         if r.below(2) == 0 {
@@ -103,6 +104,7 @@ pub fn batches(spec: &WorkloadSpec) -> Vec<Vec<Op>> {
                 to: entity_id(r.below(entities)),
                 props: BTreeMap::new(),
                 valid_from: at,
+                recorded_at: at,
             });
             e += 1;
         }
@@ -115,6 +117,7 @@ pub fn batches(spec: &WorkloadSpec) -> Vec<Vec<Op>> {
                 to: memory_id(i - 1),
                 props: BTreeMap::new(),
                 valid_from: at,
+                recorded_at: at,
             });
             e += 1;
         }

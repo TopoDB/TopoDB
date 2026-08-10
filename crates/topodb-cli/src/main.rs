@@ -1076,6 +1076,7 @@ fn link(
         to,
         props,
         valid_from,
+        recorded_at: None,
     };
     if let Err(e) = db.submit(vec![op]) {
         output::fail_engine(&e);
@@ -1349,7 +1350,11 @@ fn close_edge(db: &Db, id: &str, valid_to: Option<i64>, pretty: bool) -> ! {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid edge id {id:?}: {e}"), 2),
     };
-    let applied = match db.submit(vec![Op::CloseEdge { id, valid_to }]) {
+    let applied = match db.submit(vec![Op::CloseEdge {
+        id,
+        valid_to,
+        superseded_at: None,
+    }]) {
         Ok(a) => a,
         Err(e) => output::fail_engine(&e),
     };

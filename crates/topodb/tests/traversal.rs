@@ -44,6 +44,7 @@ fn fixture() -> Fixture {
                 to: b,
                 props: Default::default(),
                 valid_from: None,
+                recorded_at: None,
             },
             Op::CreateEdge {
                 id: e2,
@@ -53,6 +54,7 @@ fn fixture() -> Fixture {
                 to: c,
                 props: Default::default(),
                 valid_from: None,
+                recorded_at: None,
             },
         ],
         100,
@@ -62,6 +64,7 @@ fn fixture() -> Fixture {
         vec![Op::CloseEdge {
             id: e2,
             valid_to: None,
+            superseded_at: None,
         }],
         200,
     )

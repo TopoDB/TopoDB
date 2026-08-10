@@ -107,6 +107,7 @@ fn build() -> Built {
                 to: ids[target],
                 props: Props::new(),
                 valid_from: None,
+                recorded_at: None,
             }])
             .unwrap();
         }

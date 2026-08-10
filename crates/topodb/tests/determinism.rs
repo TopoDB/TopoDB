@@ -155,6 +155,7 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) -> 
                         to: to_id,
                         props: Default::default(),
                         valid_from: None,
+                        recorded_at: None,
                     }],
                     t,
                 )
@@ -168,7 +169,14 @@ fn run_script(db: &Db, n_scoped: usize, n_shared: usize, intents: &[Intent]) -> 
                 let id = edges[edge_ix % edges.len()];
                 // Tolerated: already-closed (or cascaded-away) edges yield
                 // `Rejected`, which appends nothing — harmless for replay.
-                let _ = db.submit_at(vec![Op::CloseEdge { id, valid_to: None }], t);
+                let _ = db.submit_at(
+                    vec![Op::CloseEdge {
+                        id,
+                        valid_to: None,
+                        superseded_at: None,
+                    }],
+                    t,
+                );
             }
             Intent::SetProp { node_ix, val } => {
                 if nodes.is_empty() {

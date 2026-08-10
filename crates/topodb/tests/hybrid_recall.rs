@@ -178,6 +178,7 @@ fn build_fixture() -> Fixture {
             to,
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         });
     }
     db.submit(edge_ops).unwrap();

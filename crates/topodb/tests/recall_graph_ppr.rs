@@ -73,6 +73,7 @@ fn build() -> Fixture {
             to: x,
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         });
     }
     ops.push(Op::CreateEdge {
@@ -83,6 +84,7 @@ fn build() -> Fixture {
         to: y,
         props: Default::default(),
         valid_from: None,
+        recorded_at: None,
     });
     ops.push(Op::CreateEdge {
         id: EdgeId::new(),
@@ -92,6 +94,7 @@ fn build() -> Fixture {
         to: z,
         props: Default::default(),
         valid_from: None,
+        recorded_at: None,
     });
     db.submit(ops).unwrap();
 

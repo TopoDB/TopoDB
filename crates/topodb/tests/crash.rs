@@ -60,6 +60,7 @@ fn crash_writer_child() {
                 to: e,
                 props: Default::default(),
                 valid_from: None,
+                recorded_at: None,
             },
             topodb::Op::SetNodeProps {
                 id: m,

@@ -244,6 +244,7 @@ pub fn plan_supersede(
             ops.push(Op::CloseEdge {
                 id: e.id,
                 valid_to: None,
+                superseded_at: None,
             });
         }
         marked.push(id.to_string());
@@ -308,6 +309,7 @@ pub fn plan_forget(
             ops.push(Op::CloseEdge {
                 id: e.id,
                 valid_to: None,
+                superseded_at: None,
             });
         }
         forgotten.push(id.to_string());
@@ -506,6 +508,7 @@ pub fn plan_remember(
                     to: r.id,
                     props: Props::new(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 id.to_string()
             }

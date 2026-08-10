@@ -142,6 +142,7 @@ pub fn link_superseding_with(
         ops.extend(open.iter().map(|e| Op::CloseEdge {
             id: e.id,
             valid_to: Some(now_ms),
+            superseded_at: None,
         }));
 
         let new_id = EdgeId::new();
@@ -153,6 +154,7 @@ pub fn link_superseding_with(
             to,
             props: Props::new(),
             valid_from: Some(now_ms),
+            recorded_at: None,
         });
 
         match db.submit_at(ops, now_ms) {

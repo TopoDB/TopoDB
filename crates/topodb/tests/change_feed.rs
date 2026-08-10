@@ -38,7 +38,8 @@ fn rejected_batches_and_reads_produce_no_events() {
     assert!(db
         .submit(vec![Op::CloseEdge {
             id: EdgeId::new(),
-            valid_to: None
+            valid_to: None,
+            superseded_at: None
         }])
         .is_err());
     // A read:

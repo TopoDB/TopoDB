@@ -56,6 +56,7 @@ fn main() -> Result<(), topodb::TopoError> {
             to: b,
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         },
         // Embeddings are host-computed and submitted as ops (engine, not policy).
         Op::SetEmbedding { id: a, model: "my-embedder".into(), vector: vec![0.1, 0.2, 0.3] },

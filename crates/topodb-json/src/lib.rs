@@ -795,6 +795,8 @@ mod tests {
             props: Props::new(),
             valid_from: 1_000,
             valid_to: None,
+            recorded_at: 1_000,
+            superseded_at: None,
         }
     }
 

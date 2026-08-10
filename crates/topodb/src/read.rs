@@ -437,6 +437,7 @@ mod tests {
                 to: leaf,
                 props: Default::default(),
                 valid_from: None,
+                recorded_at: None,
             })
             .collect();
         db.submit(edge_ops).unwrap();

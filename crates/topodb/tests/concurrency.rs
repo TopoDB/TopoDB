@@ -69,7 +69,13 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
                     // and uses a brand new EdgeId.
                     let open = db.open_edges_between(subject, value);
                     let mut ops: Vec<Op> =
-                        open.into_iter().map(|e| Op::CloseEdge { id: e, valid_to: None }).collect();
+                        open.into_iter()
+                            .map(|e| Op::CloseEdge {
+                                id: e,
+                                valid_to: None,
+                                superseded_at: None,
+                            })
+                            .collect();
                     ops.push(Op::CreateEdge {
                         id: EdgeId::new(),
                         scope,
@@ -78,6 +84,7 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
                         to: value,
                         props: Default::default(),
                         valid_from: None,
+                        recorded_at: None,
                     });
                     match db.submit(ops) {
                         Ok(_) => return,
@@ -108,6 +115,7 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
         .map(|e| Op::CloseEdge {
             id: e,
             valid_to: None,
+            superseded_at: None,
         })
         .collect();
     final_ops.push(Op::CreateEdge {
@@ -118,6 +126,7 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
         to: value,
         props: Default::default(),
         valid_from: None,
+        recorded_at: None,
     });
     db.submit(final_ops).unwrap();
 

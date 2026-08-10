@@ -78,6 +78,7 @@ fn seeded_db(n: usize, dim: usize) -> (tempfile::TempDir, Db, ScopeId, Vec<NodeI
             to: ids[i],
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         });
         edge_ops.push(Op::CreateEdge {
             id: EdgeId::new(),
@@ -87,6 +88,7 @@ fn seeded_db(n: usize, dim: usize) -> (tempfile::TempDir, Db, ScopeId, Vec<NodeI
             to: ids[HUB_SPOKES + i],
             props: Default::default(),
             valid_from: None,
+            recorded_at: None,
         });
     }
     db.submit(edge_ops).unwrap();

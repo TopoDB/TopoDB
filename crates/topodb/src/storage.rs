@@ -1978,7 +1978,7 @@ impl Storage {
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            out.push(crate::disk::edge_from_disk_v3(
+            out.push(crate::disk::edge_from_disk_v4(
                 disk, &dicts, &scopes, &node_ids,
             )?);
         }
@@ -2381,6 +2381,7 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
             to,
             props,
             valid_from,
+            recorded_at: _,
         } => Op::CreateEdge {
             id,
             scope,
@@ -2389,10 +2390,20 @@ fn resolve_op(op: Op, now_ms: i64) -> Op {
             to,
             props,
             valid_from: Some(valid_from.unwrap_or(now_ms)),
+            // Belief time is ALWAYS the write instant — unconditionally
+            // overwritten, unlike valid_from, which honors a caller override.
+            recorded_at: Some(now_ms),
         },
-        Op::CloseEdge { id, valid_to } => Op::CloseEdge {
+        Op::CloseEdge {
+            id,
+            valid_to,
+            superseded_at: _,
+        } => Op::CloseEdge {
             id,
             valid_to: Some(valid_to.unwrap_or(now_ms)),
+            // Belief time is ALWAYS the operation instant — unconditionally
+            // overwritten, unlike valid_to, which honors a caller override.
+            superseded_at: Some(now_ms),
         },
         other => other,
     }
@@ -2650,7 +2661,7 @@ pub(crate) fn read_edge_by_slot(
             let raw = crate::codec::unframe_value(v.value())?;
             let disk = postcard::from_bytes(raw.as_ref())
                 .map_err(|e| TopoError::Encoding(e.to_string()))?;
-            Ok(Some(crate::disk::edge_from_disk_v3(
+            Ok(Some(crate::disk::edge_from_disk_v4(
                 disk, dicts, scopes, node_ids,
             )?))
         }
@@ -2726,7 +2737,7 @@ fn put_edge(
 ) -> Result<(), TopoError> {
     let slot = crate::slots::edge_slot(edge_slots, rec.id)?
         .ok_or_else(|| TopoError::Encoding("put_edge: missing edge slot".into()))?;
-    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk_v3(
+    let raw = postcard::to_allocvec(&crate::disk::edge_to_disk_v4(
         rec,
         dict,
         dicts,
@@ -3096,6 +3107,7 @@ fn apply_op(
             to,
             props,
             valid_from,
+            recorded_at,
         } => {
             let from_rec = read_node(
                 nodes,
@@ -3141,6 +3153,8 @@ fn apply_op(
             // already-seen scopes; `put_edge` below re-interns the same scope
             // internally, also a no-op.
             let scope_id = scope_registry.intern(scopes_table, *scope, journal)?;
+            let valid_from_resolved = valid_from
+                .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)");
             let rec = EdgeRecord {
                 id: *id,
                 scope: *scope,
@@ -3148,9 +3162,12 @@ fn apply_op(
                 from: *from,
                 to: *to,
                 props: props.clone(),
-                valid_from: valid_from
-                    .expect("apply_op only runs on resolved ops (valid_from filled by resolve_op)"),
+                valid_from: valid_from_resolved,
                 valid_to: None,
+                // Pre-v9 log fallback: an op without recorded_at derives it
+                // from valid_from — MUST match the migration copy rule.
+                recorded_at: recorded_at.unwrap_or(valid_from_resolved),
+                superseded_at: None,
             };
             put_edge(
                 edges,
@@ -3184,7 +3201,11 @@ fn apply_op(
                 },
             )
         }
-        Op::CloseEdge { id, valid_to } => {
+        Op::CloseEdge {
+            id,
+            valid_to,
+            superseded_at,
+        } => {
             let mut rec = read_edge(edges, dicts, scope_registry, edge_slots, node_ids, *id)?
                 .ok_or_else(|| TopoError::Rejected(format!("CloseEdge: edge {id:?} not found")))?;
             if rec.valid_to.is_some() {
@@ -3192,10 +3213,12 @@ fn apply_op(
                     "CloseEdge: edge {id:?} already closed"
                 )));
             }
-            rec.valid_to = Some(
-                valid_to
-                    .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)"),
-            );
+            let valid_to_resolved = valid_to
+                .expect("apply_op only runs on resolved ops (valid_to filled by resolve_op)");
+            rec.valid_to = Some(valid_to_resolved);
+            // Pre-v9 log fallback: an op without superseded_at derives it
+            // from valid_to — MUST match the migration copy rule.
+            rec.superseded_at = Some(superseded_at.unwrap_or(valid_to_resolved));
             put_edge(
                 edges,
                 dict,
@@ -3777,6 +3800,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: Some(0),
+                    recorded_at: None,
                 },
             ],
             0,
@@ -3844,6 +3868,7 @@ mod tests {
                 vec![Op::CloseEdge {
                     id: ghost_edge,
                     valid_to: None,
+                    superseded_at: None,
                 }],
                 0,
             )
@@ -3953,6 +3978,7 @@ mod tests {
                     to: leaf,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 e
             })
@@ -3969,6 +3995,7 @@ mod tests {
                     to: leaf,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 e
             })
@@ -3984,6 +4011,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 });
                 e
             })
@@ -4104,6 +4132,7 @@ mod tests {
                     to: a,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
                 Op::CreateEdge {
                     id: ab_edge,
@@ -4113,6 +4142,7 @@ mod tests {
                     to: b,
                     props: Default::default(),
                     valid_from: None,
+                    recorded_at: None,
                 },
             ],
             0,

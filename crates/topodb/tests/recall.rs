@@ -373,6 +373,7 @@ fn graph_boost_surfaces_linked_but_lexically_silent_neighbor() {
         to: hit,
         props: Props::new(),
         valid_from: None,
+        recorded_at: None,
     }])
     .unwrap();
 
@@ -672,6 +673,7 @@ fn zero_weight_graph_leg_does_not_ghost_in_neighbor() {
         to: hit,
         props: Props::new(),
         valid_from: None,
+        recorded_at: None,
     }])
     .unwrap();
 
@@ -971,6 +973,7 @@ fn recall_prop_retain_drops_graph_leg_candidates_too() {
             to: neighbor,
             props: Props::new(),
             valid_from: None,
+            recorded_at: None,
         },
     ])
     .unwrap();
@@ -1170,6 +1173,7 @@ fn recall_created_range_drops_graph_leg_candidates_too() {
             to: neighbor,
             props: Props::new(),
             valid_from: None,
+            recorded_at: None,
         },
     ])
     .unwrap();

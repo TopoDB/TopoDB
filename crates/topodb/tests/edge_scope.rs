@@ -31,6 +31,7 @@ fn edge(id: EdgeId, scope: Scope, from: NodeId, to: NodeId) -> Op {
         to,
         props: Default::default(),
         valid_from: None,
+        recorded_at: None,
     }
 }
 

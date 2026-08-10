@@ -193,6 +193,7 @@ impl RunStore {
                 to: run_node,
                 props: Props::new(),
                 valid_from: Some(now_ms),
+                recorded_at: None,
             });
             for need in &n.needs {
                 ops.push(Op::CreateEdge {
@@ -203,6 +204,7 @@ impl RunStore {
                     to: store.nodes[need],
                     props: Props::new(),
                     valid_from: Some(now_ms),
+                    recorded_at: None,
                 });
             }
         }
@@ -624,6 +626,7 @@ impl RunStore {
                     to: node,
                     props: Props::new(),
                     valid_from: Some(now_ms),
+                    recorded_at: None,
                 },
             ],
             now_ms,

@@ -227,6 +227,9 @@ pub fn resolve_batch(
                     to,
                     props,
                     valid_from,
+                    // Callers never set belief fields directly; resolve_op
+                    // stamps the real write instant.
+                    recorded_at: None,
                 });
             }
             "set_node_props" => {
@@ -263,7 +266,13 @@ pub fn resolve_batch(
                 )?;
                 let valid_to = opt_i64(obj, "valid_to", idx)?;
                 produced.push(None);
-                ops.push(Op::CloseEdge { id, valid_to });
+                ops.push(Op::CloseEdge {
+                    id,
+                    valid_to,
+                    // Callers never set belief fields directly; resolve_op
+                    // stamps the real operation instant.
+                    superseded_at: None,
+                });
             }
             "set_embedding" => {
                 let id_raw = req_str(obj, "id", idx)?;
@@ -386,7 +395,7 @@ mod tests {
             _ => unreachable!(),
         };
         match &ops[3] {
-            Op::CloseEdge { id, valid_to } => {
+            Op::CloseEdge { id, valid_to, .. } => {
                 assert_eq!(id.to_string(), edge_id);
                 assert_eq!(*valid_to, None); // applier fills "now"
             }

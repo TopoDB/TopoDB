@@ -437,6 +437,7 @@ fn alias_name_resolves_to_canonical_entity() {
             to: canonical,
             props: topodb::Props::new(),
             valid_from: None,
+            recorded_at: None,
         },
     ])
     .unwrap();
