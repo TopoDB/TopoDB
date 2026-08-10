@@ -265,6 +265,8 @@ fn main() {
             k,
             include_superseded,
             kinds,
+            recency_weight,
+            recency_half_life_days,
         } => search(
             &db,
             default_scope,
@@ -272,6 +274,8 @@ fn main() {
             k,
             include_superseded,
             &kinds,
+            recency_weight,
+            recency_half_life_days,
             text_mode,
             &scope_display,
             &scope_source,
@@ -460,6 +464,8 @@ fn search(
     k: usize,
     include_superseded: bool,
     kinds: &[String],
+    recency_weight: f32,
+    recency_half_life_days: Option<f64>,
     text_mode: bool,
     scope_display: &str,
     scope_source: &str,
@@ -484,6 +490,13 @@ fn search(
     };
     let options = topodb::SearchOptions {
         prop_retain,
+        recency_weight,
+        recency_half_life_ms: recency_half_life_days
+            .map(|d| (d * 86_400_000.0) as i64)
+            .unwrap_or(30 * 24 * 60 * 60 * 1000),
+        recency_half_life_by_prop: recency_half_life_days
+            .is_none()
+            .then(topodb_json::memory_kind_half_life),
         ..topodb::SearchOptions::default()
     };
     // Search is a recall surface: memories retired by `remember --supersedes`

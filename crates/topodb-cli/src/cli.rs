@@ -204,6 +204,15 @@ pub enum Command {
         /// them. Omit for no kind filtering.
         #[arg(long = "kinds", value_delimiter = ',')]
         kinds: Vec<String>,
+        /// How much recency shifts ranking, 0.0-1.0 (0 = pure BM25). At
+        /// weight w a hit's score is multiplied by (1-w) + w·2^(-age/half_life).
+        #[arg(long = "recency-weight", default_value_t = 0.3)]
+        recency_weight: f32,
+        /// Half-life in days for a FLAT recency decay, replacing the
+        /// kind-aware default (episodic 14 / semantic 120 / procedural 365;
+        /// absent kind counts as semantic). Must be > 0.
+        #[arg(long = "recency-half-life-days")]
+        recency_half_life_days: Option<f64>,
     },
     /// Bounded BFS from a seed node, following edges up to `max_hops`.
     Traverse {
