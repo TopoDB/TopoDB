@@ -2085,6 +2085,24 @@ struct LinkResult {
     created: bool,
     /// Edge ids closed by `supersede: true` (empty otherwise).
     superseded: Vec<String>,
+    /// OTHER open edges of the same type from this node, omitted when this
+    /// call passed `supersede: true` (those were closed, not left as
+    /// conflicts) or when there are none. Advisory: the caller decides
+    /// whether one of these should have been superseded instead.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<LinkConflict>,
+}
+
+/// An OTHER open same-type edge from the node `link` just wrote to, left
+/// open because this call did not pass `supersede: true`.
+#[derive(Debug, Serialize, JsonSchema)]
+struct LinkConflict {
+    /// ULID of the other open edge.
+    edge_id: String,
+    /// ULID of that edge's target node.
+    to: String,
+    /// Millisecond timestamp the other edge became valid from.
+    valid_from: i64,
 }
 
 fn default_true() -> bool {
@@ -3916,10 +3934,16 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
             if !ops.is_empty() {
                 self.submit_write(ops)?;
             }
+            let conflicts = if p.supersede {
+                Vec::new()
+            } else {
+                self.other_open_same_type_edges(&write_set, from, &ty, e.id)
+            };
             return Ok(Json(LinkResult {
                 id: e.id.to_string(),
                 created: false,
                 superseded,
+                conflicts,
             }));
         }
 
@@ -3927,7 +3951,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         ops.push(Op::CreateEdge {
             id,
             scope,
-            ty: ty.into(),
+            ty: ty.clone().into(),
             from,
             to,
             props,
@@ -3937,11 +3961,41 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // supersede can never close the old fact and then fail to record the
         // new one.
         self.submit_write(ops)?;
+        let conflicts = if p.supersede {
+            Vec::new()
+        } else {
+            self.other_open_same_type_edges(&write_set, from, &ty, id)
+        };
         Ok(Json(LinkResult {
             id: id.to_string(),
             created: true,
             superseded,
+            conflicts,
         }))
+    }
+
+    /// OTHER open edges of type `ty` from `from`, excluding `just_written`.
+    /// Advisory read AFTER the write commits — a maintenance-style read, not
+    /// a recall, so it never fails the write: a query error degrades to no
+    /// conflicts reported rather than an error result.
+    fn other_open_same_type_edges(
+        &self,
+        scopes: &ScopeSet,
+        from: NodeId,
+        ty: &str,
+        just_written: EdgeId,
+    ) -> Vec<LinkConflict> {
+        let Ok(open) = self.db.edges_from(scopes, from, None, Some(ty), true) else {
+            return Vec::new();
+        };
+        open.into_iter()
+            .filter(|e| e.id != just_written)
+            .map(|e| LinkConflict {
+                edge_id: e.id.to_string(),
+                to: e.to.to_string(),
+                valid_from: e.valid_from,
+            })
+            .collect()
     }
 
     #[tool(
