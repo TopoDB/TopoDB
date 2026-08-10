@@ -269,6 +269,7 @@ fn main() {
             recency_half_life_days,
             created_after,
             created_before,
+            no_temporal_rewrite,
         } => search(
             &db,
             default_scope,
@@ -280,6 +281,7 @@ fn main() {
             recency_half_life_days,
             created_after,
             created_before,
+            no_temporal_rewrite,
             text_mode,
             &scope_display,
             &scope_source,
@@ -472,6 +474,7 @@ fn search(
     recency_half_life_days: Option<f64>,
     created_after: Option<String>,
     created_before: Option<String>,
+    no_temporal_rewrite: bool,
     text_mode: bool,
     scope_display: &str,
     scope_source: &str,
@@ -500,6 +503,7 @@ fn search(
     // filters are echoed to stderr so operators see what ran.
     let (mut after_ms, mut before_ms) = (None, None);
     let mut filter_note: Option<(String, &str)> = None;
+    let mut query = query.to_string();
     if created_after.is_some() || created_before.is_some() {
         let parse = |flag: &str, s: &str| {
             topodb_json::parse_iso_instant(s).unwrap_or_else(|| {
@@ -522,6 +526,17 @@ fn search(
             parts.push(format!("before {s}"));
         }
         filter_note = Some((parts.join(" "), "params"));
+    } else if !no_temporal_rewrite {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if let Some(rw) = topodb_json::parse_temporal_query(&query, now) {
+            after_ms = rw.after_ms;
+            before_ms = rw.before_ms;
+            query = rw.residual_query;
+            filter_note = Some((rw.matched_phrase, "rewrite"));
+        }
     }
     if let Some((desc, source)) = &filter_note {
         output::time_filter_echo(desc, source);
@@ -551,11 +566,11 @@ fn search(
     // 0` is what restores raw BM25. Forgotten memories are also dropped from
     // default search (same liveness model as superseded).
     let hits = if include_superseded {
-        db.search_text_with(&scopes, query, k, &options)
+        db.search_text_with(&scopes, &query, k, &options)
     } else {
         db.search_text_live(
             &scopes,
-            query,
+            &query,
             k,
             &options,
             &topodb_json::MEMORY_TOMBSTONE_PROPS,

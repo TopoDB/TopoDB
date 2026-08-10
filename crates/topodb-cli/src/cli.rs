@@ -223,6 +223,11 @@ pub enum Command {
         /// same UTC start-of-period resolution (exclusive bound).
         #[arg(long = "created-before")]
         created_before: Option<String>,
+        /// Don't rewrite a temporal phrase in the query ("before
+        /// 2026-08-01", "last week", ...) into a created-time filter —
+        /// search the query text exactly as given.
+        #[arg(long = "no-temporal-rewrite")]
+        no_temporal_rewrite: bool,
     },
     /// Bounded BFS from a seed node, following edges up to `max_hops`.
     Traverse {
