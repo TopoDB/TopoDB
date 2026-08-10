@@ -40,7 +40,23 @@ pub fn run_with_deadline(
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn()?;
+    // ETXTBSY retry (unix): exec of a just-written script can race a
+    // concurrently forked process that briefly holds the script's write fd
+    // open (fork inherits fds; the window closes when that child execs).
+    // Cargo does the same. Bounded, tiny backoff — anything persistent
+    // still surfaces as the original error.
+    let mut child = {
+        let mut attempts = 0;
+        loop {
+            match cmd.spawn() {
+                Err(e) if e.raw_os_error() == Some(26) && attempts < 5 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10 * attempts));
+                }
+                other => break other?,
+            }
+        }
+    };
 
     // Take the pipes and drain them on their own threads *before* polling
     // for exit. A child that writes more than the OS pipe buffer (~64KB)

@@ -19,7 +19,22 @@ fn holder_helper() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(900);
 
-        let _held = topodb::Db::open_stored(&db_path).expect("holder: failed to open db");
+        // Retry the open briefly: under full parallel test load the parent's
+        // seeding open (or a sibling probe) can still hold the lock when this
+        // subprocess starts. A panic here doesn't fail the parent suite, but
+        // its inherited-stdout "test result: FAILED" line pollutes the
+        // parent's output and reads like a real failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let _held = loop {
+            match topodb::Db::open_stored(&db_path) {
+                Ok(db) => break db,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("holder: failed to open db after retries: {e:?}"),
+            }
+        };
         std::thread::sleep(std::time::Duration::from_millis(hold_ms));
     }
 }
@@ -808,6 +823,8 @@ fn lock_contention_retrying_note_appears_after_500ms_elapsed() {
         // Spawn a separate OS process to hold the db lock for ~6s.
         let mut holder = Command::new(std::env::current_exe().unwrap())
             .args(["holder_helper", "--exact", "--nocapture"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .env("TOPODB_TEST_HOLD_DB", &db_str)
             .env("TOPODB_TEST_HOLD_MS", "6000")
             .spawn()
@@ -892,6 +909,8 @@ fn lock_contention_no_retrying_note_before_500ms_elapsed() {
         // below holds either way.
         let mut holder = Command::new(std::env::current_exe().unwrap())
             .args(["holder_helper", "--exact", "--nocapture"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .env("TOPODB_TEST_HOLD_DB", &db_str)
             .env("TOPODB_TEST_HOLD_MS", "400")
             .spawn()
