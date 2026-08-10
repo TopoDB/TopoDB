@@ -3865,3 +3865,295 @@ fn search_temporal_rewrite_and_opt_out() {
     assert_eq!(hits(&out), 1);
     assert!(!String::from_utf8_lossy(&out.stderr).contains("time filter"));
 }
+
+// --- Bi-temporal edges: --time-axis on get-edges/traverse, --valid-from on link ---
+
+/// 2026-06-01T00:00:00Z in Unix ms.
+const BT_JUNE: i64 = 1_780_300_800_000;
+/// 2026-07-01T00:00:00Z in Unix ms.
+const BT_JULY: i64 = 1_782_864_000_000;
+
+/// Backdated-link scenario shared by the `--time-axis` tests below: create A
+/// and X, link A->X via CLI with `--valid-from BT_JUNE` (the process clock
+/// is real "now", well after BT_JULY, so `recorded_at` lands far after the
+/// backdated `valid_from`). Returns `(db_path, scope, a_id, x_id, edge_id)`.
+fn bt_setup_backdated_edge(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, String, String, String, String) {
+    let db = dir.join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    let (a_json, code) = run_cmd(&["create-entity", "--name", "bt_a"]);
+    assert_eq!(code, 0, "create-entity A failed: {a_json:?}");
+    let a_id = a_json["id"].as_str().unwrap().to_string();
+
+    let (x_json, code) = run_cmd(&["create-entity", "--name", "bt_x"]);
+    assert_eq!(code, 0, "create-entity X failed: {x_json:?}");
+    let x_id = x_json["id"].as_str().unwrap().to_string();
+
+    let (edge_json, code) = run_cmd(&[
+        "link",
+        "--from",
+        &a_id,
+        "--to",
+        &x_id,
+        "--type",
+        "relates_to",
+        "--valid-from",
+        &BT_JUNE.to_string(),
+    ]);
+    assert_eq!(code, 0, "link with --valid-from failed: {edge_json:?}");
+    let edge_id = edge_json["id"].as_str().unwrap().to_string();
+
+    (db, scope, a_id, x_id, edge_id)
+}
+
+#[test]
+fn get_edges_time_axis_default_valid_and_belief_fields_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, _x_id, edge_id) = bt_setup_backdated_edge(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    // Default (no --as-of, no --time-axis): present, JSON carries
+    // recorded_at (far after the backdated valid_from) and superseded_at.
+    let (result, code) = run_cmd(&["get-edges", &a_id]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "expected one edge: {edges:?}");
+    let e = &edges[0];
+    assert_eq!(e["id"], serde_json::json!(edge_id));
+    assert_eq!(e["valid_from"], serde_json::json!(BT_JUNE));
+    let recorded_at = e["recorded_at"].as_i64().expect("recorded_at is numeric");
+    assert!(
+        recorded_at > BT_JUNE,
+        "recorded_at ({recorded_at}) should be far later than backdated valid_from ({BT_JUNE})"
+    );
+    assert_eq!(e["superseded_at"], serde_json::Value::Null);
+}
+
+#[test]
+fn get_edges_time_axis_valid_as_of_july_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, _x_id, edge_id) = bt_setup_backdated_edge(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    // --as-of JULY (implicit valid axis): edge is present (JUNE <= JULY).
+    let (result, code) = run_cmd(&["get-edges", &a_id, "--as-of", &BT_JULY.to_string()]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert!(
+        edges.iter().any(|e| e["id"] == serde_json::json!(edge_id)),
+        "valid-axis as-of=JULY should see the edge: {edges:?}"
+    );
+
+    // Explicit --time-axis valid: same result.
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &a_id,
+        "--as-of",
+        &BT_JULY.to_string(),
+        "--time-axis",
+        "valid",
+    ]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert!(
+        edges.iter().any(|e| e["id"] == serde_json::json!(edge_id)),
+        "explicit valid-axis as-of=JULY should see the edge: {edges:?}"
+    );
+}
+
+#[test]
+fn get_edges_time_axis_recorded_as_of_july_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, _x_id, _edge_id) = bt_setup_backdated_edge(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    // --as-of JULY --time-axis recorded: edge NOT written yet by JULY (the
+    // real write happened at process run time, well after JULY) -> absent.
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &a_id,
+        "--as-of",
+        &BT_JULY.to_string(),
+        "--time-axis",
+        "recorded",
+    ]);
+    assert_eq!(code, 0);
+    let edges = result["edges"].as_array().unwrap();
+    assert!(
+        edges.is_empty(),
+        "recorded-axis as-of=JULY should NOT see the edge: {edges:?}"
+    );
+}
+
+#[test]
+fn traverse_time_axis_mirrors_get_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, x_id, _edge_id) = bt_setup_backdated_edge(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    let node_ids = |v: &serde_json::Value| -> Vec<String> {
+        v["subgraph"]["nodes"]
+            .as_array()
+            .expect("subgraph nodes")
+            .iter()
+            .filter_map(|n| n["id"].as_str().map(|s| s.to_string()))
+            .collect()
+    };
+
+    // Default (valid axis, now): reaches X.
+    let (result, code) = run_cmd(&["traverse", &a_id, "--max-hops", "1"]);
+    assert_eq!(code, 0);
+    assert!(
+        node_ids(&result).contains(&x_id),
+        "default traverse should reach X: {result:?}"
+    );
+
+    // Valid axis, --as-of JULY: reaches X.
+    let (result, code) = run_cmd(&[
+        "traverse",
+        &a_id,
+        "--max-hops",
+        "1",
+        "--as-of",
+        &BT_JULY.to_string(),
+    ]);
+    assert_eq!(code, 0);
+    assert!(
+        node_ids(&result).contains(&x_id),
+        "valid-axis as-of=JULY traverse should reach X: {result:?}"
+    );
+
+    // Recorded axis, --as-of JULY: does NOT reach X (not written yet).
+    let (result, code) = run_cmd(&[
+        "traverse",
+        &a_id,
+        "--max-hops",
+        "1",
+        "--as-of",
+        &BT_JULY.to_string(),
+        "--time-axis",
+        "recorded",
+    ]);
+    assert_eq!(code, 0);
+    assert!(
+        !node_ids(&result).contains(&x_id),
+        "recorded-axis as-of=JULY traverse should NOT reach X: {result:?}"
+    );
+}
+
+#[test]
+fn invalid_time_axis_value_is_clap_error_naming_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", &scope])
+        .args([
+            "get-edges",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--time-axis",
+            "nonsense",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid --time-axis should be a clap usage error"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("valid") && err.contains("recorded"),
+        "clap error should name both accepted variants: {err}"
+    );
+
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args(["--scope", &scope])
+        .args([
+            "traverse",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--time-axis",
+            "nonsense",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid --time-axis should be a clap usage error"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("valid") && err.contains("recorded"),
+        "clap error should name both accepted variants: {err}"
+    );
+}
