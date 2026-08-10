@@ -98,6 +98,29 @@ impl PropRetain {
     }
 }
 
+/// Creation-time range filter for search results: a candidate survives iff
+/// its node id's ULID timestamp ([`crate::NodeId::timestamp_ms`]) is at or
+/// after `after_ms` (when set) and strictly before `before_ms` (when set).
+/// Applied wherever [`PropRetain`] applies — BEFORE top-k truncation (a
+/// filtered hit never consumes the result window) and never access-bumped
+/// on a dropped node. Both bounds set with `after_ms >= before_ms` is
+/// rejected as a caller bug: an empty range is not an empty result.
+#[derive(Debug, Clone)]
+pub struct CreatedRange {
+    /// Keep nodes created at or after this ms timestamp (None = unbounded).
+    pub after_ms: Option<i64>,
+    /// Keep nodes created strictly before this ms timestamp (None = unbounded).
+    pub before_ms: Option<i64>,
+}
+
+impl CreatedRange {
+    /// True iff a node created at `ts_ms` passes this range.
+    pub(crate) fn keeps(&self, ts_ms: i64) -> bool {
+        self.after_ms.is_none_or(|after| ts_ms >= after)
+            && self.before_ms.is_none_or(|before| ts_ms < before)
+    }
+}
+
 /// Per-node recency half-life keyed by a string prop (e.g. a memory's
 /// `kind`): a node whose `prop` value matches a `per_value` entry decays on
 /// that entry's half-life; absent, non-string, or unmatched values fall to
@@ -152,6 +175,9 @@ pub struct SearchOptions {
     /// Optional string-prop allowlist over results (see [`PropRetain`]).
     /// `None` (the default) = no filtering.
     pub prop_retain: Option<PropRetain>,
+    /// Optional creation-time range filter over results (see
+    /// [`CreatedRange`]). `None` (the default) = no filtering.
+    pub created_range: Option<CreatedRange>,
 }
 
 impl Default for SearchOptions {
@@ -163,6 +189,7 @@ impl Default for SearchOptions {
             now_ms: None,
             fuzzy_fallback: true,
             prop_retain: None,
+            created_range: None,
         }
     }
 }
@@ -230,6 +257,21 @@ impl SearchOptions {
                      nothing; omit prop_retain to search unfiltered"
                         .into(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The created_range validation shared by the text paths and `recall` —
+    /// both must reject the same caller bugs before running.
+    pub(crate) fn validate_created_range(&self) -> Result<(), TopoError> {
+        if let Some(range) = &self.created_range {
+            if let (Some(after), Some(before)) = (range.after_ms, range.before_ms) {
+                if after >= before {
+                    return Err(TopoError::Rejected(format!(
+                        "created_range is empty: after_ms {after} >= before_ms {before}"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1252,6 +1294,7 @@ impl Db {
         }
         options.validate_recency()?;
         options.validate_prop_retain()?;
+        options.validate_created_range()?;
         let tokens = tokenize(query);
         if tokens.is_empty() {
             return Err(TopoError::Rejected("query has no searchable terms".into()));
@@ -1454,6 +1497,13 @@ impl Db {
                     // filter above — dropped before top-k, never bumped.
                     if let Some(retain) = &options.prop_retain {
                         if !retain.keeps(&rec.props) {
+                            continue;
+                        }
+                    }
+                    // Created-range filter: same doctrine as the retain
+                    // above — dropped before top-k, never bumped.
+                    if let Some(range) = &options.created_range {
+                        if !range.keeps(rec.id.timestamp_ms() as i64) {
                             continue;
                         }
                     }

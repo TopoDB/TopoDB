@@ -2896,6 +2896,7 @@ impl TopoServer {
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
             prop_retain,
+            created_range: None,
         };
 
         // Process label_weights: convert from JSON map to Vec<(String, f32)>.
