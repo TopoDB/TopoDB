@@ -14,6 +14,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### Unreleased
+
+#### Added
+
+- `SearchOptions.recency_half_life_by_prop` — optional prop-keyed
+  recency half-life map (per-node decay curves; `None` = flat, unchanged).
+
 ### 0.0.13 — 2026-08-08
 
 #### Added
@@ -356,6 +363,14 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### Unreleased
+
+#### Added
+
+- `memory_kind_half_life()` — canonical kind→half-life map for ranking,
+  built from the lifecycle constants (episodic 14d / semantic 120d /
+  procedural 365d; semantic is the default bucket).
+
 ### 0.0.9 — 2026-07-27
 
 #### Added
@@ -495,6 +510,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### Unreleased
+
+#### Added
+
+- `search_memories` recency is kind-aware by default; explicit
+  `recency_half_life_days` restores a flat prior (D2 fix).
 
 ### 0.0.14 — 2026-07-27
 
@@ -1049,6 +1071,14 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 ---
 
 ## `topodb-cli`
+
+### Unreleased
+
+#### Added
+
+- `search` now applies the kind-aware recency prior by default
+  (BREAKING for score values in stdout, order-stable for same-age corpora);
+  new `--recency-weight` / `--recency-half-life-days` flags.
 
 ### 0.0.9 — 2026-07-27
 
