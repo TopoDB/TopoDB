@@ -1599,7 +1599,8 @@ struct RememberResult {
     /// Existing memories semantically close to the one just stored (advisory —
     /// nothing was merged). Uses vector-based detection when embeddings are Ready,
     /// falls back to text-based (token containment) detection otherwise. Empty on a
-    /// dedup hit. See `NearDuplicate`.
+    /// dedup hit. Also empty when `check_conflicts` is false. See `NearDuplicate`.
+    /// See `supersession_candidates` for the leaner classified projection.
     near_duplicates: Vec<NearDuplicate>,
     /// Existing memories that may need `supersedes` next time (this call did
     /// NOT do that automatically) — a leaner, spec-stable projection of
@@ -3264,8 +3265,17 @@ impl TopoServer {
         if !plan.ops.is_empty() {
             self.submit_write(plan.ops)?;
         }
+        // The near-duplicate probe runs before submit_write (it needs the pre-write
+        // graph to compare against), so it can surface ids that THIS call's own
+        // `supersedes` already tombstones. Filter those out of the classified
+        // projection so callers aren't told to supersede something already
+        // superseded. (Legacy `near_duplicates` is left as-is for compatibility —
+        // it predates `supersession_candidates` and its probe-before-write
+        // semantics are documented as-is. The CLI's equivalent probe runs after
+        // its write, so it is naturally immune to this and needs no such filter.)
         let supersession_candidates = near_duplicates
             .iter()
+            .filter(|nd| !plan.superseded.contains(&nd.id))
             .map(|nd| SupersessionCandidate {
                 memory_id: nd.id.clone(),
                 relation: nd.relation.clone(),
@@ -4032,7 +4042,9 @@ impl ServerHandler for TopoServer {
                  find-or-create entities + links); the primitives remain for the exceptions — \
                  create_memory for a deliberately unlinked note, create_entity when an entity \
                  needs extra props, link for entity↔entity relations and supersede: true when \
-                 a to-one fact changes. Recalling well: know the exact identifier → \
+                 a to-one fact changes. Write results may carry advisory conflicts / \
+                 supersession_candidates — act with supersede: true / supersedes when they are \
+                 real, or ignore them. Recalling well: know the exact identifier → \
                  find_by_prop; otherwise search_memories stems \
                  terms, falls back to close prefix/typo matches, and expands learned \
                  synonyms (add_synonym) automatically — but it can't guess vocabulary it \

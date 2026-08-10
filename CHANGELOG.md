@@ -537,6 +537,8 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Changed
 
+- **`check_conflicts: false` also suppresses the existing `near_duplicates` field**
+  (both derive from the same probe).
 - **`search_memories` recency is kind-aware by default** — episodic memories
   decay faster, procedural slower, semantic (and unstamped) in between;
   previously every memory used the same flat half-life. Pass an explicit
@@ -1110,6 +1112,8 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
   `supersession_candidates` field (text-mode duplicate/supersession
   classification against existing memories — the CLI has no embedder, so
   this always runs in text mode), omitted when empty or on a dedup hit.
+  Note: CLI `link` does not reuse identical edges, so `conflicts` may
+  include the just-linked target (MCP reuses and never reports it).
 
 #### Changed
 

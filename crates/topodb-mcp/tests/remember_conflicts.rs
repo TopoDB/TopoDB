@@ -103,6 +103,42 @@ fn unrelated_fact_has_no_candidates_field() {
 }
 
 #[test]
+fn explicit_supersedes_excludes_that_id_from_supersession_candidates() {
+    let (_dir, mut server) = fresh_server();
+    let first = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "TopoDB stores its data in redb",
+            "entities": ["TopoDB"],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    let first_id = first["memory_id"].as_str().unwrap().to_string();
+
+    // The near-duplicate probe runs BEFORE submit_write (it needs the pre-write
+    // graph), so without filtering it would list `first_id` as a candidate even
+    // though this same call's own `supersedes` already tombstones it. The
+    // projection must exclude ids this call is itself superseding.
+    let second = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "TopoDB now stores its data in sled, not redb",
+            "entities": ["TopoDB"],
+            "supersedes": [first_id],
+        }),
+        DEFAULT_TIMEOUT,
+    );
+    assert!(second.get("supersession_candidates").is_none(), "{second}");
+    let superseded = second["superseded"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected superseded on: {second}"));
+    assert_eq!(superseded.len(), 1);
+    assert_eq!(superseded[0].as_str().unwrap(), first_id);
+    // Advisory invariant: the write still succeeded.
+    assert!(second["memory_id"].as_str().is_some());
+}
+
+#[test]
 fn check_conflicts_false_skips_the_probe_even_for_a_contradicting_pair() {
     let (_dir, mut server) = fresh_server();
     server.call_tool_ok(

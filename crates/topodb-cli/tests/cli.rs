@@ -3579,10 +3579,15 @@ fn link_reports_conflicts_with_other_open_same_type_edges() {
 fn remember_prints_supersession_candidates_for_a_contradicting_pair() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.redb");
+    // Same scope on every call in this test — exercised here only to give the
+    // conflict scan coverage for `--scope`; behavior is otherwise unchanged
+    // from the scope-omitted default.
+    let scope = topodb::ScopeId::new().to_string();
 
     let first = bin()
         .args(["--db"])
         .arg(&db)
+        .args(["--scope", &scope])
         .args([
             "remember",
             "TopoDB stores its data in redb",
@@ -3602,6 +3607,7 @@ fn remember_prints_supersession_candidates_for_a_contradicting_pair() {
     let second = bin()
         .args(["--db"])
         .arg(&db)
+        .args(["--scope", &scope])
         .args([
             "remember",
             "TopoDB now stores its data in sled, not redb",

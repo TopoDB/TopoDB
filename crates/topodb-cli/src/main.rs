@@ -1093,7 +1093,8 @@ fn remember(
         Some(content) => {
             let scope_set = topodb_json::scope_to_scope_set(scope);
             let content_tokens = topodb_json::tokens(content);
-            db.search_text_unbumped(&scope_set, content, topodb_json::TEXT_NEAR_DUP_CANDIDATES)
+            let mut scored: Vec<(String, String, f64)> = db
+                .search_text_unbumped(&scope_set, content, topodb_json::TEXT_NEAR_DUP_CANDIDATES)
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|(n, _)| {
@@ -1118,6 +1119,13 @@ fn remember(
                         None
                     }
                 })
+                .collect();
+            // Rank by containment (descending) and cap at the same top-K as MCP's
+            // ranked near-duplicate probe, for parity between the two write paths.
+            scored.sort_by(|a, b| b.2.total_cmp(&a.2));
+            scored.truncate(topodb_json::NEAR_DUP_K);
+            scored
+                .into_iter()
                 .map(|(id, existing, containment)| {
                     serde_json::json!({
                         "memory_id": id,
