@@ -213,6 +213,22 @@ pub enum Command {
         /// absent kind counts as semantic). Must be > 0.
         #[arg(long = "recency-half-life-days")]
         recency_half_life_days: Option<f64>,
+        /// Only memories created at/after this time: an ISO date
+        /// (`2026-08-01`, `2026-08`, `2026`) or UTC datetime
+        /// (`2026-08-01T15:30:00Z`). Dates resolve to the UTC start of
+        /// the day/month/year (inclusive). Passing either --created-*
+        /// flag disables the temporal rewrite.
+        #[arg(long = "created-after")]
+        created_after: Option<String>,
+        /// Only memories created strictly BEFORE this time; same forms,
+        /// same UTC start-of-period resolution (exclusive bound).
+        #[arg(long = "created-before")]
+        created_before: Option<String>,
+        /// Don't rewrite a temporal phrase in the query ("before
+        /// 2026-08-01", "last week", ...) into a created-time filter —
+        /// search the query text exactly as given.
+        #[arg(long = "no-temporal-rewrite")]
+        no_temporal_rewrite: bool,
     },
     /// Bounded BFS from a seed node, following edges up to `max_hops`.
     Traverse {

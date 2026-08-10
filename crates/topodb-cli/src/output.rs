@@ -71,3 +71,10 @@ pub fn render(json: &Value, text: Option<String>, text_mode: bool, pretty: bool)
 pub fn empty_scope_echo(scope: &str, source: &str) {
     eprintln!("topodb: 0 matches in scope {scope} (source: {source})");
 }
+
+/// One-line stderr note naming an applied created-time filter — the CLI
+/// twin of the MCP result's `applied_time_filter`. Printed whenever a
+/// filter ran, explicit or rewritten; stdout is untouched.
+pub fn time_filter_echo(desc: &str, source: &str) {
+    eprintln!("topodb: time filter: {desc} (source: {source})");
+}

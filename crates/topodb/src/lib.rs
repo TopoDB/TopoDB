@@ -38,7 +38,7 @@ pub use db::{Db, DbOptions};
 pub use error::TopoError;
 pub use feed::ChangeEvent;
 pub use fts::analyze;
-pub use fts::{PropHalfLife, PropRetain, SearchOptions};
+pub use fts::{CreatedRange, PropHalfLife, PropRetain, SearchOptions};
 pub use hnsw::HnswParams;
 pub use ids::{EdgeId, NodeId, Scope, ScopeId, ScopeSet};
 pub use index::{IndexSpec, PropIndex};

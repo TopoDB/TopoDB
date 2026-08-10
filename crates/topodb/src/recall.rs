@@ -258,6 +258,7 @@ impl Db {
         // weight — see SearchOptions::validate_recency for why.
         q.options.validate_recency()?;
         q.options.validate_prop_retain()?;
+        q.options.validate_created_range()?;
         if let Some((_, v)) = &q.vector {
             if v.is_empty() {
                 return Err(TopoError::Rejected(
@@ -370,6 +371,12 @@ impl Db {
         // never pass through text search — this catches them.
         if let Some(retain) = &q.options.prop_retain {
             out.retain(|(n, _)| retain.keeps(&n.props));
+        }
+        // Post-fusion created-range (same slot as prop_retain): the text leg
+        // already filters via options, but vector/graph-leg candidates never
+        // pass through text search — this catches them.
+        if let Some(range) = &q.options.created_range {
+            out.retain(|(n, _)| range.keeps(n.id.timestamp_ms() as i64));
         }
         // Tombstone filter: drop candidates the caller marked superseded as of
         // this query's "now". The marker is a timestamp, so an as_of/now_ms set

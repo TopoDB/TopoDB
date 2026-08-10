@@ -25,8 +25,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
-    Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props, RecallQuery,
-    Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
+    CreatedRange, Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props,
+    RecallQuery, Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
@@ -770,12 +770,10 @@ struct GetNodeParams {
     /// the server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -815,12 +813,10 @@ struct FindByPropParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -844,12 +840,10 @@ struct RecentMemoriesParams {
     /// configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -1192,12 +1186,10 @@ struct SearchMemoriesParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -1275,6 +1267,19 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(length(min = 1))]
     kinds: Option<Vec<String>>,
+    /// ISO date or UTC datetime: "2026-08-01" (inclusive), "2026-08",
+    /// "2026", or "2026-08-01T15:30:00Z". Inverted ranges rejected.
+    #[serde(default)]
+    created_after: Option<String>,
+    /// ISO date or UTC datetime: exclusive upper bound. "2026-08-01"
+    /// excludes that day.
+    #[serde(default)]
+    created_before: Option<String>,
+    /// Default true: parse date phrases ("before 2026-08") to filters;
+    /// disabled if explicit created_* params given. Reports filter in
+    /// applied_time_filter. Set false for verbatim search.
+    #[serde(default = "default_true")]
+    temporal_rewrite: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1288,10 +1293,36 @@ struct SearchHit {
     score: f32,
 }
 
+/// The created-time filter a `search_memories` call actually ran with —
+/// reported so a caller (especially one whose query gets rewritten in the
+/// next task) can see what constrained the hits.
+#[derive(Debug, Serialize, JsonSchema)]
+struct AppliedTimeFilter {
+    /// Inclusive lower bound on creation time, ms since epoch UTC.
+    /// Absent = unbounded below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<i64>,
+    /// Exclusive upper bound on creation time, ms since epoch UTC.
+    /// Absent = unbounded above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<i64>,
+    /// "params" — explicit created_after/created_before; "rewrite" — a
+    /// temporal phrase in the query triggered the deterministic rewriter.
+    source: String,
+    /// The exact phrase the rewriter lifted out of the query; only present
+    /// when source is "rewrite".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_phrase: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 struct SearchMemoriesResult {
     /// Up to `k` hits, ranked by descending relevance.
     hits: Vec<SearchHit>,
+    /// Present only when a created-time filter ran (explicit params, or a
+    /// rewritten temporal phrase); absent = unfiltered search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applied_time_filter: Option<AppliedTimeFilter>,
 }
 
 /// Wire form of `topodb::Direction` for the `traverse` tool's `direction`
@@ -1349,12 +1380,10 @@ struct TraverseParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -1419,12 +1448,10 @@ struct AccessStatsParams {
     /// the server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -2071,12 +2098,10 @@ struct SearchVectorsParams {
     /// server's configured default scope when omitted.
     #[serde(default)]
     scope: Option<String>,
-    /// Read across SEVERAL scopes at once: a list of `"shared"` / scope ULIDs
-    /// (e.g. a project scope plus `"shared"`). Takes precedence over `scope`.
-    /// Omit both to use the server's configured default read scopes. Must not
-    /// be empty when present — an empty set admits nothing (there is no
-    /// unscoped read); `minItems: 1` is the advertised half of that rule, see
-    /// `resolve_scopes`'s `Some([])` rejection for the runtime half.
+    /// Read across SEVERAL scopes at once: `"shared"` / scope ULIDs (e.g. a
+    /// project scope plus `"shared"`). Takes precedence over `scope`. Omit
+    /// both for the server's default read scopes. Must not be empty when
+    /// present (there is no unscoped read).
     #[serde(default)]
     #[schemars(length(min = 1))]
     scopes: Option<Vec<String>>,
@@ -2812,6 +2837,66 @@ impl TopoServer {
         Parameters(p): Parameters<SearchMemoriesParams>,
     ) -> Result<Json<SearchMemoriesResult>, ErrorData> {
         let scope_set = self.resolve_scopes(p.scope.as_deref(), p.scopes.as_deref())?;
+        // Explicit created-time bounds (ISO → UTC ms, same resolution rules
+        // as the temporal rewriter). A bad string is a caller bug, rejected
+        // before any search runs.
+        let parse_bound = |field: &str, s: &str| {
+            convert::parse_iso_instant(s).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "{field}: {s:?} is not an ISO date or UTC datetime \
+                         (try 2026-08-01 or 2026-08-01T15:30:00Z)"
+                    ),
+                    None,
+                )
+            })
+        };
+        let after_ms = p
+            .created_after
+            .as_deref()
+            .map(|s| parse_bound("created_after", s))
+            .transpose()?;
+        let before_ms = p
+            .created_before
+            .as_deref()
+            .map(|s| parse_bound("created_before", s))
+            .transpose()?;
+        let mut query_text = p.query.clone();
+        let (created_range, applied_time_filter) = if after_ms.is_some() || before_ms.is_some() {
+            (
+                Some(CreatedRange {
+                    after_ms,
+                    before_ms,
+                }),
+                Some(AppliedTimeFilter {
+                    after: after_ms,
+                    before: before_ms,
+                    source: "params".to_string(),
+                    matched_phrase: None,
+                }),
+            )
+        } else if p.temporal_rewrite {
+            match convert::parse_temporal_query(&p.query, now_ms()) {
+                Some(rw) => {
+                    query_text = rw.residual_query;
+                    (
+                        Some(CreatedRange {
+                            after_ms: rw.after_ms,
+                            before_ms: rw.before_ms,
+                        }),
+                        Some(AppliedTimeFilter {
+                            after: rw.after_ms,
+                            before: rw.before_ms,
+                            source: "rewrite".to_string(),
+                            matched_phrase: Some(rw.matched_phrase),
+                        }),
+                    )
+                }
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         // Resolve synonyms per query word. Lookup key is the ANALYZED
         // (stemmed) form via topodb::analyze, matching how add_synonym
         // stores terms — so "logins" finds a synonym stored for "login".
@@ -2826,7 +2911,7 @@ impl TopoServer {
         // corroborates each distinct token once anyway — a second identical
         // expansion entry is pure waste, not extra signal.
         let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for word in p.query.split_whitespace() {
+        for word in query_text.split_whitespace() {
             let Some(key) = topodb::analyze(word).into_iter().next() else {
                 continue;
             };
@@ -2896,6 +2981,7 @@ impl TopoServer {
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
             prop_retain,
+            created_range,
         };
 
         // Process label_weights: convert from JSON map to Vec<(String, f32)>.
@@ -2964,7 +3050,7 @@ impl TopoServer {
             // recall then degrades to text/graph legs only.
             vector: self
                 .embedder
-                .embed(&p.query)
+                .embed(&query_text)
                 .map(|v| (self.embedder.model_name(), v)),
             expansions,
             graph_boost: p.graph_boost,
@@ -2981,7 +3067,7 @@ impl TopoServer {
             graph_weight: p.graph_weight,
             access_weight: p.access_weight,
             label_weights,
-            ..RecallQuery::new(scope_set, p.query.clone(), p.k)
+            ..RecallQuery::new(scope_set, query_text.clone(), p.k)
         };
         // `recall` opens redb read transactions, so unlike the pure snapshot
         // reads it CAN fail with `Storage`/`Encoding` — only its
@@ -3002,7 +3088,10 @@ impl TopoServer {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ErrorData::internal_error(e, None))?;
-        Ok(Json(SearchMemoriesResult { hits }))
+        Ok(Json(SearchMemoriesResult {
+            hits,
+            applied_time_filter,
+        }))
     }
 
     #[tool(
@@ -4049,9 +4138,12 @@ impl ServerHandler for TopoServer {
                  terms, falls back to close prefix/typo matches, and expands learned \
                  synonyms (add_synonym) automatically — but it can't guess vocabulary it \
                  was never taught, so retry with different words before concluding \
-                 nothing is stored — then traverse from the best hit; use \
-                 get_edges to inspect or retire a node's current relations. \
-                 Maintenance: memory_health at session start summarizes hygiene; drill into \
+                 nothing is stored — then traverse from the best hit; recall can be \
+                 time-boxed: created_after/created_before params, or a date phrase in \
+                 the query (\"before 2026-08\", \"last week\") rewritten automatically — \
+                 applied_time_filter reports what ran; use get_edges to inspect or retire \
+                 a node's current relations. Maintenance: memory_health at session start \
+                 summarizes hygiene; drill into \
                  non-zero counts with the find_* scans and act via consolidate_memories / \
                  forget — scans are advisory and never act on their own. Before treating an \
                  entity as new, check the shared scope too.",

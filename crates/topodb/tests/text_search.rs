@@ -953,3 +953,123 @@ fn kind_aware_default_fixes_d2_shape() {
         "kind-aware default must surface the fresh memory: {fixed:?}"
     );
 }
+
+/// SearchOptions.created_range: keep nodes whose id's ULID timestamp is at
+/// or after `after_ms` and strictly before `before_ms`, filtered BEFORE
+/// top-k — an out-of-range hit never consumes the result window. `None` =
+/// today's behavior, byte-identical.
+#[test]
+fn search_text_created_range_filters_at_both_bounds_and_fills_k() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    // Controlled creation times via from_u128: a ULID's top 48 bits are its
+    // millisecond timestamp (same trick as the recency tests above).
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = 1_800_000_000_000; // fixed "now" for determinism
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+    let old_id = NodeId::from_u128(ulid_at(now - 10 * DAY_MS, 1));
+    let mid_id = NodeId::from_u128(ulid_at(now - 5 * DAY_MS, 2));
+    let new_id = NodeId::from_u128(ulid_at(now - DAY_MS, 3));
+    for id in [old_id, mid_id, new_id] {
+        let mut props = Props::new();
+        props.insert("content".into(), PropValue::Str("temporal probe".into()));
+        db.submit(vec![Op::CreateNode {
+            id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }])
+        .unwrap();
+    }
+    let range = |after: Option<i64>, before: Option<i64>| SearchOptions {
+        created_range: Some(CreatedRange {
+            after_ms: after,
+            before_ms: before,
+        }),
+        ..SearchOptions::default()
+    };
+    let ids = |hits: &[(NodeRecord, f32)]| {
+        let mut v: Vec<NodeId> = hits.iter().map(|(n, _)| n.id).collect();
+        v.sort();
+        v
+    };
+
+    // after only, INCLUSIVE: the node created exactly AT the bound stays.
+    let after = db
+        .search_text_with(
+            &scopes,
+            "temporal probe",
+            10,
+            &range(Some(now - 5 * DAY_MS), None),
+        )
+        .unwrap();
+    assert_eq!(ids(&after), vec![mid_id, new_id]);
+
+    // before only, EXCLUSIVE: the node created exactly AT the bound drops.
+    let before = db
+        .search_text_with(
+            &scopes,
+            "temporal probe",
+            10,
+            &range(None, Some(now - 5 * DAY_MS)),
+        )
+        .unwrap();
+    assert_eq!(ids(&before), vec![old_id]);
+
+    // Both bounds: half-open [after, before).
+    let both = db
+        .search_text_with(
+            &scopes,
+            "temporal probe",
+            10,
+            &range(Some(now - 7 * DAY_MS), Some(now - 3 * DAY_MS)),
+        )
+        .unwrap();
+    assert_eq!(ids(&both), vec![mid_id]);
+
+    // Filters BEFORE top-k: with k = 1 and both fresher nodes out of range,
+    // the window must still fill from the in-range candidate.
+    let k1 = db
+        .search_text_with(
+            &scopes,
+            "temporal probe",
+            1,
+            &range(None, Some(now - 5 * DAY_MS)),
+        )
+        .unwrap();
+    assert_eq!(ids(&k1), vec![old_id]);
+
+    // created_range: None = byte-identical to today's behavior.
+    let plain = db.search_text(&scopes, "temporal probe", 10).unwrap();
+    let none = db
+        .search_text_with(&scopes, "temporal probe", 10, &SearchOptions::default())
+        .unwrap();
+    assert_eq!(ids(&plain), ids(&none));
+    assert_eq!(plain.len(), 3);
+}
+
+/// Validation: both bounds set with `after_ms >= before_ms` is an empty
+/// range — a caller bug, rejected loudly (mirrors prop_retain's empty
+/// allowlist doctrine: an empty range is not an empty result).
+#[test]
+fn search_text_created_range_rejects_inverted_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    for (after, before) in [(10i64, 5i64), (5, 5)] {
+        let options = SearchOptions {
+            created_range: Some(CreatedRange {
+                after_ms: Some(after),
+                before_ms: Some(before),
+            }),
+            ..SearchOptions::default()
+        };
+        match db.search_text_with(&scopes, "anything", 10, &options) {
+            Err(TopoError::Rejected(_)) => {}
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+}

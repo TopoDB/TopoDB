@@ -267,6 +267,9 @@ fn main() {
             kinds,
             recency_weight,
             recency_half_life_days,
+            created_after,
+            created_before,
+            no_temporal_rewrite,
         } => search(
             &db,
             default_scope,
@@ -276,6 +279,9 @@ fn main() {
             &kinds,
             recency_weight,
             recency_half_life_days,
+            created_after,
+            created_before,
+            no_temporal_rewrite,
             text_mode,
             &scope_display,
             &scope_source,
@@ -466,6 +472,9 @@ fn search(
     kinds: &[String],
     recency_weight: f32,
     recency_half_life_days: Option<f64>,
+    created_after: Option<String>,
+    created_before: Option<String>,
+    no_temporal_rewrite: bool,
     text_mode: bool,
     scope_display: &str,
     scope_source: &str,
@@ -488,7 +497,61 @@ fn search(
             absent_as: Some(topodb_json::MEMORY_KIND_DEFAULT.to_string()),
         })
     };
+
+    // Created-time filter (explicit flags; Task 8 adds the rewriter
+    // branch with the same precedence as MCP search_memories). Applied
+    // filters are echoed to stderr so operators see what ran.
+    let (mut after_ms, mut before_ms) = (None, None);
+    let mut filter_note: Option<(String, &str)> = None;
+    let mut query = query.to_string();
+    if created_after.is_some() || created_before.is_some() {
+        let parse = |flag: &str, s: &str| {
+            topodb_json::parse_iso_instant(s).unwrap_or_else(|| {
+                output::fail(
+                    "rejected",
+                    &format!(
+                        "parsing --{flag}: {s:?} is not an ISO date or UTC datetime \
+                         (try 2026-08-01 or 2026-08-01T15:30:00Z)"
+                    ),
+                    2,
+                )
+            })
+        };
+        after_ms = created_after.as_deref().map(|s| parse("created-after", s));
+        before_ms = created_before
+            .as_deref()
+            .map(|s| parse("created-before", s));
+        let mut parts = Vec::new();
+        if let Some(s) = &created_after {
+            parts.push(format!("after {s}"));
+        }
+        if let Some(s) = &created_before {
+            parts.push(format!("before {s}"));
+        }
+        filter_note = Some((parts.join(" "), "params"));
+    } else if !no_temporal_rewrite {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if let Some(rw) = topodb_json::parse_temporal_query(&query, now) {
+            after_ms = rw.after_ms;
+            before_ms = rw.before_ms;
+            query = rw.residual_query;
+            filter_note = Some((rw.matched_phrase, "rewrite"));
+        }
+    }
+    if let Some((desc, source)) = &filter_note {
+        output::time_filter_echo(desc, source);
+    }
+
     let options = topodb::SearchOptions {
+        created_range: (after_ms.is_some() || before_ms.is_some()).then_some(
+            topodb::CreatedRange {
+                after_ms,
+                before_ms,
+            },
+        ),
         prop_retain,
         recency_weight,
         recency_half_life_ms: recency_half_life_days
@@ -506,11 +569,11 @@ fn search(
     // 0` is what restores raw BM25. Forgotten memories are also dropped from
     // default search (same liveness model as superseded).
     let hits = if include_superseded {
-        db.search_text_with(&scopes, query, k, &options)
+        db.search_text_with(&scopes, &query, k, &options)
     } else {
         db.search_text_live(
             &scopes,
-            query,
+            &query,
             k,
             &options,
             &topodb_json::MEMORY_TOMBSTONE_PROPS,

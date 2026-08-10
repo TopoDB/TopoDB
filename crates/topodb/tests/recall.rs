@@ -1115,3 +1115,122 @@ fn recall_rejects_empty_prop_retain_allowlist() {
         other => panic!("expected Rejected, got {other:?}"),
     }
 }
+
+/// RecallQuery: options.created_range is applied POST-FUSION (the
+/// prop_retain slot), so it also drops candidates that arrive via the
+/// graph leg — which never passes through text search.
+#[test]
+fn recall_created_range_drops_graph_leg_candidates_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    const DAY_MS: i64 = 86_400_000;
+    // Wall-clock now: the graph leg's as_of follows options.now_ms, and the
+    // edge below is minted at the real wall clock — keep the two consistent
+    // by leaving now_ms unset and backdating only the neighbor's id.
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+    // Fresh seed matches the query; the BACKDATED neighbor's content does
+    // not — it is reachable only through the 1-hop graph boost.
+    let seed = NodeId::new();
+    let mut seed_props = Props::new();
+    seed_props.insert("content".into(), PropValue::Str("chrono alpha beta".into()));
+    let neighbor = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 1));
+    let mut n_props = Props::new();
+    n_props.insert("content".into(), PropValue::Str("unrelated words".into()));
+    let edge = EdgeId::new();
+    db.submit(vec![
+        Op::CreateNode {
+            id: seed,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: seed_props,
+        },
+        Op::CreateNode {
+            id: neighbor,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: n_props,
+        },
+        Op::CreateEdge {
+            id: edge,
+            scope: Scope::Id(s),
+            ty: "about".into(),
+            from: seed,
+            to: neighbor,
+            props: Props::new(),
+            valid_from: None,
+        },
+    ])
+    .unwrap();
+
+    // Precondition: without the range, graph boost surfaces the neighbor.
+    let plain = db
+        .recall(&RecallQuery::new(ScopeSet::of(&[s]), "chrono alpha", 10))
+        .unwrap();
+    assert!(
+        plain.iter().any(|(n, _)| n.id == neighbor),
+        "precondition: the graph leg must surface the linked neighbor"
+    );
+
+    // after_ms a week ago drops the month-old neighbor post-fusion.
+    let q = RecallQuery {
+        options: SearchOptions {
+            created_range: Some(CreatedRange {
+                after_ms: Some(now - 7 * DAY_MS),
+                before_ms: None,
+            }),
+            ..SearchOptions::default()
+        },
+        ..RecallQuery::new(ScopeSet::of(&[s]), "chrono alpha", 10)
+    };
+    let filtered = db.recall(&q).unwrap();
+    assert!(
+        filtered.iter().any(|(n, _)| n.id == seed),
+        "the fresh in-range seed survives"
+    );
+    assert!(
+        filtered.iter().all(|(n, _)| n.id != neighbor),
+        "post-fusion created_range must catch graph-leg candidates"
+    );
+}
+
+/// recall validates created_range BEFORE any leg runs (like prop_retain).
+/// text_weight is zeroed so the text leg cannot do the rejecting for us —
+/// without recall-level validation this would be a silent Ok(empty).
+#[test]
+fn recall_rejects_inverted_created_range_before_any_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![],
+        text: vec![PropIndex {
+            label: "Memory".into(),
+            prop: "content".into(),
+        }],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let s = ScopeId::new();
+    let mut q = RecallQuery::new(ScopeSet::of(&[s]), "anything", 10);
+    q.text_weight = 0.0; // graph leg keeps validate_tuning satisfied
+    q.options = SearchOptions {
+        created_range: Some(CreatedRange {
+            after_ms: Some(10),
+            before_ms: Some(10),
+        }),
+        ..SearchOptions::default()
+    };
+    match db.recall(&q) {
+        Err(TopoError::Rejected(_)) => {}
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}

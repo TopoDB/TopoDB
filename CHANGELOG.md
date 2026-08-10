@@ -16,6 +16,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
+#### Added
+
+- **`SearchOptions.created_range`** — optional created-time filter
+  (`CreatedRange { after_ms, before_ms }`, after inclusive / before
+  exclusive), filters before top-k on both search paths; `None` unchanged.
+
 #### Changed
 
 - **`SearchOptions` gains a new public field, `recency_half_life_by_prop`**
@@ -23,6 +29,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   without `..Default::default()`) — optional prop-keyed recency half-life
   map (per-node decay curves). `None` (via `Default`) is unchanged flat
   behavior.
+- **`SearchOptions` gains a second new public field, `created_range`** (same
+  BREAKING-for-full-struct-literals caveat as above). `None` (via `Default`)
+  is unchanged behavior.
 
 ### 0.0.13 — 2026-08-08
 
@@ -370,6 +379,11 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`parse_temporal_query` / `parse_iso_instant` / `TemporalRewrite`** —
+  deterministic regex-first temporal phrase parser (ISO date/month/year,
+  before/after/since/until, between, yesterday/today/last week/month/N days;
+  bare years require in/on/during; conservative — returns `None` without a
+  parseable date). Note the new `regex` dependency.
 - **`dup` module** — the duplicate/supersession classifier
   (`containment_of_sets`, `tokens`, `dup_band`, `text_dup_band`,
   `dup_relation`, `is_supersession`, plus the calibrated near-duplicate
@@ -524,6 +538,10 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Added
 
+- **`search_memories` temporal filters** — `created_after` / `created_before`
+  (ISO date strings, period-start); `temporal_rewrite` (default `true` — date
+  phrases become created-time filters, residual searched; explicit params
+  always win); `applied_time_filter` result echo (the derived interval).
 - **`link.conflicts`** — after a write that did not pass `supersede: true`,
   `link`'s result lists OTHER open same-type edges from the same node
   (`{edge_id, to, valid_from}`), omitted when empty. Advisory only — no
@@ -537,6 +555,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 #### Changed
 
+- **`search_memories` queries containing date phrases are now time-filtered by
+  default** (`temporal_rewrite` defaults to `true`) — pass
+  `temporal_rewrite: false` for verbatim search. Machine-constructed queries
+  built from prompt text should always pass `false` (the plugin's
+  subagent-priming hook does).
+- **`search_memories` tool description trimmed** — the 7× duplicated `scopes`
+  param doc consolidated.
 - **`check_conflicts: false` also suppresses the existing `near_duplicates` field**
   (both derive from the same probe).
 - **`search_memories` recency is kind-aware by default** — episodic memories
@@ -1102,6 +1127,10 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 #### Added
 
+- **`search` temporal filters** — `--created-after` / `--created-before`
+  (ISO date strings, period-start); `--no-temporal-rewrite` (default rewrite
+  on — date phrases become filters, residual searched); stderr time-filter
+  echo when applied.
 - **`search` — `--recency-weight` / `--recency-half-life-days` flags** —
   tune or disable (`--recency-weight 0`) the recency prior; passing
   `--recency-half-life-days` switches from the kind-aware default to a flat
