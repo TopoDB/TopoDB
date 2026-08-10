@@ -1282,6 +1282,11 @@ struct SearchMemoriesParams {
     /// ISO date: exclusive upper bound. "2026-08-01" excludes that day.
     #[serde(default)]
     created_before: Option<String>,
+    /// Default true: parse date phrases ("before 2026-08") to filters;
+    /// disabled if explicit created_* params given. Reports filter in
+    /// applied_time_filter. Set false for verbatim search.
+    #[serde(default = "default_true")]
+    temporal_rewrite: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2866,6 +2871,7 @@ impl TopoServer {
             .as_deref()
             .map(|s| parse_bound("created_before", s))
             .transpose()?;
+        let mut query_text = p.query.clone();
         let (created_range, applied_time_filter) = if after_ms.is_some() || before_ms.is_some() {
             (
                 Some(CreatedRange {
@@ -2879,6 +2885,25 @@ impl TopoServer {
                     matched_phrase: None,
                 }),
             )
+        } else if p.temporal_rewrite {
+            match convert::parse_temporal_query(&p.query, now_ms()) {
+                Some(rw) => {
+                    query_text = rw.residual_query;
+                    (
+                        Some(CreatedRange {
+                            after_ms: rw.after_ms,
+                            before_ms: rw.before_ms,
+                        }),
+                        Some(AppliedTimeFilter {
+                            after: rw.after_ms,
+                            before: rw.before_ms,
+                            source: "rewrite".to_string(),
+                            matched_phrase: Some(rw.matched_phrase),
+                        }),
+                    )
+                }
+                None => (None, None),
+            }
         } else {
             (None, None)
         };
@@ -2896,7 +2921,7 @@ impl TopoServer {
         // corroborates each distinct token once anyway — a second identical
         // expansion entry is pure waste, not extra signal.
         let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for word in p.query.split_whitespace() {
+        for word in query_text.split_whitespace() {
             let Some(key) = topodb::analyze(word).into_iter().next() else {
                 continue;
             };
@@ -3035,7 +3060,7 @@ impl TopoServer {
             // recall then degrades to text/graph legs only.
             vector: self
                 .embedder
-                .embed(&p.query)
+                .embed(&query_text)
                 .map(|v| (self.embedder.model_name(), v)),
             expansions,
             graph_boost: p.graph_boost,
@@ -3052,7 +3077,7 @@ impl TopoServer {
             graph_weight: p.graph_weight,
             access_weight: p.access_weight,
             label_weights,
-            ..RecallQuery::new(scope_set, p.query.clone(), p.k)
+            ..RecallQuery::new(scope_set, query_text.clone(), p.k)
         };
         // `recall` opens redb read transactions, so unlike the pure snapshot
         // reads it CAN fail with `Storage`/`Encoding` — only its
@@ -4123,9 +4148,12 @@ impl ServerHandler for TopoServer {
                  terms, falls back to close prefix/typo matches, and expands learned \
                  synonyms (add_synonym) automatically — but it can't guess vocabulary it \
                  was never taught, so retry with different words before concluding \
-                 nothing is stored — then traverse from the best hit; use \
-                 get_edges to inspect or retire a node's current relations. \
-                 Maintenance: memory_health at session start summarizes hygiene; drill into \
+                 nothing is stored — then traverse from the best hit; recall can be \
+                 time-boxed: created_after/created_before params, or a date phrase in \
+                 the query (\"before 2026-08\", \"last week\") rewritten automatically — \
+                 applied_time_filter reports what ran; use get_edges to inspect or retire \
+                 a node's current relations. Maintenance: memory_health at session start \
+                 summarizes hygiene; drill into \
                  non-zero counts with the find_* scans and act via consolidate_memories / \
                  forget — scans are advisory and never act on their own. Before treating an \
                  entity as new, check the shared scope too.",

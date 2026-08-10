@@ -102,3 +102,96 @@ fn unparseable_bound_is_rejected() {
         expect_tool_error(&resp);
     }
 }
+
+/// 2099-01-01T00:00:00Z in ms — safely after anything a test run creates,
+/// and still inside the parser's 1970–2099 year window (2100+ would not
+/// parse at all).
+const FUTURE_MS: i64 = 4_070_908_800_000;
+
+#[test]
+fn temporal_phrase_is_rewritten_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = seeded_server(&dir, "chose redb for the storage engine");
+    let out = s.call_tool_ok(
+        "search_memories",
+        json!({ "query": "storage engine before 2099-01-01" }),
+        T,
+    );
+    assert_eq!(out["hits"].as_array().map(Vec::len), Some(1), "{out:#?}");
+    let filter = &out["applied_time_filter"];
+    assert_eq!(filter["source"], "rewrite", "{out:#?}");
+    assert_eq!(filter["before"], json!(FUTURE_MS), "{out:#?}");
+    assert_eq!(filter["matched_phrase"], "before 2099-01-01", "{out:#?}");
+}
+
+#[test]
+fn residual_query_is_what_gets_searched() {
+    let dir = tempfile::tempdir().unwrap();
+    // The seed CONTAINS the temporal phrase's own tokens, so searching the
+    // full query string would match it; only the stripped residual must run.
+    let mut s = seeded_server(&dir, "planning meeting before 2099-01-01 kickoff");
+    let out = s.call_tool_ok(
+        "search_memories",
+        json!({ "query": "qqqzzz before 2099-01-01" }),
+        T,
+    );
+    assert_eq!(
+        out["hits"].as_array().map(Vec::len),
+        Some(0),
+        "residual 'qqqzzz' matches nothing — full-string search would have hit: {out:#?}"
+    );
+    assert_eq!(out["applied_time_filter"]["source"], "rewrite", "{out:#?}");
+}
+
+#[test]
+fn explicit_params_win_over_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = seeded_server(&dir, "chose redb for the storage engine");
+    let out = s.call_tool_ok(
+        "search_memories",
+        json!({ "query": "storage before 2099-01-01", "created_after": "2001-01-01" }),
+        T,
+    );
+    // Rewriter must not run: source is "params", no matched_phrase, and the
+    // query was searched verbatim (its "storage" term still hits).
+    assert_eq!(out["hits"].as_array().map(Vec::len), Some(1), "{out:#?}");
+    let filter = &out["applied_time_filter"];
+    assert_eq!(filter["source"], "params", "{out:#?}");
+    assert_eq!(filter["after"], json!(PAST_MS), "{out:#?}");
+    assert!(
+        filter.get("matched_phrase").is_none_or(|v| v.is_null()),
+        "{out:#?}"
+    );
+}
+
+#[test]
+fn temporal_rewrite_false_searches_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = seeded_server(&dir, "chose redb for the storage engine");
+    let out = s.call_tool_ok(
+        "search_memories",
+        json!({ "query": "storage before 2099-01-01", "temporal_rewrite": false }),
+        T,
+    );
+    assert_eq!(out["hits"].as_array().map(Vec::len), Some(1), "{out:#?}");
+    assert!(
+        out.get("applied_time_filter").is_none(),
+        "opt-out must leave the query untouched and unfiltered: {out:#?}"
+    );
+}
+
+#[test]
+fn phrase_without_parseable_date_never_triggers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = seeded_server(&dir, "v8 migration decision recorded");
+    let out = s.call_tool_ok(
+        "search_memories",
+        json!({ "query": "decision before the v8 migration" }),
+        T,
+    );
+    assert_eq!(out["hits"].as_array().map(Vec::len), Some(1), "{out:#?}");
+    assert!(
+        out.get("applied_time_filter").is_none(),
+        "'before <no date>' is conservative — no rewrite: {out:#?}"
+    );
+}
