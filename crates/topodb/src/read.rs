@@ -24,6 +24,19 @@ pub enum Direction {
     Both,
 }
 
+/// Which time axis a temporal read gates on. `Valid` (the default) is
+/// world/valid-time — `valid_from`/`valid_to`, identical to every predicate
+/// this engine had before bi-temporal edges. `Recorded` is belief time —
+/// `recorded_at`/`superseded_at` — what we had WRITTEN by `t`, regardless of
+/// what the world was doing; a late-recorded fact is invisible on this axis
+/// until the write actually happened, even if its `valid_from` predates `t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeAxis {
+    #[default]
+    Valid,
+    Recorded,
+}
+
 /// A bounded, scoped, temporal breadth-first traversal request.
 #[derive(Debug, Clone)]
 pub struct TraversalQuery {
@@ -38,6 +51,9 @@ pub struct TraversalQuery {
     /// clock (this is a read path; only writes must never embed wall-clock
     /// time).
     pub as_of: Option<i64>,
+    /// Which time axis `as_of` gates hops on. Default `Valid` — behavior
+    /// identical to every traversal before bi-temporal edges.
+    pub time_axis: TimeAxis,
 }
 
 /// Result of a traversal: every in-scope seed plus everything reached,
@@ -333,8 +349,30 @@ impl Db {
                 if !q.scopes.contains(entry_scope) {
                     continue;
                 }
-                if !(entry.valid_from <= t && entry.valid_to.is_none_or(|vt| t < vt)) {
-                    continue;
+                match q.time_axis {
+                    TimeAxis::Valid => {
+                        if !(entry.valid_from <= t && entry.valid_to.is_none_or(|vt| t < vt)) {
+                            continue;
+                        }
+                    }
+                    TimeAxis::Recorded => {
+                        // Belief axis: not on the adjacency entry, so fetch
+                        // the full record for this candidate only (Valid
+                        // stays the byte-identical hot path above).
+                        let Some(rec) = read_edge_by_slot(
+                            &edges,
+                            &dicts,
+                            &scope_registry,
+                            &node_ids,
+                            entry.edge,
+                        )?
+                        else {
+                            continue;
+                        };
+                        if !(rec.recorded_at <= t && rec.superseded_at.is_none_or(|st| st > t)) {
+                            continue;
+                        }
+                    }
                 }
                 let Some(other) = read_node_by_slot(
                     &nodes,
@@ -477,6 +515,7 @@ mod tests {
                 edge_types: None,
                 direction: Direction::Out,
                 as_of: None,
+                time_axis: TimeAxis::Valid,
             })
             .unwrap();
 

@@ -225,8 +225,17 @@ impl TopoDb {
             .transpose()?;
         let ty = opts.as_ref().and_then(|o| o.ty.clone());
         let open_only = opts.as_ref().and_then(|o| o.open_only).unwrap_or(false);
-        let edges =
-            blocking(move || db.edges_from(&set, from_id, to_id, ty.as_deref(), open_only)).await?;
+        let edges = blocking(move || {
+            db.edges_from(
+                &set,
+                from_id,
+                to_id,
+                ty.as_deref(),
+                open_only,
+                topodb::TimeAxis::Valid,
+            )
+        })
+        .await?;
         convert::edges_to_value(edges)
     }
 
@@ -278,6 +287,7 @@ impl TopoDb {
             edge_types,
             direction,
             as_of,
+            time_axis: topodb::TimeAxis::Valid,
         };
         let sg = blocking(move || db.traverse(&q)).await?;
         convert::subgraph_to_value(&sg)

@@ -4,7 +4,9 @@
 use crate::{Note, RELATED_KEY, TITLE_PROP, TOPODB_ID_KEY};
 use serde_yaml::{Mapping, Value as Yaml};
 use std::collections::BTreeMap;
-use topodb::{Db, Direction, NodeId, NodeRecord, PropValue, RecallQuery, ScopeSet, TraversalQuery};
+use topodb::{
+    Db, Direction, NodeId, NodeRecord, PropValue, RecallQuery, ScopeSet, TimeAxis, TraversalQuery,
+};
 use topodb_json::{
     find_existing_entity, ComposeError, ALIAS_EDGE_TYPE, ALIAS_NAME_PROP, ENTITY_LABEL,
     ENTITY_NAME_PROP, MEMORY_CONTENT_HASH_PROP, MEMORY_CONTENT_PROP, MEMORY_FORGOTTEN_AT_PROP,
@@ -48,6 +50,7 @@ pub fn select_by_entity(
         edge_types: None,
         direction: Direction::Both,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     })?;
     Ok(sg
         .nodes
@@ -234,7 +237,7 @@ pub fn seed_vault(
     // agree), so a colliding memory note has to be the one pushed to a suffix.
     let mut per_memory_entities: Vec<Vec<String>> = Vec::with_capacity(memories.len());
     for mem in memories {
-        let edges = match db.edges_from(scopes, mem.id, None, None, true) {
+        let edges = match db.edges_from(scopes, mem.id, None, None, true, TimeAxis::Valid) {
             Ok(e) => e,
             Err(e) => {
                 report.errors.push(crate::FileError {
@@ -291,24 +294,30 @@ pub fn seed_vault(
     }
 
     for (ent_id, (ent_node, name)) in &all_entities {
-        let aliases: Vec<String> =
-            match db.edges_to(scopes, *ent_id, None, Some(ALIAS_EDGE_TYPE), true) {
-                Ok(edges) => edges
-                    .into_iter()
-                    .filter_map(|edge| db.node(scopes, edge.from))
-                    .filter_map(|n| match n.props.get(ALIAS_NAME_PROP) {
-                        Some(PropValue::Str(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                Err(e) => {
-                    report.errors.push(crate::FileError {
-                        file: name.clone(),
-                        reason: e.to_string(),
-                    });
-                    continue;
-                }
-            };
+        let aliases: Vec<String> = match db.edges_to(
+            scopes,
+            *ent_id,
+            None,
+            Some(ALIAS_EDGE_TYPE),
+            true,
+            TimeAxis::Valid,
+        ) {
+            Ok(edges) => edges
+                .into_iter()
+                .filter_map(|edge| db.node(scopes, edge.from))
+                .filter_map(|n| match n.props.get(ALIAS_NAME_PROP) {
+                    Some(PropValue::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) => {
+                report.errors.push(crate::FileError {
+                    file: name.clone(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
         let note = render_entity_stub(ent_node, &aliases);
         let base = slug(name);
         let filename = resolve_filename(base, *ent_id, &mut used);

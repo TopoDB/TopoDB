@@ -9,8 +9,8 @@ use std::str::FromStr;
 use clap::Parser;
 use cli::{Cli, Command};
 use topodb::{
-    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TopoError, TraversalQuery,
-    VectorQuery,
+    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
+    TraversalQuery, VectorQuery,
 };
 
 fn main() {
@@ -661,6 +661,7 @@ fn traverse(
         edge_types,
         direction,
         as_of,
+        time_axis: TimeAxis::Valid,
     };
     let sg = match db.traverse(&query) {
         Ok(sg) => sg,
@@ -756,8 +757,26 @@ fn get_edges(
         open_only.unwrap_or(true)
     };
 
-    let fetch_from = |t: Option<&str>| db.edges_from(&scopes, from_id, to_id, t, open_only_to_use);
-    let fetch_to = |t: Option<&str>| db.edges_to(&scopes, from_id, to_id, t, open_only_to_use);
+    let fetch_from = |t: Option<&str>| {
+        db.edges_from(
+            &scopes,
+            from_id,
+            to_id,
+            t,
+            open_only_to_use,
+            TimeAxis::Valid,
+        )
+    };
+    let fetch_to = |t: Option<&str>| {
+        db.edges_to(
+            &scopes,
+            from_id,
+            to_id,
+            t,
+            open_only_to_use,
+            TimeAxis::Valid,
+        )
+    };
     let mut edges = match direction {
         cli::DirectionArg::Out => fetch_typed(edge_type, fetch_from),
         cli::DirectionArg::In => fetch_typed(edge_type, fetch_to),
@@ -1083,7 +1102,7 @@ fn link(
     }
     let write_set = topodb_json::scope_to_scope_set(scope);
     let conflicts: Vec<serde_json::Value> = db
-        .edges_from(&write_set, from, None, Some(&ty), true)
+        .edges_from(&write_set, from, None, Some(&ty), true, TimeAxis::Valid)
         .unwrap_or_default()
         .into_iter()
         .filter(|e| e.id != id)

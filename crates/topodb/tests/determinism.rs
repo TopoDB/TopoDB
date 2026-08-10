@@ -259,6 +259,7 @@ fn adjacency_fingerprint(
                 edge_types: None,
                 direction: Direction::Both,
                 as_of: Some(i64::MAX),
+                time_axis: TimeAxis::Valid,
             })
             .unwrap();
         let mut node_ids: Vec<NodeId> = sub.nodes.iter().map(|n| n.id).collect();

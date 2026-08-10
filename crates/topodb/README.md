@@ -16,7 +16,7 @@ stable; pin exact versions.
 ```rust,no_run
 use topodb::{
     Db, Direction, IndexSpec, NodeId, Op, PropIndex, PropValue, Scope, ScopeId,
-    ScopeSet, TraversalQuery, VectorQuery,
+    ScopeSet, TimeAxis, TraversalQuery, VectorQuery,
 };
 
 fn main() -> Result<(), topodb::TopoError> {
@@ -85,6 +85,7 @@ fn main() -> Result<(), topodb::TopoError> {
         edge_types: None,
         direction: Direction::Out,
         as_of: None,
+        time_axis: TimeAxis::Valid,
     })?;
     Ok(())
 }

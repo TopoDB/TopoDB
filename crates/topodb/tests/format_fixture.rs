@@ -738,7 +738,9 @@ fn v9_fixture_opens_and_reads() {
 
     // e1: open, backdated. World time (valid_from) 1_000, belief time
     // (recorded_at) 5_000 — deliberately divergent.
-    let from_n1 = db.edges_from(&scopes, n1, None, None, false).unwrap();
+    let from_n1 = db
+        .edges_from(&scopes, n1, None, None, false, TimeAxis::Valid)
+        .unwrap();
     assert_eq!(
         from_n1.len(),
         1,
@@ -753,7 +755,9 @@ fn v9_fixture_opens_and_reads() {
     assert_eq!(edge1.superseded_at, None, "e1 was never closed");
 
     // e2: created then closed, both axes moving together (no backdating).
-    let from_n2 = db.edges_from(&scopes, n2, None, None, false).unwrap();
+    let from_n2 = db
+        .edges_from(&scopes, n2, None, None, false, TimeAxis::Valid)
+        .unwrap();
     assert_eq!(
         from_n2.len(),
         1,

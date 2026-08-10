@@ -104,6 +104,7 @@ fn seeded_db(n: usize, dim: usize) -> (tempfile::TempDir, Db, ScopeId, Vec<NodeI
             edge_types: None,
             direction: Direction::Both,
             as_of: None,
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert!(
@@ -182,6 +183,7 @@ fn bench_recall(c: &mut Criterion) {
             edge_types: None,
             direction: Direction::Both,
             as_of: None,
+            time_axis: TimeAxis::Valid,
         };
         b.iter(|| db.traverse(&q).unwrap())
     });

@@ -61,6 +61,7 @@ fn unrelated_edge_scope_between_project_nodes_is_rejected() {
             edge_types: None,
             direction: Direction::Both,
             as_of: None,
+            time_axis: TimeAxis::Valid,
         })
         .unwrap();
     assert!(
@@ -150,6 +151,7 @@ fn project_scoped_edge_between_shared_nodes_commits_and_is_project_private() {
             edge_types: None,
             direction: Direction::Both,
             as_of: None,
+            time_axis: TimeAxis::Valid,
         })
         .unwrap()
         .edges

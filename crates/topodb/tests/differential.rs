@@ -462,6 +462,7 @@ fn assert_equivalent(db: &Db, model: &reference::RefModel, probes: &[Probe]) {
                         edge_types: None,
                         direction: *direction,
                         as_of: Some(*as_of),
+                        time_axis: TimeAxis::Valid,
                     })
                     .unwrap();
                 let actual_nodes = actual

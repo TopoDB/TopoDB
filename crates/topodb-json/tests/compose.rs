@@ -1,7 +1,7 @@
 //! plan_remember against a real (temp) engine Db. Every plan's `ops` are
 //! submitted through `db.submit` exactly as a front end would.
 
-use topodb::{Db, Op, PropValue, Scope};
+use topodb::{Db, Op, PropValue, Scope, TimeAxis};
 use topodb_json::{
     content_hash, default_spec, memory_props, plan_remember, scopes_to_scope_set,
     validate_memory_kind, ComposeError, RememberRequest, MEMORY_SUPERSEDED_AT_PROP,
@@ -297,7 +297,9 @@ fn self_supersede_mints_fresh_not_dedup() {
         "old node must have superseded_at timestamp"
     );
     // Check old node has no open out-edges (all should be closed)
-    let old_edges = db.edges_from(&lookup(), old_id, None, None, true).unwrap();
+    let old_edges = db
+        .edges_from(&lookup(), old_id, None, None, true, TimeAxis::Valid)
+        .unwrap();
     assert!(
         old_edges.is_empty(),
         "old node should have no open out-edges after supersede"
@@ -311,7 +313,14 @@ fn self_supersede_mints_fresh_not_dedup() {
     );
     // Verify the fresh node has an edge to mira
     let fresh_edges = db
-        .edges_from(&lookup(), second.memory_id, None, Some("about"), true)
+        .edges_from(
+            &lookup(),
+            second.memory_id,
+            None,
+            Some("about"),
+            true,
+            TimeAxis::Valid,
+        )
         .unwrap();
     assert_eq!(fresh_edges.len(), 1, "fresh node must have edge to mira");
 }

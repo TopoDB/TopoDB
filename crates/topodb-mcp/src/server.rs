@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
     CreatedRange, Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props,
-    RecallQuery, Scope, ScopeSet, SearchOptions, TopoError, TraversalQuery, VectorQuery,
+    RecallQuery, Scope, ScopeSet, SearchOptions, TimeAxis, TopoError, TraversalQuery, VectorQuery,
 };
 
 use crate::config::{
@@ -404,7 +404,7 @@ impl TopoServer {
             ops.push(Op::SetNodeProps { id, props });
             for e in self
                 .db
-                .edges_from(&scope_set, id, None, None, true)
+                .edges_from(&scope_set, id, None, None, true, TimeAxis::Valid)
                 .map_err(classify_topo_error)?
             {
                 ops.push(Op::CloseEdge {
@@ -2525,7 +2525,7 @@ impl TopoServer {
         // never stacks a duplicate edge.
         let mut have: std::collections::BTreeSet<(NodeId, String)> = self
             .db
-            .edges_from(&write_set, keep, None, None, true)
+            .edges_from(&write_set, keep, None, None, true, TimeAxis::Valid)
             .map_err(classify_topo_error)?
             .into_iter()
             .map(|e| (e.to, e.ty.to_string()))
@@ -2535,7 +2535,7 @@ impl TopoServer {
         let mut transferred: Vec<TransferredEdge> = Vec::new();
         for e in self
             .db
-            .edges_from(&write_set, drop, None, None, true)
+            .edges_from(&write_set, drop, None, None, true, TimeAxis::Valid)
             .map_err(classify_topo_error)?
         {
             // Never point keep at itself or at the node being retired.
@@ -2619,7 +2619,7 @@ impl TopoServer {
             scanned += 1;
             let open = self
                 .db
-                .edges_from(scope_set, n.id, None, None, true)
+                .edges_from(scope_set, n.id, None, None, true, TimeAxis::Valid)
                 .map_err(classify_topo_error)?;
             if !open.is_empty() {
                 continue;
@@ -3142,6 +3142,7 @@ impl TopoServer {
             edge_types,
             direction: p.direction.into(),
             as_of: p.as_of,
+            time_axis: TimeAxis::Valid,
         };
         // `traverse` opens a redb read transaction and walks on-disk chunked
         // adjacency (v3), so — like `search_text` — it can fail with
@@ -3692,6 +3693,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
                     Some(entity_id),
                     Some(ALIAS_EDGE_TYPE),
                     true,
+                    TimeAxis::Valid,
                 )
                 .map_err(classify_topo_error)?;
             if !edges.is_empty() {
@@ -3843,7 +3845,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // possible.
         let existing = self
             .db
-            .edges_from(&write_set, from, Some(to), Some(&ty), true)
+            .edges_from(&write_set, from, Some(to), Some(&ty), true, TimeAxis::Valid)
             .map_err(classify_topo_error)?;
 
         let mut ops: Vec<Op> = Vec::new();
@@ -3851,7 +3853,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         if p.supersede {
             let open_same_ty = self
                 .db
-                .edges_from(&write_set, from, None, Some(&ty), true)
+                .edges_from(&write_set, from, None, Some(&ty), true, TimeAxis::Valid)
                 .map_err(classify_topo_error)?;
             for e in open_same_ty.iter().filter(|e| e.to != to) {
                 ops.push(Op::CloseEdge {
@@ -3921,7 +3923,10 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         ty: &str,
         just_written: EdgeId,
     ) -> Vec<LinkConflict> {
-        let Ok(open) = self.db.edges_from(scopes, from, None, Some(ty), true) else {
+        let Ok(open) = self
+            .db
+            .edges_from(scopes, from, None, Some(ty), true, TimeAxis::Valid)
+        else {
             return Vec::new();
         };
         open.into_iter()
@@ -3972,12 +3977,12 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
 
         let fetch_from = |t: Option<&str>| {
             self.db
-                .edges_from(&scope_set, from, to, t, open_only_to_use)
+                .edges_from(&scope_set, from, to, t, open_only_to_use, TimeAxis::Valid)
                 .map_err(classify_topo_error)
         };
         let fetch_to = |t: Option<&str>| {
             self.db
-                .edges_to(&scope_set, from, to, t, open_only_to_use)
+                .edges_to(&scope_set, from, to, t, open_only_to_use, TimeAxis::Valid)
                 .map_err(classify_topo_error)
         };
         let edge_type = p.edge_type.as_deref();
