@@ -151,6 +151,72 @@ fn access_weight_plumbs_through() {
     assert_eq!(hits[0]["node"]["id"], mem["id"]);
 }
 
+/// Kind-aware recency is the default; explicit recency_half_life_days
+/// switches to a flat prior; weight 0 disables. All three must be accepted,
+/// and out-of-range values still reject. (Ranking correctness under aging
+/// is engine-tested — MCP tests cannot backdate ULIDs.)
+#[test]
+fn recency_param_combinations_plumb_through() {
+    let (_dir, mut server) = fresh_server();
+    server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "obsidian flow patterns", "entities": ["obsidian"], "kind": "episodic" }),
+        DEFAULT_TIMEOUT,
+    );
+    for params in [
+        serde_json::json!({ "query": "obsidian", "k": 5 }), // kind-aware default
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_half_life_days": 30.0 }), // explicit flat
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_weight": 0.0 }), // disabled
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_weight": 0.0,
+                            "recency_half_life_days": 30.0 }), // both: inert, still valid
+    ] {
+        let res = server.call_tool_ok("search_memories", params, DEFAULT_TIMEOUT);
+        assert!(
+            !res["hits"].as_array().unwrap().is_empty(),
+            "memory must surface: {res}"
+        );
+    }
+    let resp = server.call_tool(
+        "search_memories",
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_half_life_days": 0.0 }),
+        DEFAULT_TIMEOUT,
+    );
+    expect_tool_error(&resp);
+
+    // Polarity pin: an explicit near-zero flat half-life must score LOWER
+    // than the omitted (kind-aware) default for the SAME memory. This is the
+    // only assertion in this test that would catch
+    // `recency_half_life_days.is_none()` getting inverted to `.is_some()` in
+    // the options-assembly code — the accepted-shapes loop above only checks
+    // that both shapes are accepted, not which one wins. Sleep briefly first
+    // so the memory is guaranteed to be at least ~1s old before the
+    // flat-tiny-half-life search runs (a zero-age memory would decay by ~0%
+    // under any half-life, masking the bug).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let flat = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_half_life_days": 0.00001 }),
+        DEFAULT_TIMEOUT,
+    );
+    let omitted = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "obsidian", "k": 5 }),
+        DEFAULT_TIMEOUT,
+    );
+    let top_score = |res: &serde_json::Value| -> f64 {
+        res["hits"].as_array().unwrap()[0]["score"]
+            .as_f64()
+            .unwrap()
+    };
+    let score_flat = top_score(&flat);
+    let score_omitted = top_score(&omitted);
+    assert!(
+        score_flat < score_omitted,
+        "explicit tiny flat half-life (score {score_flat}) must decay below the \
+         kind-aware default (score {score_omitted}): flat={flat}, omitted={omitted}"
+    );
+}
+
 /// The alias→entity edge must let a query that matches ONLY the alias's name
 /// still surface the canonical entity — pulled in via `graph_boost`'s 1-hop
 /// traversal from the alias node (a preliminary-fusion seed) — while the

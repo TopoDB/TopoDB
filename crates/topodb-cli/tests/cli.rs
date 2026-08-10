@@ -3415,3 +3415,102 @@ fn text_format_search_truncation_with_ellipsis() {
         "should not contain the full original end: {s}"
     );
 }
+
+/// --recency-weight / --recency-half-life-days plumb into SearchOptions:
+/// defaults, weight 0, and an explicit flat half-life all search fine;
+/// out-of-range values surface the engine's Rejected error.
+#[test]
+fn search_recency_flags_plumb_and_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+    let out = bin()
+        .args(["--db"])
+        .arg(&db)
+        .args([
+            "--scope",
+            &scope,
+            "remember",
+            "--content",
+            "feldspar veins in the north wall",
+            "--entity",
+            "Geology",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "remember: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let search = |extra: &[&str]| {
+        let mut c = bin();
+        c.args(["--db"])
+            .arg(&db)
+            .args(["--scope", &scope, "search", "feldspar"]);
+        c.args(extra);
+        c.output().unwrap()
+    };
+
+    // defaults (kind-aware), disabled, explicit flat: all succeed and hit.
+    for extra in [
+        &[][..],
+        &["--recency-weight", "0"][..],
+        &["--recency-half-life-days", "7"][..],
+    ] {
+        let out = search(extra);
+        assert!(
+            out.status.success(),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            !v.as_array().unwrap().is_empty(),
+            "{extra:?} must return the memory: {v}"
+        );
+    }
+
+    // Out-of-range values surface the engine's Rejected error (the exit
+    // code for engine rejections — assert whatever code fail_engine uses;
+    // existing rejected-input CLI tests show it as 2).
+    let out = search(&["--recency-weight", "1.5"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("recency_weight"));
+
+    let out = search(&["--recency-half-life-days", "0"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("recency_half_life"));
+
+    // Polarity pin: an explicit near-zero flat half-life must score LOWER
+    // than the omitted (kind-aware) default for the SAME memory — the only
+    // check in this test that would catch `recency_half_life_days.is_none()`
+    // getting inverted to `.is_some()` in the options-assembly code (the
+    // accepted-shapes loop above only checks that both shapes are accepted,
+    // not which one wins). Sleep briefly first so the memory is guaranteed
+    // to be at least ~1s old before the flat-tiny-half-life search runs (a
+    // zero-age memory would decay by ~0% under any half-life, masking the
+    // bug).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let top_score = |out: &std::process::Output| -> f64 {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v.as_array().unwrap()[0]["score"].as_f64().unwrap()
+    };
+    let flat_out = search(&["--recency-half-life-days", "0.00001"]);
+    assert!(flat_out.status.success(), "{flat_out:?}");
+    let omitted_out = search(&[]);
+    assert!(omitted_out.status.success(), "{omitted_out:?}");
+    let score_flat = top_score(&flat_out);
+    let score_omitted = top_score(&omitted_out);
+    assert!(
+        score_flat < score_omitted,
+        "explicit tiny flat half-life (score {score_flat}) must decay below the \
+         kind-aware default (score {score_omitted})"
+    );
+}

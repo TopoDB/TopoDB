@@ -178,3 +178,57 @@ pub fn plan_purge(
     let ops = doomed.into_iter().map(|id| Op::RemoveNode { id }).collect();
     Ok((ops, ids))
 }
+
+/// The kind→half-life map for SEARCH RANKING, built from the same
+/// constants the lifecycle decay sweep uses so the two can never drift.
+/// Semantic is the map's default bucket: absent kind reads as semantic
+/// everywhere in the system, and non-Memory nodes (entities) deliberately
+/// decay on the semantic curve too.
+pub fn memory_kind_half_life() -> topodb::PropHalfLife {
+    topodb::PropHalfLife {
+        prop: MEMORY_KIND_PROP.to_string(),
+        per_value: vec![
+            (
+                MEMORY_KIND_EPISODIC.to_string(),
+                (LIFECYCLE_HALF_LIFE_EPISODIC_DAYS * DAY_MS) as i64,
+            ),
+            (
+                MEMORY_KIND_PROCEDURAL.to_string(),
+                (LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS * DAY_MS) as i64,
+            ),
+        ],
+        default_ms: (LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS * DAY_MS) as i64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ranking and the decay sweep must share one clock: the search half-life
+    /// map is BUILT from the lifecycle constants, and semantic is deliberately
+    /// the default bucket (absent kind == semantic everywhere else in the
+    /// system, so it must not appear as an explicit entry that could drift).
+    #[test]
+    fn memory_kind_half_life_mirrors_lifecycle_constants() {
+        let map = memory_kind_half_life();
+        assert_eq!(map.prop, MEMORY_KIND_PROP);
+        assert_eq!(
+            map.default_ms,
+            (LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS * DAY_MS) as i64
+        );
+        assert_eq!(
+            map.per_value,
+            vec![
+                (
+                    MEMORY_KIND_EPISODIC.to_string(),
+                    (LIFECYCLE_HALF_LIFE_EPISODIC_DAYS * DAY_MS) as i64
+                ),
+                (
+                    MEMORY_KIND_PROCEDURAL.to_string(),
+                    (LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS * DAY_MS) as i64
+                ),
+            ]
+        );
+    }
+}

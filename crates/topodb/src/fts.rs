@@ -98,6 +98,24 @@ impl PropRetain {
     }
 }
 
+/// Per-node recency half-life keyed by a string prop (e.g. a memory's
+/// `kind`): a node whose `prop` value matches a `per_value` entry decays on
+/// that entry's half-life; absent, non-string, or unmatched values fall to
+/// `default_ms`. `None` on [`SearchOptions`] keeps the flat
+/// `recency_half_life_ms` — the engine stays agnostic about what the prop
+/// means; callers supply the map (see `topodb-json`'s kind constants).
+#[derive(Debug, Clone)]
+pub struct PropHalfLife {
+    /// The `Str` prop to key decay on (e.g. a memory's `kind`).
+    pub prop: String,
+    /// `(prop value, half-life ms)` pairs, linear-scanned per candidate —
+    /// intended for small maps (a handful of kinds, not an open vocabulary).
+    pub per_value: Vec<(String, i64)>,
+    /// Half-life used when `prop` is absent, non-`Str`, or matches no
+    /// `per_value` entry.
+    pub default_ms: i64,
+}
+
 /// Tuning for [`Db::search_text_with`]. `Default` disables every option, so
 /// `search_text_with(scopes, query, k, &SearchOptions::default())` behaves
 /// identically to [`Db::search_text`].
@@ -113,8 +131,11 @@ pub struct SearchOptions {
     /// access.
     pub recency_weight: f32,
     /// The age at which the recency factor has decayed halfway to its floor.
-    /// Must be `> 0` when `recency_weight > 0`.
+    /// Must be `> 0` when `recency_weight > 0` and `recency_half_life_by_prop`
+    /// is `None` (the map's own half-lives govern otherwise).
     pub recency_half_life_ms: i64,
+    /// Optional per-node half-life override map; `None` = flat `recency_half_life_ms`.
+    pub recency_half_life_by_prop: Option<PropHalfLife>,
     /// The "now" ages are measured against. `None` reads the wall clock once
     /// per call (this is a read path; only writes must never embed
     /// wall-clock time). The deterministic seam for tests.
@@ -138,6 +159,7 @@ impl Default for SearchOptions {
         Self {
             recency_weight: 0.0,
             recency_half_life_ms: 30 * 24 * 60 * 60 * 1000,
+            recency_half_life_by_prop: None,
             now_ms: None,
             fuzzy_fallback: true,
             prop_retain: None,
@@ -158,11 +180,37 @@ impl SearchOptions {
                 self.recency_weight
             )));
         }
-        if self.recency_weight > 0.0 && self.recency_half_life_ms <= 0 {
-            return Err(TopoError::Rejected(format!(
-                "recency_half_life_ms must be > 0, got {}",
-                self.recency_half_life_ms
-            )));
+        if self.recency_weight > 0.0 {
+            match &self.recency_half_life_by_prop {
+                Some(map) => {
+                    if map.prop.is_empty() {
+                        return Err(TopoError::Rejected(
+                            "recency_half_life_by_prop.prop must not be empty".into(),
+                        ));
+                    }
+                    if map.default_ms <= 0 {
+                        return Err(TopoError::Rejected(format!(
+                            "recency_half_life_by_prop.default_ms must be > 0, got {}",
+                            map.default_ms
+                        )));
+                    }
+                    for (value, ms) in &map.per_value {
+                        if *ms <= 0 {
+                            return Err(TopoError::Rejected(format!(
+                                "recency_half_life_by_prop[{value:?}] must be > 0, got {ms}"
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    if self.recency_half_life_ms <= 0 {
+                        return Err(TopoError::Rejected(format!(
+                            "recency_half_life_ms must be > 0, got {}",
+                            self.recency_half_life_ms
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -185,6 +233,24 @@ impl SearchOptions {
             }
         }
         Ok(())
+    }
+
+    /// The half-life governing `rec`'s recency decay: the prop-keyed map
+    /// when set (absent/non-string/unmatched prop values → its default),
+    /// else the flat `recency_half_life_ms`.
+    pub(crate) fn half_life_for(&self, rec: &NodeRecord) -> i64 {
+        match &self.recency_half_life_by_prop {
+            Some(map) => match rec.props.get(map.prop.as_str()) {
+                Some(PropValue::Str(v)) => map
+                    .per_value
+                    .iter()
+                    .find(|(value, _)| value == v)
+                    .map(|(_, ms)| *ms)
+                    .unwrap_or(map.default_ms),
+                _ => map.default_ms,
+            },
+            None => self.recency_half_life_ms,
+        }
     }
 }
 
@@ -1095,8 +1161,11 @@ impl Db {
     /// [`SearchOptions`]). The recency factor is applied to every scored
     /// candidate BEFORE the sort and top-`k` truncation, so a fresher hit can
     /// displace a staler one out of the returned window, not merely reorder
-    /// within it. `Rejected` if `recency_weight` is outside `0.0..=1.0`, or
-    /// `recency_half_life_ms <= 0` while the weight is nonzero.
+    /// within it. `Rejected` if `recency_weight` is outside `0.0..=1.0`; if
+    /// `recency_half_life_by_prop` is `None` and `recency_half_life_ms <= 0`
+    /// while the weight is nonzero; or, when `recency_half_life_by_prop` is
+    /// `Some`, if its `prop` is empty, its `default_ms <= 0`, or any
+    /// `per_value` half-life is `<= 0`.
     pub fn search_text_with(
         &self,
         scopes: &ScopeSet,
@@ -1395,7 +1464,7 @@ impl Db {
                             // `now` (clock skew, or a backdated `now_ms`)
                             // clamps to age 0 — full score, never a boost.
                             let age = (now - rec.id.timestamp_ms() as i64).max(0) as f32;
-                            let half_life = options.recency_half_life_ms as f32;
+                            let half_life = options.half_life_for(&rec) as f32;
                             score * ((1.0 - w) + w * (-(age / half_life)).exp2())
                         }
                     };

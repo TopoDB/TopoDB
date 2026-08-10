@@ -436,11 +436,11 @@ pub(crate) fn apply_adjustments(
             .expect("system clock before UNIX epoch")
             .as_millis() as i64
     });
-    let half_life = options.recency_half_life_ms as f32;
     for (rec, score) in out.iter_mut() {
         let mut factor = 1.0f32;
         if w > 0.0 {
             let age = (now - rec.id.timestamp_ms() as i64).max(0) as f32;
+            let half_life = options.half_life_for(rec) as f32;
             factor *= (1.0 - w) + w * (-(age / half_life)).exp2();
         }
         factor *= access_factor(

@@ -265,6 +265,8 @@ fn main() {
             k,
             include_superseded,
             kinds,
+            recency_weight,
+            recency_half_life_days,
         } => search(
             &db,
             default_scope,
@@ -272,6 +274,8 @@ fn main() {
             k,
             include_superseded,
             &kinds,
+            recency_weight,
+            recency_half_life_days,
             text_mode,
             &scope_display,
             &scope_source,
@@ -460,6 +464,8 @@ fn search(
     k: usize,
     include_superseded: bool,
     kinds: &[String],
+    recency_weight: f32,
+    recency_half_life_days: Option<f64>,
     text_mode: bool,
     scope_display: &str,
     scope_source: &str,
@@ -484,13 +490,21 @@ fn search(
     };
     let options = topodb::SearchOptions {
         prop_retain,
+        recency_weight,
+        recency_half_life_ms: recency_half_life_days
+            .map(|d| (d * 86_400_000.0) as i64)
+            .unwrap_or(30 * 24 * 60 * 60 * 1000),
+        recency_half_life_by_prop: recency_half_life_days
+            .is_none()
+            .then(topodb_json::memory_kind_half_life),
         ..topodb::SearchOptions::default()
     };
     // Search is a recall surface: memories retired by `remember --supersedes`
     // are dropped by default (before top-k, unbumped), matching the MCP
-    // server's `search_memories`. `--include-superseded` restores raw BM25
-    // over the full history. Forgotten memories are also dropped from default
-    // search (same liveness model as superseded).
+    // server's `search_memories`. `--include-superseded` widens the corpus
+    // to retired memories too — it does not touch scoring; `--recency-weight
+    // 0` is what restores raw BM25. Forgotten memories are also dropped from
+    // default search (same liveness model as superseded).
     let hits = if include_superseded {
         db.search_text_with(&scopes, query, k, &options)
     } else {

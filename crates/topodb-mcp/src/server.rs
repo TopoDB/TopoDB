@@ -1370,10 +1370,6 @@ fn default_recency_weight() -> f32 {
     0.3
 }
 
-fn default_recency_half_life_days() -> f64 {
-    30.0
-}
-
 fn default_weight_one() -> f32 {
     1.0
 }
@@ -1429,10 +1425,13 @@ struct SearchMemoriesParams {
     #[serde(default = "default_recency_weight")]
     #[schemars(range(min = 0.0, max = 1.0))]
     recency_weight: f32,
-    /// Half-life for the recency decay, in days. Must be > 0.
-    #[serde(default = "default_recency_half_life_days")]
+    /// Half-life in days for a FLAT recency decay, replacing the kind-aware
+    /// default (episodic 14 / semantic 120 / procedural 365; absent kind
+    /// counts as semantic, entities decay on the semantic curve). Omit to
+    /// keep kind-aware ranking. Must be > 0.
+    #[serde(default)]
     #[schemars(range(min = 0.001))]
-    recency_half_life_days: f64,
+    recency_half_life_days: Option<f64>,
     /// Typo/prefix recovery for query terms that match nothing (default
     /// true): a missing term expands to its closest vocabulary neighbors
     /// (prefix or small edit distance) at a score discount, so exact matches
@@ -2979,7 +2978,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Hybrid recall over memory content and entity names: stemmed BM25 + vector (when embeddings are ready) + 1-hop graph legs, recency-weighted (fresher wins ties; recency_weight 0 = pure relevance). Missing terms fall back to close prefix/typo matches and learned synonyms expand automatically. Entity hits are down-weighted by default (label_weights: {} disables; exact entity lookup wants labels: [\"Entity\"]). Empty results: retry with different words before concluding nothing is stored, then traverse from the best hit."
+        description = "Hybrid recall over memory content and entity names: stemmed BM25 + vector (when embeddings are ready) + 1-hop graph legs, kind-aware recency by default (episodic decays fastest; recency_half_life_days for flat, recency_weight 0 disables). Missing terms fall back to close prefix/typo matches and learned synonyms expand automatically. Entity hits are down-weighted by default (label_weights: {} disables; exact entity lookup wants labels: [\"Entity\"]). Empty results: retry with different words before concluding nothing is stored, then traverse from the best hit."
     )]
     fn search_memories(
         &self,
@@ -3059,7 +3058,14 @@ impl TopoServer {
         };
         let options = SearchOptions {
             recency_weight: p.recency_weight,
-            recency_half_life_ms: (p.recency_half_life_days * 86_400_000.0) as i64,
+            recency_half_life_ms: p
+                .recency_half_life_days
+                .map(|d| (d * 86_400_000.0) as i64)
+                .unwrap_or(30 * 24 * 60 * 60 * 1000),
+            recency_half_life_by_prop: p
+                .recency_half_life_days
+                .is_none()
+                .then(convert::memory_kind_half_life),
             now_ms: None,
             fuzzy_fallback: p.fuzzy,
             prop_retain,

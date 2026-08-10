@@ -725,3 +725,231 @@ fn search_text_prop_retain_rejects_empty_prop_and_empty_allowlist() {
         }
     }
 }
+
+/// Three equally-matching memories, all backdated 30 days: kind
+/// "episodic", kind-less (default/semantic bucket), and kind
+/// "procedural". Under the prop-keyed map the decay factors must order
+/// procedural > default > episodic (slowest curve decays least), so the
+/// ranking at equal text relevance is procedural, plain, episodic — the
+/// spec's "episodic decays, semantic stands" invariant.
+#[test]
+fn prop_keyed_half_life_differentiates_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+
+    let mk = |n: u128, kind: Option<&str>| {
+        let mut props = Props::new();
+        props.insert(
+            "content".into(),
+            PropValue::Str("granite quarry report".into()),
+        );
+        if let Some(k) = kind {
+            props.insert("kind".into(), PropValue::Str(k.into()));
+        }
+        Op::CreateNode {
+            id: NodeId::from_u128(ulid_at(now - 30 * DAY_MS, n)),
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props,
+        }
+    };
+    let episodic_id = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 1));
+    let plain_id = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 2));
+    let procedural_id = NodeId::from_u128(ulid_at(now - 30 * DAY_MS, 3));
+    db.submit(vec![
+        mk(1, Some("episodic")),
+        mk(2, None),
+        mk(3, Some("procedural")),
+    ])
+    .unwrap();
+
+    let options = SearchOptions {
+        recency_weight: 0.3,
+        recency_half_life_by_prop: Some(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![
+                ("episodic".into(), 14 * DAY_MS),
+                ("procedural".into(), 365 * DAY_MS),
+            ],
+            default_ms: 120 * DAY_MS,
+        }),
+        now_ms: Some(now),
+        ..SearchOptions::default()
+    };
+    let hits = db
+        .search_text_with(&scopes, "granite quarry", 10, &options)
+        .unwrap();
+    let order: Vec<NodeId> = hits.iter().map(|(n, _)| n.id).collect();
+    assert_eq!(
+        order,
+        vec![procedural_id, plain_id, episodic_id],
+        "factor ordering procedural > default > episodic must decide the tie: {hits:?}"
+    );
+    assert!(
+        hits[0].1 > hits[1].1 && hits[1].1 > hits[2].1,
+        "scores must strictly differ: {hits:?}"
+    );
+}
+
+/// Map validation: with recency active, a non-positive half-life anywhere
+/// in the map — and an empty prop name — must reject loudly.
+#[test]
+fn prop_keyed_half_life_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    let (_id, op) = memory("basalt", Scope::Id(s));
+    db.submit(vec![op]).unwrap();
+
+    let bad = |map: PropHalfLife| SearchOptions {
+        recency_weight: 0.3,
+        recency_half_life_by_prop: Some(map),
+        ..SearchOptions::default()
+    };
+    for options in [
+        bad(PropHalfLife {
+            prop: "".into(),
+            per_value: vec![],
+            default_ms: 1,
+        }),
+        bad(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![("episodic".into(), 0)],
+            default_ms: 1,
+        }),
+        bad(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![],
+            default_ms: 0,
+        }),
+    ] {
+        let err = db
+            .search_text_with(&scopes, "basalt", 5, &options)
+            .unwrap_err();
+        assert!(
+            matches!(err, TopoError::Rejected(_)),
+            "want Rejected, got {err:?}"
+        );
+    }
+    // Weight 0 ignores the map entirely — even an invalid one is inert,
+    // matching the flat prior's existing weight-gated validation.
+    let inert = SearchOptions {
+        recency_weight: 0.0,
+        recency_half_life_by_prop: Some(PropHalfLife {
+            prop: "kind".into(),
+            per_value: vec![],
+            default_ms: 0,
+        }),
+        ..SearchOptions::default()
+    };
+    db.search_text_with(&scopes, "basalt", 5, &inert).unwrap();
+}
+
+/// D2 (IMPROVEMENTS.md): a short, stale, term-dense episodic memory
+/// outranked the long fresh comprehensive one under pure BM25 (length
+/// normalization). The kind-aware default prior must flip that ordering —
+/// and weight 0 must restore it. The test first ASSERTS the BM25
+/// precondition so it can't silently pass by failing to reproduce D2.
+#[test]
+fn kind_aware_default_fixes_d2_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    const DAY_MS: i64 = 86_400_000;
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ulid_at = |ts: i64, n: u128| ((ts as u128) << 80) | n;
+
+    // Stale episodic: short and term-dense (high BM25 for "next topodb").
+    let stale_id = NodeId::from_u128(ulid_at(now - 50 * DAY_MS, 1));
+    let mut stale_props = Props::new();
+    stale_props.insert(
+        "content".into(),
+        PropValue::Str("topodb next index ship release".into()),
+    );
+    stale_props.insert("kind".into(), PropValue::Str("episodic".into()));
+    // Fresh comprehensive: long, terms diluted (lower BM25), no kind
+    // (semantic bucket).
+    let mut fresh_props = Props::new();
+    fresh_props.insert(
+        "content".into(),
+        PropValue::Str("what is next for topodb: ranking system surface prior work cleanup".into()),
+    );
+    let fresh_id = NodeId::from_u128(ulid_at(now, 2));
+    db.submit(vec![
+        Op::CreateNode {
+            id: stale_id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: stale_props,
+        },
+        Op::CreateNode {
+            id: fresh_id,
+            scope: Scope::Id(s),
+            label: "Memory".into(),
+            props: fresh_props,
+        },
+    ])
+    .unwrap();
+
+    let kind_map = || PropHalfLife {
+        prop: "kind".into(),
+        per_value: vec![
+            ("episodic".into(), 14 * DAY_MS),
+            ("procedural".into(), 365 * DAY_MS),
+        ],
+        default_ms: 120 * DAY_MS,
+    };
+    let flat = SearchOptions {
+        recency_weight: 0.0,
+        now_ms: Some(now),
+        ..SearchOptions::default()
+    };
+    let kind_aware = SearchOptions {
+        recency_weight: 0.3,
+        recency_half_life_by_prop: Some(kind_map()),
+        now_ms: Some(now),
+        ..SearchOptions::default()
+    };
+
+    // Precondition: pure BM25 reproduces D2 (stale first). At the stale
+    // memory's 50-day backdate against its 14-day episodic half-life and
+    // w=0.3, the recency multiplier bottoms out at
+    // (1-w) + w*2^(-50/14) = 0.7 + 0.3*0.0841 ≈ 0.725, so the kind-aware leg
+    // can recover at most 1/0.725 ≈ 1.379x of BM25 headroom. The BM25 gap
+    // must be real but under that recovery headroom (1.37x, leaving margin)
+    // — if this assert fails, lengthen the fresh content (dilute further) or
+    // shorten the stale one; do NOT weaken the kind-aware asserts below.
+    let bm25 = db
+        .search_text_with(&scopes, "next topodb", 10, &flat)
+        .unwrap();
+    assert_eq!(
+        bm25[0].0.id, stale_id,
+        "precondition: BM25 must rank the stale memory first"
+    );
+    assert!(
+        bm25[0].1 / bm25[1].1 < 1.37,
+        "precondition: BM25 gap must be recoverable: {bm25:?}"
+    );
+
+    // The kind-aware default flips it; weight 0 restores it (asserted above).
+    let fixed = db
+        .search_text_with(&scopes, "next topodb", 10, &kind_aware)
+        .unwrap();
+    assert_eq!(
+        fixed[0].0.id, fresh_id,
+        "kind-aware default must surface the fresh memory: {fixed:?}"
+    );
+}
