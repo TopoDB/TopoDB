@@ -16,10 +16,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
-#### Added
+#### Changed
 
-- `SearchOptions.recency_half_life_by_prop` — optional prop-keyed
-  recency half-life map (per-node decay curves; `None` = flat, unchanged).
+- **`SearchOptions` gains a new public field, `recency_half_life_by_prop`**
+  (BREAKING for callers building a full `SearchOptions` struct literal
+  without `..Default::default()`) — optional prop-keyed recency half-life
+  map (per-node decay curves). `None` (via `Default`) is unchanged flat
+  behavior.
 
 ### 0.0.13 — 2026-08-08
 
@@ -513,10 +516,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ### Unreleased
 
-#### Added
+#### Changed
 
-- `search_memories` recency is kind-aware by default; explicit
-  `recency_half_life_days` restores a flat prior (D2 fix).
+- **`search_memories` recency is kind-aware by default** — episodic memories
+  decay faster, procedural slower, semantic (and unstamped) in between;
+  previously every memory used the same flat half-life. Pass an explicit
+  `recency_half_life_days` to restore a flat prior over all kinds (D2 fix).
 
 ### 0.0.14 — 2026-07-27
 
@@ -1076,9 +1081,17 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 #### Added
 
-- `search` now applies the kind-aware recency prior by default
-  (BREAKING for score values in stdout, order-stable for same-age corpora);
-  new `--recency-weight` / `--recency-half-life-days` flags.
+- **`search` — `--recency-weight` / `--recency-half-life-days` flags** —
+  tune or disable (`--recency-weight 0`) the recency prior; passing
+  `--recency-half-life-days` switches from the kind-aware default to a flat
+  half-life over all kinds.
+
+#### Changed
+
+- **`search` now applies the kind-aware recency prior by default**
+  (BREAKING for score values in stdout, order-stable for same-age corpora) —
+  episodic memories decay faster, procedural slower, semantic (and
+  unstamped) in between, instead of one flat half-life for every kind.
 
 ### 0.0.9 — 2026-07-27
 

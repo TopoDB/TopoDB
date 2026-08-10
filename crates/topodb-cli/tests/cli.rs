@@ -3487,4 +3487,30 @@ fn search_recency_flags_plumb_and_validate() {
     let out = search(&["--recency-half-life-days", "0"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("recency_half_life"));
+
+    // Polarity pin: an explicit near-zero flat half-life must score LOWER
+    // than the omitted (kind-aware) default for the SAME memory — the only
+    // check in this test that would catch `recency_half_life_days.is_none()`
+    // getting inverted to `.is_some()` in the options-assembly code (the
+    // accepted-shapes loop above only checks that both shapes are accepted,
+    // not which one wins). Sleep briefly first so the memory is guaranteed
+    // to be at least ~1s old before the flat-tiny-half-life search runs (a
+    // zero-age memory would decay by ~0% under any half-life, masking the
+    // bug).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let top_score = |out: &std::process::Output| -> f64 {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v.as_array().unwrap()[0]["score"].as_f64().unwrap()
+    };
+    let flat_out = search(&["--recency-half-life-days", "0.00001"]);
+    assert!(flat_out.status.success(), "{flat_out:?}");
+    let omitted_out = search(&[]);
+    assert!(omitted_out.status.success(), "{omitted_out:?}");
+    let score_flat = top_score(&flat_out);
+    let score_omitted = top_score(&omitted_out);
+    assert!(
+        score_flat < score_omitted,
+        "explicit tiny flat half-life (score {score_flat}) must decay below the \
+         kind-aware default (score {score_omitted})"
+    );
 }

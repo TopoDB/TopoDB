@@ -924,11 +924,14 @@ fn kind_aware_default_fixes_d2_shape() {
         ..SearchOptions::default()
     };
 
-    // Precondition: pure BM25 reproduces D2 (stale first). At defaults the
-    // factor ratio is bounded by 1/(1-w) ≈ 1.43x, so the BM25 gap must be
-    // real but under ~1.4x — if this assert fails, lengthen the fresh
-    // content (dilute further) or shorten the stale one; do NOT weaken the
-    // kind-aware asserts below.
+    // Precondition: pure BM25 reproduces D2 (stale first). At the stale
+    // memory's 50-day backdate against its 14-day episodic half-life and
+    // w=0.3, the recency multiplier bottoms out at
+    // (1-w) + w*2^(-50/14) = 0.7 + 0.3*0.0841 ≈ 0.725, so the kind-aware leg
+    // can recover at most 1/0.725 ≈ 1.379x of BM25 headroom. The BM25 gap
+    // must be real but under that recovery headroom (1.37x, leaving margin)
+    // — if this assert fails, lengthen the fresh content (dilute further) or
+    // shorten the stale one; do NOT weaken the kind-aware asserts below.
     let bm25 = db
         .search_text_with(&scopes, "next topodb", 10, &flat)
         .unwrap();
@@ -937,7 +940,7 @@ fn kind_aware_default_fixes_d2_shape() {
         "precondition: BM25 must rank the stale memory first"
     );
     assert!(
-        bm25[0].1 / bm25[1].1 < 1.4,
+        bm25[0].1 / bm25[1].1 < 1.37,
         "precondition: BM25 gap must be recoverable: {bm25:?}"
     );
 

@@ -182,6 +182,39 @@ fn recency_param_combinations_plumb_through() {
         DEFAULT_TIMEOUT,
     );
     expect_tool_error(&resp);
+
+    // Polarity pin: an explicit near-zero flat half-life must score LOWER
+    // than the omitted (kind-aware) default for the SAME memory. This is the
+    // only assertion in this test that would catch
+    // `recency_half_life_days.is_none()` getting inverted to `.is_some()` in
+    // the options-assembly code — the accepted-shapes loop above only checks
+    // that both shapes are accepted, not which one wins. Sleep briefly first
+    // so the memory is guaranteed to be at least ~1s old before the
+    // flat-tiny-half-life search runs (a zero-age memory would decay by ~0%
+    // under any half-life, masking the bug).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let flat = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "obsidian", "k": 5, "recency_half_life_days": 0.00001 }),
+        DEFAULT_TIMEOUT,
+    );
+    let omitted = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "obsidian", "k": 5 }),
+        DEFAULT_TIMEOUT,
+    );
+    let top_score = |res: &serde_json::Value| -> f64 {
+        res["hits"].as_array().unwrap()[0]["score"]
+            .as_f64()
+            .unwrap()
+    };
+    let score_flat = top_score(&flat);
+    let score_omitted = top_score(&omitted);
+    assert!(
+        score_flat < score_omitted,
+        "explicit tiny flat half-life (score {score_flat}) must decay below the \
+         kind-aware default (score {score_omitted}): flat={flat}, omitted={omitted}"
+    );
 }
 
 /// The alias→entity edge must let a query that matches ONLY the alias's name

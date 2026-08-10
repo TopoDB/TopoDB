@@ -501,9 +501,10 @@ fn search(
     };
     // Search is a recall surface: memories retired by `remember --supersedes`
     // are dropped by default (before top-k, unbumped), matching the MCP
-    // server's `search_memories`. `--include-superseded` restores raw BM25
-    // over the full history. Forgotten memories are also dropped from default
-    // search (same liveness model as superseded).
+    // server's `search_memories`. `--include-superseded` widens the corpus
+    // to retired memories too — it does not touch scoring; `--recency-weight
+    // 0` is what restores raw BM25. Forgotten memories are also dropped from
+    // default search (same liveness model as superseded).
     let hits = if include_superseded {
         db.search_text_with(&scopes, query, k, &options)
     } else {

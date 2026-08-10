@@ -106,8 +106,13 @@ impl PropRetain {
 /// means; callers supply the map (see `topodb-json`'s kind constants).
 #[derive(Debug, Clone)]
 pub struct PropHalfLife {
+    /// The `Str` prop to key decay on (e.g. a memory's `kind`).
     pub prop: String,
+    /// `(prop value, half-life ms)` pairs, linear-scanned per candidate —
+    /// intended for small maps (a handful of kinds, not an open vocabulary).
     pub per_value: Vec<(String, i64)>,
+    /// Half-life used when `prop` is absent, non-`Str`, or matches no
+    /// `per_value` entry.
     pub default_ms: i64,
 }
 
@@ -126,7 +131,8 @@ pub struct SearchOptions {
     /// access.
     pub recency_weight: f32,
     /// The age at which the recency factor has decayed halfway to its floor.
-    /// Must be `> 0` when `recency_weight > 0`.
+    /// Must be `> 0` when `recency_weight > 0` and `recency_half_life_by_prop`
+    /// is `None` (the map's own half-lives govern otherwise).
     pub recency_half_life_ms: i64,
     /// Optional per-node half-life override map; `None` = flat `recency_half_life_ms`.
     pub recency_half_life_by_prop: Option<PropHalfLife>,
@@ -1155,8 +1161,11 @@ impl Db {
     /// [`SearchOptions`]). The recency factor is applied to every scored
     /// candidate BEFORE the sort and top-`k` truncation, so a fresher hit can
     /// displace a staler one out of the returned window, not merely reorder
-    /// within it. `Rejected` if `recency_weight` is outside `0.0..=1.0`, or
-    /// `recency_half_life_ms <= 0` while the weight is nonzero.
+    /// within it. `Rejected` if `recency_weight` is outside `0.0..=1.0`; if
+    /// `recency_half_life_by_prop` is `None` and `recency_half_life_ms <= 0`
+    /// while the weight is nonzero; or, when `recency_half_life_by_prop` is
+    /// `Some`, if its `prop` is empty, its `default_ms <= 0`, or any
+    /// `per_value` half-life is `<= 0`.
     pub fn search_text_with(
         &self,
         scopes: &ScopeSet,
