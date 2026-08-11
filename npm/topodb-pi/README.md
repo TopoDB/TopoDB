@@ -12,5 +12,11 @@ proxies its memory tools. Call `{action:"list"}` to discover them, then
 (reap the idle server after this many ms so other processes can use the same
 db; default `30000`, `0` keeps it always resident).
 
+Note: on first use on an embedding-capable platform the server downloads the
+ONNX runtime and embedding model (~50MB, one-time, cached). On a slow link the
+idle reaper can interrupt that download before it completes — set
+`TOPODB_IDLE_MS=0` for the first session if semantic search stays in
+text-fallback mode.
+
 No Rust toolchain and no separate MCP adapter required — the prebuilt
 `topodb-mcp` binary is pulled in automatically for your platform.

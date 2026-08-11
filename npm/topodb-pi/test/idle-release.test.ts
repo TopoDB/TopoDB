@@ -19,6 +19,16 @@ const env = (extra: Record<string, string> = {}) => ({
   ...extra,
 });
 
+/** Poll until cond holds — fixed sleeps against the multi-hop reap chain
+ * (timer fire → stdin EOF → child exit) are a latent flake on loaded runners. */
+const until = async (cond: () => boolean, budgetMs = 5000) => {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > budgetMs) throw new Error(`condition not met within ${budgetMs}ms`);
+    await sleep(25);
+  }
+};
+
 test("idleMs: default 30s, explicit value, 0 disables, garbage falls back", () => {
   assert.equal(idleMs({}), 30_000);
   assert.equal(idleMs({ TOPODB_IDLE_MS: "150" }), 150);
@@ -32,8 +42,7 @@ test("server shuts down after TOPODB_IDLE_MS of quiet, then respawns on next cal
   try {
     await s.call("create_memory", { content: "idle test" });
     assert.equal(s.running, true, "resident right after a call");
-    await sleep(600);
-    assert.equal(s.running, false, "reaped after the idle window");
+    await until(() => !s.running);
     // Lazy respawn still works and the write persisted.
     const res: any = await s.call("search_memories", { query: "idle test", k: 5 });
     assert.equal(res.hits.length, 1);
@@ -62,7 +71,8 @@ test("idle shutdown frees the redb lock for another process", async () => {
   const b = new TopodbServer({ ...e, TOPODB_IDLE_MS: "0", TOPODB_LOCK_WAIT_MS: "1500" });
   try {
     await a.call("create_memory", { content: "handoff" });
-    await sleep(600); // a's idle window elapses; child exits, lock frees
+    await until(() => !a.running); // a's idle window elapses
+    await a.whenReaped; // the child has fully exited — the lock is provably free
     const res: any = await b.call("search_memories", { query: "handoff", k: 5 });
     assert.equal(res.hits.length, 1, "second process read the first one's write");
   } finally {
@@ -87,7 +97,7 @@ test("list serves the cached tool list without respawning", async () => {
   const s = new TopodbServer(env({ TOPODB_IDLE_MS: "150" }));
   try {
     const first = await s.list();
-    await sleep(600);
+    await until(() => !s.running, 5000);
     assert.equal(s.running, false, "precondition: idled out");
     const again = await s.list();
     assert.deepEqual(again, first);

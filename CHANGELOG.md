@@ -1226,6 +1226,23 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
   `list` now answers from the cached tool list without respawning an idled
   child. Mirrors the sgh `OnDemandBridge` lease design (#65).
 - `TopodbServer.running` — whether a child is currently resident.
+- **Failure-path hardening** (review findings on the idle-release commit):
+  reaps are graceful (stdin-EOF first — the only shutdown that provably
+  releases the redb lock through the wrapper/grandchild chain, notably on
+  Windows — with a kill fallback after `killGraceMs`); a respawn awaits the
+  previous child's full exit instead of racing it for the lock; `ensure()`
+  is single-flight (concurrent cold callers share one spawn+handshake); a
+  rejected handshake reaps the orphan instead of leaving it resident; a
+  transport-level call failure (timeout, child death) reaps the wedged
+  child while app-level errors keep it resident (sgh Tool-error
+  semantics); the spawned child now receives the caller's env (env-only
+  settings like `TOPODB_LOCK_WAIT_MS` silently didn't propagate before);
+  `TOPODB_IDLE_MS` beyond Node's setTimeout range is clamped instead of
+  inverting into reap-after-1ms; the cached tool list is invalidated on
+  respawn (it could span server versions); and the episode flush retries
+  once (`TOPODB_FLUSH_RETRY_MS`, default 2s) instead of silently dropping
+  the episode to transient lock contention. The pi suite now runs in CI
+  (node-test, both platforms).
 
 #### Fixed
 

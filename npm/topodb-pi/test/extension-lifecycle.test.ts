@@ -217,6 +217,7 @@ test("agent_end: two retrievals in one run -> back-reference (#N) indices for bo
 });
 
 test("agent_end: submit_batch rejecting resolves without throwing (never-break-the-agent)", async () => {
+  process.env.TOPODB_FLUSH_RETRY_MS = "20";
   const h = harness(async (t) => {
     if (t === "submit_batch") throw new Error("db down");
     throw new Error(`unexpected tool ${t}`);
@@ -246,9 +247,45 @@ test("agent_end: submit_batch rejecting resolves without throwing (never-break-t
       errors.some((e) => e.includes("episode write failed")),
       "the rejection should be logged, not swallowed silently",
     );
-    assert.equal(h.calls.filter((c) => c.tool === "submit_batch").length, 1);
+    // A persistent failure burns the initial attempt plus exactly one retry.
+    assert.equal(h.calls.filter((c) => c.tool === "submit_batch").length, 2);
   } finally {
     console.error = originalError;
+    delete process.env.TOPODB_FLUSH_RETRY_MS;
+    h.restore();
+  }
+});
+
+test("agent_end: a transiently failing submit_batch is retried once and the episode survives", async () => {
+  // Idle release invites exactly this: another process holds the db lock when
+  // the flush cold-spawns, the first submit_batch exhausts the lock budget,
+  // and without a retry the whole episode is silently dropped.
+  process.env.TOPODB_FLUSH_RETRY_MS = "50";
+  let submitAttempts = 0;
+  const h = harness(async (t) => {
+    if (t === "submit_batch") {
+      submitAttempts++;
+      if (submitAttempts === 1) throw new Error("db locked by another process");
+      return {};
+    }
+    throw new Error(`unexpected tool ${t}`);
+  });
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await h.handlers.get("agent_start")!({ type: "agent_start" });
+    await h.handlers.get("turn_end")!(noopTurnEnd);
+    await h.handlers.get("agent_end")!({
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "goal" },
+        { role: "assistant", content: "done", usage: { input: 1, output: 1 }, timestamp: Date.now() },
+      ],
+    });
+    assert.equal(submitAttempts, 2, "first failure triggers exactly one retry");
+  } finally {
+    console.error = originalError;
+    delete process.env.TOPODB_FLUSH_RETRY_MS;
     h.restore();
   }
 });
