@@ -1213,6 +1213,17 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## Claude Code plugin
 
+### 0.1.5 — 2026-08-11
+
+#### Changed
+
+- **Pins `@topodb/topodb-mcp` 0.0.17** (engine 0.0.15). Real sessions now
+  get: bi-temporal edges (format v9 — ⚠️ first open migrates a v8 db
+  one-way; back up first), `time_axis` and the four `valid_*` interval
+  predicates on `get_edges`/`traverse`, the `decision` memory kind with
+  its precedent convention, and corroboration-boosted `search_memories`
+  (default 0.2, `corroboration_weight: 0` disables).
+
 ### 0.1.2 — 2026-07-27
 
 #### Added
