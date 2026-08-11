@@ -23,11 +23,52 @@ export function episodeSpecArgs(env: NodeJS.ProcessEnv): string[] {
   return ["--spec", fileURLToPath(specPath)];
 }
 
+/** Idle milliseconds before the resident child is reaped so redb's exclusive
+ * lock frees for other processes. `TOPODB_IDLE_MS=0` disables idle release
+ * (always resident); unset/invalid falls back to 30s. */
+export function idleMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.TOPODB_IDLE_MS;
+  if (raw === undefined || raw === "") return 30_000;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : 30_000;
+}
+
 export class TopodbServer {
   private client?: McpStdioClient;
   private toolCache?: McpTool[];
+  private inflight = 0;
+  private idleTimer?: NodeJS.Timeout;
 
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
+
+  /** Whether a topodb-mcp child is currently resident (holding the db lock). */
+  get running(): boolean {
+    return this.client?.running ?? false;
+  }
+
+  /** The timer arms only when the LAST in-flight op completes, never at op
+   * start — a cold spawn can outlast a short idle window and must not be
+   * reaped under the call that is paying for it. unref: an armed timer must
+   * not keep the host process alive. */
+  private beginOp(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+    this.inflight++;
+  }
+
+  private endOp(): void {
+    this.inflight--;
+    const ms = idleMs(this.env);
+    if (ms > 0 && this.inflight === 0 && this.running) {
+      this.idleTimer = setTimeout(() => {
+        this.idleTimer = undefined;
+        if (this.inflight === 0) this.shutdown();
+      }, ms);
+      this.idleTimer.unref?.();
+    }
+  }
 
   static resolveLauncher(): string {
     return require.resolve("@topodb/topodb-mcp/bin/topodb-mcp.js");
@@ -55,17 +96,34 @@ export class TopodbServer {
   }
 
   async list(): Promise<McpTool[]> {
-    const c = await this.ensure();
-    if (!this.toolCache) this.toolCache = await c.listTools();
-    return this.toolCache;
+    // The tool list is static per server version — serving the cache without
+    // ensure() avoids respawning an idled child just to re-answer discovery.
+    if (this.toolCache) return this.toolCache;
+    this.beginOp();
+    try {
+      const c = await this.ensure();
+      this.toolCache = await c.listTools();
+      return this.toolCache;
+    } finally {
+      this.endOp();
+    }
   }
 
   async call(tool: string, args: Record<string, unknown>): Promise<unknown> {
-    const c = await this.ensure();
-    return c.callTool(tool, args);
+    this.beginOp();
+    try {
+      const c = await this.ensure();
+      return await c.callTool(tool, args);
+    } finally {
+      this.endOp();
+    }
   }
 
   shutdown(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
     this.client?.stop();
     this.client = undefined;
   }
