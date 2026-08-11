@@ -69,13 +69,13 @@ test("buildEpisodeBatch: exact command array shape", () => {
         confidence: 0.5, failure: "" } },
     { op: "create_node", label: "RetrievalEvent",
       props: { query: "bug history", at: 1500 } },
-    { op: "link", from: "#0", to: "#1", type: "ISSUED" },
-    { op: "link", from: "#1", to: "01MEMAAAAAAAAAAAAAAAAAAAAA", type: "RETURNED",
+    { op: "link", from: "#0", to: "#1", type: "issued" },
+    { op: "link", from: "#1", to: "01MEMAAAAAAAAAAAAAAAAAAAAA", type: "returned",
       props: { rank: 0, score: 0.9, channel: "text" } },
-    { op: "link", from: "#1", to: "01MEMBBBBBBBBBBBBBBBBBBBBB", type: "RETURNED",
+    { op: "link", from: "#1", to: "01MEMBBBBBBBBBBBBBBBBBBBBB", type: "returned",
       props: { rank: 1, score: 0.4, channel: "text" } },
-    { op: "link", from: "#1", to: "01MEMAAAAAAAAAAAAAAAAAAAAA", type: "USED" },
-    { op: "link", from: "#0", to: "01POLICYVVVVVVVVVVVVVVVVVV", type: "USED_POLICY" },
+    { op: "link", from: "#1", to: "01MEMAAAAAAAAAAAAAAAAAAAAA", type: "used" },
+    { op: "link", from: "#0", to: "01POLICYVVVVVVVVVVVVVVVVVV", type: "used_policy" },
   ]);
 });
 
@@ -173,5 +173,5 @@ test("buildEpisodeBatch: no policy -> no USED_POLICY command", () => {
     endedAt: 2, tokens: 0, used: new Map(),
   }) as Array<{ type?: string }>;
   assert.equal(cmds.length, 1);
-  assert.ok(!cmds.some((c) => c.type === "USED_POLICY"));
+  assert.ok(!cmds.some((c) => c.type === "used_policy"));
 });

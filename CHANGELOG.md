@@ -1211,6 +1211,29 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ---
 
+## `@topodb/pi` (Pi extension)
+
+### 0.0.5 — 2026-08-11
+
+#### Changed
+
+- **Bundles `@topodb/topodb-mcp` 0.0.17** (was 0.0.6 — eleven server
+  releases of drift closed in one jump; ⚠️ an existing Pi-side `.redb`
+  chain-migrates one-way to format v9 on first open). The bundled episode
+  IndexSpec now unions the modern default spec (Alias/Synonym equality,
+  `(Memory, content_hash)` dedup, Entity/Alias name text) with the
+  episode-specific indexes — `remember`-path dedup and alias resolution
+  work against Pi-created dbs.
+- **Episode edge vocabulary is normalized-lowercase** (`issued` /
+  `returned` / `used` / `used_policy`) — the server's
+  `normalize_edge_type` lowercases on write, so the recorder now emits
+  the stored form instead of relying on case that no longer survives.
+- **Tests: tool-count pin centralized** (`test/tool-count.ts`, currently
+  31) and every spawned server is reaped in `finally` — an assertion
+  failure can no longer leak a child and hang the runner.
+
+---
+
 ## Claude Code plugin
 
 ### 0.1.5 — 2026-08-11

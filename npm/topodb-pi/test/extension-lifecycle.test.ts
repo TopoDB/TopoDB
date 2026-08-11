@@ -126,18 +126,18 @@ test("agent_end: one retrieval whose memory is quoted back -> single submit_batc
     assert.equal(retrievalEvent.label, "RetrievalEvent");
     assert.equal(retrievalEvent.props.query, "ownership");
 
-    assert.deepEqual(cmds[2], { op: "link", from: "#0", to: "#1", type: "ISSUED" });
+    assert.deepEqual(cmds[2], { op: "link", from: "#0", to: "#1", type: "issued" });
 
     const returned = cmds[3] as { op: string; from: string; to: string; type: string; props: Record<string, unknown> };
     assert.equal(returned.op, "link");
     assert.equal(returned.from, "#1");
     assert.equal(returned.to, memId);
-    assert.equal(returned.type, "RETURNED");
+    assert.equal(returned.type, "returned");
     assert.equal(returned.props.rank, 0);
     assert.equal(returned.props.score, 0.9);
     assert.equal(returned.props.channel, "text");
 
-    assert.deepEqual(cmds[4], { op: "link", from: "#1", to: memId, type: "USED" });
+    assert.deepEqual(cmds[4], { op: "link", from: "#1", to: memId, type: "used" });
   } finally {
     h.restore();
   }
@@ -201,16 +201,16 @@ test("agent_end: two retrievals in one run -> back-reference (#N) indices for bo
     assert.equal(cmds.length, 9);
 
     assert.equal((cmds[1] as { label: string }).label, "RetrievalEvent");
-    assert.deepEqual(cmds[2], { op: "link", from: "#0", to: "#1", type: "ISSUED" });
+    assert.deepEqual(cmds[2], { op: "link", from: "#0", to: "#1", type: "issued" });
     assert.equal((cmds[3] as { to: string }).to, memA);
     assert.equal((cmds[3] as { from: string }).from, "#1");
-    assert.deepEqual(cmds[4], { op: "link", from: "#1", to: memA, type: "USED" });
+    assert.deepEqual(cmds[4], { op: "link", from: "#1", to: memA, type: "used" });
 
     assert.equal((cmds[5] as { label: string }).label, "RetrievalEvent");
-    assert.deepEqual(cmds[6], { op: "link", from: "#0", to: "#5", type: "ISSUED" });
+    assert.deepEqual(cmds[6], { op: "link", from: "#0", to: "#5", type: "issued" });
     assert.equal((cmds[7] as { to: string }).to, memB);
     assert.equal((cmds[7] as { from: string }).from, "#5");
-    assert.deepEqual(cmds[8], { op: "link", from: "#5", to: memB, type: "USED" });
+    assert.deepEqual(cmds[8], { op: "link", from: "#5", to: memB, type: "used" });
   } finally {
     h.restore();
   }

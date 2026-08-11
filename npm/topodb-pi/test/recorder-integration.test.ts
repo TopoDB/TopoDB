@@ -85,18 +85,18 @@ test(
       assert.ok(retrievalEvent, "subgraph should contain the RetrievalEvent node");
 
       const issued = edges.find(
-        (e: any) => e.from === episodeId && e.to === retrievalEvent.id && e.type === "ISSUED",
+        (e: any) => e.from === episodeId && e.to === retrievalEvent.id && e.type === "issued",
       );
       assert.ok(issued, "Episode should be ISSUED-linked to the RetrievalEvent");
 
       const returned = edges.find(
-        (e: any) => e.from === retrievalEvent.id && e.to === memoryId && e.type === "RETURNED",
+        (e: any) => e.from === retrievalEvent.id && e.to === memoryId && e.type === "returned",
       );
       assert.ok(returned, "RetrievalEvent should be RETURNED-linked to the memory");
       assert.equal(returned.props.rank, 0, "RETURNED edge should carry rank:0");
 
       const used = edges.find(
-        (e: any) => e.from === retrievalEvent.id && e.to === memoryId && e.type === "USED",
+        (e: any) => e.from === retrievalEvent.id && e.to === memoryId && e.type === "used",
       );
       assert.ok(used, "RetrievalEvent should be USED-linked to the memory");
 
