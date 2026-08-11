@@ -1213,6 +1213,25 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `@topodb/pi` (Pi extension)
 
+### Unreleased
+
+#### Added
+
+- **Idle release: the resident `topodb-mcp` child is reaped after
+  `TOPODB_IDLE_MS` (default 30s) of quiet**, freeing redb's exclusive lock
+  so other processes (the CLI, another agent) can use the same db while a
+  Pi session sits idle. The next tool call respawns lazily; an in-flight
+  call is never reaped (the timer arms only when the last in-flight op
+  completes); `TOPODB_IDLE_MS=0` keeps the old always-resident behavior.
+  `list` now answers from the cached tool list without respawning an idled
+  child. Mirrors the sgh `OnDemandBridge` lease design (#65).
+- `TopodbServer.running` — whether a child is currently resident.
+
+#### Fixed
+
+- README no longer hardcodes the proxied tool count (said "16", server has
+  31 — the same count-drift class the 0.0.5 test centralization addressed).
+
 ### 0.0.5 — 2026-08-11
 
 #### Changed
