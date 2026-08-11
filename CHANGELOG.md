@@ -14,7 +14,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
-### Unreleased
+### 0.0.15 — 2026-08-11
 
 #### Added
 
@@ -444,7 +444,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
-### Unreleased
+### 0.0.12 — 2026-08-11
 
 #### Added
 
@@ -623,6 +623,15 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-obsidian`
 
+### 0.0.4 — 2026-08-11
+
+#### Changed
+
+- **Frontmatter `kind` rejection message derives from `MEMORY_KINDS`** —
+  it now names every kind in the shared vocabulary (including the new
+  `decision`) instead of a hand-listed three; a future kind can never be
+  missing from this message again.
+
 ### 0.0.1 — 2026-07-27
 
 #### Added
@@ -633,7 +642,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-mcp`
 
-### Unreleased
+### 0.0.17 — 2026-08-11
 
 #### Added
 
@@ -1248,7 +1257,7 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `topodb-cli`
 
-### Unreleased
+### 0.0.12 — 2026-08-11
 
 #### Added
 
