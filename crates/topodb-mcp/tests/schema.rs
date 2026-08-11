@@ -490,7 +490,12 @@ fn tool_descriptions_stay_lean() {
     // fields — a new queryable axis is deliberate capability growth, not
     // prose drift. Measured 79488 bytes; ceiling re-based to that + ~500
     // bytes of margin, rounded up.
-    const PAYLOAD_CEILING_BYTES: usize = 80_000;
+    //
+    // Re-based for the semantica completion sweep: four valid_* Allen
+    // interval params on BOTH get_edges and traverse, corroboration_weight
+    // on search_memories, and the decision kind in the kind docs — all
+    // deliberate capability growth whose param docs justify the bump.
+    const PAYLOAD_CEILING_BYTES: usize = 85_000;
     assert!(
         payload.len() <= PAYLOAD_CEILING_BYTES,
         "tools/list payload is {} bytes (ceiling {PAYLOAD_CEILING_BYTES}) — trim, don't relocate prose",

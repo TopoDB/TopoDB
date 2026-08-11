@@ -36,8 +36,9 @@ pub fn plan_note(
     }
     if let Some(kind) = &input.kind {
         if !MEMORY_KINDS.contains(&kind.as_str()) {
+            let kinds = MEMORY_KINDS.join(" | ");
             return Err(ComposeError::Invalid(format!(
-                "invalid kind {kind:?} (episodic | semantic | procedural)"
+                "invalid kind {kind:?} ({kinds})"
             )));
         }
     }
@@ -532,5 +533,36 @@ mod tests {
             crate::Note::parse(&std::fs::read_to_string(vdir.path().join("second.md")).unwrap())
                 .unwrap();
         assert_eq!(second.id().unwrap(), id);
+    }
+
+    #[test]
+    fn invalid_kind_error_message_names_all_four_kinds() {
+        let (_d, db) = db();
+        let lookup = scopes_to_scope_set(&[Scope::Shared]);
+        let invalid = plan_note(
+            &db,
+            Scope::Shared,
+            &lookup,
+            1_000,
+            &input("---\nkind: invalid_kind\n---\ntext\n"),
+        );
+        match invalid {
+            Err(ComposeError::Invalid(msg)) => {
+                // The error message must include all four kinds and the invalid value.
+                assert!(
+                    msg.contains("invalid_kind"),
+                    "message should include the invalid value"
+                );
+                assert!(msg.contains("episodic"), "message should include episodic");
+                assert!(msg.contains("semantic"), "message should include semantic");
+                assert!(
+                    msg.contains("procedural"),
+                    "message should include procedural"
+                );
+                assert!(msg.contains("decision"), "message should include decision");
+            }
+            Err(other) => panic!("expected Invalid error, got {other:?}"),
+            Ok(_) => panic!("expected Invalid error, got Ok"),
+        }
     }
 }

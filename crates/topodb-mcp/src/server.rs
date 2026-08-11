@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use topodb::{
     CreatedRange, Db, Direction, EdgeId, EdgeRecord, NodeId, NodeRecord, Op, PropValue, Props,
-    RecallQuery, Scope, ScopeSet, SearchOptions, TimeAxis, TopoError, TraversalQuery, VectorQuery,
+    RecallQuery, Scope, ScopeSet, SearchOptions, TimeAxis, TopoError, TraversalQuery,
+    ValidInterval, VectorQuery,
 };
 
 use crate::config::{
@@ -701,6 +702,27 @@ fn validate_as_of(v: Option<i64>) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Folds the four mutually-exclusive `valid_*` interval params (Allen
+/// predicates over the edge valid interval) into at most one engine
+/// [`ValidInterval`]. More than one present is named explicitly here;
+/// bounds/ordering validation stays in the engine (`ValidInterval::validate`
+/// runs inside every `*_interval` read and `Rejected` maps to
+/// invalid_params), so the truth table lives in exactly one place.
+fn parse_valid_interval(
+    during: Option<[i64; 2]>,
+    overlaps: Option<[i64; 2]>,
+    before: Option<i64>,
+    after: Option<i64>,
+) -> Result<Option<ValidInterval>, ErrorData> {
+    // Convert [i64; 2] arrays to tuples for the engine's from_parts constructor.
+    let during_tuple = during.map(|[from, until]| (from, until));
+    let overlaps_tuple = overlaps.map(|[from, until]| (from, until));
+
+    // Use the engine's shared constructor, mapping its Err into ErrorData.
+    ValidInterval::from_parts(during_tuple, overlaps_tuple, before, after)
+        .map_err(|e| ErrorData::invalid_params(e, None))
+}
+
 /// `time_axis` string -> `TimeAxis`: omitted/"valid" -> `Valid`, "recorded"
 /// -> `Recorded`, anything else -> invalid_params naming the two accepted
 /// values.
@@ -1162,6 +1184,13 @@ fn default_recency_weight() -> f32 {
     0.3
 }
 
+fn default_corroboration_weight() -> f32 {
+    // Host policy per the semantica-completion spec: mild tie-breaking on by
+    // default (max effect x1.2); the engine's own default stays 0.0
+    // (mechanism/policy split, same as recency).
+    0.2
+}
+
 fn default_weight_one() -> f32 {
     1.0
 }
@@ -1185,6 +1214,9 @@ fn default_half_life_semantic_days() -> f64 {
 }
 fn default_half_life_procedural_days() -> f64 {
     convert::LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS
+}
+fn default_half_life_decision_days() -> f64 {
+    convert::LIFECYCLE_HALF_LIFE_DECISION_DAYS
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1261,6 +1293,14 @@ struct SearchMemoriesParams {
     #[serde(default)]
     #[schemars(range(min = 0.0, max = 1.0))]
     access_weight: f32,
+    /// How much cross-leg corroboration boosts ranking, 0.0-1.0 (default
+    /// 0.2): after fusion each hit is multiplied by `1 + w*(legs_hit-1)/2`,
+    /// where legs_hit counts the legs that ran and found it (text, vector,
+    /// graph) — a mild re-ranker breaking near-ties toward hits several
+    /// legs agree on. Set 0 to disable (ranking identical to no boost).
+    #[serde(default = "default_corroboration_weight")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    corroboration_weight: f32,
     /// Post-fusion score multipliers by label, factors 0.0-10.0 (finite;
     /// out-of-range rejected). Omitted = {"Entity": 0.5} — entity hits
     /// down-weighted so facts surface first (exact entity lookup: prefer
@@ -1269,11 +1309,11 @@ struct SearchMemoriesParams {
     #[serde(default)]
     label_weights: Option<serde_json::Map<String, Value>>,
     /// Only return hits of these memory kinds: "episodic" | "semantic" |
-    /// "procedural". Omit for no kind filtering. Applied post-fusion to
-    /// EVERY hit; a node without a kind prop counts as "semantic" — that
-    /// covers entity hits too, so a filter excluding "semantic" hides
-    /// them (combine with labels: ["Memory"] when that is the intent).
-    /// Must not be empty when present.
+    /// "procedural" | "decision". Omit for no kind filtering. Applied
+    /// post-fusion to EVERY hit; a node without a kind prop counts as
+    /// "semantic" — that covers entity hits too, so a filter excluding
+    /// "semantic" hides them (combine with labels: ["Memory"] when that is
+    /// the intent). Must not be empty when present.
     #[serde(default)]
     #[schemars(length(min = 1))]
     kinds: Option<Vec<String>>,
@@ -1407,6 +1447,26 @@ struct TraverseParams {
     /// write actually happened.
     #[serde(default)]
     time_axis: Option<String>,
+    /// Only follow edges fully contained in the half-open world-time window
+    /// `[a, b)` — a `[a, b]` array of Unix-ms timestamps: `a <= valid_from`
+    /// and closed with `valid_to <= b`; an open edge never matches. The four
+    /// `valid_*` interval predicates are mutually exclusive with each other
+    /// and with `as_of` / `time_axis: "recorded"`.
+    #[serde(default)]
+    valid_during: Option<[i64; 2]>,
+    /// Only follow edges intersecting the half-open window `[a, b)` (Unix
+    /// ms): `valid_from < b` and the edge is open or has `valid_to > a`.
+    /// Same exclusivity as `valid_during`.
+    #[serde(default)]
+    valid_overlaps: Option<[i64; 2]>,
+    /// Only follow edges fully over by `t` (Unix ms): closed with `valid_to
+    /// <= t`; an open edge never matches. Same exclusivity as `valid_during`.
+    #[serde(default)]
+    valid_before: Option<i64>,
+    /// Only follow edges starting at or after `t` (Unix ms): `valid_from >=
+    /// t`; open edges qualify. Same exclusivity as `valid_during`.
+    #[serde(default)]
+    valid_after: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1500,8 +1560,8 @@ struct LifecycleCandidatesParams {
     #[serde(default = "default_half_life_episodic_days")]
     #[schemars(range(min = 0.001))]
     half_life_episodic_days: f64,
-    /// Staleness half-life for semantic memories (and memories with no
-    /// kind), in days (> 0).
+    /// Staleness half-life for semantic memories, in days (> 0). Also
+    /// governs memories with no kind.
     #[serde(default = "default_half_life_semantic_days")]
     #[schemars(range(min = 0.001))]
     half_life_semantic_days: f64,
@@ -1509,6 +1569,11 @@ struct LifecycleCandidatesParams {
     #[serde(default = "default_half_life_procedural_days")]
     #[schemars(range(min = 0.001))]
     half_life_procedural_days: f64,
+    /// Staleness half-life for decision memories, in days (> 0). Defaults
+    /// to the semantic constant — a deliberate tie, tunable independently.
+    #[serde(default = "default_half_life_decision_days")]
+    #[schemars(range(min = 0.001))]
+    half_life_decision_days: f64,
     /// Pin the sweep's "now" (Unix ms) for reproducible runs; omitted =
     /// wall clock.
     #[serde(default)]
@@ -1599,8 +1664,9 @@ struct RememberParams {
     #[schemars(length(min = 1))]
     supersedes: Option<Vec<String>>,
     /// Taxonomy kind for a NEW memory: "episodic" (a dated observation),
-    /// "semantic" (a standing fact — what an omitted kind reads as), or
-    /// "procedural" (a how-to). Ignored when the content dedups to an
+    /// "semantic" (a standing fact — what an omitted kind reads as),
+    /// "procedural" (a how-to), or "decision" (a choice made — put the
+    /// rationale in the content). Ignored when the content dedups to an
     /// existing memory — the stored kind wins.
     #[serde(default)]
     kind: Option<String>,
@@ -2019,6 +2085,26 @@ struct GetEdgesParams {
     /// write actually happened.
     #[serde(default)]
     time_axis: Option<String>,
+    /// Only edges fully contained in the half-open world-time window
+    /// `[a, b)` — a `[a, b]` array of Unix-ms timestamps: `a <= valid_from`
+    /// and closed with `valid_to <= b`; an open edge never matches. The four
+    /// `valid_*` interval predicates are mutually exclusive with each other
+    /// and with `as_of` / `open_only` / `time_axis: "recorded"`.
+    #[serde(default)]
+    valid_during: Option<[i64; 2]>,
+    /// Only edges intersecting the half-open window `[a, b)` (Unix ms):
+    /// `valid_from < b` and the edge is open or has `valid_to > a`. Same
+    /// exclusivity as `valid_during`.
+    #[serde(default)]
+    valid_overlaps: Option<[i64; 2]>,
+    /// Only edges fully over by `t` (Unix ms): closed with `valid_to <= t`;
+    /// an open edge never matches. Same exclusivity as `valid_during`.
+    #[serde(default)]
+    valid_before: Option<i64>,
+    /// Only edges starting at or after `t` (Unix ms): `valid_from >= t`;
+    /// open edges qualify. Same exclusivity as `valid_during`.
+    #[serde(default)]
+    valid_after: Option<i64>,
 }
 
 fn get_edges_default_direction() -> DirectionParam {
@@ -3099,6 +3185,7 @@ impl TopoServer {
             vector_weight: p.vector_weight,
             graph_weight: p.graph_weight,
             access_weight: p.access_weight,
+            corroboration_weight: p.corroboration_weight,
             label_weights,
             ..RecallQuery::new(scope_set, query_text.clone(), p.k)
         };
@@ -3128,7 +3215,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Walk the graph outward from a seed node up to max_hops and return the subgraph (nodes + edges) — the context around something already found. as_of views past topology (e.g. before a supersession); omit for now."
+        description = "Walk the graph outward from a seed node up to max_hops and return the subgraph (nodes + edges) — the context around something already found. as_of views past topology (e.g. before a supersession); valid_during/valid_overlaps/valid_before/valid_after gate hops by world-time interval instead; omit all for now."
     )]
     fn traverse(
         &self,
@@ -3136,6 +3223,31 @@ impl TopoServer {
     ) -> Result<Json<TraverseResult>, ErrorData> {
         validate_as_of(p.as_of)?;
         let time_axis = parse_time_axis(p.time_axis.as_deref())?;
+        // Allen interval predicate (at most one of the four valid_* params).
+        // When present it REPLACES the as_of temporal gate on the valid axis
+        // (the engine's `traverse_interval` composition rules); as_of and the
+        // recorded axis are named conflicts here so the caller sees which
+        // param to drop, not just the engine's Rejected.
+        let valid_interval = parse_valid_interval(
+            p.valid_during,
+            p.valid_overlaps,
+            p.valid_before,
+            p.valid_after,
+        )?;
+        if valid_interval.is_some() {
+            if p.as_of.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "as_of and valid_* interval predicates are mutually exclusive — a point query is a one-instant overlaps; pick one gate".to_string(),
+                    None,
+                ));
+            }
+            if matches!(time_axis, TimeAxis::Recorded) {
+                return Err(ErrorData::invalid_params(
+                    "valid_* interval predicates gate the valid axis only — omit time_axis: \"recorded\"".to_string(),
+                    None,
+                ));
+            }
+        }
         // `seed_ids` (non-empty) wins over `seed_id`; at least one is required.
         let seed_strs: Vec<String> = match p.seed_ids {
             Some(ids) if !ids.is_empty() => ids,
@@ -3185,7 +3297,11 @@ impl TopoServer {
         // Only the input-validation `Rejected` maps to invalid_params;
         // everything else is a server-side internal_error (same split as
         // `search_memories`).
-        let sg = self.db.traverse(&query).map_err(|e| match e {
+        let sg = match valid_interval {
+            Some(iv) => self.db.traverse_interval(&query, iv),
+            None => self.db.traverse(&query),
+        }
+        .map_err(|e| match e {
             TopoError::Rejected(_) => ErrorData::invalid_params(e.to_string(), None),
             other => ErrorData::internal_error(other.to_string(), None),
         })?;
@@ -3276,7 +3392,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Rank live memories by kind-aware staleness (half-lives: episodic 14d / semantic 120d / procedural 365d; absent kind = semantic). Read-only, unbumped, deterministic under now_ms. PROPOSES only — review each candidate and act via forget or consolidate_memories; never forget from staleness alone. Near-duplicates are find_duplicate_memories' job."
+        description = "Rank live memories by kind-aware staleness (half-lives: episodic 14d / semantic 120d / procedural 365d / decision 120d; absent kind = semantic). Read-only, unbumped, deterministic under now_ms. PROPOSES only — review each candidate and act via forget or consolidate_memories; never forget from staleness alone. Near-duplicates are find_duplicate_memories' job."
     )]
     fn lifecycle_candidates(
         &self,
@@ -3288,6 +3404,7 @@ impl TopoServer {
             half_life_episodic_ms: (p.half_life_episodic_days * 86_400_000.0) as i64,
             half_life_semantic_ms: (p.half_life_semantic_days * 86_400_000.0) as i64,
             half_life_procedural_ms: (p.half_life_procedural_days * 86_400_000.0) as i64,
+            half_life_decision_ms: (p.half_life_decision_days * 86_400_000.0) as i64,
         };
         let now = p.now_ms.unwrap_or_else(now_ms);
         let candidates = convert::lifecycle_candidates(&self.db, &scope_set, &params, now)
@@ -3338,7 +3455,7 @@ impl TopoServer {
     }
 
     #[tool(
-        description = "Store a linked fact in one atomic call (preferred write path): memory + find-or-create entities + memory→entity links. Use create_memory / create_entity / link only for an unlinked note, extra entity props, or entity↔entity relations. kind: episodic | semantic | procedural (omitted = semantic); on dedup the stored kind wins."
+        description = "Store a linked fact in one atomic call (preferred write path): memory + find-or-create entities + memory→entity links. create_memory / create_entity / link remain for an unlinked note, extra entity props, or entity↔entity relations. kind: episodic | semantic | procedural | decision (omitted = semantic); dedup keeps the stored kind."
     )]
     fn remember(
         &self,
@@ -3975,7 +4092,7 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
     }
 
     #[tool(
-        description = "List a node's edges (default: outgoing, open only), filterable by far-end node and edge type. as_of shows edges open at that past instant — omit open_only with it. Use this to find the edge id for close_edge and to check what a node already links to; valid_to null means open."
+        description = "List a node's edges (default: outgoing, open only), filterable by far-end node and edge type. as_of shows edges open at that past instant — omit open_only with it; valid_during/valid_overlaps/valid_before/valid_after ask interval questions instead. Use this to find the edge id for close_edge; valid_to null means open."
     )]
     fn get_edges(
         &self,
@@ -3995,6 +4112,36 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
             ));
         }
 
+        // Allen interval predicate (at most one of the four valid_* params).
+        // When present it REPLACES the as_of/open_only gate on the valid
+        // axis, so each of those (and the recorded axis) is a named conflict.
+        let valid_interval = parse_valid_interval(
+            p.valid_during,
+            p.valid_overlaps,
+            p.valid_before,
+            p.valid_after,
+        )?;
+        if valid_interval.is_some() {
+            if p.as_of.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "as_of and valid_* interval predicates are mutually exclusive — a point query is a one-instant overlaps; pick one gate".to_string(),
+                    None,
+                ));
+            }
+            if p.open_only.is_some() {
+                return Err(ErrorData::invalid_params(
+                    "open_only and valid_* interval predicates are mutually exclusive — the predicate already says which edges qualify; omit open_only".to_string(),
+                    None,
+                ));
+            }
+            if matches!(time_axis, TimeAxis::Recorded) {
+                return Err(ErrorData::invalid_params(
+                    "valid_* interval predicates gate the valid axis only — omit time_axis: \"recorded\"".to_string(),
+                    None,
+                ));
+            }
+        }
+
         let from = parse_node_id(&p.from_id)?;
         let to = match &p.to_id {
             Some(s) => Some(parse_node_id(s)?),
@@ -4011,15 +4158,25 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
             p.open_only.unwrap_or(true)
         };
 
-        let fetch_from = |t: Option<&str>| {
-            self.db
+        let fetch_from = |t: Option<&str>| match valid_interval {
+            Some(iv) => self
+                .db
+                .edges_from_interval(&scope_set, from, to, t, iv)
+                .map_err(classify_topo_error),
+            None => self
+                .db
                 .edges_from(&scope_set, from, to, t, open_only_to_use, time_axis)
-                .map_err(classify_topo_error)
+                .map_err(classify_topo_error),
         };
-        let fetch_to = |t: Option<&str>| {
-            self.db
+        let fetch_to = |t: Option<&str>| match valid_interval {
+            Some(iv) => self
+                .db
+                .edges_to_interval(&scope_set, from, to, t, iv)
+                .map_err(classify_topo_error),
+            None => self
+                .db
                 .edges_to(&scope_set, from, to, t, open_only_to_use, time_axis)
-                .map_err(classify_topo_error)
+                .map_err(classify_topo_error),
         };
         let edge_type = p.edge_type.as_deref();
         let mut edges = match p.direction {
@@ -4196,7 +4353,11 @@ impl ServerHandler for TopoServer {
                  find-or-create entities + links); the primitives remain for the exceptions — \
                  create_memory for a deliberately unlinked note, create_entity when an entity \
                  needs extra props, link for entity↔entity relations and supersede: true when \
-                 a to-one fact changes. Write results may carry advisory conflicts / \
+                 a to-one fact changes. Store a decision as kind: \"decision\" with the \
+                 rationale in the content; link it to the entities it affects; retrieve \
+                 precedent with search_memories + kinds: [\"decision\"]. For causal structure \
+                 between memories, use edge types caused_by / influenced. Write results may \
+                 carry advisory conflicts / \
                  supersession_candidates — act with supersede: true / supersedes when they are \
                  real, or ignore them. Recalling well: know the exact identifier → \
                  find_by_prop; otherwise search_memories stems \

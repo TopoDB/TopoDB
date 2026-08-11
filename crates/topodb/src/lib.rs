@@ -45,7 +45,7 @@ pub use ids::{EdgeId, NodeId, Scope, ScopeId, ScopeSet};
 pub use index::{IndexSpec, PropIndex};
 pub use op::Op;
 pub use props::{PropValue, Props};
-pub use read::{Direction, Subgraph, TimeAxis, TraversalQuery};
+pub use read::{Direction, Subgraph, TimeAxis, TraversalQuery, ValidInterval};
 pub use recall::RecallQuery;
 pub use state::{EdgeRecord, NodeRecord};
 pub use storage::AppliedBatch;

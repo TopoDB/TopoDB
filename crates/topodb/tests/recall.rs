@@ -1238,3 +1238,61 @@ fn recall_rejects_inverted_created_range_before_any_leg() {
         other => panic!("expected Rejected, got {other:?}"),
     }
 }
+
+#[test]
+fn corroboration_counts_co_seed_graph_evidence_for_top_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path().join("t.redb"), spec()).unwrap();
+    let s = ScopeId::new();
+    let scopes = ScopeSet::of(&[s]);
+    // Two linked memories sharing the query token: both fuse into the
+    // top-GRAPH_SEEDS preliminary hits, so the PPR list (which excludes
+    // seeds by contract) can never corroborate them — the co-seed rule
+    // must. Third same-token memory left unlinked as the single-leg
+    // control.
+    let (a, op_a) = memory("basalt columns cool slowly", Scope::Id(s));
+    let (b, op_b) = memory("basalt flows layer the coast", Scope::Id(s));
+    let (lone, op_c) = memory("basalt sand darkens beaches", Scope::Id(s));
+    db.submit(vec![op_a, op_b, op_c]).unwrap();
+    db.submit(vec![Op::CreateEdge {
+        id: EdgeId::new(),
+        scope: Scope::Id(s),
+        ty: "about".into(),
+        from: a,
+        to: b,
+        props: Props::new(),
+        valid_from: None,
+        recorded_at: None,
+    }])
+    .unwrap();
+
+    let score_of = |w: f32, id: NodeId| -> f32 {
+        let mut q = text_only(&scopes, "basalt", 10);
+        q.graph_boost = true;
+        q.corroboration_weight = w;
+        db.recall(&q)
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n.id == id)
+            .map(|(_, score)| score)
+            .expect("hit must surface")
+    };
+
+    // legs_hit = 2 (text + co-seed graph evidence) at w = 0.5: the factor
+    // is exactly 1 + 0.5·(2−1)/2 = 1.25.
+    for id in [a, b] {
+        let off = score_of(0.0, id);
+        let on = score_of(0.5, id);
+        assert!(
+            (on - off * 1.25).abs() < 1e-6,
+            "co-seed hit must carry the two-leg factor: off={off} on={on}"
+        );
+    }
+    // The unlinked same-token hit is single-leg: its score is untouched
+    // bit-for-bit by the knob.
+    assert_eq!(
+        score_of(0.0, lone).to_bits(),
+        score_of(0.5, lone).to_bits(),
+        "single-leg hit must be byte-identical under the boost"
+    );
+}

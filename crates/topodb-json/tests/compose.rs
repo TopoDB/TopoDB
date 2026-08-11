@@ -616,16 +616,59 @@ fn plan_forget_rejects_empty_and_dedups_repeats() {
 
 #[test]
 fn validate_memory_kind_accepts_the_enum_and_rejects_everything_else() {
-    for ok in ["episodic", "semantic", "procedural"] {
+    for ok in ["episodic", "semantic", "procedural", "decision"] {
         assert!(validate_memory_kind(ok).is_ok(), "{ok} must validate");
     }
-    for bad in ["", "Episodic", "SEMANTIC", "factual", "kind"] {
+    for bad in ["", "Episodic", "SEMANTIC", "Decision", "factual", "kind"] {
         let err = validate_memory_kind(bad).unwrap_err();
         assert!(
             err.contains("episodic") && err.contains(&format!("{bad:?}")),
             "message must name the vocabulary and the bad value: {err}"
         );
     }
+}
+
+/// The vocabulary is closed at FOUR kinds and the rejection message names
+/// every one of them — a fifth kind added to the array without updating the
+/// message (or vice versa) fails here.
+#[test]
+fn decision_kind_is_in_the_vocabulary_and_the_error_lists_all_four() {
+    assert!(topodb_json::MEMORY_KINDS.contains(&"decision"));
+    assert_eq!(
+        topodb_json::MEMORY_KIND_DEFAULT,
+        "semantic",
+        "adding decision must not move the absent-kind default"
+    );
+    let err = validate_memory_kind("resolution").unwrap_err();
+    for kind in topodb_json::MEMORY_KINDS {
+        assert!(err.contains(kind), "message must list {kind:?}, got: {err}");
+    }
+}
+
+#[test]
+fn plan_remember_stamps_decision_kind_on_new_memories() {
+    // fixture: empty db + write scope, as the suite's other plan_remember
+    // tests build them.
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let lookup = lookup();
+
+    let mut request = req("ship semantica as one lean PR", &["semantica"]);
+    request.kind = Some("decision".into());
+    let plan = plan_remember(&db, Scope::Shared, &lookup, 5_000, &request).unwrap();
+    let create = plan
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::CreateNode { id, props, .. } if *id == plan.memory_id => Some(props),
+            _ => None,
+        })
+        .expect("a new memory CreateNode");
+    assert_eq!(
+        create.get("kind"),
+        Some(&PropValue::Str("decision".into())),
+        "decision must stamp like every other kind"
+    );
 }
 
 #[test]

@@ -9,7 +9,9 @@ in-process, no server.
 
 Status: **early development (0.0.x)** — the engine core **and the recall
 layer** are implemented: op log, single-applier concurrency, scoped temporal
-traversal, BM25 full-text search, graph-scoped vector search, access stats,
+traversal (point-in-time `as_of` and Allen-style valid-time interval
+predicates), BM25 full-text search, graph-scoped vector search, hybrid RRF
+recall (recency-, access-, and corroboration-weighted), access stats,
 change feed, and replay-determinism property tests. The API is not yet
 stable; pin exact versions.
 
@@ -101,7 +103,7 @@ fn main() -> Result<(), topodb::TopoError> {
 
 ## Core properties
 
-- **Temporal edges** — facts supersede, never overwrite; `as_of` reads see history
+- **Temporal edges** — facts supersede, never overwrite; `as_of` reads see history, and Allen-style interval predicates (`ValidInterval`: `During`/`Overlaps`/`Before`/`After`) ask interval-vs-interval questions over edge valid time (`edges_from_interval` / `edges_to_interval` / `traverse_interval`)
 - **Structural scoping** — every read takes a `ScopeSet`; cross-scope edges require a `Shared` endpoint
 - **Deterministic replay** — the op log stores fully-resolved ops; replaying it reproduces state exactly (property-tested)
 - **Single-applier concurrency** — writers from any thread serialize through one applier; reads run in redb MVCC read transactions, never block each other, and never block redb's storage commits, though a long-running read can briefly delay the applier's next batch while it holds the dicts/scope-registry read guards

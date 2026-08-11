@@ -404,3 +404,55 @@ fn label_weights_validation() {
     );
     expect_tool_error(&resp);
 }
+
+/// Wiring polarity for `corroboration_weight` (the #80 lesson: omitted vs
+/// passed must not be invertible without a test going red). The host default
+/// is 0.2 while the engine default is 0.0, so a hit corroborated by the text
+/// AND graph legs must score strictly HIGHER with the param omitted than
+/// with an explicit 0 — proving both the default and the off-switch reach
+/// the engine. Out-of-range values reject like the other weights.
+#[test]
+fn corroboration_weight_default_boosts_and_zero_disables() {
+    let (_dir, mut server) = fresh_server();
+    // remember links the memory to an entity sharing the query token, so the
+    // memory lands in BOTH the text leg and the 1-hop graph leg (legs_hit =
+    // 2, factor 1 + 0.2/2 = 1.1); the vector leg never runs in tests (no
+    // embedder) and legs that don't run are never counted.
+    let mem = server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "scoria cools with trapped gas", "entities": ["scoria"] }),
+        DEFAULT_TIMEOUT,
+    )["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut score_for = |params: serde_json::Value| -> f64 {
+        let res = server.call_tool_ok("search_memories", params, DEFAULT_TIMEOUT);
+        res["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["node"]["id"].as_str() == Some(mem.as_str()))
+            .and_then(|h| h["score"].as_f64())
+            .unwrap_or_else(|| panic!("memory must surface: {res}"))
+    };
+
+    let boosted = score_for(serde_json::json!({ "query": "scoria", "k": 5 }));
+    let disabled =
+        score_for(serde_json::json!({ "query": "scoria", "k": 5, "corroboration_weight": 0.0 }));
+    assert!(
+        boosted > disabled,
+        "the corroborated (text+graph) memory must score higher under the omitted-param \
+         0.2 default than with the boost switched off: {boosted} vs {disabled}"
+    );
+
+    for bad in [-0.1, 1.5] {
+        let resp = server.call_tool(
+            "search_memories",
+            serde_json::json!({ "query": "scoria", "k": 5, "corroboration_weight": bad }),
+            DEFAULT_TIMEOUT,
+        );
+        expect_tool_error(&resp);
+    }
+}

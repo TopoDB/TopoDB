@@ -130,6 +130,73 @@ struct Inner {
     debug_last_search_used_graph: AtomicBool,
 }
 
+/// Which adjacency table to scan: OUT_ADJ (edges FROM a node) or IN_ADJ
+/// (edges TO a node). Used by the private `scan_adjacency` helper.
+enum EdgeDirection {
+    Out,
+    In,
+}
+
+/// Temporal gate for adjacency scanning: either `open_only` with a time axis
+/// (Valid gates on entry.valid_to before fetch, Recorded gates on
+/// rec.superseded_at after fetch), or an Allen predicate over the edge's
+/// valid interval (gates only on entry fields, pre-fetch). Used by the
+/// private `scan_adjacency` helper to parameterize the temporal logic shared
+/// by `edges_from`, `edges_to`, `edges_from_interval`, and `edges_to_interval`.
+enum EdgeGate<'a> {
+    OpenOnly {
+        open_only: bool,
+        axis: crate::read::TimeAxis,
+    },
+    Interval(&'a crate::read::ValidInterval),
+}
+
+impl<'a> EdgeGate<'a> {
+    /// Returns true if the entry should be skipped (filtered out) by this
+    /// gate's pre-fetch logic.
+    fn should_skip_entry(&self, entry: &crate::adj::AdjEntryDisk) -> bool {
+        match self {
+            EdgeGate::OpenOnly { open_only, axis } => {
+                if !open_only {
+                    return false;
+                }
+                match axis {
+                    // Valid axis: gate on the adjacency entry before the fetch
+                    // (hot path, byte-unchanged).
+                    crate::read::TimeAxis::Valid => entry.valid_to.is_some(),
+                    // Recorded axis: the entry doesn't carry `superseded_at`,
+                    // so defer the gate to the fetched record.
+                    crate::read::TimeAxis::Recorded => false,
+                }
+            }
+            // Interval gate: check the Allen predicate on entry fields.
+            EdgeGate::Interval(interval) => !interval.matches(entry.valid_from, entry.valid_to),
+        }
+    }
+
+    /// Returns true if the record should be skipped (filtered out) by this
+    /// gate's post-fetch logic.
+    fn should_skip_record(&self, record: &crate::state::EdgeRecord) -> bool {
+        match self {
+            EdgeGate::OpenOnly { open_only, axis } => {
+                if !open_only {
+                    return false;
+                }
+                match axis {
+                    // Valid axis: already filtered at entry level.
+                    crate::read::TimeAxis::Valid => false,
+                    // Recorded axis: gate on the fetched record's
+                    // `superseded_at` (nearly free here since every candidate
+                    // already needs a full-record fetch for the result).
+                    crate::read::TimeAxis::Recorded => record.superseded_at.is_some(),
+                }
+            }
+            // Interval gate: no post-fetch logic.
+            EdgeGate::Interval(_) => false,
+        }
+    }
+}
+
 impl Db {
     /// Opens (creating if necessary) the database at `path` and starts its
     /// single applier thread. `submit`/`submit_at` route through this thread;
@@ -683,81 +750,14 @@ impl Db {
         open_only: bool,
         axis: crate::read::TimeAxis,
     ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
-        let storage = self.storage();
-        let dicts = storage.dicts.read().expect("dict lock poisoned");
-        let scope_registry = storage
-            .scope_registry
-            .read()
-            .expect("scope registry lock poisoned");
-        // An edge-type name the dict has never interned has never been
-        // written: match nothing (an empty filter list is still a filter),
-        // mirroring `traverse`'s treatment of unknown type names.
-        let type_filter: Option<Vec<u32>> = ty.map(|name| {
-            dicts
-                .id_of(crate::dict::DictKind::EdgeType, name)
-                .into_iter()
-                .collect()
-        });
-        let tx = storage.db.begin_read().map_err(crate::error::storage_err)?;
-        let node_slots = tx
-            .open_table(crate::slots::NODE_SLOTS)
-            .map_err(crate::error::storage_err)?;
-        let Some(from_slot) = crate::slots::node_slot(&node_slots, from)? else {
-            return Ok(Vec::new());
-        };
-        let to_slot = match to {
-            None => None,
-            Some(to) => match crate::slots::node_slot(&node_slots, to)? {
-                // A target that has no slot has no edges either.
-                None => return Ok(Vec::new()),
-                some => some,
-            },
-        };
-        let out_adj = tx
-            .open_table(crate::adj::OUT_ADJ)
-            .map_err(crate::error::storage_err)?;
-        let edges_table = tx
-            .open_table(crate::storage::EDGES)
-            .map_err(crate::error::storage_err)?;
-        let node_ids = tx
-            .open_table(crate::slots::NODE_IDS)
-            .map_err(crate::error::storage_err)?;
-        let mut out = Vec::new();
-        for (_ty, entry) in crate::adj::read_adj(&out_adj, from_slot, type_filter.as_deref())? {
-            if to_slot.is_some_and(|slot| entry.target != slot) {
-                continue;
-            }
-            // Valid axis: gate on the adjacency entry before the fetch (hot
-            // path, byte-unchanged). Recorded axis: the entry doesn't carry
-            // `superseded_at`, so defer the open-only gate to the fetched
-            // record below.
-            if open_only && axis == crate::read::TimeAxis::Valid && entry.valid_to.is_some() {
-                continue;
-            }
-            let entry_scope = scope_registry.resolve(entry.scope)?;
-            if !scopes.contains(entry_scope) {
-                continue;
-            }
-            if let Some(rec) = crate::storage::read_edge_by_slot(
-                &edges_table,
-                &dicts,
-                &scope_registry,
-                &node_ids,
-                entry.edge,
-            )? {
-                if open_only
-                    && axis == crate::read::TimeAxis::Recorded
-                    && rec.superseded_at.is_some()
-                {
-                    continue;
-                }
-                out.push(rec);
-            }
-        }
-        // Deterministic order: by edge id (ULIDs sort by mint time, so this
-        // is oldest-first).
-        out.sort_by_key(|e| e.id);
-        Ok(out)
+        self.scan_adjacency(
+            scopes,
+            from,
+            to,
+            ty,
+            EdgeDirection::Out,
+            EdgeGate::OpenOnly { open_only, axis },
+        )
     }
 
     /// Scoped edge listing to `to`: every edge whose target is `to`,
@@ -785,15 +785,96 @@ impl Db {
         open_only: bool,
         axis: crate::read::TimeAxis,
     ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
+        self.scan_adjacency(
+            scopes,
+            to,
+            from,
+            ty,
+            EdgeDirection::In,
+            EdgeGate::OpenOnly { open_only, axis },
+        )
+    }
+
+    /// [`Db::edges_from`], gated by an Allen predicate over the edge's valid
+    /// interval `[valid_from, valid_to)` (pragmatic subset — see
+    /// [`crate::ValidInterval`]) instead of the `open_only`/`axis` pair. The
+    /// predicate REPLACES the open-only gate, so this surface has no
+    /// `open_only` parameter — the two cannot be combined here (hosts reject
+    /// an explicit `open_only` alongside a predicate); and it gates the valid
+    /// axis only, so there is no `axis` parameter either (recorded-axis
+    /// intervals are out of scope). Gating happens on the adjacency entries'
+    /// interval fields, same place as `edges_from`'s open-only gate — no
+    /// extra record fetches. `Rejected` on an inverted or non-positive
+    /// interval; everything else (scoping, type filter, missing-slot
+    /// behavior, no counter bumps, oldest-first order) matches `edges_from`.
+    pub fn edges_from_interval(
+        &self,
+        scopes: &ScopeSet,
+        from: NodeId,
+        to: Option<NodeId>,
+        ty: Option<&str>,
+        valid_interval: crate::read::ValidInterval,
+    ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
+        valid_interval.validate()?;
+        self.scan_adjacency(
+            scopes,
+            from,
+            to,
+            ty,
+            EdgeDirection::Out,
+            EdgeGate::Interval(&valid_interval),
+        )
+    }
+
+    /// Incoming-edge counterpart to [`Db::edges_from_interval`]: every edge
+    /// pointing TO `to` whose valid interval satisfies the Allen predicate,
+    /// read via IN_ADJ. Same contract as `edges_from_interval` throughout
+    /// (predicate replaces the open-only gate, valid axis only, no counter
+    /// bumps, oldest-first order).
+    pub fn edges_to_interval(
+        &self,
+        scopes: &ScopeSet,
+        to: NodeId,
+        from: Option<NodeId>,
+        ty: Option<&str>,
+        valid_interval: crate::read::ValidInterval,
+    ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
+        valid_interval.validate()?;
+        self.scan_adjacency(
+            scopes,
+            to,
+            from,
+            ty,
+            EdgeDirection::In,
+            EdgeGate::Interval(&valid_interval),
+        )
+    }
+
+    /// Private helper for adjacency scanning shared by `edges_from`,
+    /// `edges_to`, `edges_from_interval`, and `edges_to_interval`. Scans the
+    /// adjacency table in the given `direction` from `primary_node`,
+    /// optionally filtered to `filter_node`, by `ty`, and gated by `gate`.
+    /// Returns scope-filtered edge records in deterministic (oldest-first)
+    /// order by edge id.
+    ///
+    /// An edge-type name the dict has never interned has never been written:
+    /// match nothing (an empty filter list is still a filter), mirroring
+    /// `traverse`'s treatment of unknown type names.
+    fn scan_adjacency(
+        &self,
+        scopes: &ScopeSet,
+        primary_node: NodeId,
+        filter_node: Option<NodeId>,
+        ty: Option<&str>,
+        direction: EdgeDirection,
+        gate: EdgeGate,
+    ) -> Result<Vec<crate::state::EdgeRecord>, TopoError> {
         let storage = self.storage();
         let dicts = storage.dicts.read().expect("dict lock poisoned");
         let scope_registry = storage
             .scope_registry
             .read()
             .expect("scope registry lock poisoned");
-        // An edge-type name the dict has never interned has never been
-        // written: match nothing (an empty filter list is still a filter),
-        // mirroring `traverse`'s treatment of unknown type names.
         let type_filter: Option<Vec<u32>> = ty.map(|name| {
             dicts
                 .id_of(crate::dict::DictKind::EdgeType, name)
@@ -804,20 +885,25 @@ impl Db {
         let node_slots = tx
             .open_table(crate::slots::NODE_SLOTS)
             .map_err(crate::error::storage_err)?;
-        let Some(to_slot) = crate::slots::node_slot(&node_slots, to)? else {
+        let Some(primary_slot) = crate::slots::node_slot(&node_slots, primary_node)? else {
             return Ok(Vec::new());
         };
-        let from_slot = match from {
+        let filter_slot = match filter_node {
             None => None,
-            Some(from) => match crate::slots::node_slot(&node_slots, from)? {
-                // A source that has no slot has no edges either.
+            Some(node) => match crate::slots::node_slot(&node_slots, node)? {
+                // A filter node that has no slot has no edges either.
                 None => return Ok(Vec::new()),
                 some => some,
             },
         };
-        let in_adj = tx
-            .open_table(crate::adj::IN_ADJ)
-            .map_err(crate::error::storage_err)?;
+        let adj = match direction {
+            EdgeDirection::Out => tx
+                .open_table(crate::adj::OUT_ADJ)
+                .map_err(crate::error::storage_err)?,
+            EdgeDirection::In => tx
+                .open_table(crate::adj::IN_ADJ)
+                .map_err(crate::error::storage_err)?,
+        };
         let edges_table = tx
             .open_table(crate::storage::EDGES)
             .map_err(crate::error::storage_err)?;
@@ -825,11 +911,11 @@ impl Db {
             .open_table(crate::slots::NODE_IDS)
             .map_err(crate::error::storage_err)?;
         let mut out = Vec::new();
-        for (_ty, entry) in crate::adj::read_adj(&in_adj, to_slot, type_filter.as_deref())? {
-            if from_slot.is_some_and(|slot| entry.target != slot) {
+        for (_ty, entry) in crate::adj::read_adj(&adj, primary_slot, type_filter.as_deref())? {
+            if filter_slot.is_some_and(|slot| entry.target != slot) {
                 continue;
             }
-            if open_only && axis == crate::read::TimeAxis::Valid && entry.valid_to.is_some() {
+            if gate.should_skip_entry(&entry) {
                 continue;
             }
             let entry_scope = scope_registry.resolve(entry.scope)?;
@@ -843,10 +929,7 @@ impl Db {
                 &node_ids,
                 entry.edge,
             )? {
-                if open_only
-                    && axis == crate::read::TimeAxis::Recorded
-                    && rec.superseded_at.is_some()
-                {
+                if gate.should_skip_record(&rec) {
                     continue;
                 }
                 out.push(rec);

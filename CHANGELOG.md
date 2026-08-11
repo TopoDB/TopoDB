@@ -28,6 +28,45 @@ workspace are versioned and released independently (tags are per-package, e.g.
   `Db::edges_from`/`edges_to` — `Recorded` answers "what did we believe at
   t"; a late-recorded fact (backdated `valid_from`) differs between axes.
   The `Valid` axis is behavior-identical to pre-v9 `as_of`.
+- **Allen-style interval predicates (`ValidInterval`)** — new public enum
+  (`During`/`Overlaps`/`Before`/`After`) over the half-open edge valid
+  interval `[valid_from, valid_to)` (an open edge is unbounded on the
+  right, so it never satisfies `During` or `Before`; an EMPTY interval —
+  `valid_to <= valid_from`, creatable by a backdated close — was never
+  valid at any instant and satisfies NO predicate, keeping `Overlaps
+  [a,b)` exactly the union of `as_of` points in `[a,b)`), plus
+  `ValidInterval::from_parts` — the single shared fold of the four
+  optional surface params into at most one predicate (mutual exclusion,
+  inversion, positivity), used by every host instead of per-surface
+  ladders — with new reads
+  `Db::edges_from_interval`/`Db::edges_to_interval` and
+  `Db::traverse_interval` — the interval-vs-interval questions ("which
+  edges were valid during Q2", "what overlapped the migration window")
+  that the point-in-time `as_of` cannot express. The predicate REPLACES
+  the `open_only`/`as_of` gate (valid axis only: `as_of` present or
+  `time_axis: Recorded` is `Rejected`, as is an explicit `open_only`
+  alongside a predicate at surfaces that express one), gates on the
+  adjacency entries' interval fields (no extra record fetches, no access
+  bumps, oldest-first order preserved), and is pure query-time
+  mechanics — no format change; a v9 file opens with zero migration work.
+- **`RecallQuery.corroboration_weight`** — RRF corroboration boost:
+  post-fusion, each fused score is multiplied by `1 + w·(legs_hit − 1)/2`,
+  where `legs_hit` counts the legs that actually RAN (text/vector/graph; a
+  zero-weight leg is skipped entirely and never counts; expansions live
+  inside the text leg). The graph leg counts a hit when the PPR list holds
+  it OR when it is a seed 1-hop adjacent to ANOTHER seed — PPR excludes
+  its seeds by contract, and without the co-seed rule the top hits
+  (exactly what a tie-breaker is for) could never be graph-corroborated
+  while their own neighbors could. Counting only; fusion inputs are
+  untouched. A mild re-ranker that breaks near-ties toward hits
+  corroborated across legs — RRF's additive term already favors agreement,
+  and no recall-quality win beyond tie-breaking is claimed. Validated
+  finite in `0.0..=1.0` (same envelope and error style as `access_weight`);
+  the default `0.0` skips the code path entirely, so results are
+  byte-identical to before (differential-tested, same pattern as the
+  recency knob). **Breaking for struct-literal construction** of
+  `RecallQuery` (new field) — same caveat as `label_weights`; use
+  `RecallQuery::new(..)` with struct-update syntax.
 
 #### Changed
 
@@ -412,6 +451,28 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **`edge_believed_at`** — the belief-axis (recorded) liveness predicate,
   twin of `edge_live_at`; `edge_to_json` output gains `recorded_at`
   (number) and `superseded_at` (number|null).
+- **`decision` memory kind** — the closed vocabulary `MEMORY_KINDS` grows
+  to four (`episodic | semantic | procedural | decision`), giving "what
+  did we decide about X, and what similar decisions preceded it?" a
+  filterable vocabulary; `validate_memory_kind` accepts it and its error
+  message lists all four. Half-life: new
+  `LIFECYCLE_HALF_LIFE_DECISION_DAYS` `= LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS`
+  (120d — a deliberate tie: decisions age like standing facts; change
+  independently if dogfooding shows otherwise), wired EXPLICITLY rather
+  than by fall-through: its own arm in the `lifecycle_candidates` kind
+  match and its own entry in `memory_kind_half_life()`, with the
+  anti-drift mirror test extended to enforce that all four kinds are
+  covered. `MEMORY_KIND_DEFAULT` stays `semantic`; dedup stored-kind-wins
+  and the `kind`-is-a-reserved-prop rejection are unchanged.
+  `LifecycleParams` gains a `half_life_decision_ms` tunable (defaulted
+  from the constant, positive-validated like the other three; BREAKING
+  for full struct literals) so the sweep and the ranking map draw the
+  decision half-life from the same constant — editing it can never move
+  one and silently not the other. Stored as the
+  existing `kind` Str prop — no disk-format change — and accepted
+  immediately by every host (CLI `--kind`, MCP `remember` /
+  `create_memory`, Obsidian frontmatter `kind`) through this shared
+  validation.
 
 ### 0.0.11 — 2026-08-10
 
@@ -580,6 +641,23 @@ workspace are versioned and released independently (tags are per-package, e.g.
   unchanged behavior) or `"recorded"` ("what did we believe at as_of");
   edge results carry `recorded_at` / `superseded_at`. Payload ceiling
   re-based to 80,000 bytes for the new axis docs (measured 79,488).
+- **Interval predicates on `get_edges` / `traverse`** — four optional
+  params over the edge valid interval: `valid_during: [a, b]`,
+  `valid_overlaps: [a, b]`, `valid_before: t`, `valid_after: t` (Unix ms,
+  half-open `[a, b)`). At most one may be set; each is mutually exclusive
+  with `as_of`, explicit `open_only`, and `time_axis: "recorded"` — a
+  predicate REPLACES the temporal gate. Folded and validated by the
+  engine's shared `ValidInterval::from_parts`.
+- **`search_memories.corroboration_weight`** — host default `0.2` (mild:
+  max ×1.2), `0` disables, engine default stays off; boosts hits present
+  in multiple recall legs (see the engine entry for the counting rule,
+  including co-seed graph evidence).
+- **`decision` memory kind across the surface** — `remember` /
+  `create_memory` accept `kind: "decision"`, the `search_memories.kinds`
+  filter takes `"decision"`, staleness uses its 120d bucket; server
+  instructions document the convention: rationale in the content, link to
+  affected entities, precedent via `kinds: ["decision"]`, causal edge
+  types `caused_by` / `influenced`.
 
 ### 0.0.16 — 2026-08-10
 
@@ -1177,6 +1255,18 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 - **`--time-axis <valid|recorded>`** on `get-edges` and `traverse`
   (default valid, unchanged); `link` documents `--valid-from` as the
   world-time override; edge output carries the belief-axis fields.
+- **`--valid-during a..b` / `--valid-overlaps a..b` / `--valid-before t`
+  / `--valid-after t`** on `get-edges` and `traverse` — the same interval
+  predicates as MCP (at most one; exclusive with `--as-of`, explicit
+  `--open-only`, and `--time-axis recorded`), folded by the engine's
+  shared `ValidInterval::from_parts`. Negative timestamps reach the
+  engine's structured rejection in both `--flag value` and `--flag=value`
+  forms.
+- **`--kind decision`** accepted wherever kinds are (`remember`, kind
+  filters) via the shared `topodb-json` vocabulary. NOTE: CLI `search`
+  deliberately has NO `--corroboration-weight` — it is a single-leg text
+  surface with no fusion legs; the corroboration boost is an MCP
+  `search_memories` tunable.
 
 ### 0.0.11 — 2026-08-10
 

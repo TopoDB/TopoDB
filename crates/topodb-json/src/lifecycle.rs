@@ -5,8 +5,9 @@
 //! primitives (`nodes_by_label_unbumped`, `access_stats`).
 
 use crate::{
-    ComposeError, MEMORY_CONTENT_PROP, MEMORY_KINDS, MEMORY_KIND_DEFAULT, MEMORY_KIND_EPISODIC,
-    MEMORY_KIND_PROCEDURAL, MEMORY_KIND_PROP, MEMORY_LABEL, MEMORY_TOMBSTONE_PROPS,
+    ComposeError, MEMORY_CONTENT_PROP, MEMORY_KINDS, MEMORY_KIND_DECISION, MEMORY_KIND_DEFAULT,
+    MEMORY_KIND_EPISODIC, MEMORY_KIND_PROCEDURAL, MEMORY_KIND_PROP, MEMORY_LABEL,
+    MEMORY_TOMBSTONE_PROPS,
 };
 use topodb::{Db, NodeId, Op, PropValue, ScopeSet};
 
@@ -18,6 +19,9 @@ pub const LIFECYCLE_DEFAULT_LIMIT: usize = 20;
 pub const LIFECYCLE_HALF_LIFE_EPISODIC_DAYS: f64 = 14.0;
 pub const LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS: f64 = 120.0;
 pub const LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS: f64 = 365.0;
+/// A deliberate tie to the semantic constant: decisions age like standing
+/// facts. Change independently if dogfood shows otherwise.
+pub const LIFECYCLE_HALF_LIFE_DECISION_DAYS: f64 = LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS;
 
 const DAY_MS: f64 = 86_400_000.0;
 
@@ -29,6 +33,7 @@ pub struct LifecycleParams {
     pub half_life_episodic_ms: i64,
     pub half_life_semantic_ms: i64,
     pub half_life_procedural_ms: i64,
+    pub half_life_decision_ms: i64,
 }
 
 impl Default for LifecycleParams {
@@ -38,6 +43,7 @@ impl Default for LifecycleParams {
             half_life_episodic_ms: (LIFECYCLE_HALF_LIFE_EPISODIC_DAYS * DAY_MS) as i64,
             half_life_semantic_ms: (LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS * DAY_MS) as i64,
             half_life_procedural_ms: (LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS * DAY_MS) as i64,
+            half_life_decision_ms: (LIFECYCLE_HALF_LIFE_DECISION_DAYS * DAY_MS) as i64,
         }
     }
 }
@@ -86,6 +92,7 @@ pub fn lifecycle_candidates(
         (MEMORY_KIND_EPISODIC, params.half_life_episodic_ms),
         (crate::MEMORY_KIND_SEMANTIC, params.half_life_semantic_ms),
         (MEMORY_KIND_PROCEDURAL, params.half_life_procedural_ms),
+        (MEMORY_KIND_DECISION, params.half_life_decision_ms),
     ] {
         if hl <= 0 {
             return Err(ComposeError::Invalid(format!(
@@ -112,12 +119,13 @@ pub fn lifecycle_candidates(
             Some(PropValue::Str(k)) if MEMORY_KINDS.contains(&k.as_str()) => k.clone(),
             _ => MEMORY_KIND_DEFAULT.to_string(),
         };
-        let half_life_ms = if kind == MEMORY_KIND_EPISODIC {
-            params.half_life_episodic_ms
-        } else if kind == MEMORY_KIND_PROCEDURAL {
-            params.half_life_procedural_ms
-        } else {
-            params.half_life_semantic_ms
+        let half_life_ms = match kind.as_str() {
+            MEMORY_KIND_EPISODIC => params.half_life_episodic_ms,
+            MEMORY_KIND_PROCEDURAL => params.half_life_procedural_ms,
+            // Named explicitly, not left to the fall-through: the shared
+            // semantic tunable IS decision's half-life (deliberate 120d tie).
+            MEMORY_KIND_DECISION => params.half_life_decision_ms,
+            _ => params.half_life_semantic_ms,
         };
         let stats = db.access_stats(scopes, node.id)?.unwrap_or_default();
         let created_at = node.id.timestamp_ms() as i64;
@@ -196,6 +204,13 @@ pub fn memory_kind_half_life() -> topodb::PropHalfLife {
                 MEMORY_KIND_PROCEDURAL.to_string(),
                 (LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS * DAY_MS) as i64,
             ),
+            // Numerically the default bucket today, but named explicitly:
+            // the decision constant may diverge from semantic later, and an
+            // explicit entry is what the mirror test can pin.
+            (
+                MEMORY_KIND_DECISION.to_string(),
+                (LIFECYCLE_HALF_LIFE_DECISION_DAYS * DAY_MS) as i64,
+            ),
         ],
         default_ms: (LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS * DAY_MS) as i64,
     }
@@ -209,6 +224,12 @@ mod tests {
     /// map is BUILT from the lifecycle constants, and semantic is deliberately
     /// the default bucket (absent kind == semantic everywhere else in the
     /// system, so it must not appear as an explicit entry that could drift).
+    /// Every OTHER kind in the closed vocabulary gets an explicit entry —
+    /// including `decision`, whose constant ties to semantic today but must
+    /// stay independently pinned so the tie can be broken deliberately.
+    /// The lifecycle sweep's decision half-life (LifecycleParams) is also
+    /// pinned to the same constant, so editing LIFECYCLE_HALF_LIFE_DECISION_DAYS
+    /// automatically updates both search ranking and decay candidates.
     #[test]
     fn memory_kind_half_life_mirrors_lifecycle_constants() {
         let map = memory_kind_half_life();
@@ -228,7 +249,51 @@ mod tests {
                     MEMORY_KIND_PROCEDURAL.to_string(),
                     (LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS * DAY_MS) as i64
                 ),
+                (
+                    MEMORY_KIND_DECISION.to_string(),
+                    (LIFECYCLE_HALF_LIFE_DECISION_DAYS * DAY_MS) as i64
+                ),
             ]
+        );
+        // The map's explicit entries plus the default bucket must cover the
+        // closed vocabulary exactly — a fifth kind without a wiring decision
+        // here is the drift this test exists to catch.
+        let explicit: Vec<&str> = map.per_value.iter().map(|(k, _)| k.as_str()).collect();
+        for kind in MEMORY_KINDS {
+            assert!(
+                explicit.contains(&kind) || kind == crate::MEMORY_KIND_DEFAULT,
+                "kind {kind:?} has no half-life wiring"
+            );
+        }
+        // The lifecycle sweep's decision half-life must also mirror the constant,
+        // so the tie cannot drift between the two independent tables.
+        let params = LifecycleParams::default();
+        assert_eq!(
+            params.half_life_decision_ms,
+            (LIFECYCLE_HALF_LIFE_DECISION_DAYS * DAY_MS) as i64,
+            "lifecycle sweep's decision half-life must equal LIFECYCLE_HALF_LIFE_DECISION_DAYS constant"
+        );
+        // And it must match what memory_kind_half_life() declares (the same constant).
+        let map_decision_ms = map
+            .per_value
+            .iter()
+            .find(|(k, _)| k == MEMORY_KIND_DECISION)
+            .map(|(_, ms)| *ms)
+            .expect("decision must have an explicit entry");
+        assert_eq!(
+            params.half_life_decision_ms, map_decision_ms,
+            "lifecycle sweep and search ranking must use the same decision half-life"
+        );
+    }
+
+    /// The 120d tie is deliberate and named: decision's constant equals
+    /// semantic's, so a decision memory decays on the standing-fact curve
+    /// until dogfood says otherwise.
+    #[test]
+    fn decision_half_life_ties_to_semantic() {
+        assert_eq!(
+            LIFECYCLE_HALF_LIFE_DECISION_DAYS,
+            LIFECYCLE_HALF_LIFE_SEMANTIC_DAYS
         );
     }
 }

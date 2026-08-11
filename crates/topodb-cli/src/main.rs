@@ -10,7 +10,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use topodb::{
     Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
-    TraversalQuery, VectorQuery,
+    TraversalQuery, ValidInterval, VectorQuery,
 };
 
 fn main() {
@@ -294,6 +294,7 @@ fn main() {
             edge_type,
             as_of,
             time_axis,
+            valid_interval,
         } => traverse(
             &db,
             default_scope,
@@ -303,6 +304,7 @@ fn main() {
             edge_type,
             as_of,
             time_axis.into(),
+            allen_interval(&valid_interval),
             cli.pretty,
         ),
         Command::GetEdges {
@@ -313,6 +315,7 @@ fn main() {
             as_of,
             direction,
             time_axis,
+            valid_interval,
         } => get_edges(
             &db,
             default_scope,
@@ -323,6 +326,7 @@ fn main() {
             as_of,
             direction,
             time_axis.into(),
+            allen_interval(&valid_interval),
             cli.pretty,
         ),
         Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
@@ -331,6 +335,7 @@ fn main() {
             half_life_episodic_days,
             half_life_semantic_days,
             half_life_procedural_days,
+            half_life_decision_days,
             now_ms,
         } => lifecycle_candidates(
             &db,
@@ -339,6 +344,7 @@ fn main() {
             half_life_episodic_days,
             half_life_semantic_days,
             half_life_procedural_days,
+            half_life_decision_days,
             now_ms,
             cli.pretty,
         ),
@@ -372,6 +378,45 @@ fn main() {
 fn resolve_cmd_scope(scope: Option<&str>, default: Scope) -> Scope {
     match topodb_json::resolve_scope(scope, default) {
         Ok(s) => s,
+        Err(e) => output::fail("rejected", &e, 2),
+    }
+}
+
+/// Resolves the four `--valid-*` flags (the pragmatic allen subset —
+/// `topodb::ValidInterval`) into at most one predicate. More than one is a
+/// caller-fixable conflict -> `fail("rejected", .., 2)` naming the flags;
+/// range flags parse `A..B` into two Unix-ms timestamps. Uses the engine's
+/// shared `ValidInterval::from_parts` to handle mutual-exclusion checks, range
+/// inversion, and timestamp positivity validation. Timestamp errors from the
+/// engine are surfaced verbatim to the CLI exit code contract (exit 2).
+fn allen_interval(args: &cli::ValidIntervalArgs) -> Option<ValidInterval> {
+    let parse_range = |flag: &str, s: &str| -> Option<(i64, i64)> {
+        let parsed = s
+            .split_once("..")
+            .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+        match parsed {
+            Some(pair) => Some(pair),
+            None => output::fail(
+                "rejected",
+                &format!("parsing --{flag}: expected A..B with Unix-ms timestamps, got {s:?}"),
+                2,
+            ),
+        }
+    };
+
+    let during = args
+        .valid_during
+        .as_deref()
+        .and_then(|s| parse_range("valid-during", s));
+    let overlaps = args
+        .valid_overlaps
+        .as_deref()
+        .and_then(|s| parse_range("valid-overlaps", s));
+    let before = args.valid_before;
+    let after = args.valid_after;
+
+    match ValidInterval::from_parts(during, overlaps, before, after) {
+        Ok(iv) => iv,
         Err(e) => output::fail("rejected", &e, 2),
     }
 }
@@ -633,6 +678,7 @@ fn traverse(
     edge_type: Vec<String>,
     as_of: Option<i64>,
     time_axis: TimeAxis,
+    valid_interval: Option<ValidInterval>,
     pretty: bool,
 ) -> ! {
     let seed = match NodeId::from_str(seed) {
@@ -645,6 +691,25 @@ fn traverse(
             output::fail(
                 "rejected",
                 "as-of must be a positive Unix-millisecond timestamp",
+                2,
+            );
+        }
+    }
+    // Composition rules for an interval predicate, checked here so the
+    // errors name CLI flags (the engine re-checks with its own wording).
+    if valid_interval.is_some() {
+        if as_of.is_some() {
+            output::fail(
+                "rejected",
+                "a --valid-* interval predicate and --as-of are mutually exclusive — a \
+                 point-in-time query is a degenerate --valid-overlaps",
+                2,
+            );
+        }
+        if time_axis == TimeAxis::Recorded {
+            output::fail(
+                "rejected",
+                "--valid-* interval predicates gate the valid axis only — omit --time-axis recorded",
                 2,
             );
         }
@@ -668,7 +733,11 @@ fn traverse(
         as_of,
         time_axis,
     };
-    let sg = match db.traverse(&query) {
+    let sg = match valid_interval {
+        Some(iv) => db.traverse_interval(&query, iv),
+        None => db.traverse(&query),
+    };
+    let sg = match sg {
         Ok(sg) => sg,
         Err(e) => output::fail_engine(&e),
     };
@@ -715,6 +784,7 @@ fn get_edges(
     as_of: Option<i64>,
     direction: cli::DirectionArg,
     time_axis: TimeAxis,
+    valid_interval: Option<ValidInterval>,
     pretty: bool,
 ) -> ! {
     // Validate as_of timestamp first (so as_of: 0 gets the timestamp error,
@@ -754,6 +824,36 @@ fn get_edges(
 
     let scopes = topodb_json::scope_to_scope_set(scope);
 
+    // An interval predicate REPLACES the open-only/as-of gating: an explicit
+    // temporal flag alongside it is a conflict, and only the valid axis is
+    // in scope. Passing predicates then routes to the `*_interval` reads,
+    // which gate on the adjacency interval fields (no post-filter here).
+    if valid_interval.is_some() {
+        if as_of.is_some() {
+            output::fail(
+                "rejected",
+                "a --valid-* interval predicate and --as-of are mutually exclusive — a \
+                 point-in-time query is a degenerate --valid-overlaps",
+                2,
+            );
+        }
+        if open_only.is_some() {
+            output::fail(
+                "rejected",
+                "a --valid-* interval predicate replaces --open-only — omit --open-only; the \
+                 predicate already says which edges qualify",
+                2,
+            );
+        }
+        if time_axis == TimeAxis::Recorded {
+            output::fail(
+                "rejected",
+                "--valid-* interval predicates gate the valid axis only — omit --time-axis recorded",
+                2,
+            );
+        }
+    }
+
     // Determine whether to fetch only open edges: when as_of is present,
     // always fetch with open_only=false to see the full history, then filter
     // below. When as_of is absent, use the provided open_only or default to true.
@@ -763,10 +863,17 @@ fn get_edges(
         open_only.unwrap_or(true)
     };
 
-    let fetch_from =
-        |t: Option<&str>| db.edges_from(&scopes, from_id, to_id, t, open_only_to_use, time_axis);
-    let fetch_to =
-        |t: Option<&str>| db.edges_to(&scopes, from_id, to_id, t, open_only_to_use, time_axis);
+    // Fold the interval conditional INSIDE the fetch closures so there is one
+    // shared tail (mirrors the MCP server's shape at server.rs ~4153-4172).
+    let fetch_from = |t: Option<&str>| match valid_interval {
+        Some(iv) => db.edges_from_interval(&scopes, from_id, to_id, t, iv),
+        None => db.edges_from(&scopes, from_id, to_id, t, open_only_to_use, time_axis),
+    };
+    let fetch_to = |t: Option<&str>| match valid_interval {
+        Some(iv) => db.edges_to_interval(&scopes, from_id, to_id, t, iv),
+        None => db.edges_to(&scopes, from_id, to_id, t, open_only_to_use, time_axis),
+    };
+
     let mut edges = match direction {
         cli::DirectionArg::Out => fetch_typed(edge_type, fetch_from),
         cli::DirectionArg::In => fetch_typed(edge_type, fetch_to),
@@ -835,6 +942,7 @@ fn lifecycle_candidates(
     half_life_episodic_days: f64,
     half_life_semantic_days: f64,
     half_life_procedural_days: f64,
+    half_life_decision_days: f64,
     now_ms: Option<i64>,
     pretty: bool,
 ) -> ! {
@@ -844,6 +952,7 @@ fn lifecycle_candidates(
         half_life_episodic_ms: (half_life_episodic_days * 86_400_000.0) as i64,
         half_life_semantic_ms: (half_life_semantic_days * 86_400_000.0) as i64,
         half_life_procedural_ms: (half_life_procedural_days * 86_400_000.0) as i64,
+        half_life_decision_ms: (half_life_decision_days * 86_400_000.0) as i64,
     };
     let now = now_ms.unwrap_or_else(|| {
         std::time::SystemTime::now()

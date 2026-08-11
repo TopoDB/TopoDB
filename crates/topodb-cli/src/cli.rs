@@ -140,7 +140,8 @@ pub enum Command {
         scope: Option<String>,
         /// Taxonomy kind for a NEW memory: "episodic" (dated observation),
         /// "semantic" (standing fact — the default reading when omitted),
-        /// or "procedural" (how-to). Ignored on a dedup hit: the existing
+        /// "procedural" (how-to), or "decision" (a recorded choice with its
+        /// rationale in the content). Ignored on a dedup hit: the existing
         /// memory's stored kind wins.
         #[arg(long)]
         kind: Option<String>,
@@ -198,7 +199,7 @@ pub enum Command {
         #[arg(long)]
         include_superseded: bool,
         /// Only return memories of these kinds ("episodic" | "semantic" |
-        /// "procedural"); repeatable or comma-delimited. A node without a
+        /// "procedural" | "decision"); repeatable or comma-delimited. A node without a
         /// kind prop counts as "semantic" — note that covers non-Memory
         /// nodes (entities) too, so a filter excluding "semantic" hides
         /// them. Omit for no kind filtering.
@@ -209,8 +210,8 @@ pub enum Command {
         #[arg(long = "recency-weight", default_value_t = 0.3)]
         recency_weight: f32,
         /// Half-life in days for a FLAT recency decay, replacing the
-        /// kind-aware default (episodic 14 / semantic 120 / procedural 365;
-        /// absent kind counts as semantic). Must be > 0.
+        /// kind-aware default (episodic 14 / semantic 120 / procedural 365 /
+        /// decision 120; absent kind counts as semantic). Must be > 0.
         #[arg(long = "recency-half-life-days")]
         recency_half_life_days: Option<f64>,
         /// Only memories created at/after this time: an ISO date
@@ -231,6 +232,8 @@ pub enum Command {
         no_temporal_rewrite: bool,
     },
     /// Bounded BFS from a seed node, following edges up to `max_hops`.
+    /// The `--valid-*` interval flags gate each hop on an Allen predicate
+    /// over the edge validity interval instead of the point-in-time view.
     Traverse {
         /// Seed node id (ULID) to start from.
         seed: String,
@@ -257,12 +260,16 @@ pub enum Command {
         /// recorded axis until the write actually happened.
         #[arg(long = "time-axis", value_enum, default_value_t = TimeAxisArg::Valid)]
         time_axis: TimeAxisArg,
+        #[command(flatten)]
+        valid_interval: ValidIntervalArgs,
     },
     /// List edges from a source node, with optional time-travel (as_of) and
     /// history access (open_only). Defaults to currently-open edges when neither
     /// flag is set; pass `--open-only false` to see closed edges (history).
     /// `--as-of <UNIX_MS>` filters to edges live at that Unix-millisecond instant
-    /// (mutually exclusive with `--open-only`).
+    /// (mutually exclusive with `--open-only`). The `--valid-*` interval flags
+    /// filter by an Allen predicate over the edge validity interval instead,
+    /// replacing both gates.
     GetEdges {
         /// Source node id (ULID) whose outgoing edges to list.
         from: String,
@@ -300,6 +307,8 @@ pub enum Command {
         /// recorded axis until the write actually happened.
         #[arg(long = "time-axis", value_enum, default_value_t = TimeAxisArg::Valid)]
         time_axis: TimeAxisArg,
+        #[command(flatten)]
+        valid_interval: ValidIntervalArgs,
     },
     /// Read a node's access statistics (count, last-accessed timestamp).
     /// `{"found":false}` (exit 0) if the node doesn't exist or is out of the
@@ -312,8 +321,9 @@ pub enum Command {
     /// staleness ((age/half_life)/ln(e+access_count); age since last
     /// access, falling back to creation). Read-only and unbumped — the
     /// sweep PROPOSES, it never stamps; act on its output with `forget`.
-    /// Half-life defaults: episodic 14d, semantic 120d, procedural 365d
-    /// (absent/unknown kind counts as semantic).
+    /// Half-life defaults: episodic 14d, semantic 120d, procedural 365d,
+    /// decision 120d (a deliberate tie to semantic's CONSTANT, tunable
+    /// independently; absent/unknown kind counts as semantic).
     LifecycleCandidates {
         /// Top-N candidates to report.
         #[arg(long, default_value_t = topodb_json::LIFECYCLE_DEFAULT_LIMIT)]
@@ -324,6 +334,8 @@ pub enum Command {
         half_life_semantic_days: f64,
         #[arg(long = "half-life-procedural-days", default_value_t = topodb_json::LIFECYCLE_HALF_LIFE_PROCEDURAL_DAYS)]
         half_life_procedural_days: f64,
+        #[arg(long = "half-life-decision-days", default_value_t = topodb_json::LIFECYCLE_HALF_LIFE_DECISION_DAYS)]
+        half_life_decision_days: f64,
         /// Pin the sweep's "now" (Unix ms) for reproducible runs; omitted =
         /// wall clock.
         #[arg(long = "now-ms")]
@@ -478,6 +490,34 @@ pub enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+}
+
+/// The four mutually exclusive allen/Allen interval predicates (the engine's
+/// pragmatic subset — `topodb::ValidInterval`) over each edge's half-open
+/// validity interval `[valid_from, valid_to)`, valid axis only. Shared by
+/// `traverse` and `get-edges`. At most ONE may be given; each is also
+/// mutually exclusive with `--as-of`, an explicit `--open-only`, and
+/// `--time-axis recorded` — when present, the predicate REPLACES those
+/// gates. Range flags use `A..B` (half-open, positive Unix-ms timestamps).
+#[derive(clap::Args)]
+pub struct ValidIntervalArgs {
+    /// Only edges fully contained in [A,B): A <= valid_from and the edge is
+    /// closed with valid_to <= B. An open edge never matches.
+    #[arg(long = "valid-during", value_name = "A..B")]
+    pub valid_during: Option<String>,
+    /// Only edges intersecting [A,B): valid_from < B and the edge is open
+    /// or ends after A (valid_to > A). An edge closing exactly at A, or
+    /// starting exactly at B, does NOT overlap.
+    #[arg(long = "valid-overlaps", value_name = "A..B")]
+    pub valid_overlaps: Option<String>,
+    /// Only edges fully over by T: closed with valid_to <= T (Unix ms). An
+    /// open edge never matches.
+    #[arg(long = "valid-before", value_name = "T", allow_negative_numbers = true)]
+    pub valid_before: Option<i64>,
+    /// Only edges starting at or after T: valid_from >= T (Unix ms). Open
+    /// edges qualify.
+    #[arg(long = "valid-after", value_name = "T", allow_negative_numbers = true)]
+    pub valid_after: Option<i64>,
 }
 
 /// Wire form of `topodb::Direction` for `--direction`: lowercase

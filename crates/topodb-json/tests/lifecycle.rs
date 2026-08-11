@@ -101,6 +101,43 @@ fn candidates_rank_by_kind_half_life_with_semantic_fallback() {
     assert_eq!(ids, ids2);
 }
 
+/// A `decision` memory decays on the semantic (120d) curve: same age, same
+/// staleness as a semantic memory, but it keeps reporting its OWN kind —
+/// the tie is in the half-life wiring, not a degrade-to-default.
+#[test]
+fn decision_kind_uses_the_semantic_half_life_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir);
+    let s = ScopeId::new();
+    let (de, op_a) = memory("decision fact", Some("decision"), s);
+    let (se, op_b) = memory("semantic fact", Some("semantic"), s);
+    let (ep, op_c) = memory("episodic fact", Some("episodic"), s);
+    db.submit(vec![op_a, op_b, op_c]).unwrap();
+
+    let now = de.timestamp_ms() as i64 + 60 * DAY_MS;
+    let scopes = ScopeSet::of(&[s]);
+    let got = lifecycle_candidates(&db, &scopes, &LifecycleParams::default(), now).unwrap();
+
+    assert_eq!(got.len(), 3);
+    let decision = got.iter().find(|c| c.id == de.to_string()).unwrap();
+    let semantic = got.iter().find(|c| c.id == se.to_string()).unwrap();
+    let episodic = got.iter().find(|c| c.id == ep.to_string()).unwrap();
+    assert_eq!(decision.kind, "decision", "stored kind survives the sweep");
+    // Each on ITS OWN 120d curve (mint timestamps may differ by a few ms,
+    // so expected values are computed per node, not compared across nodes).
+    let exp_de = staleness(now - de.timestamp_ms() as i64, 120 * DAY_MS, 0);
+    let exp_se = staleness(now - se.timestamp_ms() as i64, 120 * DAY_MS, 0);
+    assert!(
+        (decision.staleness - exp_de).abs() < 1e-9,
+        "decision must use the 120d semantic half-life"
+    );
+    assert!((semantic.staleness - exp_se).abs() < 1e-9);
+    assert!(
+        episodic.staleness > decision.staleness,
+        "the shared bucket is semantic's, not episodic's"
+    );
+}
+
 /// Tombstoned memories never surface; limit truncates AFTER ranking.
 #[test]
 fn candidates_skip_tombstoned_and_honor_limit() {
