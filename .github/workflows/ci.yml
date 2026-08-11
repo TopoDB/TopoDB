@@ -53,6 +53,14 @@ jobs:
         working-directory: plugins/claude-code
       - run: npm test
         working-directory: plugins/claude-code
+      # The pi extension's suite (idle-release, failure-path hardening) ran
+      # nowhere in CI before publish — the npm install pulls the published
+      # topodb-mcp with its prebuilt binary, so the real-server tests run on
+      # both platforms; recorder-integration self-skips without a cargo build.
+      - run: npm install --no-audit --no-fund
+        working-directory: npm/topodb-pi
+      - run: npm test
+        working-directory: npm/topodb-pi
   msrv:
     runs-on: ubuntu-latest
     steps:

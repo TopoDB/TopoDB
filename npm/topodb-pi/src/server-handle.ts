@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { McpStdioClient, type McpTool } from "./mcp-client.ts";
+import { McpStdioClient, type McpClientOptions, type McpTool } from "./mcp-client.ts";
 
 const require = createRequire(import.meta.url);
 
@@ -25,21 +25,46 @@ export function episodeSpecArgs(env: NodeJS.ProcessEnv): string[] {
 
 /** Idle milliseconds before the resident child is reaped so redb's exclusive
  * lock frees for other processes. `TOPODB_IDLE_MS=0` disables idle release
- * (always resident); unset/invalid falls back to 30s. */
+ * (always resident); unset/invalid falls back to 30s. Values beyond Node's
+ * setTimeout range (2^31-1) are clamped — Node would otherwise clamp the
+ * delay to 1ms, turning "practically never" into "after every call". */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 export function idleMs(env: NodeJS.ProcessEnv): number {
   const raw = env.TOPODB_IDLE_MS;
   if (raw === undefined || raw === "") return 30_000;
   const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 ? n : 30_000;
+  return Number.isInteger(n) && n >= 0 ? Math.min(n, MAX_TIMEOUT_MS) : 30_000;
 }
+
+export type TopodbServerOptions = {
+  /** Full node-args override for the spawned child. Tests inject stub servers
+   * here; production always uses the bundled launcher. */
+  launcherArgs?: string[];
+  /** Options threaded to the underlying McpStdioClient (timeouts, grace). */
+  clientOpts?: McpClientOptions;
+};
 
 export class TopodbServer {
   private client?: McpStdioClient;
   private toolCache?: McpTool[];
   private inflight = 0;
   private idleTimer?: NodeJS.Timeout;
+  /** Single-flight guard: concurrent cold callers share one spawn+handshake
+   * instead of the second one racing a half-initialized client. */
+  private starting?: Promise<McpStdioClient>;
+  /** Exit promise of the most recently reaped child. A respawn awaits it so
+   * the new child never races the dying one for the redb lock. */
+  private reaping?: Promise<void>;
 
-  constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
+  constructor(
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly opts: TopodbServerOptions = {},
+  ) {}
+
+  /** Resolves when the last reaped child has fully exited (lock released). */
+  get whenReaped(): Promise<void> | undefined {
+    return this.reaping;
+  }
 
   /** Whether a topodb-mcp child is currently resident (holding the db lock). */
   get running(): boolean {
@@ -76,13 +101,23 @@ export class TopodbServer {
 
   private async ensure(): Promise<McpStdioClient> {
     if (this.client?.running) return this.client;
+    if (!this.starting) {
+      this.starting = this.spawnClient().finally(() => {
+        this.starting = undefined;
+      });
+    }
+    return this.starting;
+  }
+
+  private async spawnClient(): Promise<McpStdioClient> {
+    await this.reaping; // let the previous child release the lock first
     const db = this.env.TOPODB_DB || ".topodb/memory.redb";
     const scope = this.env.TOPODB_SCOPE || "shared";
     // topodb-mcp creates the db file on open but treats a missing parent
     // directory as a startup error — and the default `.topodb/` won't exist in
     // a fresh project. Create it so the server comes up on first use.
     mkdirSync(dirname(db), { recursive: true });
-    const args = [
+    const args = this.opts.launcherArgs ?? [
       TopodbServer.resolveLauncher(),
       "--db",
       db,
@@ -90,9 +125,22 @@ export class TopodbServer {
       scope,
       ...episodeSpecArgs(this.env),
     ];
-    this.client = new McpStdioClient(args);
-    await this.client.start();
-    return this.client;
+    // env last: the server's env-only settings (TOPODB_LOCK_WAIT_MS, ...) must
+    // reach the child, which spawn() does not do implicitly.
+    const client = new McpStdioClient(args, { ...this.opts.clientOpts, env: this.env });
+    try {
+      await client.start();
+    } catch (e) {
+      // A rejected handshake must not leave an alive-but-orphaned child
+      // holding the db lock (e.g. initialize timing out during a long
+      // first-open migration).
+      client.stop();
+      throw e;
+    }
+    this.client = client;
+    // A new child may be new code — the cached tool list belongs to the old one.
+    this.toolCache = undefined;
+    return client;
   }
 
   async list(): Promise<McpTool[]> {
@@ -114,6 +162,13 @@ export class TopodbServer {
     try {
       const c = await this.ensure();
       return await c.callTool(tool, args);
+    } catch (e) {
+      // Transport-level failure (timeout, child death): the child is wedged
+      // or gone — reap it so the lock frees and the next call gets a fresh
+      // spawn. App-level errors from a healthy child keep it resident,
+      // matching sgh's OnDemandBridge (Tool errors never respawn).
+      if ((e as { transport?: boolean })?.transport === true) this.shutdown();
+      throw e;
     } finally {
       this.endOp();
     }
@@ -124,7 +179,10 @@ export class TopodbServer {
       clearTimeout(this.idleTimer);
       this.idleTimer = undefined;
     }
-    this.client?.stop();
-    this.client = undefined;
+    if (this.client) {
+      this.client.stop();
+      this.reaping = this.client.whenExited;
+      this.client = undefined;
+    }
   }
 }

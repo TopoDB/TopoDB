@@ -10,11 +10,29 @@ export type McpClientOptions = {
   requestTimeoutMs?: number;
   /** Executable to spawn instead of the current node binary. Mainly for tests. */
   command?: string;
+  /** Environment for the child. Without this, spawn() silently inherits
+   * process.env and env-only server settings (TOPODB_LOCK_WAIT_MS, ...)
+   * injected by the caller never arrive. */
+  env?: NodeJS.ProcessEnv;
+  /** How long stop() waits for the stdin-EOF shutdown before escalating to
+   * kill(). EOF is the graceful path: the Rust grandchild exits on EOF, the
+   * wrapper's spawnSync returns, and the wrapper exits — which is the only
+   * sequence that provably releases the redb lock (SIGTERM hits the wrapper
+   * alone and can orphan the lock-holding grandchild, notably on Windows). */
+  killGraceMs?: number;
 };
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_KILL_GRACE_MS = 1500;
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void };
+
+/** Errors from the transport layer (timeout, child death, stop) — as opposed
+ * to app-level errors a healthy server returned. Callers use the tag to
+ * decide whether the child is trustworthy enough to keep resident. */
+function transportError(message: string): Error {
+  return Object.assign(new Error(message), { transport: true });
+}
 
 export class McpStdioClient {
   private child?: ChildProcessByStdio<Writable, Readable, null>;
@@ -23,6 +41,12 @@ export class McpStdioClient {
   private pending = new Map<number, Pending>();
   private readonly requestTimeoutMs: number;
   private readonly command: string;
+  private readonly env?: NodeJS.ProcessEnv;
+  private readonly killGraceMs: number;
+  /** Resolves when the child is fully gone ('exit' or spawn 'error'). Set by
+   * start(); undefined before. The wrapper's spawnSync blocks until the Rust
+   * grandchild exits, so wrapper-exit implies the redb lock is released. */
+  whenExited?: Promise<void>;
 
   constructor(
     private readonly nodeArgs: string[],
@@ -30,6 +54,8 @@ export class McpStdioClient {
   ) {
     this.requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.command = opts.command ?? process.execPath;
+    this.env = opts.env;
+    this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   }
 
   get running(): boolean {
@@ -39,12 +65,17 @@ export class McpStdioClient {
   async start(): Promise<void> {
     const child = spawn(this.command, this.nodeArgs, {
       stdio: ["pipe", "pipe", "ignore"],
+      env: this.env,
     });
     this.child = child;
+    this.whenExited = new Promise((res) => {
+      child.on("exit", () => res());
+      child.on("error", () => res()); // spawn failure may never emit 'exit'
+    });
     // A spawn failure (bad executable, EMFILE/EAGAIN, ...) emits 'error' instead of
     // (or in addition to) 'exit'. Without a handler this is an uncaught exception
     // that crashes the host process. Route it through the same failAll() path.
-    child.on("error", (e) => this.failAll(e));
+    child.on("error", (e) => this.failAll(Object.assign(e, { transport: true })));
     // Writing to stdin after the child has died surfaces as EPIPE here. failAll()
     // (via the 'exit'/'error' handlers above) already rejects pending requests, so
     // this handler exists purely to prevent an unhandled 'error' event from
@@ -52,7 +83,7 @@ export class McpStdioClient {
     child.stdin.on("error", () => {});
     this.rl = createInterface({ input: child.stdout });
     this.rl.on("line", (line) => this.onLine(line));
-    child.on("exit", () => this.failAll(new Error("topodb-mcp exited")));
+    child.on("exit", () => this.failAll(transportError("topodb-mcp exited")));
 
     await this.request("initialize", {
       protocolVersion: "2025-11-25",
@@ -81,8 +112,19 @@ export class McpStdioClient {
 
   stop(): void {
     this.rl?.close();
-    this.child?.kill();
-    this.failAll(new Error("client stopped"));
+    const child = this.child;
+    if (child && child.exitCode === null && !child.killed) {
+      // Graceful first: stdin EOF is the only shutdown that provably releases
+      // the redb lock (grandchild exits on EOF → wrapper's spawnSync returns
+      // → wrapper exits). kill() is the fallback for a child ignoring EOF.
+      child.stdin.end();
+      const t = setTimeout(() => {
+        if (child.exitCode === null) child.kill();
+      }, this.killGraceMs);
+      t.unref?.();
+      child.on("exit", () => clearTimeout(t));
+    }
+    this.failAll(transportError("client stopped"));
   }
 
   private onLine(line: string): void {
@@ -103,7 +145,7 @@ export class McpStdioClient {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(
-          new Error(`topodb-mcp request timed out after ${this.requestTimeoutMs}ms: ${method}`),
+          transportError(`topodb-mcp request timed out after ${this.requestTimeoutMs}ms: ${method}`),
         );
       }, this.requestTimeoutMs);
       timer.unref?.();

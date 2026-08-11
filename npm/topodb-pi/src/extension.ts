@@ -5,10 +5,27 @@ import { TopodbServer, recordingEnabled } from "./server-handle.ts";
 import { EpisodeBuffer, extractText, isUsed, buildEpisodeBatch, toRetrievalRecord } from "./recorder.ts";
 import { ensurePolicyVersion } from "./policy.ts";
 
+/** One spaced retry for the episode flush. Idle release invites transient
+ * lock contention at exactly flush time (another process may grab the db
+ * while our child is reaped); without a retry the whole episode is dropped. */
+async function submitWithRetry(
+  server: TopodbServer,
+  cmds: unknown[],
+  retryDelayMs: number,
+): Promise<void> {
+  try {
+    await server.call("submit_batch", { commands: cmds });
+  } catch {
+    if (retryDelayMs > 0) await new Promise((r) => setTimeout(r, retryDelayMs));
+    await server.call("submit_batch", { commands: cmds });
+  }
+}
+
 export default function (pi: ExtensionAPI): void {
   const server = new TopodbServer();
 
   const recording = recordingEnabled(process.env);
+  const flushRetryMs = Number(process.env.TOPODB_FLUSH_RETRY_MS ?? "") || 2000;
   const buffer = new EpisodeBuffer();
   const memContents = new Map<string, string>(); // memory id -> content seen at retrieval
   let policyId: string | undefined;
@@ -147,7 +164,7 @@ export default function (pi: ExtensionAPI): void {
         used,
         policyVersionId: policyId,
       });
-      await server.call("submit_batch", { commands: cmds });
+      await submitWithRetry(server, cmds, flushRetryMs);
     } catch (e) {
       console.error(`topodb recorder: episode write failed: ${(e as Error).message}`);
     }
@@ -170,7 +187,9 @@ export default function (pi: ExtensionAPI): void {
           used: new Map(),
           policyVersionId: policyId,
         });
-        await server.call("submit_batch", { commands: cmds });
+        // No spaced retry here — the process is exiting and a delay may never
+        // run; one immediate second attempt is all we can afford.
+        await submitWithRetry(server, cmds, 0);
       } catch {
         /* dying anyway */
       }
