@@ -152,3 +152,55 @@ fn kind_params_reject_bad_values_and_empty_kinds() {
         );
     }
 }
+
+/// The fourth taxonomy kind, "decision" (semantica completion): stamped by
+/// remember, and precedent retrieval IS the existing kinds filter — no new
+/// tool, just `kinds: ["decision"]`.
+#[test]
+fn remember_decision_kind_round_trips_and_kinds_filter_finds_precedent() {
+    let (_dir, mut server) = fresh_server();
+    let decision = server.call_tool_ok(
+        "remember",
+        serde_json::json!({
+            "content": "vega adopts paseto over jwt for session tokens",
+            "entities": ["vega"],
+            "kind": "decision"
+        }),
+        DEFAULT_TIMEOUT,
+    )["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain = server.call_tool_ok(
+        "remember",
+        serde_json::json!({ "content": "vega serves the auth tier", "entities": ["vega"] }),
+        DEFAULT_TIMEOUT,
+    )["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let node = server.call_tool_ok(
+        "get_node",
+        serde_json::json!({ "id": decision }),
+        DEFAULT_TIMEOUT,
+    );
+    assert_eq!(node["node"]["props"]["kind"].as_str(), Some("decision"));
+
+    let res = server.call_tool_ok(
+        "search_memories",
+        serde_json::json!({ "query": "vega", "kinds": ["decision"] }),
+        DEFAULT_TIMEOUT,
+    );
+    let ids: Vec<&str> = res["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["node"]["id"].as_str())
+        .collect();
+    assert!(ids.contains(&decision.as_str()), "{res}");
+    assert!(
+        !ids.contains(&plain.as_str()),
+        "an absent kind reads as semantic, never decision: {res}"
+    );
+}

@@ -41,14 +41,14 @@ All 19 subcommands, in scaffold + write + read order:
 | `info` | — | `{"path","format_version","current_seq","index_spec","default_scope"}` |
 | `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>", "deduplicated": bool}` |
 | `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>`, `--always-create` | `{"id": "<ulid>", "created": bool}` |
-| `remember` | `--content <text>` (required), `--entity <name>` (required, repeatable), `--edge-type <ty>` (default `"about"`), `--supersedes <id>` (repeatable), `--kind <episodic\|semantic\|procedural>`, `--props <json-object>`, `--scope <ulid\|shared>` | `{"memory_id": "<ulid>", "deduplicated": bool, "entities": [{"name": "<name>", "id": "<ulid>", "created": bool}], "edge_ids": ["<ulid>", ...], "superseded": ["<ulid>", ...]}` |
+| `remember` | `--content <text>` (required), `--entity <name>` (required, repeatable), `--edge-type <ty>` (default `"about"`), `--supersedes <id>` (repeatable), `--kind <episodic\|semantic\|procedural\|decision>`, `--props <json-object>`, `--scope <ulid\|shared>` | `{"memory_id": "<ulid>", "deduplicated": bool, "entities": [{"name": "<name>", "id": "<ulid>", "created": bool}], "edge_ids": ["<ulid>", ...], "superseded": ["<ulid>", ...]}` |
 | `forget <id>...` | positional memory ids (≥1), `--scope <ulid\|shared>` | `{"forgotten": ["<ulid>", ...]}` |
 | `link` | `--from <id>`, `--to <id>`, `--type <ty>` (all required), `--props <json-object>`, `--valid-from <unix-ms>`, `--scope <ulid\|shared>` | `{"id": "<ulid>"}` |
 | `get <id>` | positional node id | `{"found": bool, "node"?: {...}}` |
 | `find` | `--label <l>`, `--prop <p>`, `--value <v>` (all required) | `[ node, ... ]` |
 | `search <query>` | positional query, `--k <n>` (default 10), `--kinds <kind>[,<kind>...]`, `--include-superseded` | `[ {"node":..., "score": f}, ... ]` |
-| `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>` | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
-| `get-edges <from>` | positional source node id (or target when `--direction in`), `--direction out\|in\|both` (default `out`; for `in`, the anchor shifts to the target and `--to` filters the far source end), `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
+| `traverse <seed>` | positional seed id, `--max-hops <n>` (default 2), `--direction out\|in\|both` (default `both`), `--edge-type <ty>` (repeatable), `--as-of <unix-ms>`, `--valid-during\|--valid-overlaps <a..b>` / `--valid-before\|--valid-after <t>` (at most one; excludes `--as-of` and `--time-axis recorded`) | `{"subgraph": {"nodes":[...],"edges":[...]}}` |
+| `get-edges <from>` | positional source node id (or target when `--direction in`), `--direction out\|in\|both` (default `out`; for `in`, the anchor shifts to the target and `--to` filters the far source end), `--to <id>`, `--edge-type <ty>`, `--open-only <true\|false>` (default true; omit with `--as-of`), `--as-of <unix-ms>` (optional; mutually exclusive with `--open-only`), `--valid-during\|--valid-overlaps <a..b>` / `--valid-before\|--valid-after <t>` (at most one; an Allen predicate over `[valid_from, valid_to)` that replaces the `--open-only`/`--as-of` gating, valid axis only) | `{"edges":[{"id","from","to","type","props","scope","valid_from","valid_to"},...]}`  |
 | `stats <id>` | positional node id | `{"found": bool, "access_stats"?: {"access_count","last_accessed_at"}}` |
 | `lifecycle-candidates` | `--limit <N>`, `--half-life-episodic-days <F>`, `--half-life-semantic-days <F>`, `--half-life-procedural-days <F>`, `--now-ms <MS>` | JSON array of `{id, content, kind, created_at, last_accessed_at, access_count, staleness}` |
 | `purge` | `--tombstoned-before <MS>`, `--yes` | dry-run: `{dry_run, count, ids}`; with `--yes`: `{dry_run, count, ids, seq}` |
@@ -88,14 +88,19 @@ Notes on individual commands:
   `forgotten_at` timestamp in the past) are skipped by default — they neither surface, nor
   consume the `--k` window, nor get access-bumped. `--include-superseded` is the general history
   switch over the whole tombstone set — the same default-liveness shape `get-edges` has with
-  `--open-only`. Matches the MCP server's `search` tool, which filters the same set.
+  `--open-only`. Matches the MCP server's `search` tool, which filters the same set. Corroboration
+  boost (multi-leg fusion ranking) is an MCP `search_memories` tunable; CLI search is a single-leg
+  text surface with no fusion, so that knob does not exist here.
 - **`kind`**: an optional taxonomy on memories — `episodic` (dated observation), `semantic`
-  (standing fact), `procedural` (how-to). An unstamped memory reads as `semantic`, so existing
-  dbs need no migration. `remember --kind` stamps new memories (dedup ignores it — the stored
-  kind wins); `search --kinds` filters by it. Kind never affects ranking.
+  (standing fact), `procedural` (how-to), `decision` (a choice made, with its rationale). An
+  unstamped memory reads as `semantic`, so existing dbs need no migration. `remember --kind`
+  stamps new memories (dedup ignores it — the stored kind wins); `search --kinds` filters by it
+  (`--kinds decision` is precedent retrieval: "what did we decide about X?"). Kind never
+  affects ranking.
 - **`lifecycle-candidates`**: surfaces decay candidates — live memories ranked by kind-aware
   staleness (`(age/half_life)/ln(e+access_count)`; half-life defaults 14d/120d/365d for
-  episodic/semantic/procedural, absent kind counts as semantic). Deterministic under `--now-ms`,
+  episodic/semantic/procedural, absent kind counts as semantic, and `decision` shares the
+  semantic 120d — decisions age like standing facts). Deterministic under `--now-ms`,
   read-only, and unbumped (the sweep never perturbs the access signal it reads). It only
   PROPOSES: review the evidence and retire memories explicitly with `forget`.
 - **`purge`**: DESTRUCTIVE. Hard-deletes every memory whose `superseded_at`/`forgotten_at`

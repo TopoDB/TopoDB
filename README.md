@@ -90,16 +90,18 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 
 - Op-log write path — atomic batches, deterministic replay (property-tested)
 - Single-applier concurrency; MVCC reads that never block each other or redb's storage commits (a long read can briefly delay the applier's next batch via registry guards)
-- Scoped k-hop temporal traversal with `as_of` history reads
+- Scoped k-hop temporal traversal with `as_of` history reads and Allen-style interval predicates (`during` / `overlaps` / `before` / `after` over edge valid time)
 - Temporal edges — facts supersede, never overwrite
 - Equality property index; BM25 full-text search (per-scope corpus)
 - Graph-scoped vector search (cosine; embeddings host-computed, stored via `SetEmbedding`)
+- Hybrid recall (`Db::recall`) — RRF fusion of the text/vector/graph legs with recency, access, and optional cross-leg corroboration weighting (corroborated hits win near-ties)
 - Access stats (recall-driven counters); change feed (`subscribe` / `ops_since`) + op-log compaction
 - Versioned on-disk format ([FORMAT.md](FORMAT.md))
 
 **Memory & recall over MCP — `topodb-mcp`** (31 tools; [full table](crates/topodb-mcp/README.md))
 
 - Hybrid recall — BM25 + vector + graph, RRF-fused, recency-weighted
+- Memory kinds — `episodic | semantic | procedural | decision`, with kind-aware lifecycle decay (filter recall to `decision` for precedent retrieval)
 - Memory hygiene — write-time dedup + supersession, banded/contradiction-aware near-duplicate detection, `consolidate_memories`, orphan + stale scans, `memory_health`, `suggest_links`
 - Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup and search
 - Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime)

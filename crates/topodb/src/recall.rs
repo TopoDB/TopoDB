@@ -141,6 +141,22 @@ pub struct RecallQuery {
     /// bounded below `1+w`. Live counters are db state: like wall-clock
     /// recency, results may shift as counters move.
     pub access_weight: f32,
+    /// Opt-in post-fusion corroboration boost (0.0-1.0, default 0 = off):
+    /// each hit's fused score is multiplied by `1 + w·(legs_hit − 1)/2`,
+    /// where `legs_hit` counts how many legs that actually RAN contained
+    /// it (text, vector, graph — a zero-weight leg is skipped entirely and
+    /// never counts; expansions live inside the text leg and are not a
+    /// leg). The graph leg counts a hit when the PPR list holds it OR when
+    /// it is a seed adjacent to ANOTHER seed — `ppr_over_subgraph` excludes
+    /// its seeds by contract, and without the co-seed rule the top
+    /// `GRAPH_SEEDS` hits (exactly the ones a tie-breaker is for) could
+    /// never be graph-corroborated while their own 1-hop neighbors could.
+    /// Counting only: fusion inputs are untouched. Exactly 1 for
+    /// single-leg hits, bounded `[1, 1+w]` (three legs max). A mild
+    /// re-ranker that breaks near-ties toward corroborated hits — RRF's
+    /// additive term already rewards agreement. The engine default stays
+    /// 0.0; the host default is policy (same split as recency).
+    pub corroboration_weight: f32,
     /// Post-fusion score multipliers by node label. Each `(label, weight)`
     /// applies a multiplicative factor to fused scores of matching nodes.
     /// Empty (the default) changes nothing. Each weight is validated
@@ -163,8 +179,9 @@ pub(crate) const GRAPH_SEEDS: usize = 5;
 
 impl RecallQuery {
     /// A query with every tunable at its default: stock leg weights, no
-    /// label filter, no access boost, graph boost on, no vector leg, no
-    /// expansions, default search options. Prefer struct-update over this
+    /// label filter, no access boost, no corroboration boost, graph boost
+    /// on, no vector leg, no expansions, default search options. Prefer
+    /// struct-update over this
     /// (`RecallQuery { vector: …, ..RecallQuery::new(…) }`) so future
     /// tunables don't break your construction site.
     pub fn new(scopes: ScopeSet, query: impl Into<String>, k: usize) -> Self {
@@ -182,6 +199,7 @@ impl RecallQuery {
             vector_weight: WEIGHT_VECTOR,
             graph_weight: WEIGHT_GRAPH,
             access_weight: 0.0,
+            corroboration_weight: 0.0,
             label_weights: Vec::new(),
         }
     }
@@ -213,6 +231,14 @@ impl RecallQuery {
             return Err(TopoError::Rejected(format!(
                 "access_weight must be finite and within 0.0..=1.0, got {}",
                 self.access_weight
+            )));
+        }
+        if !(self.corroboration_weight.is_finite()
+            && (0.0..=1.0).contains(&self.corroboration_weight))
+        {
+            return Err(TopoError::Rejected(format!(
+                "corroboration_weight must be finite and within 0.0..=1.0, got {}",
+                self.corroboration_weight
             )));
         }
         if let Some(labels) = &self.labels {
@@ -324,6 +350,10 @@ impl Db {
         // off one seed — replacing the old flat seed-rank concatenation.
         // Seeds stay excluded from the list (ppr_over_subgraph's contract);
         // half weight as ever: adjacency is corroboration, not relevance.
+        // Seeds the graph leg vouches for despite `ppr_over_subgraph`'s
+        // seed-exclusion contract — counted by `apply_corroboration` below,
+        // never fused.
+        let mut co_seed_ids: Vec<crate::NodeId> = Vec::new();
         if q.graph_boost && q.graph_weight > 0.0 {
             let prelim = rrf_fuse(&lists);
             let seeds: Vec<(crate::NodeId, f32)> = prelim
@@ -342,6 +372,24 @@ impl Db {
                     time_axis: TimeAxis::Valid,
                 })?;
                 let scored = crate::ppr::ppr_over_subgraph(&sg, &seeds);
+                // Corroboration counting (review amendment, spec
+                // 2026-08-11): the PPR list excludes its seeds by contract,
+                // so a top-GRAPH_SEEDS hit could never earn graph
+                // corroboration — exactly the hits the boost exists to
+                // separate — while its own 1-hop neighbors could, letting
+                // the boost promote a rank-6 neighbor over the top hits it
+                // rode in on. For COUNTING only (fusion is untouched), a
+                // seed earns the graph leg when it is adjacent to ANOTHER
+                // seed: two independently strong hits vouching for each
+                // other.
+                let seed_set: std::collections::HashSet<crate::NodeId> =
+                    seeds.iter().map(|(id, _)| *id).collect();
+                for e in &sg.edges {
+                    if e.from != e.to && seed_set.contains(&e.from) && seed_set.contains(&e.to) {
+                        co_seed_ids.push(e.from);
+                        co_seed_ids.push(e.to);
+                    }
+                }
                 let mut by_id: std::collections::HashMap<crate::NodeId, NodeRecord> =
                     sg.nodes.into_iter().map(|n| (n.id, n)).collect();
                 let mut graph_ids: Vec<crate::NodeId> = Vec::new();
@@ -356,7 +404,25 @@ impl Db {
                 }
             }
         }
-        let fused = rrf_fuse(&lists);
+        let mut fused = rrf_fuse(&lists);
+        // Corroboration boost (spec 2026-08-11): mild multiplicative
+        // re-ranker toward hits present in multiple legs that actually ran
+        // (`lists` holds exactly those — a zero-weight leg was never
+        // pushed). Composes with the recency/access/label adjustments
+        // below; multiplication commutes, so application order can't change
+        // the ranking. Weight 0 skips everything, keeping defaults
+        // byte-identical. The co-seed ids ride as their OWN counting entry:
+        // they are disjoint from the PPR list (which excludes seeds), so no
+        // node can double-count the graph leg — and with only seed-to-seed
+        // edges in the neighborhood the PPR list is empty and was never
+        // pushed, yet the evidence is real.
+        if q.corroboration_weight > 0.0 {
+            let mut corrob_lists = lists;
+            if !co_seed_ids.is_empty() {
+                corrob_lists.push((q.graph_weight, co_seed_ids));
+            }
+            apply_corroboration(&mut fused, &corrob_lists, q.corroboration_weight);
+        }
 
         let mut out: Vec<(NodeRecord, f32)> = fused
             .into_iter()
@@ -407,6 +473,57 @@ impl Db {
         out.truncate(q.k);
         Ok(out)
     }
+}
+
+/// Post-fusion corroboration factor: `1 + weight·(legs_hit − 1)/2`.
+/// Exactly 1 for single-leg hits (and for nodes absent from every leg,
+/// which cannot occur post-fusion but costs nothing to handle); bounded
+/// within `[1, 1 + weight]` since three legs is the maximum. See the
+/// design spec's framing: a tie-breaker, not a recall-quality claim.
+pub(crate) fn corroboration_factor(weight: f32, legs_hit: usize) -> f32 {
+    if weight <= 0.0 || legs_hit <= 1 {
+        return 1.0;
+    }
+    1.0 + weight * (legs_hit as f32 - 1.0) / 2.0
+}
+
+/// Applies the corroboration boost to fused scores and re-sorts (score
+/// desc, id asc — the same determinism contract as `rrf_fuse`). `lists`
+/// are the per-leg COUNTING lists: the lists that were fused, plus at most
+/// one extra graph entry for co-seed evidence (see `recall` — disjoint
+/// from the fused graph list, so a node still counts each leg once). A leg
+/// that never ran is absent and can never count; a zero-weight list is
+/// skipped here too for the same reason. Weight 0 skips the code path
+/// entirely so results stay byte-identical to today — same pattern as the
+/// recency knob.
+pub(crate) fn apply_corroboration(
+    fused: &mut [(NodeId, f32)],
+    lists: &[(f32, Vec<NodeId>)],
+    weight: f32,
+) {
+    if weight <= 0.0 {
+        return;
+    }
+    use std::collections::{HashMap, HashSet};
+    let mut legs_hit: HashMap<NodeId, usize> = HashMap::new();
+    for (leg_weight, ids) in lists {
+        if *leg_weight <= 0.0 {
+            continue;
+        }
+        // A leg counts a node at most once, even if a list ever carried a
+        // duplicate id.
+        for id in ids.iter().copied().collect::<HashSet<NodeId>>() {
+            *legs_hit.entry(id).or_insert(0) += 1;
+        }
+    }
+    for (id, score) in fused.iter_mut() {
+        *score *= corroboration_factor(weight, legs_hit.get(id).copied().unwrap_or(0));
+    }
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 /// Post-fusion access factor: neutral at count 0, log-damped (recall's own
@@ -670,5 +787,117 @@ mod query_tests {
     #[test]
     fn default_tuning_validates() {
         assert!(q().validate_tuning().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod corroboration_tests {
+    use super::*;
+    use crate::ids::ScopeSet;
+
+    fn id(n: u128) -> NodeId {
+        NodeId::from_u128(n)
+    }
+
+    fn q() -> RecallQuery {
+        RecallQuery::new(ScopeSet::of(&[crate::ids::ScopeId::new()]), "hello", 5)
+    }
+
+    #[test]
+    fn corroboration_weight_defaults_to_zero() {
+        assert_eq!(
+            q().corroboration_weight,
+            0.0,
+            "off by default: engine is mechanism"
+        );
+    }
+
+    #[test]
+    fn corroboration_factor_neutral_and_bounded() {
+        assert_eq!(
+            corroboration_factor(1.0, 0),
+            1.0,
+            "absent from every leg: neutral"
+        );
+        assert_eq!(
+            corroboration_factor(1.0, 1),
+            1.0,
+            "single-leg hit: exactly 1"
+        );
+        assert_eq!(corroboration_factor(0.0, 3), 1.0, "weight 0: neutral");
+        assert!((corroboration_factor(0.2, 2) - 1.1).abs() < 1e-6);
+        assert_eq!(
+            corroboration_factor(1.0, 3),
+            2.0,
+            "three legs at weight 1: the 1 + w ceiling"
+        );
+        assert!(
+            corroboration_factor(0.5, 3) <= 1.5,
+            "bounded within [1, 1 + w]"
+        );
+    }
+
+    #[test]
+    fn corroboration_weight_validation_matches_access_weight_envelope() {
+        for bad in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            let query = RecallQuery {
+                corroboration_weight: bad,
+                ..q()
+            };
+            assert!(
+                matches!(query.validate_tuning(), Err(crate::TopoError::Rejected(_))),
+                "must reject corroboration_weight {bad}"
+            );
+        }
+        for good in [0.0, 0.2, 1.0] {
+            let query = RecallQuery {
+                corroboration_weight: good,
+                ..q()
+            };
+            assert!(
+                query.validate_tuning().is_ok(),
+                "must accept corroboration_weight {good}"
+            );
+        }
+    }
+
+    #[test]
+    fn corroboration_zero_weight_is_byte_identical() {
+        let lists = vec![(1.0, vec![id(1), id(2), id(3)]), (0.5, vec![id(3), id(2)])];
+        let mut fused = rrf_fuse(&lists);
+        let before = fused.clone();
+        apply_corroboration(&mut fused, &lists, 0.0);
+        assert_eq!(before, fused, "weight 0 skips the code path entirely");
+    }
+
+    #[test]
+    fn corroborated_hit_wins_near_tie_only_when_weight_positive() {
+        // A is #1 in the text leg; B is #2 there AND the barely-weighted
+        // vector leg's #1. At w = 0, A's 1/61 edges out B's
+        // 1/62 + 0.01/61 — a near-tie resolved toward the single-leg hit.
+        // Any positive weight breaks it the other way: B's two-leg factor
+        // (1.1 at w = 0.2) overtakes while A's single-leg factor stays 1.
+        let lists = vec![
+            (1.0, vec![id(1), id(2)]), // text: A, B
+            (0.01, vec![id(2)]),       // vector: B only
+        ];
+        let mut fused = rrf_fuse(&lists);
+        assert_eq!(fused[0].0, id(1), "boost off: near-tie resolves to A");
+        apply_corroboration(&mut fused, &lists, 0.0);
+        assert_eq!(fused[0].0, id(1), "weight 0 must not touch the ordering");
+        apply_corroboration(&mut fused, &lists, 0.2);
+        assert_eq!(fused[0].0, id(2), "corroborated B overtakes once boosted");
+    }
+
+    #[test]
+    fn zero_weight_legs_do_not_count_toward_corroboration() {
+        // B rides in a second list whose leg weight is 0.0 — that leg never
+        // ran, so B stays a single-leg hit and every factor is exactly 1.
+        let ran = vec![(1.0, vec![id(1), id(2)])];
+        let mut fused = rrf_fuse(&ran);
+        let before = fused.clone();
+        let with_dead_leg = vec![(1.0, vec![id(1), id(2)]), (0.0, vec![id(2)])];
+        apply_corroboration(&mut fused, &with_dead_leg, 1.0);
+        assert_eq!(before, fused, "a zero-weight leg must not create a boost");
     }
 }

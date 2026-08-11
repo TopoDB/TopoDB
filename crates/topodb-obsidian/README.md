@@ -16,7 +16,7 @@ One note = one memory. Atomicity and supersession are managed at the memory leve
 ```markdown
 ---
 topodb-id: 01JX…          # identity key; stamped by ingest, present on seeds
-kind: semantic             # optional; episodic | semantic | procedural only
+kind: semantic             # optional; episodic | semantic | procedural | decision only
 type: decision             # any other scalar key → memory prop
 status: open
 tags: [auth, refactor]     # → `tags` prop (string list); tags are NOT entities
@@ -34,7 +34,7 @@ Reserved vault keys (never stored as props):
 Mapping rules:
 - **Filename** is vault-local presentation and is **not** stored in the graph. Use an explicit `title:` frontmatter key for a durable memory title; seed uses it for filenames when present.
 - **Body** (frontmatter stripped, trimmed) → memory content.
-- **Frontmatter `kind`** → `RememberRequest.kind` (episodic | semantic | procedural); every other scalar key → memory prop.
+- **Frontmatter `kind`** → `RememberRequest.kind` (episodic | semantic | procedural | decision); every other scalar key → memory prop.
 - **YAML sequences of scalars** flatten to one comma-joined string prop: `tags: [auth, refactor]` stores as `tags: "auth, refactor"`.
 - **Wikilinks** — `[[Target]]`, `[[Target|alias]]` (entity name `Target`), `[[Target#heading]]` (entity `Target`) in body and frontmatter → entities with memory→entity edges. Embeds (`![[…]]`) are ignored.
 - **Vault walk** skips `.obsidian/`, `.trash/`, any dot-directory, non-`.md` files.

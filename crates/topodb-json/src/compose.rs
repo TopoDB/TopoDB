@@ -91,7 +91,7 @@ pub fn memory_props(content: &str, extra: Option<&Value>) -> Result<Props, Strin
         if map.contains_key(crate::MEMORY_KIND_PROP) {
             return Err(format!(
                 "props must not include {:?}: set it via remember's kind parameter \
-                 (episodic | semantic | procedural)",
+                 (episodic | semantic | procedural | decision)",
                 crate::MEMORY_KIND_PROP
             ));
         }
@@ -336,9 +336,9 @@ pub struct RememberRequest {
     /// Extra memory metadata as a JSON object (same contract as
     /// `merge_required_prop`'s `extra`).
     pub props: Option<Value>,
-    /// Declared taxonomy kind for a NEW memory: `episodic`, `semantic`, or
-    /// `procedural`. `None` = unstamped (reads as `semantic`). Ignored on a
-    /// dedup hit — the existing node's stored kind wins.
+    /// Declared taxonomy kind for a NEW memory: `episodic`, `semantic`,
+    /// `procedural`, or `decision`. `None` = unstamped (reads as `semantic`).
+    /// Ignored on a dedup hit — the existing node's stored kind wins.
     pub kind: Option<String>,
 }
 

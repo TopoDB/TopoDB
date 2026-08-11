@@ -3872,6 +3872,8 @@ fn search_temporal_rewrite_and_opt_out() {
 const BT_JUNE: i64 = 1_780_300_800_000;
 /// 2026-07-01T00:00:00Z in Unix ms.
 const BT_JULY: i64 = 1_782_864_000_000;
+/// 2026-08-01T00:00:00Z in Unix ms.
+const BT_AUG: i64 = 1_785_542_400_000;
 
 /// Backdated-link scenario shared by the `--time-axis` tests below: create A
 /// and X, link A->X via CLI with `--valid-from BT_JUNE` (the process clock
@@ -4156,4 +4158,380 @@ fn invalid_time_axis_value_is_clap_error_naming_variants() {
         err.contains("valid") && err.contains("recorded"),
         "clap error should name both accepted variants: {err}"
     );
+}
+
+// --- Semantica completion: Allen `--valid-*` predicates, `--corroboration-weight`,
+// --- and the `decision` memory kind ---
+
+/// Two-edge fixture for the Allen predicate tests: entity A with a CLOSED
+/// edge to X valid over [BT_JUNE, BT_JULY) and an OPEN edge to Y with
+/// `valid_from = BT_AUG` (the process clock is real "now", after BT_AUG).
+/// Returns `(db_path, scope, a_id, x_id, y_id, e1_id, e2_id)`.
+fn allen_setup(
+    dir: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
+    let db = dir.join("t.redb");
+    let scope = topodb::ScopeId::new().to_string();
+
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+
+    let (a_json, code) = run_cmd(&["create-entity", "--name", "allen_a"]);
+    assert_eq!(code, 0, "create-entity A failed: {a_json:?}");
+    let a_id = a_json["id"].as_str().unwrap().to_string();
+    let (x_json, code) = run_cmd(&["create-entity", "--name", "allen_x"]);
+    assert_eq!(code, 0, "create-entity X failed: {x_json:?}");
+    let x_id = x_json["id"].as_str().unwrap().to_string();
+    let (y_json, code) = run_cmd(&["create-entity", "--name", "allen_y"]);
+    assert_eq!(code, 0, "create-entity Y failed: {y_json:?}");
+    let y_id = y_json["id"].as_str().unwrap().to_string();
+
+    let (e1_json, code) = run_cmd(&[
+        "link",
+        "--from",
+        &a_id,
+        "--to",
+        &x_id,
+        "--type",
+        "relates_to",
+        "--valid-from",
+        &BT_JUNE.to_string(),
+    ]);
+    assert_eq!(code, 0, "link A->X failed: {e1_json:?}");
+    let e1_id = e1_json["id"].as_str().unwrap().to_string();
+    let (closed, code) = run_cmd(&["close-edge", &e1_id, "--valid-to", &BT_JULY.to_string()]);
+    assert_eq!(code, 0, "close-edge E1 failed: {closed:?}");
+
+    let (e2_json, code) = run_cmd(&[
+        "link",
+        "--from",
+        &a_id,
+        "--to",
+        &y_id,
+        "--type",
+        "relates_to",
+        "--valid-from",
+        &BT_AUG.to_string(),
+    ]);
+    assert_eq!(code, 0, "link A->Y failed: {e2_json:?}");
+    let e2_id = e2_json["id"].as_str().unwrap().to_string();
+
+    (db, scope, a_id, x_id, y_id, e1_id, e2_id)
+}
+
+#[test]
+fn get_edges_allen_predicates_filter_by_validity_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, _x, _y, e1_id, e2_id) = allen_setup(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        let out = bin().args(&v).output().unwrap();
+        (
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null),
+            out.status.code().unwrap_or(999),
+        )
+    };
+    let edge_ids = |result: &serde_json::Value| -> Vec<String> {
+        result["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(String::from))
+            .collect()
+    };
+
+    // during [JUNE, JULY): E1 is exactly contained (valid_to == b passes the
+    // half-open bound); the open E2 never matches a during.
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &a_id,
+        "--valid-during",
+        &format!("{BT_JUNE}..{BT_JULY}"),
+    ]);
+    assert_eq!(code, 0, "{result:?}");
+    assert_eq!(edge_ids(&result), vec![e1_id.clone()]);
+
+    // during [JUNE, JULY-1): E1's valid_to now exceeds b -> nothing.
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &a_id,
+        "--valid-during",
+        &format!("{BT_JUNE}..{}", BT_JULY - 1),
+    ]);
+    assert_eq!(code, 0, "{result:?}");
+    assert!(edge_ids(&result).is_empty(), "{result:?}");
+
+    // overlaps [JULY, AUG+1): E1 closes exactly at a (valid_to > a fails);
+    // E2 starts inside the window -> E2 only.
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &a_id,
+        "--valid-overlaps",
+        &format!("{BT_JULY}..{}", BT_AUG + 1),
+    ]);
+    assert_eq!(code, 0, "{result:?}");
+    assert_eq!(edge_ids(&result), vec![e2_id.clone()]);
+
+    // overlaps [JUNE, JULY): E1 intersects; E2 starts at AUG >= b -> E1 only.
+    let (result, code) = run_cmd(&[
+        "get-edges",
+        &a_id,
+        "--valid-overlaps",
+        &format!("{BT_JUNE}..{BT_JULY}"),
+    ]);
+    assert_eq!(code, 0, "{result:?}");
+    assert_eq!(edge_ids(&result), vec![e1_id.clone()]);
+
+    // before JULY: only the closed E1 (valid_to <= t); open edges never match.
+    let (result, code) = run_cmd(&["get-edges", &a_id, "--valid-before", &BT_JULY.to_string()]);
+    assert_eq!(code, 0, "{result:?}");
+    assert_eq!(edge_ids(&result), vec![e1_id]);
+
+    // after JULY: only E2 (valid_from >= t; open edges qualify).
+    let (result, code) = run_cmd(&["get-edges", &a_id, "--valid-after", &BT_JULY.to_string()]);
+    assert_eq!(code, 0, "{result:?}");
+    assert_eq!(edge_ids(&result), vec![e2_id]);
+}
+
+#[test]
+fn get_edges_allen_predicate_conflicts_and_parse_errors_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, ..) = allen_setup(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.push("get-edges");
+        v.push(&a_id);
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let range = format!("{BT_JUNE}..{BT_JULY}");
+    let july = BT_JULY.to_string();
+    let inverted = format!("{BT_JULY}..{BT_JUNE}");
+
+    // (args, needle the stderr error message must contain)
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        // Mutual exclusion errors now come from the engine's from_parts
+        (
+            vec!["--valid-during", &range, "--valid-after", &july],
+            "at most one of",
+        ),
+        (vec!["--valid-before", &july, "--as-of", &july], "as-of"),
+        (
+            vec!["--valid-after", &july, "--open-only", "true"],
+            "open-only",
+        ),
+        (
+            vec!["--valid-after", &july, "--time-axis", "recorded"],
+            "valid axis",
+        ),
+        (vec!["--valid-during", "oops"], "A..B"),
+        // Inverted interval: the engine's from_parts validates this
+        (vec!["--valid-during", &inverted], "inverted"),
+        // Space-separated negative value: now reaches the engine's positive-timestamp
+        // error (after clap parsing fix) instead of being a clap parse error.
+        (vec!["--valid-before", "-100"], "positive"),
+    ];
+    for (args, needle) in cases {
+        let out = run_cmd(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(needle),
+            "{args:?} should mention {needle:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn traverse_allen_predicate_gates_hops_and_rejects_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, scope, a_id, ..) = allen_setup(dir.path());
+    let run_cmd = |args: &[&str]| {
+        let mut v = vec!["--db"];
+        v.push(db.to_str().unwrap());
+        v.push("--scope");
+        v.push(&scope);
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+    let names = |out: &std::process::Output| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["subgraph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["props"]["name"].as_str().map(String::from))
+            .collect()
+    };
+
+    // after JULY: only the open A->Y edge qualifies -> Y reachable, X not.
+    let out = run_cmd(&[
+        "traverse",
+        &a_id,
+        "--max-hops",
+        "1",
+        "--valid-after",
+        &BT_JULY.to_string(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let ns = names(&out);
+    assert!(ns.contains(&"allen_y".to_string()), "{ns:?}");
+    assert!(!ns.contains(&"allen_x".to_string()), "{ns:?}");
+
+    // overlaps [JUNE, JULY): only the closed A->X edge intersects.
+    let out = run_cmd(&[
+        "traverse",
+        &a_id,
+        "--max-hops",
+        "1",
+        "--valid-overlaps",
+        &format!("{BT_JUNE}..{BT_JULY}"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let ns = names(&out);
+    assert!(ns.contains(&"allen_x".to_string()), "{ns:?}");
+    assert!(!ns.contains(&"allen_y".to_string()), "{ns:?}");
+
+    // Composition rules: a predicate is mutually exclusive with --as-of and
+    // with the recorded axis.
+    let july = BT_JULY.to_string();
+    for (args, needle) in [
+        (
+            vec!["--valid-after", july.as_str(), "--as-of", july.as_str()],
+            "as-of",
+        ),
+        (
+            vec!["--valid-after", july.as_str(), "--time-axis", "recorded"],
+            "valid axis",
+        ),
+    ] {
+        let mut v = vec!["traverse", a_id.as_str(), "--max-hops", "1"];
+        v.extend_from_slice(&args);
+        let out = run_cmd(&v);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(needle),
+            "{args:?} should mention {needle:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn decision_kind_stamps_filters_and_is_in_the_error_vocabulary() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        bin().args(&v).output().unwrap()
+    };
+
+    // Stamp: --kind decision lands on the node's props.
+    let stored: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "topodb chose redb over sqlite for the store",
+            "--entity",
+            "topodb",
+            "--kind",
+            "decision",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let dec_mem = stored["memory_id"].as_str().unwrap().to_string();
+    let got: serde_json::Value = serde_json::from_slice(&run(&["get", &dec_mem]).stdout).unwrap();
+    assert_eq!(got["node"]["props"]["kind"].as_str(), Some("decision"));
+
+    // An unstamped memory reads as semantic, not decision.
+    let plain: serde_json::Value = serde_json::from_slice(
+        &run(&[
+            "remember",
+            "--content",
+            "topodb stores props inline",
+            "--entity",
+            "topodb",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let sem_mem = plain["memory_id"].as_str().unwrap().to_string();
+
+    // Filter: --kinds decision is the precedent-retrieval path — it sees the
+    // stamped decision and nothing else.
+    let hits: serde_json::Value =
+        serde_json::from_slice(&run(&["search", "topodb", "--kinds", "decision"]).stdout).unwrap();
+    let ids: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["node"]["id"].as_str())
+        .collect();
+    assert!(ids.contains(&dec_mem.as_str()), "{ids:?}");
+    assert!(!ids.contains(&sem_mem.as_str()), "{ids:?}");
+
+    // Validation errors now name the four-kind vocabulary on both surfaces.
+    for args in [
+        vec![
+            "remember",
+            "--content",
+            "x y",
+            "--entity",
+            "e",
+            "--kind",
+            "verdict",
+        ],
+        vec!["search", "topodb", "--kinds", "verdict"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("decision"),
+            "vocabulary missing for {args:?}: {all}"
+        );
+    }
 }
