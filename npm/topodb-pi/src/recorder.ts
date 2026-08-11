@@ -175,18 +175,18 @@ export function buildEpisodeBatch(args: {
       label: "RetrievalEvent",
       props: { query: r.query, at: r.at },
     });
-    cmds.push({ op: "link", from: "#0", to: evRef, type: "ISSUED" });
+    cmds.push({ op: "link", from: "#0", to: evRef, type: "issued" });
     for (const m of r.returned) {
       cmds.push({
         op: "link",
         from: evRef,
         to: m.id,
-        type: "RETURNED",
+        type: "returned",
         props: { rank: m.rank, score: m.score, channel: r.channel },
       });
     }
     for (const id of args.used.get(i) ?? []) {
-      cmds.push({ op: "link", from: evRef, to: id, type: "USED" });
+      cmds.push({ op: "link", from: evRef, to: id, type: "used" });
     }
   });
   if (args.policyVersionId) {
@@ -194,7 +194,7 @@ export function buildEpisodeBatch(args: {
       op: "link",
       from: "#0",
       to: args.policyVersionId,
-      type: "USED_POLICY",
+      type: "used_policy",
     });
   }
   return cmds;

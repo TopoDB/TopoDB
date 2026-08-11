@@ -1,6 +1,9 @@
 {
   "equality": [
     { "label": "Entity", "prop": "name" },
+    { "label": "Alias", "prop": "name" },
+    { "label": "Synonym", "prop": "term" },
+    { "label": "Memory", "prop": "content_hash" },
     { "label": "Artifact", "prop": "sha256" },
     { "label": "PolicyVersion", "prop": "version" },
     { "label": "Procedure", "prop": "name" },
@@ -8,6 +11,8 @@
   ],
   "text": [
     { "label": "Memory", "prop": "content" },
+    { "label": "Entity", "prop": "name" },
+    { "label": "Alias", "prop": "name" },
     { "label": "Lesson", "prop": "content" },
     { "label": "Episode", "prop": "goal" }
   ]
