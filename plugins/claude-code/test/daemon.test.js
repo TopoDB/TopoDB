@@ -684,7 +684,21 @@ test("repairs an install whose platform binary is missing", pinnedPredatesDaemon
     const session = await connectAndInit({
       dataDir,
       projectDir: proj,
-      env: { TOPODB_DAEMON_IDLE_MS: "500" },
+      // Clear the file-level TOPODB_MCP_SERVER_BIN (set when a local cargo
+      // build exists): these two tests exercise REAL npm resolution/repair, so
+      // the spawned launch.js must NOT be handed a native-binary override.
+      // Empty string reads as unset in launch.js.
+      //
+      // Both idle vars are set because launch.js is platform-split: unix spawns
+      // the Rust daemon (TOPODB_DAEMON_IDLE_MS), Windows spawns broker.js
+      // (TOPODB_BROKER_IDLE_MS). Whichever runs must reap FAST so its
+      // topodb-mcp(.exe) child releases the data dir before teardown deletes it
+      // — on Windows a still-running .exe can't be unlinked (EPERM).
+      env: {
+        TOPODB_DAEMON_IDLE_MS: "500",
+        TOPODB_BROKER_IDLE_MS: "500",
+        TOPODB_MCP_SERVER_BIN: "",
+      },
       initTimeoutMs: 120_000,
     });
     sessions.push(session);
@@ -774,7 +788,21 @@ test("never runs a stale binary resolved from outside its own data dir", pinnedP
     const session = await connectAndInit({
       dataDir,
       projectDir: proj,
-      env: { TOPODB_DAEMON_IDLE_MS: "500" },
+      // Clear the file-level TOPODB_MCP_SERVER_BIN (set when a local cargo
+      // build exists): these two tests exercise REAL npm resolution/repair, so
+      // the spawned launch.js must NOT be handed a native-binary override.
+      // Empty string reads as unset in launch.js.
+      //
+      // Both idle vars are set because launch.js is platform-split: unix spawns
+      // the Rust daemon (TOPODB_DAEMON_IDLE_MS), Windows spawns broker.js
+      // (TOPODB_BROKER_IDLE_MS). Whichever runs must reap FAST so its
+      // topodb-mcp(.exe) child releases the data dir before teardown deletes it
+      // — on Windows a still-running .exe can't be unlinked (EPERM).
+      env: {
+        TOPODB_DAEMON_IDLE_MS: "500",
+        TOPODB_BROKER_IDLE_MS: "500",
+        TOPODB_MCP_SERVER_BIN: "",
+      },
       initTimeoutMs: 120_000,
     });
     sessions.push(session);
