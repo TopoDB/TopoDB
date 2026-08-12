@@ -565,6 +565,25 @@ mod imp {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global `XDG_RUNTIME_DIR` (which
+    /// `socket_path_for` reads): under cargo's parallel harness a sibling test
+    /// flipping it mid-body would change the derived path out from under this
+    /// one. Each holder saves and restores the prior value.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(not(windows))]
+    fn with_xdg_runtime_dir<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", dir);
+        let out = body();
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        out
+    }
+
     // --- endpoint derivation: identical scheme to topodb-mcp's socket_path ---
 
     #[test]
@@ -643,8 +662,7 @@ mod tests {
     fn discover_absent_signals_fall_through() {
         // Point discovery at a runtime dir with no socket in it.
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        let got = discover(Path::new("/tmp/never-served.redb"));
+        let got = with_xdg_runtime_dir(dir.path(), || discover(Path::new("/tmp/never-served.redb")));
         assert_eq!(got, Discovery::NoSocket);
     }
 
@@ -652,14 +670,15 @@ mod tests {
     #[test]
     fn discover_present_returns_the_endpoint() {
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        let db = Path::new("/tmp/served.redb");
-        let endpoint = socket_path_for(db);
-        std::fs::write(&endpoint, b"").unwrap();
-        match discover(db) {
-            Discovery::SocketPresent(p) => assert_eq!(p, endpoint),
-            Discovery::NoSocket => panic!("socket exists but discovery reported NoSocket"),
-        }
+        with_xdg_runtime_dir(dir.path(), || {
+            let db = Path::new("/tmp/served.redb");
+            let endpoint = socket_path_for(db);
+            std::fs::write(&endpoint, b"").unwrap();
+            match discover(db) {
+                Discovery::SocketPresent(p) => assert_eq!(p, endpoint),
+                Discovery::NoSocket => panic!("socket exists but discovery reported NoSocket"),
+            }
+        });
     }
 
     // --- hello frame: matches ipc.js's helloFrame wire shape ---

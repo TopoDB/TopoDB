@@ -248,6 +248,43 @@ fn search_stays_available_under_a_resident_daemon() {
 }
 
 #[test]
+fn routed_reads_honor_a_non_shared_scope_like_the_direct_path() {
+    // The routed read set must equal the direct path's, which for a `--scope
+    // <ULID>` read is EXACTLY that one scope (never shared). A daemon that
+    // stamped `[scope, "shared"]` would return shared-scope memories a direct
+    // `--scope <ULID>` read never sees — a silent divergence on the dogfood
+    // workflow. Seed one shared and one scoped memory; a scoped search must
+    // return only the scoped one, whether routed or direct.
+    let Some(bin) = daemon_bin() else {
+        eprintln!("skipping: target topodb-mcp not built");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("scoped.redb");
+    // A ULID scope (26 Crockford chars); any fixed valid one works.
+    let ulid = "0000000000ABCDEFGHJKMNPQRS";
+    run(&db, &["--scope", "shared", "remember", "--content", "shared visible fact", "--entity", "S"]);
+    run(&db, &["--scope", ulid, "remember", "--content", "scoped only fact", "--entity", "P"]);
+
+    let direct = run(&db, &["--scope", ulid, "search", "fact"]);
+    let _daemon = start_daemon(&bin, &db);
+    let routed = run(&db, &["--scope", ulid, "search", "fact"]);
+    run(&db, &["daemon", "stop"]);
+
+    // Both paths: the scoped memory is visible, the shared one is NOT.
+    for (label, out) in [("direct", &direct), ("routed", &routed)] {
+        assert!(
+            out.contains("scoped only fact"),
+            "{label} scoped search should see the scoped memory: {out}"
+        );
+        assert!(
+            !out.contains("shared visible fact"),
+            "{label} scoped search must NOT leak the shared-scope memory: {out}"
+        );
+    }
+}
+
+#[test]
 fn info_is_not_routed() {
     // `info` deliberately does not route (db_info is a lighter summary than
     // the direct full index_spec dump). A lone direct call prints the full

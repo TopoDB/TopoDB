@@ -85,16 +85,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // power-user seam for creating a db with a custom spec or forcing a
     // re-declare. `Path::exists` is safe here — the parent-dir check above ran,
     // and a stdio MCP server is a single writer per db path.
-    let budget_ms = match std::env::var("TOPODB_LOCK_WAIT_MS") {
-        Err(_) => 3000,
-        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
-            // A long-running server config'd by hand should start, not die,
-            // on a typo — warn once and use the default (the CLI, by
-            // contrast, hard-errors via clap on the same variable).
-            eprintln!("topodb-mcp: ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using 3000");
-            3000
-        }),
-    };
+    // Shared parse/default policy (`topodb_json::lock_wait_budget_ms`); a
+    // long-running server config'd by hand warns once and uses the default
+    // rather than dying on a typo.
+    let (budget_ms, lock_wait_warn) =
+        topodb_json::lock_wait_budget_ms(std::env::var("TOPODB_LOCK_WAIT_MS").ok().as_deref());
+    if let Some(warn) = lock_wait_warn {
+        eprintln!("topodb-mcp: {warn}");
+    }
     let db = topodb_json::open_with_busy_retry(budget_ms, || {
         match &config.spec {
             Some(spec) => Db::open_with(&config.db_path, spec.clone()),

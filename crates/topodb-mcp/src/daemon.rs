@@ -166,15 +166,13 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
 /// comes from `TOPODB_LOCK_WAIT_MS` (warn+default on garbage, aligning with the
 /// design's ride-along note). A `Busy` return here is the lost-election signal.
 fn open_db(config: &Config) -> Result<Db, TopoError> {
-    let budget_ms = match std::env::var("TOPODB_LOCK_WAIT_MS") {
-        Err(_) => 3000,
-        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
-            eprintln!(
-                "topodb daemon: ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using 3000"
-            );
-            3000
-        }),
-    };
+    // Shared parse/default policy with the CLI and the stdio server
+    // (`topodb_json::lock_wait_budget_ms`).
+    let (budget_ms, lock_wait_warn) =
+        topodb_json::lock_wait_budget_ms(std::env::var("TOPODB_LOCK_WAIT_MS").ok().as_deref());
+    if let Some(warn) = lock_wait_warn {
+        eprintln!("topodb daemon: {warn}");
+    }
     topodb_json::open_with_busy_retry(budget_ms, || match &config.spec {
         Some(spec) => Db::open_with(&config.db_path, spec.clone()),
         None if config.db_path.exists() => {

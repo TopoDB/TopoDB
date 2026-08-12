@@ -1492,14 +1492,28 @@ impl Storage {
                 let mut label_index = tx.open_table(LABEL_INDEX).map_err(storage_err)?;
 
                 // Resolve UpsertNode → plain ops WITHIN this transaction, before
-                // the apply loop. A lookup here sees every node written by prior
-                // ops in this batch and by prior batches in the same group commit
-                // (they share `tx`); because the applier is single-threaded, that
-                // makes find-or-create atomic — concurrent writers targeting the
-                // same equality-indexed name all collapse onto the node the first
-                // one commits, and their edges remap onto it. `rewritten` (plain
-                // CreateNode/CreateEdge only) is what the loop applies AND what the
-                // op log stores, so replay never sees an UpsertNode.
+                // the apply loop. Find-or-create is atomic against two sources:
+                //  * COMMITTED state (`lookup_indexed_node` reads the tx tables,
+                //    which reflect prior ops in this batch that have already been
+                //    applied AND prior batches in the same group commit — they
+                //    share `tx`), and
+                //  * PENDING creates in THIS batch that the pre-pass has emitted
+                //    into `rewritten` but the apply loop below has NOT yet written
+                //    to the tables (`pending`), so two UpsertNodes for the same
+                //    key in one batch collapse instead of both creating.
+                // Because the applier is single-threaded, concurrent writers
+                // targeting the same equality-indexed name all collapse onto the
+                // node the first one commits, and their edges remap onto it.
+                // `rewritten` (plain CreateNode/CreateEdge only) is what the loop
+                // applies AND what the op log stores, so replay never sees an
+                // UpsertNode.
+                let mut pending: Vec<(
+                    Scope,
+                    smol_str::SmolStr,
+                    smol_str::SmolStr,
+                    crate::props::PropValue,
+                    NodeId,
+                )> = Vec::new();
                 for op in &resolved {
                     match op {
                         Op::UpsertNode {
@@ -1509,7 +1523,8 @@ impl Storage {
                             key_prop,
                             props,
                         } => {
-                            let existing = match props.get(key_prop.as_str()) {
+                            let value = props.get(key_prop.as_str());
+                            let existing = match value {
                                 Some(value) => lookup_indexed_node(
                                     &prop_index,
                                     &nodes,
@@ -1522,7 +1537,21 @@ impl Storage {
                                     key_prop,
                                     value,
                                     *scope,
-                                )?,
+                                )?
+                                // Not yet committed — was it created earlier in
+                                // THIS batch's pre-pass? Same (scope, label, key,
+                                // value) collapses to that pending id.
+                                .or_else(|| {
+                                    pending
+                                        .iter()
+                                        .find(|(s, l, k, v, _)| {
+                                            s == scope
+                                                && l == label
+                                                && k == key_prop
+                                                && v == value
+                                        })
+                                        .map(|(_, _, _, _, pid)| *pid)
+                                }),
                                 // No value for the key prop → cannot dedup; create.
                                 None => None,
                             };
@@ -1530,12 +1559,23 @@ impl Storage {
                                 Some(found) => {
                                     upsert_remap.insert(*id, found);
                                 }
-                                None => rewritten.push(Op::CreateNode {
-                                    id: *id,
-                                    scope: *scope,
-                                    label: label.clone(),
-                                    props: props.clone(),
-                                }),
+                                None => {
+                                    if let Some(value) = value {
+                                        pending.push((
+                                            *scope,
+                                            label.clone(),
+                                            key_prop.clone(),
+                                            value.clone(),
+                                            *id,
+                                        ));
+                                    }
+                                    rewritten.push(Op::CreateNode {
+                                        id: *id,
+                                        scope: *scope,
+                                        label: label.clone(),
+                                        props: props.clone(),
+                                    });
+                                }
                             }
                         }
                         other => rewritten.push(remap_op_node_ids(other, &upsert_remap)),

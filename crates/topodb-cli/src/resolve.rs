@@ -153,9 +153,10 @@ pub fn resolve_scope_str(
     }
 }
 
-/// Default busy-retry budget in milliseconds when neither the flag nor a
-/// valid env value is supplied. Mirrors topodb-mcp's default.
-pub const DEFAULT_LOCK_WAIT_MS: u64 = 3000;
+/// Default busy-retry budget in milliseconds when neither the flag nor a valid
+/// env value is supplied. Single-sourced from `topodb_json` so the CLI, the MCP
+/// server, and the daemon cannot drift.
+pub const DEFAULT_LOCK_WAIT_MS: u64 = topodb_json::DEFAULT_LOCK_WAIT_MS;
 
 /// Resolve the busy-retry budget: an explicit `--lock-wait-ms` flag wins;
 /// otherwise `TOPODB_LOCK_WAIT_MS` is parsed. An unparseable env value is NOT
@@ -167,18 +168,10 @@ pub fn resolve_lock_wait_ms(flag: Option<u64>, env: Option<String>) -> (u64, Opt
     if let Some(f) = flag {
         return (f, None);
     }
-    match env {
-        None => (DEFAULT_LOCK_WAIT_MS, None),
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(v) => (v, None),
-            Err(_) => (
-                DEFAULT_LOCK_WAIT_MS,
-                Some(format!(
-                    "topodb: ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using {DEFAULT_LOCK_WAIT_MS}"
-                )),
-            ),
-        },
-    }
+    // Core parse/default is shared with the MCP server and daemon
+    // (`topodb_json::lock_wait_budget_ms`); prepend this front end's own name.
+    let (budget, warn) = topodb_json::lock_wait_budget_ms(env.as_deref());
+    (budget, warn.map(|m| format!("topodb: {m}")))
 }
 
 fn parse_format(s: &str) -> Result<Format, String> {

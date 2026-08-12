@@ -146,7 +146,13 @@ fn main() {
     if is_daemon_routable(&cli.cmd) {
         if let Discovery::SocketPresent(endpoint) = daemon_client::discover(&db_path) {
             let scope_str = topodb_json::scope_label(&default_scope);
-            let read_scopes = vec![scope_str.clone(), "shared".to_string()];
+            // The routed read set MUST equal the direct path's, which is
+            // `scope_to_scope_set(default_scope)` — i.e. exactly the one scope
+            // (a ULID reads only itself; `Scope::Shared` reads only shared).
+            // Adding "shared" here would make a `--scope <ULID>` search return
+            // shared-scope memories the direct path never sees — a silent
+            // daemon-vs-no-daemon divergence on the dogfood workflow.
+            let read_scopes = vec![scope_str.clone()];
             let scopes = daemon_client::HelloScopes {
                 scope: scope_str,
                 read_scopes,
@@ -2213,11 +2219,23 @@ fn daemon_start(db_path: &Path) -> ! {
         }
     };
 
-    // Spawn detached daemon with --socket flag
+    // Spawn a detached daemon. Two things are load-bearing here (mirroring
+    // launch.js's `stdio:"ignore", detached:true`):
+    //  * stdio → null: if the daemon inherited our stdout/stderr it would hold
+    //    the write end of any pipe/capture, so `out=$(topodb daemon start)`
+    //    would block until the daemon exited (up to TOPODB_DAEMON_IDLE_MS, or
+    //    forever with =0) instead of returning as soon as we print our JSON.
+    //  * new process group: so a terminal SIGINT/SIGHUP to the CLI's group does
+    //    not also kill the daemon we just launched to outlive this process.
+    use std::os::unix::process::CommandExt;
     let _child = ProcessCommand::new(&mcp_binary)
         .arg("--db")
         .arg(db_path)
         .arg("--socket")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
         .unwrap_or_else(|e| {
             output::fail(
@@ -2227,9 +2245,6 @@ fn daemon_start(db_path: &Path) -> ! {
             )
         });
 
-    // On Unix, detach by double-fork or by spawning in background.
-    // For simplicity, we just spawn and let it run; the parent process doesn't wait.
-    // On Unix this works because the daemon is designed to outlive the spawner.
     #[cfg(unix)]
     {
         // Minimal polling: wait up to 5 seconds for socket to appear

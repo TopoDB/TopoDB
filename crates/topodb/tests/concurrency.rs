@@ -144,6 +144,63 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
     assert_eq!(closed_count, 16, "every non-final edge must be closed");
 }
 
+/// Two `UpsertNode`s for the same key in ONE batch must collapse to a single
+/// node — the pre-pass has to see its own not-yet-applied create, not just
+/// committed state. (Current callers dedup names before submit, but the applier
+/// invariant must hold regardless of caller.)
+#[test]
+fn two_upserts_same_name_in_one_batch_collapse() {
+    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+    let (a, b) = (NodeId::new(), NodeId::new());
+    let mk = || {
+        let mut p = Props::new();
+        p.insert("name".into(), PropValue::Str("Dup".into()));
+        p
+    };
+    db.submit(vec![
+        Op::UpsertNode {
+            id: a,
+            scope,
+            label: "Entity".into(),
+            key_prop: "name".into(),
+            props: mk(),
+        },
+        Op::UpsertNode {
+            id: b,
+            scope,
+            label: "Entity".into(),
+            key_prop: "name".into(),
+            props: mk(),
+        },
+    ])
+    .unwrap();
+    let hits = db
+        .nodes_by_prop(
+            &ScopeSet::of(&[scope_id]),
+            "Entity",
+            "name",
+            &PropValue::Str("Dup".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "two same-name upserts in one batch must collapse to one node, got {}",
+        hits.len()
+    );
+}
+
 /// Atomic apply-time find-or-create: N writers concurrently `UpsertNode` the
 /// SAME equality-indexed name, each also creating a memory and an edge to that
 /// entity. The applier must collapse them to EXACTLY ONE entity node and route

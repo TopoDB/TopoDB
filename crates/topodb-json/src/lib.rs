@@ -562,6 +562,32 @@ pub fn resolve_scope(scope: Option<&str>, default: Scope) -> Result<Scope, Strin
     }
 }
 
+/// Default busy-retry budget (ms) when `TOPODB_LOCK_WAIT_MS` is unset or
+/// unparseable. Shared so the CLI, the MCP stdio server, and the daemon can
+/// never drift apart on the value.
+pub const DEFAULT_LOCK_WAIT_MS: u64 = 3000;
+
+/// Parse a `TOPODB_LOCK_WAIT_MS` env value into a busy-retry budget. Absent →
+/// the default, silently. Present-but-unparseable → the default plus a
+/// prefix-less warning (the caller prepends its own program name, since the CLI,
+/// the stdio server, and the daemon each identify themselves differently). This
+/// is the single source of truth for the parse-and-default policy the three
+/// front ends share.
+pub fn lock_wait_budget_ms(env: Option<&str>) -> (u64, Option<String>) {
+    match env {
+        None => (DEFAULT_LOCK_WAIT_MS, None),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) => (v, None),
+            Err(_) => (
+                DEFAULT_LOCK_WAIT_MS,
+                Some(format!(
+                    "ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using {DEFAULT_LOCK_WAIT_MS}"
+                )),
+            ),
+        },
+    }
+}
+
 /// A resolved `Scope` → the singleton `ScopeSet` a read call needs: `Shared`
 /// admits only the shared scope, `Id(id)` admits only that one scope id.
 pub fn scope_to_scope_set(scope: Scope) -> ScopeSet {
