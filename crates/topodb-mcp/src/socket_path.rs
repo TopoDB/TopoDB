@@ -94,6 +94,8 @@ pub fn socket_path_for(db_path: &Path) -> PathBuf {
 /// so no other user can reach the socket. On Windows the endpoint is a named
 /// pipe with no filesystem parent, so this is a no-op (pipe ACLs are set at
 /// bind time by the daemon, not here).
+// Called only from the unix accept loop's `bind_or_reclaim`; dead on non-unix.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn ensure_socket_dir(endpoint: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {

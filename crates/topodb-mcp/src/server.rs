@@ -203,6 +203,9 @@ impl TopoServer {
     /// it into a connection refusal) so this stays free of rmcp's `ErrorData`.
     ///
     /// [`for_request`]: TopoServer::for_request
+    // Consumed only by the unix daemon's per-connection hello handling; the
+    // stdio server never calls it, so it is dead on non-unix builds.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn for_hello(&self, scope: &str, read_scopes: Option<&[String]>) -> Result<Self, String> {
         let mut out = self.clone();
         out.default_scope = convert::resolve_scope(Some(scope), self.default_scope)?;

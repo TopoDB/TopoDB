@@ -32,6 +32,12 @@
 //! both processes resolve a given DB path to the same endpoint — the hash
 //! vectors pinned in the tests are the cross-crate contract.
 
+// The socket client is unix-only (Windows named-pipe support is a follow-up);
+// on Windows only `BusyDiagnosis` (the direct-open Busy message) is live, so the
+// rest of the module is legitimately dead there. Suppress dead-code noise on
+// non-unix rather than `#[cfg(unix)]`-gate every item individually.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 /// Wire-protocol version. Bump in lockstep with `topodb-mcp`'s

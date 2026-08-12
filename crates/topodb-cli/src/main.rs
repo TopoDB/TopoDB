@@ -9,7 +9,11 @@ use std::str::FromStr;
 
 use clap::Parser;
 use cli::{Cli, Command, DaemonCommand};
-use daemon_client::{BusyDiagnosis, DaemonClient, Discovery};
+// BusyDiagnosis is built on every platform (the Busy error path); DaemonClient
+// and Discovery are the unix socket client, used only under #[cfg(unix)].
+use daemon_client::BusyDiagnosis;
+#[cfg(unix)]
+use daemon_client::{DaemonClient, Discovery};
 use topodb::{
     Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
     TraversalQuery, ValidInterval, VectorQuery,
@@ -1689,6 +1693,7 @@ fn submit(db: &Db, default_scope: Scope, input: &str, pretty: bool) -> ! {
 /// Determine if a command can be routed to a daemon via MCP tools.
 /// Commands that lack direct MCP tool equivalents or are admin-only
 /// (require exclusive lock) fall through to direct open.
+#[cfg(unix)]
 fn is_daemon_routable(cmd: &Command) -> bool {
     match cmd {
         // create_entity's --always-create has no tool equivalent, so a
@@ -2118,10 +2123,13 @@ fn insert_valid_interval(params: &mut serde_json::Value, interval: &Option<Valid
 }
 
 /// Extend the DirectionArg enum with an as_str method for MCP calls.
+/// Used only by the socket-routing path (`try_daemon_route`), hence unix-only.
+#[cfg(unix)]
 trait DirectionArgExt {
     fn as_str(&self) -> &'static str;
 }
 
+#[cfg(unix)]
 impl DirectionArgExt for cli::DirectionArg {
     fn as_str(&self) -> &'static str {
         match self {
@@ -2133,10 +2141,13 @@ impl DirectionArgExt for cli::DirectionArg {
 }
 
 /// Extend the TimeAxisArg enum with an as_str method for MCP calls.
+/// Used only by the socket-routing path (`try_daemon_route`), hence unix-only.
+#[cfg(unix)]
 trait TimeAxisArgExt {
     fn as_str(&self) -> &'static str;
 }
 
+#[cfg(unix)]
 impl TimeAxisArgExt for cli::TimeAxisArg {
     fn as_str(&self) -> &'static str {
         match self {

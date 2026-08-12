@@ -34,6 +34,13 @@
 //! 6. **Startup budget.** A startup that cannot open the DB within its budget
 //!    surfaces the error to the caller (nonzero exit) rather than lingering.
 
+// Socket serving is unix-only (Windows named-pipe support is a CI-tracked
+// follow-up); on non-unix, `serve` opens the DB then returns `Unsupported`, so
+// the accept-loop machinery (hello parsing, extra ServeOutcome/DaemonError
+// variants, some imports) is legitimately dead. Suppress that noise on non-unix
+// rather than `#[cfg(unix)]`-gate every item.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

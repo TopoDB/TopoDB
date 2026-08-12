@@ -1,23 +1,30 @@
-#![cfg(unix)]
-
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Child, Command};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use tempfile::TempDir;
 
 /// Guard to ensure daemon is killed on exit, even if test panics.
+#[cfg(unix)]
 struct DaemonGuard {
     child: Child,
 }
 
+#[cfg(unix)]
 impl DaemonGuard {
     fn new(child: Child) -> Self {
         DaemonGuard { child }
     }
 }
 
+#[cfg(unix)]
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -26,6 +33,7 @@ impl Drop for DaemonGuard {
 }
 
 /// Spawn the daemon with a temp DB and socket.
+#[cfg(unix)]
 fn spawn_daemon(db_path: &PathBuf, socket_path: &PathBuf) -> std::io::Result<DaemonGuard> {
     let binary = env!("CARGO_BIN_EXE_topodb-mcp");
     let child = Command::new(binary)
@@ -41,11 +49,13 @@ fn spawn_daemon(db_path: &PathBuf, socket_path: &PathBuf) -> std::io::Result<Dae
 }
 
 /// A single client connection to the daemon.
+#[cfg(unix)]
 struct Client {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
 }
 
+#[cfg(unix)]
 impl Client {
     fn new(socket_path: &PathBuf) -> std::io::Result<Self> {
         let stream = UnixStream::connect(socket_path)?;
@@ -154,6 +164,7 @@ impl Client {
     }
 }
 
+#[cfg(unix)]
 fn main() {
     println!("TopoDB daemon throughput benchmark");
 
