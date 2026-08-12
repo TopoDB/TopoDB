@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use clap::Parser;
 use cli::{Cli, Command, DaemonCommand};
-use daemon_client::{BusyDiagnosis, Discovery, DaemonClient};
+use daemon_client::{BusyDiagnosis, DaemonClient, Discovery};
 use topodb::{
     Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
     TraversalQuery, ValidInterval, VectorQuery,
@@ -93,10 +93,8 @@ fn main() {
     // Busy-retry budget: flag → TOPODB_LOCK_WAIT_MS → default. An unparseable
     // env value warns and falls back to the default rather than hard-erroring
     // (aligned with topodb-mcp; resolved here, not by clap).
-    let (lock_wait_ms, lock_wait_warn) = resolve::resolve_lock_wait_ms(
-        cli.lock_wait_ms,
-        std::env::var("TOPODB_LOCK_WAIT_MS").ok(),
-    );
+    let (lock_wait_ms, lock_wait_warn) =
+        resolve::resolve_lock_wait_ms(cli.lock_wait_ms, std::env::var("TOPODB_LOCK_WAIT_MS").ok());
     if let Some(w) = lock_wait_warn {
         eprintln!("{w}");
     }
@@ -205,7 +203,10 @@ fn main() {
         Ok(db) => db,
         Err(TopoError::Busy) => {
             #[cfg(unix)]
-            let socket_present = matches!(daemon_client::discover(&db_path), Discovery::SocketPresent(_));
+            let socket_present = matches!(
+                daemon_client::discover(&db_path),
+                Discovery::SocketPresent(_)
+            );
             #[cfg(not(unix))]
             let socket_present = false;
 
@@ -1696,7 +1697,9 @@ fn is_daemon_routable(cmd: &Command) -> bool {
         Command::CreateEntity { always_create, .. } => !always_create,
         // `--include-superseded` search has no tool parameter, so that
         // variant direct-opens; a plain search routes (see the Search arm).
-        Command::Search { include_superseded, .. } => !include_superseded,
+        Command::Search {
+            include_superseded, ..
+        } => !include_superseded,
         // Commands deliberately NOT routed (direct-open, Busy-retry under a
         // resident daemon) because no tool reproduces the direct output:
         //   * `info` — `db_info` is a lighter summary than the direct CLI's
@@ -1869,7 +1872,10 @@ fn try_daemon_route(
             let result = client.call_tool("access_stats", serde_json::json!({ "id": id }))?;
             // Direct `stats` nests the counters under `access_stats` when found;
             // the tool returns them flat. Reshape to match.
-            let found = result.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+            let found = result
+                .get("found")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if found {
                 Ok(serde_json::json!({
                     "found": true,
@@ -2045,7 +2051,9 @@ fn try_daemon_route(
             let vector_json: serde_json::Value = match serde_json::from_str(vector) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(DaemonError::Protocol(format!("parsing --vector as JSON: {e}")))
+                    return Err(DaemonError::Protocol(format!(
+                        "parsing --vector as JSON: {e}"
+                    )))
                 }
             };
             let vector = match topodb_json::json_to_f32_vec(&vector_json) {
@@ -2066,7 +2074,9 @@ fn try_daemon_route(
             let vector_json: serde_json::Value = match serde_json::from_str(vector) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(DaemonError::Protocol(format!("parsing --vector as JSON: {e}")))
+                    return Err(DaemonError::Protocol(format!(
+                        "parsing --vector as JSON: {e}"
+                    )))
                 }
             };
             let vector = match topodb_json::json_to_f32_vec(&vector_json) {
@@ -2189,11 +2199,7 @@ fn daemon_start(db_path: &Path) -> ! {
 
     // Find topodb-mcp binary: same directory as current exe, then PATH
     let current_exe = std::env::current_exe().unwrap_or_else(|_| {
-        output::fail(
-            "internal",
-            "cannot determine current executable path",
-            1,
-        )
+        output::fail("internal", "cannot determine current executable path", 1)
     });
     let current_dir = current_exe
         .parent()
@@ -2209,13 +2215,11 @@ fn daemon_start(db_path: &Path) -> ! {
                 let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 std::path::PathBuf::from(path_str)
             }
-            _ => {
-                output::fail(
-                    "rejected",
-                    "could not find topodb-mcp binary (checked same directory as CLI and PATH)",
-                    2,
-                )
-            }
+            _ => output::fail(
+                "rejected",
+                "could not find topodb-mcp binary (checked same directory as CLI and PATH)",
+                2,
+            ),
         }
     };
 
@@ -2228,7 +2232,7 @@ fn daemon_start(db_path: &Path) -> ! {
     //  * new process group: so a terminal SIGINT/SIGHUP to the CLI's group does
     //    not also kill the daemon we just launched to outlive this process.
     use std::os::unix::process::CommandExt;
-    let _child = ProcessCommand::new(&mcp_binary)
+    let child = ProcessCommand::new(&mcp_binary)
         .arg("--db")
         .arg(db_path)
         .arg("--socket")
@@ -2237,13 +2241,11 @@ fn daemon_start(db_path: &Path) -> ! {
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .unwrap_or_else(|e| {
-            output::fail(
-                "internal",
-                &format!("spawning topodb-mcp: {e}"),
-                1,
-            )
-        });
+        .unwrap_or_else(|e| output::fail("internal", &format!("spawning topodb-mcp: {e}"), 1));
+    // Deliberately do NOT wait on / reap this child: it is a detached daemon
+    // meant to outlive this one-shot CLI process. `forget` drops our handle
+    // without the Drop-time reap clippy's zombie_processes lint expects.
+    std::mem::forget(child);
 
     #[cfg(unix)]
     {
@@ -2298,8 +2300,7 @@ fn daemon_stop(db_path: &Path) -> ! {
     // socket is stale (daemon already dead) — not an error for `stop`, whose
     // contract is "no daemon holds this db when I return"; the socket/lock
     // wait below is the actual verification either way.
-    if let Err(daemon_client::DaemonError::Protocol(e)) =
-        daemon_client::send_shutdown(&socket_path)
+    if let Err(daemon_client::DaemonError::Protocol(e)) = daemon_client::send_shutdown(&socket_path)
     {
         // The daemon answered but REFUSED the shutdown — that's a real
         // failure, not a stale socket; waiting below would just time out.
@@ -2348,13 +2349,11 @@ fn daemon_stop(db_path: &Path) -> ! {
             });
             output::ok(&result, false);
         }
-        Err(TopoError::Busy) => {
-            output::fail(
-                "internal",
-                "database lock did not become free within 5s of daemon shutdown",
-                1,
-            )
-        }
+        Err(TopoError::Busy) => output::fail(
+            "internal",
+            "database lock did not become free within 5s of daemon shutdown",
+            1,
+        ),
         Err(e) => output::fail_engine(&e),
     }
 }

@@ -14,14 +14,14 @@
 //! children are wrapped in drop guards to ensure cleanup. Timeouts are 10-30s
 //! with clear panic messages naming the stalled step.
 
+use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use serde_json::json;
 use tempfile::TempDir;
 
 /// Guard that kills a spawned daemon process on drop. Ensures no leaked child
@@ -40,7 +40,7 @@ impl Drop for DaemonGuard {
 
 /// Spawn a daemon process on the given socket path, serving a fresh temp DB.
 /// Returns a guard that kills the process when dropped. Panics if spawn fails.
-fn spawn_daemon(temp_dir: &TempDir, socket_path: &PathBuf) -> DaemonGuard {
+fn spawn_daemon(temp_dir: &TempDir, socket_path: &Path) -> DaemonGuard {
     let db_path = temp_dir.path().join("test.redb");
     let socket_str = socket_path.to_string_lossy().into_owned();
 
@@ -59,7 +59,7 @@ fn spawn_daemon(temp_dir: &TempDir, socket_path: &PathBuf) -> DaemonGuard {
 
     DaemonGuard {
         child,
-        _socket_path: socket_path.clone(),
+        _socket_path: socket_path.to_path_buf(),
     }
 }
 
@@ -141,10 +141,7 @@ fn connect_with_hello(socket_path: &PathBuf, scope: &str) -> TestClient {
     )
     .expect("send initialize");
     let init = read_rpc_response(&mut client).expect("read initialize response");
-    assert!(
-        init.get("error").is_none(),
-        "initialize failed: {init}"
-    );
+    assert!(init.get("error").is_none(), "initialize failed: {init}");
     let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} });
     let mut line = notif.to_string();
     line.push('\n');
@@ -196,7 +193,6 @@ fn read_rpc_response(
     }
 }
 
-
 // ============================================================================
 // Test 1: concurrent remember storm (8 threads, ~10 memories each, 80 total)
 // ============================================================================
@@ -227,7 +223,12 @@ fn concurrent_remember_storm() {
                     "scope": "shared"
                 });
 
-                if let Err(e) = send_rpc_request(&mut stream, mem_idx, "tools/call", json!({"name": "remember", "arguments": params})) {
+                if let Err(e) = send_rpc_request(
+                    &mut stream,
+                    mem_idx,
+                    "tools/call",
+                    json!({"name": "remember", "arguments": params}),
+                ) {
                     let mut err_list = errors.lock().unwrap();
                     err_list.push(format!("Thread {}: send failed: {}", thread_id, e));
                 }
@@ -238,10 +239,7 @@ fn concurrent_remember_storm() {
                         // Check for errors in response.
                         if let Some(err) = resp.get("error") {
                             let mut err_list = errors.lock().unwrap();
-                            err_list.push(format!(
-                                "Thread {}: RPC error: {}",
-                                thread_id, err
-                            ));
+                            err_list.push(format!("Thread {}: RPC error: {}", thread_id, err));
                         }
                     }
                     Err(e) => {
@@ -256,9 +254,7 @@ fn concurrent_remember_storm() {
 
     // Wait for all threads.
     for handle in handles {
-        handle
-            .join()
-            .expect("thread panicked")
+        handle.join().expect("thread panicked")
     }
 
     // Assert zero errors.
@@ -272,8 +268,13 @@ fn concurrent_remember_storm() {
     // Verify all 80 memories were written by doing a recent_memories query.
     let mut stream = connect_with_hello(&socket_path, "shared");
     let params = json!({ "k": 100, "scope": "shared" });
-    send_rpc_request(&mut stream, 999, "tools/call", json!({"name": "recent_memories", "arguments": params}))
-        .expect("send recent_memories request");
+    send_rpc_request(
+        &mut stream,
+        999,
+        "tools/call",
+        json!({"name": "recent_memories", "arguments": params}),
+    )
+    .expect("send recent_memories request");
 
     let response = read_rpc_response(&mut stream).expect("read recent_memories response");
 
@@ -323,7 +324,12 @@ fn find_or_create_collapse() {
                 "scope": "shared"
             });
 
-            if let Err(e) = send_rpc_request(&mut stream, 1, "tools/call", json!({"name": "remember", "arguments": params})) {
+            if let Err(e) = send_rpc_request(
+                &mut stream,
+                1,
+                "tools/call",
+                json!({"name": "remember", "arguments": params}),
+            ) {
                 let mut err_list = errors.lock().unwrap();
                 err_list.push(format!("Thread {}: failed to send: {}", thread_id, e));
                 return;
@@ -357,8 +363,13 @@ fn find_or_create_collapse() {
         "scope": "shared"
     });
 
-    send_rpc_request(&mut stream, 999, "tools/call", json!({"name": "find_by_prop", "arguments": params}))
-        .expect("send find_by_prop request");
+    send_rpc_request(
+        &mut stream,
+        999,
+        "tools/call",
+        json!({"name": "find_by_prop", "arguments": params}),
+    )
+    .expect("send find_by_prop request");
 
     let response = read_rpc_response(&mut stream).expect("read find_by_prop response");
 
@@ -379,10 +390,7 @@ fn find_or_create_collapse() {
     // Rough heuristic: if the response mentions exactly one entity or shows
     // a single node in results, collapse worked.
     let text = nodes.unwrap();
-    assert!(
-        !text.is_empty(),
-        "find_by_prop response appears empty"
-    );
+    assert!(!text.is_empty(), "find_by_prop response appears empty");
 }
 
 // ============================================================================
@@ -413,13 +421,20 @@ fn reads_during_writes() {
                 "scope": "shared"
             });
 
-            if let Err(_) = send_rpc_request(&mut stream, i, "tools/call", json!({"name": "remember", "arguments": params})) {
+            if send_rpc_request(
+                &mut stream,
+                i,
+                "tools/call",
+                json!({"name": "remember", "arguments": params}),
+            )
+            .is_err()
+            {
                 let mut err_list = writer_errors.lock().unwrap();
                 err_list.push("writer: send failed".to_string());
                 continue;
             }
 
-            if let Err(_) = read_rpc_response(&mut stream) {
+            if read_rpc_response(&mut stream).is_err() {
                 let mut err_list = writer_errors.lock().unwrap();
                 err_list.push("writer: read failed".to_string());
                 continue;
@@ -446,13 +461,20 @@ fn reads_during_writes() {
                     "scope": "shared"
                 });
 
-                if let Err(_) = send_rpc_request(&mut stream, attempt, "tools/call", json!({"name": "search_memories", "arguments": params})) {
+                if send_rpc_request(
+                    &mut stream,
+                    attempt,
+                    "tools/call",
+                    json!({"name": "search_memories", "arguments": params}),
+                )
+                .is_err()
+                {
                     let mut err_list = reader_errors.lock().unwrap();
                     err_list.push(format!("reader {}: send failed", reader_id));
                     continue;
                 }
 
-                if let Err(_) = read_rpc_response(&mut stream) {
+                if read_rpc_response(&mut stream).is_err() {
                     let mut err_list = reader_errors.lock().unwrap();
                     err_list.push(format!("reader {}: read failed", reader_id));
                 }
@@ -553,14 +575,12 @@ fn election_race() {
         thread::sleep(Duration::from_millis(100));
     };
 
-    let (winner_socket, loser_status) = if status_1.is_none() {
-        // Daemon 1 is still running = it won.
-        (&socket_1, status_2.expect("daemon 2 should have exited"))
-    } else if status_2.is_none() {
-        // Daemon 2 is still running = it won.
-        (&socket_2, status_1.expect("daemon 1 should have exited"))
-    } else {
-        panic!("both daemons exited; neither won the election");
+    // Exactly one exited (the loop above guarantees `s1.is_some() != s2.is_some()`).
+    // The still-running one won; its sibling's exit status is the loser's.
+    let (winner_socket, loser_status) = match (status_1, status_2) {
+        (None, Some(loser)) => (&socket_1, loser),
+        (Some(loser), None) => (&socket_2, loser),
+        _ => panic!("election did not settle to exactly one winner"),
     };
 
     // Loser should have exited with code 0 (lost election, not an error).
@@ -578,8 +598,13 @@ fn election_race() {
         "scope": "shared"
     });
 
-    send_rpc_request(&mut stream, 1, "tools/call", json!({"name": "search_memories", "arguments": params}))
-        .expect("winner should still be serving");
+    send_rpc_request(
+        &mut stream,
+        1,
+        "tools/call",
+        json!({"name": "search_memories", "arguments": params}),
+    )
+    .expect("winner should still be serving");
 
     let response = read_rpc_response(&mut stream).expect("winner should respond");
 
@@ -630,7 +655,10 @@ fn idle_exit_then_late_client() {
         thread::sleep(Duration::from_millis(50));
     };
 
-    assert!(exited, "daemon did not exit within 3 seconds after idle timeout");
+    assert!(
+        exited,
+        "daemon did not exit within 3 seconds after idle timeout"
+    );
 
     // Socket should be gone (cleaned up) or a fresh daemon should be able to bind it.
     let socket_exists = socket_path.exists();
@@ -659,8 +687,13 @@ fn idle_exit_then_late_client() {
 
     // Verify fresh daemon is responsive.
     let mut stream = connect_with_hello(&socket_path, "shared");
-    send_rpc_request(&mut stream, 1, "tools/call", json!({"name": "db_info", "arguments": json!({})}))
-        .expect("fresh daemon should respond to db_info");
+    send_rpc_request(
+        &mut stream,
+        1,
+        "tools/call",
+        json!({"name": "db_info", "arguments": json!({})}),
+    )
+    .expect("fresh daemon should respond to db_info");
 
     let response = read_rpc_response(&mut stream).expect("read db_info response");
 
@@ -745,10 +778,7 @@ fn hello_refusal() {
                     response
                 );
             } else {
-                panic!(
-                    "response was not valid JSON-RPC: {}",
-                    response_line
-                );
+                panic!("response was not valid JSON-RPC: {}", response_line);
             }
         }
         Err(e) => {

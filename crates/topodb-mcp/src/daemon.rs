@@ -193,13 +193,22 @@ fn open_db(config: &Config) -> Result<Db, TopoError> {
 /// Build the embedder handle exactly as `main.rs` does: `off` disables it,
 /// `auto`/omitted starts the default model, anything else names a model.
 fn build_embedder(config: &Config) -> Embedder {
-    let cache_dir = || config.model_dir.clone().unwrap_or_else(default_model_cache_dir);
+    let cache_dir = || {
+        config
+            .model_dir
+            .clone()
+            .unwrap_or_else(default_model_cache_dir)
+    };
     match config.embeddings.as_deref() {
         Some(s) if s.eq_ignore_ascii_case("off") => Embedder::disabled(),
         Some(s) if s.eq_ignore_ascii_case("auto") => {
             Embedder::start(None, cache_dir(), !config.no_ort_download)
         }
-        other => Embedder::start(other.map(str::to_string), cache_dir(), !config.no_ort_download),
+        other => Embedder::start(
+            other.map(str::to_string),
+            cache_dir(),
+            !config.no_ort_download,
+        ),
     }
 }
 
@@ -207,9 +216,10 @@ fn build_embedder(config: &Config) -> Embedder {
 /// the same fallback `main.rs` uses for `--model-dir`.
 fn default_model_cache_dir() -> PathBuf {
     match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => {
-            PathBuf::from(home).join(".cache").join("topodb").join("models")
-        }
+        Some(home) if !home.is_empty() => PathBuf::from(home)
+            .join(".cache")
+            .join("topodb")
+            .join("models"),
         _ => PathBuf::from(".topodb-models"),
     }
 }
@@ -477,15 +487,10 @@ async fn handle_conn(
     // respond and signal the main loop to drain and exit. Otherwise, hand off
     // to rmcp with the peeked line buffered (BufReader retains it internally).
     let mut next_line = String::new();
-    let peek_ok = match tokio::time::timeout(
-        hello_timeout,
-        reader.read_line(&mut next_line),
-    )
-    .await
-    {
-        Ok(Ok(n)) if n > 0 => true,
-        _ => false,
-    };
+    let peek_ok = matches!(
+        tokio::time::timeout(hello_timeout, reader.read_line(&mut next_line)).await,
+        Ok(Ok(n)) if n > 0
+    );
 
     if peek_ok {
         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(next_line.trim()) {
@@ -554,7 +559,8 @@ mod tests {
 
     #[test]
     fn parses_a_valid_hello() {
-        let line = r#"{"topodb/hello":{"scope":"6DNBXHJSPZ","read_scopes":["6DNBXHJSPZ","shared"]}}"#;
+        let line =
+            r#"{"topodb/hello":{"scope":"6DNBXHJSPZ","read_scopes":["6DNBXHJSPZ","shared"]}}"#;
         let h = parse_hello(line).expect("valid hello");
         assert_eq!(h.scope, "6DNBXHJSPZ");
         assert_eq!(

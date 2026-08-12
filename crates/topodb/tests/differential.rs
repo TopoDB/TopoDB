@@ -115,7 +115,9 @@ mod reference {
                 // and the op log never stores one (the applier resolves it to a
                 // plain CreateNode before append), so the RefModel never has to
                 // mirror find-or-create resolution.
-                Op::UpsertNode { .. } => unreachable!("differential test does not generate UpsertNode"),
+                Op::UpsertNode { .. } => {
+                    unreachable!("differential test does not generate UpsertNode")
+                }
             }
         }
 

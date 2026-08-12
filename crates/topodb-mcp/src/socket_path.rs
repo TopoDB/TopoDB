@@ -60,7 +60,11 @@ pub fn protocol_tag() -> String {
 /// The basename shared by both platforms: `topodb-v{N}-{hash12}`. Unix appends
 /// `.sock`; Windows prefixes the pipe namespace.
 fn endpoint_stem(db_path: &Path) -> String {
-    format!("topodb-{}-{}", protocol_tag(), hash12(&db_path.to_string_lossy()))
+    format!(
+        "topodb-{}-{}",
+        protocol_tag(),
+        hash12(&db_path.to_string_lossy())
+    )
 }
 
 /// Derive the daemon IPC endpoint path for a resolved database path.
@@ -186,7 +190,9 @@ mod tests {
     fn hash12_is_twelve_lowercase_hex_chars() {
         let h = hash12("/Users/drew/.topodb/memory.redb");
         assert_eq!(h.len(), 12);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     // Compare on file_name, not the full path: the directory depends on process
@@ -202,7 +208,10 @@ mod tests {
 
     #[test]
     fn derivation_is_deterministic() {
-        assert_eq!(endpoint_name("/tmp/topodb/memory.redb"), endpoint_name("/tmp/topodb/memory.redb"));
+        assert_eq!(
+            endpoint_name("/tmp/topodb/memory.redb"),
+            endpoint_name("/tmp/topodb/memory.redb")
+        );
     }
 
     #[test]
@@ -257,7 +266,12 @@ mod tests {
 
         std::env::remove_var("XDG_RUNTIME_DIR");
         let without_xdg = socket_path_for(Path::new("/tmp/test.redb"));
-        let parent = without_xdg.parent().unwrap().file_name().unwrap().to_string_lossy();
+        let parent = without_xdg
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert!(
             parent.starts_with("topodb-"),
             "expected per-user topodb-* subdir, got {parent}"

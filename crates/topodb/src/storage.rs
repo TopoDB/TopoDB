@@ -1545,10 +1545,7 @@ impl Storage {
                                     pending
                                         .iter()
                                         .find(|(s, l, k, v, _)| {
-                                            s == scope
-                                                && l == label
-                                                && k == key_prop
-                                                && v == value
+                                            s == scope && l == label && k == key_prop && v == value
                                         })
                                         .map(|(_, _, _, _, pid)| *pid)
                                 }),

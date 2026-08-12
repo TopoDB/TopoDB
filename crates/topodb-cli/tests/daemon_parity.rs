@@ -143,7 +143,13 @@ fn routed_reads_match_direct_output() {
     let mem: String = {
         let out = run(
             &db,
-            &["remember", "--content", "alpha fact about foxes", "--entity", "Fox"],
+            &[
+                "remember",
+                "--content",
+                "alpha fact about foxes",
+                "--entity",
+                "Fox",
+            ],
         );
         let v: serde_json::Value = serde_json::from_str(&out).expect("remember json");
         v["memory_id"].as_str().expect("memory id").to_string()
@@ -162,7 +168,12 @@ fn routed_reads_match_direct_output() {
     );
 
     let ent: String = {
-        let out = run(&db, &["find", "--label", "Entity", "--prop", "name", "--value", "Fox"]);
+        let out = run(
+            &db,
+            &[
+                "find", "--label", "Entity", "--prop", "name", "--value", "Fox",
+            ],
+        );
         let v: serde_json::Value = serde_json::from_str(&out).expect("find json");
         v[0]["id"].as_str().expect("entity id").to_string()
     };
@@ -170,7 +181,12 @@ fn routed_reads_match_direct_output() {
     // Every routable read command, with args that exercise its output shape.
     let cases: Vec<(&str, Vec<&str>)> = vec![
         ("get", vec!["get", &ent]),
-        ("find", vec!["find", "--label", "Entity", "--prop", "name", "--value", "Fox"]),
+        (
+            "find",
+            vec![
+                "find", "--label", "Entity", "--prop", "name", "--value", "Fox",
+            ],
+        ),
         ("get-edges", vec!["get-edges", &ent]),
         ("stats", vec!["stats", &mem]),
         ("lifecycle-candidates", vec!["lifecycle-candidates"]),
@@ -225,11 +241,23 @@ fn search_stays_available_under_a_resident_daemon() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("search.redb");
-    run(&db, &["remember", "--content", "gamma about badgers", "--entity", "Badger"]);
+    run(
+        &db,
+        &[
+            "remember",
+            "--content",
+            "gamma about badgers",
+            "--entity",
+            "Badger",
+        ],
+    );
 
     // Direct (no daemon): a bare array.
     let direct = run(&db, &["search", "badgers"]);
-    assert!(direct.starts_with('['), "direct search should be a bare array: {direct}");
+    assert!(
+        direct.starts_with('['),
+        "direct search should be a bare array: {direct}"
+    );
 
     // Routed (daemon resident): still a bare array, still finds the memory,
     // and crucially NOT a Busy error.
@@ -263,8 +291,30 @@ fn routed_reads_honor_a_non_shared_scope_like_the_direct_path() {
     let db = dir.path().join("scoped.redb");
     // A ULID scope (26 Crockford chars); any fixed valid one works.
     let ulid = "0000000000ABCDEFGHJKMNPQRS";
-    run(&db, &["--scope", "shared", "remember", "--content", "shared visible fact", "--entity", "S"]);
-    run(&db, &["--scope", ulid, "remember", "--content", "scoped only fact", "--entity", "P"]);
+    run(
+        &db,
+        &[
+            "--scope",
+            "shared",
+            "remember",
+            "--content",
+            "shared visible fact",
+            "--entity",
+            "S",
+        ],
+    );
+    run(
+        &db,
+        &[
+            "--scope",
+            ulid,
+            "remember",
+            "--content",
+            "scoped only fact",
+            "--entity",
+            "P",
+        ],
+    );
 
     let direct = run(&db, &["--scope", ulid, "search", "fact"]);
     let _daemon = start_daemon(&bin, &db);
@@ -291,7 +341,10 @@ fn info_is_not_routed() {
     // spec regardless of routing.
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("info.redb");
-    run(&db, &["remember", "--content", "delta note", "--entity", "Delta"]);
+    run(
+        &db,
+        &["remember", "--content", "delta note", "--entity", "Delta"],
+    );
     let info = run(&db, &["info"]);
     let v: serde_json::Value = serde_json::from_str(&info).expect("info json");
     assert!(

@@ -227,7 +227,12 @@ impl Config {
                 }
                 "--scope" => {
                     i += 1;
-                    scope = Some(args_vec.get(i).ok_or("--scope requires a <ulid|shared> value")?.clone());
+                    scope = Some(
+                        args_vec
+                            .get(i)
+                            .ok_or("--scope requires a <ulid|shared> value")?
+                            .clone(),
+                    );
                 }
                 "--read-scopes" => {
                     i += 1;
@@ -525,8 +530,7 @@ mod tests {
 
     #[test]
     fn socket_with_explicit_path_yields_some() {
-        let cfg = Config::from_args(argv(&["--db", "t.redb", "--socket", "/tmp/my.sock"]))
-            .unwrap();
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--socket", "/tmp/my.sock"])).unwrap();
         assert_eq!(cfg.socket, Some(Some(PathBuf::from("/tmp/my.sock"))));
     }
 

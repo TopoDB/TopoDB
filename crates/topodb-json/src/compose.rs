@@ -605,8 +605,14 @@ mod tests {
         ];
         // Only A collapsed onto an existing node; B won its race.
         apply_upsert_remap(&mut entities, &[(planned_a, surviving)]);
-        assert_eq!(entities[0].id, surviving, "collapsed entity takes surviving id");
-        assert!(!entities[0].created, "collapsed entity is not created by this call");
+        assert_eq!(
+            entities[0].id, surviving,
+            "collapsed entity takes surviving id"
+        );
+        assert!(
+            !entities[0].created,
+            "collapsed entity is not created by this call"
+        );
         assert_eq!(entities[1].id, planned_b, "un-remapped entity is untouched");
         assert!(entities[1].created, "un-remapped entity keeps created=true");
         // Empty remap is a no-op.

@@ -18,9 +18,9 @@
 mod config;
 mod daemon;
 mod embedder;
-mod socket_path;
 mod ort_fetch;
 mod server;
+mod socket_path;
 
 use std::error::Error;
 use std::path::PathBuf;

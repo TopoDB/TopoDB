@@ -254,7 +254,10 @@ fn main() {
     while start.elapsed() < bench_duration {
         // Send search from each reader (pipelined).
         for (reader_idx, client) in readers.iter_mut().enumerate() {
-            let query = format!("memory {}", (reader_idx as u128 + start.elapsed().as_millis()) % 10);
+            let query = format!(
+                "memory {}",
+                (reader_idx as u128 + start.elapsed().as_millis()) % 10
+            );
             if let Err(e) = client.send_search_memories(&query, req_id) {
                 eprintln!("Failed to send search from reader {}: {}", reader_idx, e);
                 return;
@@ -283,7 +286,10 @@ fn main() {
                     read_count += 1;
                 }
                 Err(e) => {
-                    eprintln!("Failed to read search response from reader {}: {}", reader_idx, e);
+                    eprintln!(
+                        "Failed to read search response from reader {}: {}",
+                        reader_idx, e
+                    );
                     return;
                 }
             }
@@ -325,14 +331,8 @@ fn main() {
     };
 
     println!("\n=== Throughput Benchmark Results ===");
-    println!(
-        "Read latency p50: {:.2}ms",
-        p50.as_secs_f64() * 1000.0
-    );
-    println!(
-        "Read latency p95: {:.2}ms",
-        p95.as_secs_f64() * 1000.0
-    );
+    println!("Read latency p50: {:.2}ms", p50.as_secs_f64() * 1000.0);
+    println!("Read latency p95: {:.2}ms", p95.as_secs_f64() * 1000.0);
     println!("Total reads: {}", read_count);
     println!("Total throughput: {:.0} reads/sec", throughput);
     println!("Benchmark duration: {:.2}s", elapsed.as_secs_f64());

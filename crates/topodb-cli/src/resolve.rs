@@ -155,7 +155,9 @@ pub fn resolve_scope_str(
 
 /// Default busy-retry budget in milliseconds when neither the flag nor a valid
 /// env value is supplied. Single-sourced from `topodb_json` so the CLI, the MCP
-/// server, and the daemon cannot drift.
+/// server, and the daemon cannot drift. (Referenced by tests; the runtime path
+/// gets the default straight from `topodb_json::lock_wait_budget_ms`.)
+#[allow(dead_code)]
 pub const DEFAULT_LOCK_WAIT_MS: u64 = topodb_json::DEFAULT_LOCK_WAIT_MS;
 
 /// Resolve the busy-retry budget: an explicit `--lock-wait-ms` flag wins;

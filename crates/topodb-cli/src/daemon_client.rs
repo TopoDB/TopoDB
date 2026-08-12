@@ -60,7 +60,11 @@ pub fn protocol_tag() -> String {
 /// `.sock`; Windows prefixes the pipe namespace. Identical to
 /// `topodb-mcp`'s `socket_path::endpoint_stem`.
 fn endpoint_stem(db_path: &Path) -> String {
-    format!("topodb-{}-{}", protocol_tag(), hash12(&db_path.to_string_lossy()))
+    format!(
+        "topodb-{}-{}",
+        protocol_tag(),
+        hash12(&db_path.to_string_lossy())
+    )
 }
 
 /// Derive the daemon IPC endpoint path for a resolved database path.
@@ -262,7 +266,10 @@ pub fn unwrap_tool_result(result: &serde_json::Value) -> Result<serde_json::Valu
         let text = obj
             .get("content")
             .and_then(|c| c.as_array())
-            .and_then(|a| a.iter().find_map(|b| b.get("text").and_then(|t| t.as_str())))
+            .and_then(|a| {
+                a.iter()
+                    .find_map(|b| b.get("text").and_then(|t| t.as_str()))
+            })
             .unwrap_or("tool call reported isError with no message");
         return Err(DaemonError::Protocol(text.to_string()));
     }
@@ -286,7 +293,9 @@ pub fn unwrap_tool_result(result: &serde_json::Value) -> Result<serde_json::Valu
             })
         })
         .ok_or_else(|| {
-            DaemonError::Protocol("tool result had no structuredContent or text content".to_string())
+            DaemonError::Protocol(
+                "tool result had no structuredContent or text content".to_string(),
+            )
         })?;
 
     serde_json::from_str(text)
@@ -443,8 +452,9 @@ mod imp {
         /// any I/O error is a [`DaemonError::Transport`] — the caller's cue to
         /// fall through to direct open.
         pub fn connect(endpoint: &Path, scopes: &HelloScopes) -> Result<Self, DaemonError> {
-            let stream = UnixStream::connect(endpoint)
-                .map_err(|e| DaemonError::Transport(format!("connect {}: {e}", endpoint.display())))?;
+            let stream = UnixStream::connect(endpoint).map_err(|e| {
+                DaemonError::Transport(format!("connect {}: {e}", endpoint.display()))
+            })?;
             stream
                 .set_read_timeout(Some(IO_TIMEOUT))
                 .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
@@ -524,7 +534,10 @@ mod imp {
                 if let Some(err) = msg.get("error") {
                     return Err(DaemonError::Protocol(err.to_string()));
                 }
-                return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                return Ok(msg
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
             }
         }
 
@@ -662,7 +675,8 @@ mod tests {
     fn discover_absent_signals_fall_through() {
         // Point discovery at a runtime dir with no socket in it.
         let dir = tempfile::tempdir().unwrap();
-        let got = with_xdg_runtime_dir(dir.path(), || discover(Path::new("/tmp/never-served.redb")));
+        let got =
+            with_xdg_runtime_dir(dir.path(), || discover(Path::new("/tmp/never-served.redb")));
         assert_eq!(got, Discovery::NoSocket);
     }
 
@@ -689,7 +703,10 @@ mod tests {
             scope: "01ABC".to_string(),
             read_scopes: vec!["01ABC".to_string(), "shared".to_string()],
         });
-        assert!(frame.ends_with('\n'), "hello frame must be newline-terminated");
+        assert!(
+            frame.ends_with('\n'),
+            "hello frame must be newline-terminated"
+        );
         let parsed: serde_json::Value = serde_json::from_str(frame.trim()).unwrap();
         assert_eq!(parsed[HELLO_KEY]["scope"], "01ABC");
         assert_eq!(parsed[HELLO_KEY]["read_scopes"][0], "01ABC");
@@ -710,10 +727,19 @@ mod tests {
         };
         assert_eq!(d.likely_holder(), LikelyHolder::NonDaemonProcess);
         let m = d.message();
-        assert!(m.contains("/tmp/memory.redb"), "message names the db path: {m}");
-        assert!(m.contains("3000ms"), "message names the exhausted budget: {m}");
+        assert!(
+            m.contains("/tmp/memory.redb"),
+            "message names the db path: {m}"
+        );
+        assert!(
+            m.contains("3000ms"),
+            "message names the exhausted budget: {m}"
+        );
         // The three non-daemon holder classes the design calls out.
-        assert!(m.contains("old pre-daemon topodb binary"), "names old binary: {m}");
+        assert!(
+            m.contains("old pre-daemon topodb binary"),
+            "names old binary: {m}"
+        );
         assert!(m.contains("sgh run"), "names sgh: {m}");
         assert!(m.contains("binding"), "names a binding: {m}");
         assert!(m.contains("non-daemon"), "classifies as non-daemon: {m}");
@@ -728,10 +754,19 @@ mod tests {
         };
         assert_eq!(d.likely_holder(), LikelyHolder::UnusableDaemonSocket);
         let m = d.message();
-        assert!(m.contains("daemon socket exists"), "explains the skew case: {m}");
-        assert!(m.contains("topodb daemon status"), "points at the daemon: {m}");
+        assert!(
+            m.contains("daemon socket exists"),
+            "explains the skew case: {m}"
+        );
+        assert!(
+            m.contains("topodb daemon status"),
+            "points at the daemon: {m}"
+        );
         // It must NOT send the operator hunting a stray process in this case.
-        assert!(!m.contains("sgh run"), "should not enumerate stray holders: {m}");
+        assert!(
+            !m.contains("sgh run"),
+            "should not enumerate stray holders: {m}"
+        );
     }
 
     // --- tool-result unwrap: same JSON as the direct path ---
@@ -744,7 +779,10 @@ mod tests {
             "isError": false,
         });
         let got = unwrap_tool_result(&result).unwrap();
-        assert_eq!(got, serde_json::json!({ "id": "01XYZ", "deduplicated": false }));
+        assert_eq!(
+            got,
+            serde_json::json!({ "id": "01XYZ", "deduplicated": false })
+        );
     }
 
     #[test]
