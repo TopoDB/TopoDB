@@ -144,6 +144,159 @@ fn sixteen_writers_supersede_leaves_exactly_one_open_edge() {
     assert_eq!(closed_count, 16, "every non-final edge must be closed");
 }
 
+/// Two `UpsertNode`s for the same key in ONE batch must collapse to a single
+/// node — the pre-pass has to see its own not-yet-applied create, not just
+/// committed state. (Current callers dedup names before submit, but the applier
+/// invariant must hold regardless of caller.)
+#[test]
+fn two_upserts_same_name_in_one_batch_collapse() {
+    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![],
+    };
+    let db = Db::open_with(dir.path().join("t.redb"), spec).unwrap();
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+    let (a, b) = (NodeId::new(), NodeId::new());
+    let mk = || {
+        let mut p = Props::new();
+        p.insert("name".into(), PropValue::Str("Dup".into()));
+        p
+    };
+    db.submit(vec![
+        Op::UpsertNode {
+            id: a,
+            scope,
+            label: "Entity".into(),
+            key_prop: "name".into(),
+            props: mk(),
+        },
+        Op::UpsertNode {
+            id: b,
+            scope,
+            label: "Entity".into(),
+            key_prop: "name".into(),
+            props: mk(),
+        },
+    ])
+    .unwrap();
+    let hits = db
+        .nodes_by_prop(
+            &ScopeSet::of(&[scope_id]),
+            "Entity",
+            "name",
+            &PropValue::Str("Dup".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "two same-name upserts in one batch must collapse to one node, got {}",
+        hits.len()
+    );
+}
+
+/// Atomic apply-time find-or-create: N writers concurrently `UpsertNode` the
+/// SAME equality-indexed name, each also creating a memory and an edge to that
+/// entity. The applier must collapse them to EXACTLY ONE entity node and route
+/// every edge to it — no graph fragmentation. This is the concurrency the
+/// plan-time find-then-create path could not survive (the N1 fragmentation
+/// class): each writer read "Hub absent" and minted its own node, stranding
+/// facts across duplicate entities.
+#[test]
+fn concurrent_upsert_by_name_collapses_to_one_node() {
+    let _serialize = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let spec = IndexSpec {
+        equality: vec![PropIndex {
+            label: "Entity".into(),
+            prop: "name".into(),
+        }],
+        text: vec![],
+    };
+    let db = Arc::new(Db::open_with(dir.path().join("t.redb"), spec).unwrap());
+    let scope_id = ScopeId::new();
+    let scope = Scope::Id(scope_id);
+    let scopes = ScopeSet::of(&[scope_id]);
+
+    const N: usize = 16;
+    let barrier = Arc::new(std::sync::Barrier::new(N));
+    let mems: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let mems = mems.clone();
+            std::thread::spawn(move || {
+                let entity = NodeId::new();
+                let mem = NodeId::new();
+                let mut ename = Props::new();
+                ename.insert("name".into(), PropValue::Str("Hub".into()));
+                let mut mprops = Props::new();
+                mprops.insert("content".into(), PropValue::Str(format!("fact {i}")));
+                // Release all writers at once so their read-plan windows overlap.
+                barrier.wait();
+                db.submit(vec![
+                    Op::UpsertNode {
+                        id: entity,
+                        scope,
+                        label: "Entity".into(),
+                        key_prop: "name".into(),
+                        props: ename,
+                    },
+                    Op::CreateNode {
+                        id: mem,
+                        scope,
+                        label: "Memory".into(),
+                        props: mprops,
+                    },
+                    Op::CreateEdge {
+                        id: EdgeId::new(),
+                        scope,
+                        ty: "about".into(),
+                        from: mem,
+                        to: entity,
+                        props: Default::default(),
+                        valid_from: None,
+                        recorded_at: None,
+                    },
+                ])
+                .unwrap();
+                mems.lock().unwrap().push(mem);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let hubs = db
+        .nodes_by_prop(&scopes, "Entity", "name", &PropValue::Str("Hub".into()))
+        .unwrap();
+    assert_eq!(
+        hubs.len(),
+        1,
+        "N concurrent UpsertNode of the same name must collapse to ONE node, got {}",
+        hubs.len()
+    );
+    let hub = hubs[0].id;
+    // Every memory's edge must have been routed to the single surviving hub —
+    // no fact stranded on an orphan duplicate.
+    for mem in mems.lock().unwrap().iter() {
+        let edges = db.all_edges_between(*mem, hub);
+        assert_eq!(
+            edges.len(),
+            1,
+            "memory {mem:?} must link to the single surviving hub {hub:?}"
+        );
+    }
+}
+
 /// F9b/F11b: once the write-guards (`dicts`/`scope_registry`) are held only
 /// across interning — not across `tx.commit()`'s fsync — a reader running
 /// concurrently with a large in-flight batch must never be serialized

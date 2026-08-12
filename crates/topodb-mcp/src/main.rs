@@ -1,19 +1,26 @@
-//! `topodb-mcp` — a stdio MCP server exposing the TopoDB agent-memory engine.
+//! `topodb-mcp` — a stdio MCP server / resident daemon exposing the TopoDB agent-memory engine.
 //!
 //! Usage: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!         [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
 //!         [--allow-unscoped-changes] [--embeddings <off|model>]
-//!         [--model-dir <path>] [--no-ort-download]` — see `config`'s module
-//! doc for what each flag controls.
+//!         [--model-dir <path>] [--no-ort-download] [--socket [PATH]]` — see
+//! `config`'s module doc for what each flag controls.
 //!
-//! The process speaks newline-delimited JSON-RPC over stdio (rmcp's `stdio`
-//! transport). stdout is reserved for the protocol; all diagnostics go to
-//! stderr.
+//! Without `--socket` (the default), the process speaks newline-delimited JSON-RPC
+//! over stdio (rmcp's `stdio` transport). stdout is reserved for the protocol; all
+//! diagnostics go to stderr.
+//!
+//! With `--socket [PATH]`, the process runs as a resident daemon: opens the DB,
+//! claims the exclusive lock via election, binds the socket endpoint, and serves
+//! multiple clients concurrently over that endpoint. Stdout is not used for
+//! protocol in this mode.
 
 mod config;
+mod daemon;
 mod embedder;
 mod ort_fetch;
 mod server;
+mod socket_path;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -55,6 +62,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Daemon mode: --socket runs the resident server instead of stdio mode.
+    if config.socket.is_some() {
+        match daemon::serve(&config).await {
+            Ok(daemon::ServeOutcome::Served) => std::process::exit(0),
+            Ok(daemon::ServeOutcome::LostElection) => {
+                eprintln!("another daemon holds this db; exiting (lost election)");
+                std::process::exit(0);
+            }
+            Err(e) => return Err(format!("{e}").into()),
+        }
+    }
+
     // Open using the db's own persisted index spec unless the caller passed an
     // explicit `--spec`. This mirrors `topodb-cli`: an EXISTING file inherits
     // its persisted spec exactly (via `open_stored`), so a db another front end
@@ -66,16 +85,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // power-user seam for creating a db with a custom spec or forcing a
     // re-declare. `Path::exists` is safe here — the parent-dir check above ran,
     // and a stdio MCP server is a single writer per db path.
-    let budget_ms = match std::env::var("TOPODB_LOCK_WAIT_MS") {
-        Err(_) => 3000,
-        Ok(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
-            // A long-running server config'd by hand should start, not die,
-            // on a typo — warn once and use the default (the CLI, by
-            // contrast, hard-errors via clap on the same variable).
-            eprintln!("topodb-mcp: ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using 3000");
-            3000
-        }),
-    };
+    // Shared parse/default policy (`topodb_json::lock_wait_budget_ms`); a
+    // long-running server config'd by hand warns once and uses the default
+    // rather than dying on a typo.
+    let (budget_ms, lock_wait_warn) =
+        topodb_json::lock_wait_budget_ms(std::env::var("TOPODB_LOCK_WAIT_MS").ok().as_deref());
+    if let Some(warn) = lock_wait_warn {
+        eprintln!("topodb-mcp: {warn}");
+    }
     let db = topodb_json::open_with_busy_retry(budget_ms, || {
         match &config.spec {
             Some(spec) => Db::open_with(&config.db_path, spec.clone()),

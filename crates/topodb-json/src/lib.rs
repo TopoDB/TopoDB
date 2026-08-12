@@ -14,9 +14,10 @@ pub use batch::resolve_batch;
 
 mod compose;
 pub use compose::{
-    content_hash, entity_dedup_key, existing_memory, find_existing_entity, memory_props,
-    normalize_content, plan_forget, plan_remember, plan_supersede, resolve_entities_by_name,
-    ComposeError, PlannedEntity, RememberPlan, RememberRequest, DEFAULT_REMEMBER_EDGE_TYPE,
+    apply_upsert_remap, content_hash, entity_dedup_key, existing_memory, find_existing_entity,
+    memory_props, normalize_content, plan_forget, plan_remember, plan_supersede,
+    resolve_entities_by_name, ComposeError, PlannedEntity, RememberPlan, RememberRequest,
+    DEFAULT_REMEMBER_EDGE_TYPE,
 };
 
 mod dup;
@@ -558,6 +559,32 @@ pub fn resolve_scope(scope: Option<&str>, default: Scope) -> Result<Scope, Strin
         Some(s) => ScopeId::from_str(s)
             .map(Scope::Id)
             .map_err(|e| format!("invalid scope {s:?} (expected \"shared\" or a ULID): {e}")),
+    }
+}
+
+/// Default busy-retry budget (ms) when `TOPODB_LOCK_WAIT_MS` is unset or
+/// unparseable. Shared so the CLI, the MCP stdio server, and the daemon can
+/// never drift apart on the value.
+pub const DEFAULT_LOCK_WAIT_MS: u64 = 3000;
+
+/// Parse a `TOPODB_LOCK_WAIT_MS` env value into a busy-retry budget. Absent →
+/// the default, silently. Present-but-unparseable → the default plus a
+/// prefix-less warning (the caller prepends its own program name, since the CLI,
+/// the stdio server, and the daemon each identify themselves differently). This
+/// is the single source of truth for the parse-and-default policy the three
+/// front ends share.
+pub fn lock_wait_budget_ms(env: Option<&str>) -> (u64, Option<String>) {
+    match env {
+        None => (DEFAULT_LOCK_WAIT_MS, None),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) => (v, None),
+            Err(_) => (
+                DEFAULT_LOCK_WAIT_MS,
+                Some(format!(
+                    "ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using {DEFAULT_LOCK_WAIT_MS}"
+                )),
+            ),
+        },
     }
 }
 

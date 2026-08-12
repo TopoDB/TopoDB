@@ -14,7 +14,6 @@ import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { serverArgs, sessionScopes, SERVER_VERSION } from "./server-args.js";
 import { socketPathFor, helloFrame } from "./ipc.js";
 import { serveDegraded } from "./degraded.js";
@@ -320,14 +319,16 @@ const tryConnect = (sock) =>
     c.on("error", () => res(null));
   });
 
-/** Once connected, this process is a dumb byte pipe: the broker does the id
- *  rewriting and the scope stamping, so the client's JSON-RPC passes through
- *  untouched.
+/** Once connected, this process is a dumb byte pipe: the daemon owns the DB and
+ *  stamps this connection's scope onto every request, so the client's JSON-RPC
+ *  passes through untouched. Each connection is its own session on the daemon,
+ *  so there is no id rewriting to do — the broker-era multiplexing machinery is
+ *  retired.
  *
  *  `hello` is written FIRST, before stdin is piped in. Not cosmetic: stdin is
  *  already flowing by the time we get here (Claude Code sends `initialize`
- *  immediately), so piping first would let a real request reach the broker ahead
- *  of the frame that says which scope this session is — and the broker would have
+ *  immediately), so piping first would let a real request reach the daemon ahead
+ *  of the frame that says which scope this session is — and the daemon would have
  *  to either guess or drop it. Writing hello before the pipe is what makes
  *  "every request from this connection carries this session's scope" true for the
  *  FIRST request too, not just the rest. */
@@ -336,7 +337,7 @@ function relay(conn, hello) {
   process.stdin.pipe(conn);
   conn.pipe(process.stdout);
   conn.on("close", () => {
-    // NOT process.exit(0). If the broker dies mid-session (killed, crashed,
+    // NOT process.exit(0). If the daemon dies mid-session (killed, crashed,
     // machine put it under memory pressure), the socket closes and this
     // process is still the MCP server Claude Code is talking to. Exiting 0
     // here reads to Claude Code as a clean, intentional shutdown -- no
@@ -354,10 +355,10 @@ function relay(conn, hello) {
     // returning, silently, with no listener ever having failed and no error
     // thrown -- an even more misleading variant of the exact bug this whole
     // fix exists to close. `serveDegraded`'s OWN direct callers (never having
-    // connected to a broker at all) don't need this: that stdin was never
+    // connected to a daemon at all) don't need this: that stdin was never
     // piped anywhere, so Node's normal on("data") auto-resume behavior holds.
     process.stdin.resume();
-    serveDegraded("the topodb broker exited mid-session; memory is unavailable for the rest of this session (see broker.log)");
+    serveDegraded("the topodb daemon exited mid-session; memory is unavailable for the rest of this session (see the daemon log in the plugin data dir)");
   });
 }
 
@@ -366,7 +367,7 @@ let degradedReason = null;
 let hello = null;
 
 // The ENTIRE bootstrap — reading CLAUDE_PLUGIN_DATA, creating the data dir,
-// resolving/installing the server, spawning the broker — is one try/catch.
+// resolving/installing the server, spawning the daemon — is one try/catch.
 // Before this fix, the CLAUDE_PLUGIN_DATA-unset check and mkdirSync sat
 // OUTSIDE any try/catch: an uncaught throw there is exit 1 with a stack
 // trace and no MCP server at all, while the skill still tells the agent to
@@ -383,47 +384,62 @@ try {
   // fail to come up in a fresh project. Do not remove.
   mkdirSync(dataDir, { recursive: true });
 
-  // This process is no longer the server: it is a thin client of the broker
-  // that owns memory.redb. See specs/2026-07-12-plugin-broker-design.md.
+  // This process is no longer the server: it is a thin client of the daemon
+  // that owns memory.redb. See specs/2026-08-12-topodb-daemon-design.md.
   const args = serverArgs({ projectDir, dataDir });
   const dbPath = args[args.indexOf("--db") + 1];
   const sock = socketPathFor(dbPath);
 
   // The scopes of THIS session, which are not necessarily the ones in `args`:
-  // `args` only take effect if this shim is the one whose broker wins the race,
-  // and one broker serves every project. Sent on connect so the broker can stamp
+  // `args` only take effect if this shim is the one whose daemon wins the race,
+  // and one daemon serves every project. Sent on connect so the daemon can stamp
   // them onto our requests — see sessionScopes()'s comment.
   hello = helloFrame(sessionScopes({ projectDir }));
 
   conn = await tryConnect(sock);
 
   if (!conn) {
-    // No broker. Become one — or race another shim doing the same. Both spawn;
-    // redb's lock decides which survives (see broker.js). Then connect to the
-    // winner.
-    resolveServer(dataDir); // ensure the server is installed BEFORE the broker needs it
-    const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "broker.js");
-    spawn(process.execPath, [brokerPath, ...args], {
-      detached: true,
-      stdio: "ignore",
-    }).unref();
+    // No daemon. Spawn one — or race another shim doing the same. Every spawn
+    // is `topodb-mcp --socket`, the Rust daemon that owns the DB and multiplexes
+    // connections itself; redb's exclusive lock is the election, so the loser's
+    // daemon exits without binding the socket and both shims connect to the
+    // winner. The broker.js multiplexing process is retired from this path.
+    // TOPODB_MCP_SERVER_BIN points at a NATIVE topodb-mcp binary (a local
+    // `cargo build` output) and bypasses npm resolution entirely. The pinned
+    // npm release can lag the daemon protocol (0.0.17 predates `--socket`),
+    // so tests — and anyone running against a dev build — need a seam that
+    // does not route through the shim. Empty string means unset, so a test
+    // can opt a child back into real resolution.
+    const binOverride = process.env.TOPODB_MCP_SERVER_BIN;
+    if (binOverride) {
+      spawn(binOverride, ["--socket", sock, ...args], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    } else {
+      const shimPath = resolveServer(dataDir); // installs the server if needed; returns the topodb-mcp launcher
+      spawn(process.execPath, [shimPath, "--socket", sock, ...args], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
+    }
 
     // 50 × 200ms = a 10s budget (the loop exits the moment the socket is
     // up, so a fast boot pays nothing). The previous 5s budget was too
     // tight for a Windows cold start — fresh exe copy + Defender scan +
     // redb open routinely overran it, and the shim declared memory
-    // degraded while the broker was still coming up.
+    // degraded while the daemon was still coming up.
     for (let i = 0; i < 50 && !conn; i++) {
       await new Promise((r) => setTimeout(r, 200));
       conn = await tryConnect(sock);
     }
     if (!conn) {
-      degradedReason = "could not reach or start the topodb broker; see broker.log in the plugin data dir";
+      degradedReason = "could not reach or start the topodb daemon; see the daemon log in the plugin data dir";
     }
   }
 } catch (err) {
   // Anything above — unset CLAUDE_PLUGIN_DATA, a mkdirSync failure,
-  // resolveServer's install, or the broker spawn itself — failed outright.
+  // resolveServer's install, or the daemon spawn itself — failed outright.
   // This must NOT crash the process: a failed MCP server is nearly invisible
   // in Claude Code while the skill keeps telling the agent to call memory
   // tools. Explain the failure instead of dying — see design §5.
@@ -433,4 +449,4 @@ try {
 // `hello` is null only if the bootstrap threw before deriving it, in which case
 // `conn` is null too and we degrade — so a connected shim always has one.
 if (conn) relay(conn, hello);
-else serveDegraded(degradedReason ?? "could not reach or start the topodb broker; see broker.log in the plugin data dir");
+else serveDegraded(degradedReason ?? "could not reach or start the topodb daemon; see the daemon log in the plugin data dir");

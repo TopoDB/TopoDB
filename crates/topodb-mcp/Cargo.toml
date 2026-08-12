@@ -17,7 +17,7 @@ topodb-obsidian = { path = "../topodb-obsidian", version = "0.0.4" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rmcp = { version = "2.2.0", features = ["server", "transport-io"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "net", "time", "sync"] }
 schemars = "1.2.1"
 fastembed = { version = "5.17.3", default-features = false, features = ["hf-hub-native-tls", "ort-load-dynamic"] }
 libloading = "0.9"
@@ -31,3 +31,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "throughput"
+harness = false

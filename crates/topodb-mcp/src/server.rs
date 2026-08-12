@@ -180,6 +180,49 @@ impl TopoServer {
         Ok(out)
     }
 
+    /// Build a per-connection handler for the resident daemon from a
+    /// `topodb/hello` frame's scopes.
+    ///
+    /// The daemon holds one `Db` (one redb lock) and multiplexes every project
+    /// onto it, exactly as the plugin broker did — so, like [`for_request`],
+    /// scope cannot come from the process's `--scope`/`--read-scopes` (those
+    /// belong only to whoever started the daemon). Each connection announces
+    /// its own scopes in a hello frame; this returns a clone whose *defaults*
+    /// are those scopes, so every later request on that connection resolves
+    /// against them with no per-request `_meta` plumbing. It is the
+    /// connection-open analogue of [`for_request`]'s per-message override, and
+    /// the reason the broker's id-rewriting/`_meta`-stamping multiplexer is
+    /// retired rather than ported: each connection is its own rmcp session
+    /// whose defaults are already the session's scopes.
+    ///
+    /// `scope` is the write scope (`"shared"` or a ULID). `read_scopes`, when
+    /// present and non-empty, is the read set; omitted or empty it falls back
+    /// to the single write scope — the same rule `config.rs` uses when
+    /// `--read-scopes` is omitted, and `for_request` uses for a write-only
+    /// override. Returns the resolution error as a `String` (the daemon turns
+    /// it into a connection refusal) so this stays free of rmcp's `ErrorData`.
+    ///
+    /// [`for_request`]: TopoServer::for_request
+    // Consumed only by the unix daemon's per-connection hello handling; the
+    // stdio server never calls it, so it is dead on non-unix builds.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn for_hello(&self, scope: &str, read_scopes: Option<&[String]>) -> Result<Self, String> {
+        let mut out = self.clone();
+        out.default_scope = convert::resolve_scope(Some(scope), self.default_scope)?;
+
+        let list: Vec<Scope> = match read_scopes {
+            Some(rs) if !rs.is_empty() => rs
+                .iter()
+                .map(|s| convert::resolve_scope(Some(s), out.default_scope))
+                .collect::<Result<Vec<Scope>, String>>()?,
+            _ => vec![out.default_scope],
+        };
+        let rs = ReadScopes::new(list).map_err(|e| e.to_string())?;
+        out.default_scopes = convert::scopes_to_scope_set(rs.as_slice());
+        out.default_read_scopes = rs;
+        Ok(out)
+    }
+
     /// Wraps an open [`Db`], the resolved [`Config`], and the process's
     /// [`Embedder`] handle into a server handler.
     pub fn new(db: Db, config: &Config, embedder: Embedder) -> Self {
@@ -3504,7 +3547,12 @@ impl TopoServer {
             plan.ops.extend(self.embed_op(*id, name));
         }
         if !plan.ops.is_empty() {
-            self.submit_write(plan.ops)?;
+            // Capture the batch's upsert remap: if a concurrent writer had
+            // already created one of this remember's entities, the applier
+            // collapsed onto it and reported the surviving id here. Correct the
+            // reported entities so a caller never gets an orphaned planned id.
+            let batch = self.db.submit(plan.ops).map_err(classify_topo_error)?;
+            convert::apply_upsert_remap(&mut plan.entities, &batch.remap);
         }
         // The near-duplicate probe runs before submit_write (it needs the pre-write
         // graph to compare against), so it can surface ids that THIS call's own
@@ -3763,17 +3811,27 @@ Stamps new ids back into note frontmatter. Deterministic; embeddings applied whe
         // the canonical node either already has its vector or backfill
         // covers it.
         let embed = self.embed_op(id, &p.name);
-        let mut ops = vec![Op::CreateNode {
+        // UpsertNode, not CreateNode: a concurrent create_entity/remember for
+        // the same name resolves atomically at apply time onto the first-
+        // committed node rather than fragmenting into duplicates.
+        let mut ops = vec![Op::UpsertNode {
             id,
             scope,
             label: ENTITY_LABEL.into(),
+            key_prop: ENTITY_NAME_PROP.into(),
             props,
         }];
         ops.extend(embed);
-        self.submit_write(ops)?;
+        let batch = self.db.submit(ops).map_err(classify_topo_error)?;
+        // If the upsert collapsed onto a node a concurrent writer created, the
+        // batch remap names it; report that surviving id and created:false.
+        let (final_id, created) = match batch.remap.iter().find(|(planned, _)| *planned == id) {
+            Some((_, surviving)) => (*surviving, false),
+            None => (id, true),
+        };
         Ok(Json(UpsertResult {
-            id: id.to_string(),
-            created: true,
+            id: final_id.to_string(),
+            created,
         }))
     }
 

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import { socketPathFor, lineReader } from "../ipc.js";
 
 test("socketPathFor is deterministic and db-specific", () => {
@@ -9,9 +10,18 @@ test("socketPathFor is deterministic and db-specific", () => {
 });
 
 test("socketPathFor uses the platform's IPC convention", () => {
+  // The scheme MUST match crates/topodb-mcp/src/socket_path.rs: a `v{N}`
+  // protocol tag in the name, and (on unix) a per-user `topodb-{user}`
+  // runtime dir unless $XDG_RUNTIME_DIR is set.
   const p = socketPathFor("/tmp/x/memory.redb");
-  if (process.platform === "win32") assert.match(p, /^\\\\[.]\\pipe\\topodb-[0-9a-f]{12}$/);
-  else assert.match(p, /topodb-[0-9a-f]{12}\.sock$/);
+  if (process.platform === "win32") {
+    assert.match(p, /^\\\\[.]\\pipe\\topodb-v\d+-[0-9a-f]{12}$/);
+  } else {
+    assert.match(p, /topodb-v\d+-[0-9a-f]{12}\.sock$/);
+    if (!process.env.XDG_RUNTIME_DIR) {
+      assert.match(path.dirname(p), /topodb-[A-Za-z0-9_]+$/);
+    }
+  }
 });
 
 test("socketPathFor stays under the unix 104-byte sun_path limit", () => {

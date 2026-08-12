@@ -3313,6 +3313,7 @@ version = "0.0.12"
 dependencies = [
  "clap",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "topodb",

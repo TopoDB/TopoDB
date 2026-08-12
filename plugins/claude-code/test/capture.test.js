@@ -13,6 +13,22 @@ import { readState, stateFilePath } from "../recorder.js";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOKS = path.join(HERE, "..", "hooks");
 
+// Same seam as daemon.test.js (per-file test processes): launch.js now starts
+// the Rust daemon (`topodb-mcp --socket`), which the pinned npm server
+// predates — the end-to-end broker test needs a local cargo build or a skip.
+const REPO_ROOT = path.join(HERE, "..", "..", "..");
+const DAEMON_BIN = path.join(
+  REPO_ROOT,
+  "target",
+  "debug",
+  process.platform === "win32" ? "topodb-mcp.exe" : "topodb-mcp",
+);
+const HAVE_DAEMON_BIN = existsSync(DAEMON_BIN);
+if (HAVE_DAEMON_BIN) process.env.TOPODB_MCP_SERVER_BIN = DAEMON_BIN;
+const needsDaemonBin = HAVE_DAEMON_BIN
+  ? {}
+  : { skip: "needs target/debug/topodb-mcp (cargo build): pinned npm server predates --socket" };
+
 function runHook(script, payload, env) {
   return execFileSync(process.execPath, [path.join(HOOKS, script)], {
     input: JSON.stringify(payload),
@@ -53,14 +69,18 @@ test("post-tool-use records search results into the state file", () => {
   }
 });
 
-test("session-end flushes an episode through a real broker and deletes state", async () => {
-  // Broker via a real launch.js shim (pinned server 0.0.10 is FINE here:
-  // submit_batch/create_memory/get_node all exist in it).
+test("session-end flushes an episode through a real broker and deletes state", needsDaemonBin, async () => {
+  // Daemon via a real launch.js shim (spawns the local `topodb-mcp --socket`
+  // build through the TOPODB_MCP_SERVER_BIN seam above).
   const { spawn } = await import("node:child_process");
   const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-se-"));
   const projectDir = mkdtempSync(path.join(tmpdir(), "topodb-sep-"));
   const shim = spawn(process.execPath, [path.join(HERE, "..", "launch.js")], {
-    env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: projectDir, TOPODB_BROKER_IDLE_MS: "5000" },
+    // TOPODB_DAEMON_IDLE_MS is what the Rust daemon reads (the old
+    // TOPODB_BROKER_IDLE_MS belonged to the retired broker.js); without it the
+    // detached daemon this test spawns lingers on the 60s default after the
+    // shim is killed in `finally`.
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: projectDir, TOPODB_DAEMON_IDLE_MS: "2000" },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let client = null;

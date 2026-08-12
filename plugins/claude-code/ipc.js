@@ -13,11 +13,27 @@ import path from "node:path";
  * could diagnose.
  */
 export function socketPathFor(dbPath) {
+  // MUST stay byte-for-byte in step with `socket_path_for` in
+  // crates/topodb-mcp/src/socket_path.rs — the CLI derives the endpoint with
+  // that function, and a scheme mismatch means the CLI can never find a daemon
+  // this plugin spawned (or vice versa). Version tag included so an old client
+  // and an incompatible daemon simply never meet at the same name.
   const h = createHash("sha256").update(path.resolve(dbPath), "utf8").digest("hex").slice(0, 12);
-  return process.platform === "win32"
-    ? `\\\\.\\pipe\\topodb-${h}`
-    : path.join(tmpdir(), `topodb-${h}.sock`);
+  const stem = `topodb-${PROTOCOL_TAG}-${h}`;
+  if (process.platform === "win32") return `\\\\.\\pipe\\${stem}`;
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  if (xdg) return path.join(xdg, `${stem}.sock`);
+  // Same per-user fallback dir as the Rust side: {tmp}/topodb-{user}, with the
+  // user sanitized to [A-Za-z0-9] so a hostile $USER cannot escape the temp
+  // dir. The daemon creates and 0700s it at bind time.
+  const rawUser = process.env.USER || process.env.LOGNAME || "default";
+  const user = rawUser.replace(/[^A-Za-z0-9]/g, "_");
+  return path.join(tmpdir(), `topodb-${user}`, `${stem}.sock`);
 }
+
+/** Wire-protocol tag, embedded in every endpoint name. MUST match
+ * `PROTOCOL_TAG` in crates/topodb-mcp/src/socket_path.rs; bump together. */
+export const PROTOCOL_TAG = "v1";
 
 /**
  * The first line a shim sends after connecting: which scopes THIS session reads

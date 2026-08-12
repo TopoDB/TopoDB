@@ -3,7 +3,7 @@
 //! CLI: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!      [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
 //!      [--allow-unscoped-changes] [--embeddings <off|model>]
-//!      [--model-dir <path>] [--no-ort-download]`
+//!      [--model-dir <path>] [--no-ort-download] [--socket [PATH]]`
 //! - `--scope`: the default **write** scope — the scope a created node/edge is
 //!   stamped with when a write tool omits `scope`. `"shared"` (case-insensitive)
 //!   or omitted => [`Scope::Shared`]; any other value is parsed as a ULID.
@@ -32,8 +32,15 @@
 //!   downloaded/cached. Omitted => `default_model_cache_dir()` (`main.rs`).
 //! - `--no-ort-download`: disable the automatic ONNX Runtime dylib download;
 //!   embeddings then require a system runtime or `ORT_DYLIB_PATH`.
+//! - `--socket [PATH]`: enable daemon mode — a resident process serving multiple
+//!   clients over a socket (vs the default stdio mode for single-client embedding).
+//!   Omitted => stdio mode (the default). `--socket` with no following value (or a
+//!   value starting with `-`) => daemon mode with a derived socket path
+//!   (`socket_path_for` from the DB path). `--socket /some/path` => daemon mode with
+//!   an explicit socket path. Daemon mode opens the DB itself and does election-by-lock;
+//!   stdio mode is unchanged and does not touch this field.
 //!
-//! Arg parsing is hand-rolled: the surface is eight flags, so `clap` would add
+//! Arg parsing is hand-rolled: the surface is nine flags, so `clap` would add
 //! a dependency and a proc-macro build for no real gain here.
 
 use std::error::Error;
@@ -45,7 +52,7 @@ use topodb::{IndexSpec, Scope, ScopeId};
 /// The one canonical usage line, shared by `--help` and the unknown-argument
 /// error so the two can never drift. `<off|auto|model>` matches the README
 /// (an explicit `auto` spells out the default model).
-const USAGE: &str = "usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|auto|model>] [--model-dir <path>] [--no-ort-download]";
+const USAGE: &str = "usage: topodb-mcp --db <path> [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>] [--allow-unscoped-changes] [--embeddings <off|auto|model>] [--model-dir <path>] [--no-ort-download] [--socket [PATH]]";
 
 /// Label/prop name constants, single-sourced in `topodb-json` (shared with
 /// `topodb-cli`'s `create-entity`/`create-memory`) and re-exported here so
@@ -122,6 +129,11 @@ pub struct Config {
     /// --no-ort-download: disable the automatic ONNX Runtime dylib download;
     /// embeddings then require a system runtime or ORT_DYLIB_PATH.
     pub no_ort_download: bool,
+    /// `--socket [PATH]`: daemon mode (vs stdio mode, the default).
+    /// `None` => stdio mode. `Some(None)` => daemon mode with derived socket path.
+    /// `Some(Some(p))` => daemon mode with explicit path `p`. Daemon mode opens
+    /// the DB itself and does election-by-lock; stdio mode is unchanged.
+    pub socket: Option<Option<PathBuf>>,
 }
 
 /// The built-in default index spec used when `--spec` is omitted: equality on
@@ -188,9 +200,12 @@ impl Config {
         let mut embeddings: Option<String> = None;
         let mut model_dir: Option<PathBuf> = None;
         let mut no_ort_download = false;
+        let mut socket: Option<Option<PathBuf>> = None;
 
-        let mut it = args.into_iter();
-        while let Some(arg) = it.next() {
+        let args_vec: Vec<String> = args.into_iter().collect();
+        let mut i = 0;
+        while i < args_vec.len() {
+            let arg = &args_vec[i];
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!("{USAGE}");
@@ -201,21 +216,40 @@ impl Config {
                     std::process::exit(0);
                 }
                 "--db" => {
-                    db_path = Some(it.next().ok_or("--db requires a <path> value")?.into());
+                    i += 1;
+                    db_path = Some(
+                        args_vec
+                            .get(i)
+                            .ok_or("--db requires a <path> value")?
+                            .clone()
+                            .into(),
+                    );
                 }
                 "--scope" => {
-                    scope = Some(it.next().ok_or("--scope requires a <ulid|shared> value")?);
+                    i += 1;
+                    scope = Some(
+                        args_vec
+                            .get(i)
+                            .ok_or("--scope requires a <ulid|shared> value")?
+                            .clone(),
+                    );
                 }
                 "--read-scopes" => {
+                    i += 1;
                     read_scopes = Some(
-                        it.next()
-                            .ok_or("--read-scopes requires a comma-separated <ulid|shared> list")?,
+                        args_vec
+                            .get(i)
+                            .ok_or("--read-scopes requires a comma-separated <ulid|shared> list")?
+                            .clone(),
                     );
                 }
                 "--spec" => {
+                    i += 1;
                     spec_path = Some(
-                        it.next()
+                        args_vec
+                            .get(i)
                             .ok_or("--spec requires a <spec.json> value")?
+                            .clone()
                             .into(),
                     );
                 }
@@ -223,25 +257,44 @@ impl Config {
                     allow_unscoped_changes = true;
                 }
                 "--embeddings" => {
+                    i += 1;
                     embeddings = Some(
-                        it.next()
-                            .ok_or("--embeddings requires an <off|model> value")?,
+                        args_vec
+                            .get(i)
+                            .ok_or("--embeddings requires an <off|model> value")?
+                            .clone(),
                     );
                 }
                 "--model-dir" => {
+                    i += 1;
                     model_dir = Some(
-                        it.next()
+                        args_vec
+                            .get(i)
                             .ok_or("--model-dir requires a <path> value")?
+                            .clone()
                             .into(),
                     );
                 }
                 "--no-ort-download" => {
                     no_ort_download = true;
                 }
+                "--socket" => {
+                    // --socket with optional following value: if next arg exists
+                    // and doesn't start with '-', it's the PATH; otherwise derive.
+                    let next = args_vec.get(i + 1);
+                    socket = Some(match next {
+                        Some(path) if !path.starts_with('-') => {
+                            i += 1;
+                            Some(path.clone().into())
+                        }
+                        _ => None,
+                    });
+                }
                 other => {
                     return Err(format!("unknown argument {other:?}; {USAGE}").into());
                 }
             }
+            i += 1;
         }
 
         let db_path = db_path.ok_or("missing required --db <path>")?;
@@ -273,6 +326,7 @@ impl Config {
             embeddings,
             model_dir,
             no_ort_download,
+            socket,
         })
     }
 }
@@ -460,5 +514,37 @@ mod tests {
     fn no_ort_download_flag_is_a_bare_toggle() {
         let cfg = Config::from_args(argv(&["--db", "x.redb", "--no-ort-download"])).unwrap();
         assert!(cfg.no_ort_download);
+    }
+
+    #[test]
+    fn socket_flag_is_absent_by_default() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb"])).unwrap();
+        assert!(cfg.socket.is_none());
+    }
+
+    #[test]
+    fn socket_without_path_yields_derived() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--socket"])).unwrap();
+        assert_eq!(cfg.socket, Some(None));
+    }
+
+    #[test]
+    fn socket_with_explicit_path_yields_some() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--socket", "/tmp/my.sock"])).unwrap();
+        assert_eq!(cfg.socket, Some(Some(PathBuf::from("/tmp/my.sock"))));
+    }
+
+    #[test]
+    fn socket_followed_by_flag_yields_derived() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--socket", "--embeddings", "off"]))
+            .unwrap();
+        assert_eq!(cfg.socket, Some(None));
+        assert_eq!(cfg.embeddings.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn socket_at_end_yields_derived() {
+        let cfg = Config::from_args(argv(&["--db", "t.redb", "--socket"])).unwrap();
+        assert_eq!(cfg.socket, Some(None));
     }
 }

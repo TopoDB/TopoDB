@@ -1,4 +1,5 @@
 mod cli;
+mod daemon_client;
 mod output;
 mod resolve;
 
@@ -7,7 +8,12 @@ use std::path::Path;
 use std::str::FromStr;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, DaemonCommand};
+// BusyDiagnosis is built on every platform (the Busy error path); DaemonClient
+// and Discovery are the unix socket client, used only under #[cfg(unix)].
+use daemon_client::BusyDiagnosis;
+#[cfg(unix)]
+use daemon_client::{DaemonClient, Discovery};
 use topodb::{
     Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
     TraversalQuery, ValidInterval, VectorQuery,
@@ -88,6 +94,15 @@ fn main() {
         Ok(r) => r.value,
         Err(e) => output::fail("rejected", &e, 2),
     };
+    // Busy-retry budget: flag → TOPODB_LOCK_WAIT_MS → default. An unparseable
+    // env value warns and falls back to the default rather than hard-erroring
+    // (aligned with topodb-mcp; resolved here, not by clap).
+    let (lock_wait_ms, lock_wait_warn) =
+        resolve::resolve_lock_wait_ms(cli.lock_wait_ms, std::env::var("TOPODB_LOCK_WAIT_MS").ok());
+    if let Some(w) = lock_wait_warn {
+        eprintln!("{w}");
+    }
+
     let text_mode = matches!(fmt, resolve::Format::Text);
     let scope_display = scope_r.value.clone();
     let scope_source = scope_r.source.label();
@@ -120,7 +135,55 @@ fn main() {
         _ => default_scope,
     };
 
-    let db = topodb_json::open_with_busy_retry(cli.lock_wait_ms, || {
+    // Daemon control runs BEFORE any direct open: `status`/`stop` target a
+    // RESIDENT daemon, and opening the DB here would just contend with the very
+    // lock that daemon holds (`stop` would then time out against itself).
+    if let Command::Daemon(daemon_cmd) = &cli.cmd {
+        handle_daemon_command(&db_path, daemon_cmd.clone());
+    }
+
+    // Socket-first dispatch: check if a daemon socket exists for this DB path,
+    // and if the command can be routed to it.
+    #[cfg(unix)]
+    if is_daemon_routable(&cli.cmd) {
+        if let Discovery::SocketPresent(endpoint) = daemon_client::discover(&db_path) {
+            let scope_str = topodb_json::scope_label(&default_scope);
+            // The routed read set MUST equal the direct path's, which is
+            // `scope_to_scope_set(default_scope)` — i.e. exactly the one scope
+            // (a ULID reads only itself; `Scope::Shared` reads only shared).
+            // Adding "shared" here would make a `--scope <ULID>` search return
+            // shared-scope memories the direct path never sees — a silent
+            // daemon-vs-no-daemon divergence on the dogfood workflow.
+            let read_scopes = vec![scope_str.clone()];
+            let scopes = daemon_client::HelloScopes {
+                scope: scope_str,
+                read_scopes,
+            };
+            match daemon_client::DaemonClient::connect(&endpoint, &scopes) {
+                Ok(mut client) => {
+                    match try_daemon_route(&mut client, &cli.cmd, &db_path) {
+                        Ok(result) => {
+                            output::ok(&result, cli.pretty);
+                        }
+                        Err(e) => {
+                            // Daemon error: fall through to direct open. Transport errors
+                            // (connection refused, etc.) indicate a stale socket or version
+                            // skew, so the direct open will be attempted and will fail with
+                            // a Busy error (if something holds the lock) or a real error.
+                            eprintln!("topodb: daemon unavailable ({}); trying direct access", e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Connection refused or other transport error: fall through to
+                    // direct open. If a daemon socket exists but is dead, we'll
+                    // discover that when the direct open fails with Busy.
+                }
+            }
+        }
+    }
+
+    let db = topodb_json::open_with_busy_retry(lock_wait_ms, || {
         if db_path.exists() {
             // Inherit the persisted spec, but silently upgrade a db still on an
             // older STOCK default to the current one (`topodb_json::upgraded_spec`
@@ -142,15 +205,22 @@ fn main() {
     });
     let db = match db {
         Ok(db) => db,
-        Err(TopoError::Busy) => output::fail(
-            "busy",
-            &format!(
-                "another process holds {}; retried for {}ms (tune with --lock-wait-ms / TOPODB_LOCK_WAIT_MS)",
-                db_path.display(),
-                cli.lock_wait_ms
-            ),
-            3,
-        ),
+        Err(TopoError::Busy) => {
+            #[cfg(unix)]
+            let socket_present = matches!(
+                daemon_client::discover(&db_path),
+                Discovery::SocketPresent(_)
+            );
+            #[cfg(not(unix))]
+            let socket_present = false;
+
+            let diagnosis = BusyDiagnosis {
+                db_path: db_path.clone(),
+                lock_wait_ms,
+                socket_present,
+            };
+            output::fail("busy", &diagnosis.message(), 3)
+        }
         Err(e) => output::fail_engine(&e),
     };
 
@@ -367,6 +437,7 @@ fn main() {
             candidate,
         } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
         Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
+        Command::Daemon(_) => unreachable!("daemon subcommands exit before the direct open"),
     }
 }
 
@@ -1143,17 +1214,34 @@ fn create_entity(
         Err(e) => output::fail("rejected", &e, 2),
     };
     let id = NodeId::new();
-    let op = Op::CreateNode {
-        id,
-        scope,
-        label: topodb_json::ENTITY_LABEL.into(),
-        props,
+    // `--always-create` means "mint a distinct node even if the name exists" —
+    // a plain CreateNode. Otherwise use UpsertNode so a concurrent create for
+    // the same name collapses atomically at apply time instead of fragmenting.
+    let op = if always_create {
+        Op::CreateNode {
+            id,
+            scope,
+            label: topodb_json::ENTITY_LABEL.into(),
+            props,
+        }
+    } else {
+        Op::UpsertNode {
+            id,
+            scope,
+            label: topodb_json::ENTITY_LABEL.into(),
+            key_prop: topodb_json::ENTITY_NAME_PROP.into(),
+            props,
+        }
     };
-    if let Err(e) = db.submit(vec![op]) {
-        output::fail_engine(&e);
-    }
+    let (final_id, created) = match db.submit(vec![op]) {
+        Ok(batch) => match batch.remap.iter().find(|(planned, _)| *planned == id) {
+            Some((_, surviving)) => (*surviving, false),
+            None => (id, true),
+        },
+        Err(e) => output::fail_engine(&e),
+    };
     output::ok(
-        &serde_json::json!({ "id": id.to_string(), "created": true }),
+        &serde_json::json!({ "id": final_id.to_string(), "created": created }),
         pretty,
     );
 }
@@ -1266,14 +1354,18 @@ fn remember(
         memory_id,
         deduplicated,
         new_memory,
-        entities,
+        mut entities,
         edge_ids,
         superseded,
         ..
     } = plan;
     if !ops.is_empty() {
-        if let Err(e) = db.submit(ops) {
-            output::fail_engine(&e);
+        match db.submit(ops) {
+            // Correct any entity that a concurrent writer had already created:
+            // the applier collapsed this remember's UpsertNode onto the surviving
+            // node and reported it in the batch remap.
+            Ok(batch) => topodb_json::apply_upsert_remap(&mut entities, &batch.remap),
+            Err(e) => output::fail_engine(&e),
         }
     }
     let supersession_candidates: Vec<serde_json::Value> = match &new_memory {
@@ -1596,4 +1688,683 @@ fn submit(db: &Db, default_scope: Scope, input: &str, pretty: bool) -> ! {
         })
         .collect();
     output::ok(&serde_json::json!({ "ids": ids }), pretty);
+}
+
+/// Determine if a command can be routed to a daemon via MCP tools.
+/// Commands that lack direct MCP tool equivalents or are admin-only
+/// (require exclusive lock) fall through to direct open.
+#[cfg(unix)]
+fn is_daemon_routable(cmd: &Command) -> bool {
+    match cmd {
+        // create_entity's --always-create has no tool equivalent, so a
+        // create with that flag set takes the direct path rather than
+        // silently dropping it.
+        Command::CreateEntity { always_create, .. } => !always_create,
+        // `--include-superseded` search has no tool parameter, so that
+        // variant direct-opens; a plain search routes (see the Search arm).
+        Command::Search {
+            include_superseded, ..
+        } => !include_superseded,
+        // Commands deliberately NOT routed (direct-open, Busy-retry under a
+        // resident daemon) because no tool reproduces the direct output:
+        //   * `info` — `db_info` is a lighter summary than the direct CLI's
+        //     full storage/index_spec dump.
+        //   * `changes` — `get_changes` is disabled on the shared daemon (it
+        //     has no --allow-unscoped-changes), so routing always fails over.
+        // These are rare/admin reads, so an occasional Busy under a resident
+        // daemon is acceptable; `search` (the hot read path) is NOT among them.
+        Command::CreateMemory { .. }
+        | Command::Link { .. }
+        | Command::Remember { .. }
+        | Command::Forget { .. }
+        | Command::Get { .. }
+        | Command::Find { .. }
+        | Command::Traverse { .. }
+        | Command::GetEdges { .. }
+        | Command::Stats { .. }
+        | Command::LifecycleCandidates { .. }
+        | Command::SetProps { .. }
+        | Command::RemoveNode { .. }
+        | Command::CloseEdge { .. }
+        | Command::SetEmbedding { .. }
+        | Command::SearchVector { .. } => true,
+        _ => false,
+    }
+}
+
+/// Pull one field out of a tool's structured result, defaulting to `null` if
+/// absent. Used where a tool wraps a collection (`{"nodes": [...]}`) that the
+/// direct CLI path prints unwrapped (a bare array), so routed output matches.
+#[cfg(unix)]
+fn unwrap_field(mut result: serde_json::Value, field: &str) -> serde_json::Value {
+    result
+        .get_mut(field)
+        .map(serde_json::Value::take)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Attempt to route a command to the daemon via MCP tool calls.
+/// Returns the tool result JSON if successful; Err if the daemon cannot handle the command.
+/// The caller must output and exit.
+#[cfg(unix)]
+fn try_daemon_route(
+    client: &mut DaemonClient,
+    cmd: &Command,
+    _db_path: &Path,
+) -> Result<serde_json::Value, daemon_client::DaemonError> {
+    use daemon_client::DaemonError;
+
+    match cmd {
+        Command::Get { id } => client.call_tool("get_node", serde_json::json!({ "id": id })),
+        Command::Find {
+            label,
+            prop,
+            value,
+            normalized,
+        } => {
+            let parsed_value = parse_value_arg(value);
+            let value_json = topodb_json::prop_value_to_json(&parsed_value)
+                .map_err(|e| DaemonError::Protocol(format!("serializing value: {e}")))?;
+            let result = client.call_tool(
+                "find_by_prop",
+                serde_json::json!({
+                    "label": label,
+                    "prop": prop,
+                    "value": value_json,
+                    "exact": !normalized,
+                }),
+            )?;
+            // Direct `find` prints a bare array of nodes; the tool wraps it in
+            // `{"nodes": [...]}`. Unwrap so routed output is byte-identical.
+            Ok(unwrap_field(result, "nodes"))
+        }
+        Command::Search {
+            query,
+            k,
+            include_superseded: _, // guaranteed false by is_daemon_routable
+            kinds,
+            recency_weight,
+            recency_half_life_days,
+            created_after,
+            created_before,
+            no_temporal_rewrite,
+        } => {
+            // Under a resident daemon, `search` routes to `search_memories` so
+            // it stays AVAILABLE rather than hitting Busy — availability under
+            // concurrency is the point of the daemon. Note: search_memories is
+            // the richer memory-recall pipeline (synonym expansion, graph
+            // boost, entity down-weighting), so ranking can differ from the
+            // direct all-label path; the hits SHAPE ({node, score}) matches.
+            // Unifying the two search implementations is a tracked follow-up.
+            let mut params = serde_json::json!({
+                "query": query,
+                "k": k,
+                "recency_weight": recency_weight,
+            });
+            if !kinds.is_empty() {
+                params["kinds"] = serde_json::to_value(kinds).unwrap();
+            }
+            if let Some(days) = recency_half_life_days {
+                params["recency_half_life_days"] = serde_json::json!(days);
+            }
+            if let Some(after) = created_after {
+                params["created_after"] = serde_json::json!(after);
+            }
+            if let Some(before) = created_before {
+                params["created_before"] = serde_json::json!(before);
+            }
+            if *no_temporal_rewrite {
+                params["temporal_rewrite"] = serde_json::json!(false);
+            }
+            let result = client.call_tool("search_memories", params)?;
+            Ok(unwrap_field(result, "hits"))
+        }
+        Command::Traverse {
+            seed,
+            max_hops,
+            direction,
+            edge_type,
+            as_of,
+            time_axis,
+            valid_interval,
+        } => {
+            let mut params = serde_json::json!({
+                "seed_id": seed,
+                "max_hops": max_hops,
+                "direction": direction.as_str(),
+            });
+            if !edge_type.is_empty() {
+                params["edge_types"] = serde_json::to_value(edge_type).unwrap();
+            }
+            if let Some(ts) = as_of {
+                params["as_of"] = serde_json::json!(ts);
+            }
+            params["time_axis"] = serde_json::json!(time_axis.as_str());
+            insert_valid_interval(&mut params, &allen_interval(valid_interval));
+            client.call_tool("traverse", params)
+        }
+        Command::GetEdges {
+            from,
+            to,
+            edge_type,
+            open_only,
+            as_of,
+            direction,
+            time_axis,
+            valid_interval,
+        } => {
+            let mut params = serde_json::json!({
+                "from_id": from,
+                "direction": direction.as_str(),
+            });
+            if let Some(t) = to {
+                params["to_id"] = serde_json::json!(t);
+            }
+            if let Some(et) = edge_type {
+                params["edge_type"] = serde_json::json!(et);
+            }
+            if let Some(oo) = open_only {
+                params["open_only"] = serde_json::json!(oo);
+            }
+            if let Some(ts) = as_of {
+                params["as_of"] = serde_json::json!(ts);
+            }
+            params["time_axis"] = serde_json::json!(time_axis.as_str());
+            insert_valid_interval(&mut params, &allen_interval(valid_interval));
+            client.call_tool("get_edges", params)
+        }
+        Command::Stats { id } => {
+            let result = client.call_tool("access_stats", serde_json::json!({ "id": id }))?;
+            // Direct `stats` nests the counters under `access_stats` when found;
+            // the tool returns them flat. Reshape to match.
+            let found = result
+                .get("found")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if found {
+                Ok(serde_json::json!({
+                    "found": true,
+                    "access_stats": {
+                        "access_count": result.get("access_count").cloned().unwrap_or(serde_json::json!(0)),
+                        "last_accessed_at": result.get("last_accessed_at").cloned().unwrap_or(serde_json::json!(0)),
+                    }
+                }))
+            } else {
+                Ok(serde_json::json!({ "found": false }))
+            }
+        }
+        Command::LifecycleCandidates {
+            limit,
+            half_life_episodic_days,
+            half_life_semantic_days,
+            half_life_procedural_days,
+            half_life_decision_days,
+            now_ms,
+        } => {
+            let mut params = serde_json::json!({
+                "limit": limit,
+                "half_life_episodic_days": half_life_episodic_days,
+                "half_life_semantic_days": half_life_semantic_days,
+                "half_life_procedural_days": half_life_procedural_days,
+                "half_life_decision_days": half_life_decision_days,
+            });
+            if let Some(ms) = now_ms {
+                params["now_ms"] = serde_json::json!(ms);
+            }
+            let result = client.call_tool("lifecycle_candidates", params)?;
+            // Direct prints a bare array; the tool wraps in `{"candidates": [...]}`.
+            Ok(unwrap_field(result, "candidates"))
+        }
+        Command::CreateMemory {
+            content,
+            props,
+            scope,
+            ..
+        } => {
+            let mut params = serde_json::json!({ "content": content });
+            if let Some(s) = scope {
+                params["scope"] = serde_json::json!(s);
+            }
+            if let Some(p) = props {
+                let props_obj: serde_json::Value = match serde_json::from_str(p) {
+                    Ok(v) => v,
+                    Err(e) => return Err(DaemonError::Protocol(format!("parsing --props: {e}"))),
+                };
+                params["props"] = props_obj;
+            }
+            client.call_tool("create_memory", params)
+        }
+        Command::CreateEntity {
+            name,
+            props,
+            always_create: _, // guaranteed false by is_daemon_routable
+            scope,
+        } => {
+            let mut params = serde_json::json!({ "name": name });
+            if let Some(s) = scope {
+                params["scope"] = serde_json::json!(s);
+            }
+            if let Some(p) = props {
+                let props_obj: serde_json::Value = match serde_json::from_str(p) {
+                    Ok(v) => v,
+                    Err(e) => return Err(DaemonError::Protocol(format!("parsing --props: {e}"))),
+                };
+                params["props"] = props_obj;
+            }
+            client.call_tool("create_entity", params)
+        }
+        Command::Link {
+            from,
+            to,
+            ty,
+            props,
+            valid_from,
+            scope,
+        } => {
+            let mut params = serde_json::json!({
+                "from_id": from,
+                "to_id": to,
+                "edge_type": ty,
+            });
+            if let Some(s) = scope {
+                params["scope"] = serde_json::json!(s);
+            }
+            if let Some(p) = props {
+                let props_obj: serde_json::Value = match serde_json::from_str(p) {
+                    Ok(v) => v,
+                    Err(e) => return Err(DaemonError::Protocol(format!("parsing --props: {e}"))),
+                };
+                params["props"] = props_obj;
+            }
+            if let Some(vf) = valid_from {
+                params["valid_from"] = serde_json::json!(vf);
+            }
+            client.call_tool("link", params)
+        }
+        Command::Remember {
+            content,
+            content_flag,
+            entity,
+            edge_type,
+            supersedes,
+            props,
+            kind,
+            scope,
+            ..
+        } => {
+            let content_str = match content.as_ref().or(content_flag.as_ref()) {
+                Some(c) => c,
+                None => {
+                    return Err(DaemonError::Protocol(
+                        "provide the fact as a positional argument or via --content".to_string(),
+                    ))
+                }
+            };
+            let mut params = serde_json::json!({
+                "content": content_str,
+                "entities": entity,
+            });
+            if let Some(s) = scope {
+                params["scope"] = serde_json::json!(s);
+            }
+            if let Some(et) = edge_type {
+                params["edge_type"] = serde_json::json!(et);
+            }
+            if !supersedes.is_empty() {
+                params["supersedes"] = serde_json::to_value(supersedes).unwrap();
+            }
+            if let Some(p) = props {
+                let props_obj: serde_json::Value = match serde_json::from_str(p) {
+                    Ok(v) => v,
+                    Err(e) => return Err(DaemonError::Protocol(format!("parsing --props: {e}"))),
+                };
+                params["props"] = props_obj;
+            }
+            if let Some(k) = kind {
+                params["kind"] = serde_json::json!(k);
+            }
+            client.call_tool("remember", params)
+        }
+        Command::Forget { ids, scope, .. } => {
+            let mut params = serde_json::json!({ "ids": ids });
+            if let Some(s) = scope {
+                params["scope"] = serde_json::json!(s);
+            }
+            client.call_tool("forget", params)
+        }
+        Command::SetProps { id, props } => {
+            let props_obj: serde_json::Value = match serde_json::from_str(props) {
+                Ok(v) => v,
+                Err(e) => return Err(DaemonError::Protocol(format!("parsing --props: {e}"))),
+            };
+            client.call_tool(
+                "set_node_props",
+                serde_json::json!({ "id": id, "props": props_obj }),
+            )
+        }
+        Command::RemoveNode { id } => {
+            client.call_tool("remove_node", serde_json::json!({ "id": id }))
+        }
+        Command::CloseEdge { id, valid_to } => {
+            let mut params = serde_json::json!({ "id": id });
+            if let Some(vt) = valid_to {
+                params["valid_to"] = serde_json::json!(vt);
+            }
+            client.call_tool("close_edge", params)
+        }
+        Command::SetEmbedding { id, model, vector } => {
+            let vector_json: serde_json::Value = match serde_json::from_str(vector) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(DaemonError::Protocol(format!(
+                        "parsing --vector as JSON: {e}"
+                    )))
+                }
+            };
+            let vector = match topodb_json::json_to_f32_vec(&vector_json) {
+                Ok(v) => v,
+                Err(e) => return Err(DaemonError::Protocol(e)),
+            };
+            client.call_tool(
+                "set_embedding",
+                serde_json::json!({ "id": id, "model": model, "vector": vector }),
+            )
+        }
+        Command::SearchVector {
+            model,
+            vector,
+            k,
+            candidate,
+        } => {
+            let vector_json: serde_json::Value = match serde_json::from_str(vector) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(DaemonError::Protocol(format!(
+                        "parsing --vector as JSON: {e}"
+                    )))
+                }
+            };
+            let vector = match topodb_json::json_to_f32_vec(&vector_json) {
+                Ok(v) => v,
+                Err(e) => return Err(DaemonError::Protocol(e)),
+            };
+            let mut params = serde_json::json!({ "model": model, "vector": vector, "k": k });
+            if !candidate.is_empty() {
+                params["candidates"] = serde_json::to_value(candidate).unwrap();
+            }
+            client.call_tool("search_vectors", params)
+        }
+        _ => unreachable!("is_daemon_routable should have filtered this"),
+    }
+}
+
+/// Flatten a CLI ValidInterval into the tool schema's four mutually exclusive
+/// `valid_*` fields (`valid_during`/`valid_overlaps` as `[from, until]` pairs,
+/// `valid_before`/`valid_after` as bare timestamps) — the daemon has no nested
+/// `valid_interval` object.
+#[cfg(unix)]
+fn insert_valid_interval(params: &mut serde_json::Value, interval: &Option<ValidInterval>) {
+    if let Some(iv) = interval {
+        match iv {
+            ValidInterval::During { from, until } => {
+                params["valid_during"] = serde_json::json!([from, until]);
+            }
+            ValidInterval::Overlaps { from, until } => {
+                params["valid_overlaps"] = serde_json::json!([from, until]);
+            }
+            ValidInterval::Before { t } => {
+                params["valid_before"] = serde_json::json!(t);
+            }
+            ValidInterval::After { t } => {
+                params["valid_after"] = serde_json::json!(t);
+            }
+        }
+    }
+}
+
+/// Extend the DirectionArg enum with an as_str method for MCP calls.
+/// Used only by the socket-routing path (`try_daemon_route`), hence unix-only.
+#[cfg(unix)]
+trait DirectionArgExt {
+    fn as_str(&self) -> &'static str;
+}
+
+#[cfg(unix)]
+impl DirectionArgExt for cli::DirectionArg {
+    fn as_str(&self) -> &'static str {
+        match self {
+            cli::DirectionArg::In => "in",
+            cli::DirectionArg::Out => "out",
+            cli::DirectionArg::Both => "both",
+        }
+    }
+}
+
+/// Extend the TimeAxisArg enum with an as_str method for MCP calls.
+/// Used only by the socket-routing path (`try_daemon_route`), hence unix-only.
+#[cfg(unix)]
+trait TimeAxisArgExt {
+    fn as_str(&self) -> &'static str;
+}
+
+#[cfg(unix)]
+impl TimeAxisArgExt for cli::TimeAxisArg {
+    fn as_str(&self) -> &'static str {
+        match self {
+            cli::TimeAxisArg::Valid => "valid",
+            cli::TimeAxisArg::Recorded => "recorded",
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_daemon_command(db_path: &Path, cmd: DaemonCommand) -> ! {
+    match cmd {
+        DaemonCommand::Status => daemon_status(db_path),
+        DaemonCommand::Start => daemon_start(db_path),
+        DaemonCommand::Stop => daemon_stop(db_path),
+    }
+}
+
+#[cfg(not(unix))]
+fn handle_daemon_command(_db_path: &Path, _cmd: DaemonCommand) -> ! {
+    output::fail(
+        "rejected",
+        "daemon commands are not supported on this platform",
+        2,
+    )
+}
+
+#[cfg(unix)]
+fn daemon_status(db_path: &Path) -> ! {
+    let socket_path = daemon_client::socket_path_for(db_path);
+    // A real connect probe, not mere file existence: a crashed daemon leaves a
+    // dead `.sock` inode behind, and reporting that as live would be a lie.
+    let live = daemon_client::probe_live(&socket_path);
+    // connection_count is omitted (null): the daemon exposes no introspection
+    // frame for it, and a bare connect probe cannot see the count cheaply.
+    let status = serde_json::json!({
+        "socket_path": socket_path,
+        "live": live,
+        "connection_count": serde_json::Value::Null,
+    });
+    output::ok(&status, false);
+}
+
+#[cfg(unix)]
+fn daemon_start(db_path: &Path) -> ! {
+    use std::process::Command as ProcessCommand;
+
+    let socket_path = daemon_client::socket_path_for(db_path);
+
+    // Already serving? Use a live connect probe, not file existence — a stale
+    // inode from a crashed daemon must NOT block a fresh start (the new daemon
+    // reclaims that dead socket itself on bind).
+    if daemon_client::probe_live(&socket_path) {
+        let result = serde_json::json!({
+            "started": false,
+            "socket_path": socket_path,
+        });
+        output::ok(&result, false);
+    }
+
+    // Find topodb-mcp binary: same directory as current exe, then PATH
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| {
+        output::fail("internal", "cannot determine current executable path", 1)
+    });
+    let current_dir = current_exe
+        .parent()
+        .unwrap_or_else(|| Path::new("/usr/bin"));
+    let mcp_path = current_dir.join("topodb-mcp");
+
+    let mcp_binary = if mcp_path.exists() {
+        mcp_path
+    } else {
+        // Fall back to PATH
+        match ProcessCommand::new("which").arg("topodb-mcp").output() {
+            Ok(output) if output.status.success() => {
+                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                std::path::PathBuf::from(path_str)
+            }
+            _ => output::fail(
+                "rejected",
+                "could not find topodb-mcp binary (checked same directory as CLI and PATH)",
+                2,
+            ),
+        }
+    };
+
+    // Spawn a detached daemon. Two things are load-bearing here (mirroring
+    // launch.js's `stdio:"ignore", detached:true`):
+    //  * stdio → null: if the daemon inherited our stdout/stderr it would hold
+    //    the write end of any pipe/capture, so `out=$(topodb daemon start)`
+    //    would block until the daemon exited (up to TOPODB_DAEMON_IDLE_MS, or
+    //    forever with =0) instead of returning as soon as we print our JSON.
+    //  * new process group: so a terminal SIGINT/SIGHUP to the CLI's group does
+    //    not also kill the daemon we just launched to outlive this process.
+    use std::os::unix::process::CommandExt;
+    let child = ProcessCommand::new(&mcp_binary)
+        .arg("--db")
+        .arg(db_path)
+        .arg("--socket")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|e| output::fail("internal", &format!("spawning topodb-mcp: {e}"), 1));
+    // Deliberately do NOT wait on / reap this child: it is a detached daemon
+    // meant to outlive this one-shot CLI process. `forget` drops our handle
+    // without the Drop-time reap clippy's zombie_processes lint expects.
+    std::mem::forget(child);
+
+    #[cfg(unix)]
+    {
+        // Minimal polling: wait up to 5 seconds for socket to appear
+        use std::thread;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        loop {
+            // Wait for the daemon to actually be LISTENING, not just for the
+            // inode to appear — there is a window where the file exists but
+            // bind()/listen() has not completed, and a client connecting then
+            // would be refused.
+            if daemon_client::probe_live(&socket_path) {
+                break;
+            }
+            if start.elapsed() > timeout {
+                output::fail(
+                    "internal",
+                    "daemon socket did not become live within 5 seconds",
+                    1,
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let result = serde_json::json!({
+        "started": true,
+        "socket_path": socket_path,
+    });
+    output::ok(&result, false);
+}
+
+#[cfg(unix)]
+fn daemon_stop(db_path: &Path) -> ! {
+    let socket_path = daemon_client::socket_path_for(db_path);
+
+    // Nothing LIVE to stop: either no socket file, or a stale inode a crashed
+    // daemon left behind (which the next daemon reclaims on bind — we do not
+    // touch it here). A stale inode never "disappears" on its own, so treating
+    // it as live would make the disappear-wait below hang for its full budget.
+    if !daemon_client::probe_live(&socket_path) {
+        let result = serde_json::json!({
+            "stopped": false,
+            "reason": "no live daemon at this db's socket",
+        });
+        output::ok(&result, false);
+    }
+
+    // Ask the daemon to drain and exit. A transport failure here means the
+    // socket is stale (daemon already dead) — not an error for `stop`, whose
+    // contract is "no daemon holds this db when I return"; the socket/lock
+    // wait below is the actual verification either way.
+    if let Err(daemon_client::DaemonError::Protocol(e)) = daemon_client::send_shutdown(&socket_path)
+    {
+        // The daemon answered but REFUSED the shutdown — that's a real
+        // failure, not a stale socket; waiting below would just time out.
+        output::fail("internal", &format!("daemon refused shutdown: {e}"), 1);
+    }
+
+    // Wait for socket to disappear and for flock to be free
+    use std::thread;
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let timeout = Duration::from_secs(10);
+
+    loop {
+        if !daemon_client::socket_present_at(&socket_path) {
+            break;
+        }
+        if start.elapsed() > timeout {
+            output::fail(
+                "internal",
+                "daemon socket did not disappear within 10 seconds",
+                1,
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Verify the db lock is actually free. The daemon unlinks its socket
+    // BEFORE it drops the Db (listener-first teardown), so there is a window
+    // where the socket is gone but the flock is still held — poll rather than
+    // probing once, or a healthy stop reads as a failure.
+    let verify_free = || {
+        topodb_json::open_with_busy_retry(5000, || {
+            if db_path.exists() {
+                Db::open_stored(db_path)
+            } else {
+                Db::open_with(db_path, topodb_json::default_spec())
+            }
+        })
+    };
+
+    match verify_free() {
+        Ok(_) => {
+            let result = serde_json::json!({
+                "stopped": true,
+                "socket_path": socket_path,
+            });
+            output::ok(&result, false);
+        }
+        Err(TopoError::Busy) => output::fail(
+            "internal",
+            "database lock did not become free within 5s of daemon shutdown",
+            1,
+        ),
+        Err(e) => output::fail_engine(&e),
+    }
 }

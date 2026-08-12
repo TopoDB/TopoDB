@@ -1,4 +1,14 @@
-// Cross-process concurrency tests for the plugin broker.
+// Cross-process concurrency tests for the TopoDB daemon (`topodb-mcp --socket`).
+//
+// launch.js is a thin stdio<->socket client now: it connects to the resident
+// Rust daemon (spawning `topodb-mcp --socket` if none is up) which owns the one
+// memory.redb and multiplexes every session's connection itself. These tests
+// therefore exercise the daemon THROUGH launch.js -- election, scope stamping,
+// idle-exit, degraded fallback -- exactly as a real Claude Code session does.
+// The broker.js multiplexing machinery these tests once covered (JSON-RPC id
+// rewriting, cancellation-id translation, listener-close scraping) is retired
+// with the code; those id/cancel concerns no longer exist because each daemon
+// connection is its own rmcp session.
 //
 // THE MISTAKE THIS FILE EXISTS TO NOT REPEAT: every earlier test in this repo
 // ran Claude Code sessions SEQUENTIALLY, and a sequential test cannot see the
@@ -42,10 +52,35 @@ const require = createRequire(import.meta.url);
 const { binaryFileName } = require("@topodb/topodb-mcp/bin/topodb-mcp.js");
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.join(HERE, "..");
-const LAUNCH_JS = path.join(PLUGIN_ROOT, "launch.js");
-const BROKER_JS = path.join(PLUGIN_ROOT, "broker.js");
 
-// Windows CI runners are slow enough that broker handshakes have blown the
+// The pinned npm @topodb/topodb-mcp (SERVER_VERSION) predates `--socket`, so
+// every end-to-end session in this file needs a daemon-capable binary that only
+// a local `cargo build` provides. TOPODB_MCP_SERVER_BIN is launch.js's seam for
+// exactly this; setting it here reaches every spawned shim because the test
+// helpers spread process.env into child env. Without the binary, skip rather
+// than fail — same gate the pi recorder tests use.
+const REPO_ROOT = path.join(PLUGIN_ROOT, "..", "..");
+const DAEMON_BIN = path.join(
+  REPO_ROOT,
+  "target",
+  "debug",
+  process.platform === "win32" ? "topodb-mcp.exe" : "topodb-mcp",
+);
+const HAVE_DAEMON_BIN = existsSync(DAEMON_BIN);
+if (HAVE_DAEMON_BIN) process.env.TOPODB_MCP_SERVER_BIN = DAEMON_BIN;
+const needsDaemonBin = HAVE_DAEMON_BIN
+  ? {}
+  : { skip: "needs target/debug/topodb-mcp (cargo build): pinned npm server predates --socket" };
+// 0.0.17 is the last release WITHOUT --socket. The two npm-resolution tests run
+// the real pinned binary end to end, so they cannot pass until the pin advances
+// to a daemon-capable release — at which point this skip lifts by itself.
+const pinnedPredatesDaemon =
+  SERVER_VERSION === "0.0.17"
+    ? { skip: "pinned @topodb/topodb-mcp predates --socket; unskips when the pin advances" }
+    : {};
+const LAUNCH_JS = path.join(PLUGIN_ROOT, "launch.js");
+
+// Windows CI runners are slow enough that daemon handshakes have blown the
 // 8s deadline twice on unrelated PRs (#56's flake family) — triple it there.
 const DEFAULT_RPC_TIMEOUT_MS = process.platform === "win32" ? 24000 : 8000;
 
@@ -85,8 +120,8 @@ function platformPkgDir(dataDir) {
 
 function rmDir(dir) {
   // Windows kill() is asynchronous (TerminateProcess) and won't remove a
-  // directory while the just-killed broker (or its topodb-mcp child) still
-  // holds a handle on memory.redb / broker.log — rmdir then throws ENOTEMPTY
+  // directory while the just-killed daemon still holds a handle on
+  // memory.redb / its log — rmdir then throws ENOTEMPTY
   // (or EBUSY/EPERM), failing the test in teardown, not on any assertion. This
   // file's own retry budget (10×100ms ≈ 5.5s) was too short and flaked; use the
   // shared grace helper (30×1000ms, and it names what is still held if it ever
@@ -174,10 +209,10 @@ function launchSession({ dataDir, projectDir, env = {} }) {
   return spawnRpcClient(process.execPath, [LAUNCH_JS], {
     CLAUDE_PLUGIN_DATA: dataDir,
     CLAUDE_PROJECT_DIR: projectDir,
-    // Keep every broker THIS suite spawns short-lived. Without this it
+    // Keep every daemon THIS suite spawns short-lived. Without this it
     // inherits the production 60s idle timeout and lingers as an orphan
     // process for up to a minute after each test finishes.
-    TOPODB_BROKER_IDLE_MS: "5000",
+    TOPODB_DAEMON_IDLE_MS: "5000",
     ...env,
   });
 }
@@ -186,7 +221,7 @@ async function connectAndInit({ dataDir, projectDir, env, initTimeoutMs }) {
   const session = launchSession({ dataDir, projectDir, env });
   const initMsg = await session.rpc(
     "initialize",
-    { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "broker-test", version: "0" } },
+    { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "daemon-test", version: "0" } },
     { timeoutMs: initTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS },
   );
   if (initMsg.error) {
@@ -215,6 +250,24 @@ function spawnRawServer(dbPath, scope) {
   return spawnRpcClient(process.execPath, [bin, "--db", dbPath, "--scope", scope, "--read-scopes", `${scope},shared`]);
 }
 
+/** Spawn the resident daemon DIRECTLY (`topodb-mcp --socket`), bypassing
+ * launch.js, so a test owns its process handle. Needed to kill the daemon out
+ * from under a live session without scraping its pid from a log file -- the
+ * broker-era trick, retired with broker.log. Returns the child; wait for its
+ * socket with connectSocketWithRetry before pointing a shim at it. */
+function spawnDaemon(dbPath, scope, env = {}) {
+  // Spawn the LOCAL cargo build directly — the pinned npm shim's binary
+  // predates `--socket` (see the DAEMON_BIN seam at the top of this file), so
+  // resolving through @topodb/topodb-mcp would launch a server that dies on
+  // the flag and the test would time out waiting for a socket.
+  const sock = socketPathFor(dbPath);
+  return spawn(
+    DAEMON_BIN,
+    ["--socket", sock, "--db", dbPath, "--scope", scope, "--read-scopes", `${scope},shared`],
+    { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, ...env } },
+  );
+}
+
 function killAll(sessions) {
   for (const s of sessions) {
     try {
@@ -234,80 +287,13 @@ function killAndWaitForExit(session) {
   });
 }
 
-// --- C2 (notifications/cancelled id-translation) plumbing ----------------
-//
-// Pinning C2 needs an EXACT id collision: session A's own client-chosen id
-// must equal the broker's upstream id for session B's in-flight request. Real
-// timing can't guarantee that deterministically, so this fake server never
-// answers a "hold" call until told to, and echoes back the upstream id the
-// broker assigned each forwarded request (a notification real servers never
-// send -- it exists ONLY so the test can construct the collision on purpose
-// instead of hoping a race lands right).
-const FAKE_CANCEL_SERVER_SRC = `
-import { createInterface } from "node:readline";
-const rl = createInterface({ input: process.stdin, terminal: false });
-const held = new Map();
-const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
-rl.on("line", (line) => {
-  line = line.trim();
-  if (!line) return;
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
-  if (msg.method === "initialize") {
-    out({ jsonrpc: "2.0", id: msg.id, result: {
-      protocolVersion: "2024-11-05", capabilities: { tools: {} },
-      serverInfo: { name: "fake-cancel-server", version: "0" },
-    }});
-    return;
-  }
-  if (msg.method === "notifications/initialized") return;
-  if (msg.method === "notifications/cancelled") {
-    const rid = msg.params && msg.params.requestId;
-    if (held.has(rid)) {
-      held.delete(rid);
-      out({ jsonrpc: "2.0", id: rid, error: { code: -32800, message: "cancelled" } });
-    }
-    return;
-  }
-  if (msg.method === "tools/call" && msg.id !== undefined) {
-    out({ jsonrpc: "2.0", method: "notifications/test-received", params: { upstreamId: msg.id, name: msg.params && msg.params.name } });
-    const name = msg.params && msg.params.name;
-    if (name === "hold") { held.set(msg.id, true); return; }
-    if (name === "count_held") {
-      out({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { heldIds: Array.from(held.keys()) } } });
-      return;
-    }
-    if (name === "flush") {
-      for (const id of held.keys()) out({ jsonrpc: "2.0", id, result: { structuredContent: { status: "completed" } } });
-      held.clear();
-      out({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { status: "flushed" } } });
-      return;
-    }
-    out({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { status: "completed" } } });
-  }
-});
-`;
-
-/** A CLAUDE_PLUGIN_DATA dir wired to the fake cancel-tracking server above
- * instead of the real topodb-mcp, so broker.js's require.resolve finds it at
- * the exact subpath it expects. */
-function mkFakeCancelServerDataDir(prefix) {
-  const dir = mkdtempSync(path.join(tmpdir(), prefix));
-  const pkgDir = path.join(dir, "node_modules", "@topodb", "topodb-mcp");
-  mkdirSync(path.join(pkgDir, "bin"), { recursive: true });
-  writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "@topodb/topodb-mcp", version: "0.0.5", type: "module" }));
-  writeFileSync(path.join(pkgDir, "bin", "topodb-mcp.js"), FAKE_CANCEL_SERVER_SRC);
-  return dir;
-}
-
-/** Newline-delimited JSON-RPC client over a raw socket -- connects DIRECTLY
- * to a broker's socket, bypassing launch.js entirely, so a test can act as
- * its own MCP session and choose ITS OWN client-space ids explicitly (needed
- * to construct the exact id collision C2 is about). */
-/** A raw client on the broker's socket, standing in for a session's shim.
+/** A raw client on the daemon's socket, standing in for a session's shim.
+ * Connects DIRECTLY to the daemon's socket, bypassing launch.js entirely, so a
+ * test can act as its own MCP session -- the reference client broker-client.js
+ * (hooks) mirrors.
  *
  * It MUST open with a hello frame, because that is what a real shim does
- * (`launch.js`'s `relay`) and the broker now refuses to forward a request from a
+ * (`launch.js`'s `relay`) and the daemon refuses to serve a request from a
  * connection whose scope it does not know — it would otherwise have to run that
  * request under whatever scope the server happened to be started with, which is
  * precisely the scope-bleed bug. A test double that skipped the hello would be
@@ -418,7 +404,7 @@ async function connectSocketWithRetry(sock, { retries = 50, intervalMs = 100 } =
 
 // --- tests ---------------------------------------------------------------
 
-test("two_concurrent_sessions_both_get_memory", async () => {
+test("two_concurrent_sessions_both_get_memory", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t1-data-");
   const projA = mkdtempSync(path.join(tmpdir(), "topodb-t1-projA-"));
   const projB = mkdtempSync(path.join(tmpdir(), "topodb-t1-projB-"));
@@ -457,7 +443,7 @@ test("two_concurrent_sessions_both_get_memory", async () => {
   }
 });
 
-test("answers_do_not_cross_between_sessions", async () => {
+test("answers_do_not_cross_between_sessions", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t2-data-");
   const projA = mkdtempSync(path.join(tmpdir(), "topodb-t2-projA-"));
   const projB = mkdtempSync(path.join(tmpdir(), "topodb-t2-projB-"));
@@ -473,9 +459,11 @@ test("answers_do_not_cross_between_sessions", async () => {
     const markerB = `marker-B-${randomUUID()}`;
 
     // Both clients use the SAME JSON-RPC id (1) for DIFFERENT requests, sent
-    // at the same instant. This pins the broker's id-namespacing: if it
-    // forwarded ids unrewritten, session B could receive session A's answer
-    // -- silent, plausible, and catastrophic for a memory tool.
+    // at the same instant. Each shim is its OWN connection = its own rmcp
+    // session on the daemon, so their id-spaces are independent by
+    // construction; this pins that isolation end to end -- a crossed answer
+    // (B receiving A's) would be silent, plausible, and catastrophic for a
+    // memory tool.
     const [resA, resB] = await Promise.all([
       a.rpc("tools/call", { name: "create_memory", arguments: { content: markerA } }, { id: 1 }),
       b.rpc("tools/call", { name: "create_memory", arguments: { content: markerB } }, { id: 1 }),
@@ -512,15 +500,16 @@ test("answers_do_not_cross_between_sessions", async () => {
   }
 });
 
-test("startup_race_elects_one_broker", async () => {
+test("startup_race_elects_one_daemon", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t3-data-");
   const projDirs = Array.from({ length: 5 }, (_, i) => mkdtempSync(path.join(tmpdir(), `topodb-t3-proj${i}-`)));
   const sessions = [];
   try {
-    // Five shims race a COLD db at once. Only one wins redb's exclusive lock
-    // and becomes the broker (see broker.js's election comment); the other
-    // four's brokers exit with DatabaseAlreadyOpen without ever binding the
-    // socket, and their shims connect to the winner instead.
+    // Five shims race a COLD db at once. Each spawns `topodb-mcp --socket`, but
+    // only one wins redb's exclusive lock and binds the socket; the other four
+    // daemons exit with DatabaseAlreadyOpen without ever binding it (redb's lock
+    // IS the election -- see the daemon design doc), and their shims connect to
+    // the winner instead.
     const results = await Promise.all(projDirs.map((projectDir) => connectAndInit({ dataDir, projectDir })));
     sessions.push(...results);
 
@@ -539,21 +528,22 @@ test("startup_race_elects_one_broker", async () => {
   }
 });
 
-test("each_session_writes_to_its_own_project_scope", async () => {
+test("each_session_writes_to_its_own_project_scope", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t3b-data-");
   const projA = mkdtempSync(path.join(tmpdir(), "topodb-t3b-projA-"));
   const projB = mkdtempSync(path.join(tmpdir(), "topodb-t3b-projB-"));
   const sessions = [];
   try {
     // THE SCOPE-BLEED REGRESSION TEST. The tests above already prove two
-    // projects SHARE one database and one broker -- which is the whole point.
+    // projects SHARE one database and one daemon -- which is the whole point.
     // What none of them assert is which SCOPE each session lands in, and that
     // omission is exactly why the bug shipped: `serverArgs()` bakes
-    // `--scope <ULID(projectDir)>` into argv, `broker.js` spawns ONE
-    // topodb-mcp with whichever session's argv got there first, and
-    // `socketPathFor(dbPath)` keys the broker on the DB PATH ALONE -- which is
-    // identical for every project. So session B connects to A's broker and
-    // silently inherits A's scope.
+    // `--scope <ULID(projectDir)>` into argv, ONE daemon wins the lock with
+    // whichever session's argv got there first, and `socketPathFor(dbPath)`
+    // keys the daemon on the DB PATH ALONE -- which is identical for every
+    // project. If the daemon ran every connection under its own startup scope
+    // instead of the per-connection hello scope, session B would silently
+    // inherit A's scope. The hello frame each shim sends is what prevents that.
     //
     // t2 (answers_do_not_cross_between_sessions) PASSES while this is broken:
     // it writes a marker per session and reads each back, which works fine
@@ -596,7 +586,7 @@ test("each_session_writes_to_its_own_project_scope", async () => {
   }
 });
 
-test("one_project_cannot_read_another_projects_memory", async () => {
+test("one_project_cannot_read_another_projects_memory", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t3c-data-");
   const projA = mkdtempSync(path.join(tmpdir(), "topodb-t3c-projA-"));
   const projB = mkdtempSync(path.join(tmpdir(), "topodb-t3c-projB-"));
@@ -652,7 +642,7 @@ test("one_project_cannot_read_another_projects_memory", async () => {
   }
 });
 
-test("repairs an install whose platform binary is missing", async () => {
+test("repairs an install whose platform binary is missing", pinnedPredatesDaemon, async () => {
   // THE GHOST-BINARY BUG, reproduced. On a real Windows install, npm resolved
   // the WRONG platform's optional dependency (`topodb-mcp-linux-x64` on a win32
   // host), so this host's platform package was simply absent — while
@@ -688,13 +678,13 @@ test("repairs an install whose platform binary is missing", async () => {
     //
     // A short idle window because, unlike every other test here, this data dir
     // holds a real COPY of the server rather than a junction to the repo's — so
-    // the topodb-mcp.exe the broker is running lives INSIDE the directory the
+    // the topodb-mcp.exe the daemon is running lives INSIDE the directory the
     // teardown has to delete, and Windows will not delete a running executable.
-    // The broker has to exit before cleanup can succeed.
+    // The daemon has to idle-exit before cleanup can succeed.
     const session = await connectAndInit({
       dataDir,
       projectDir: proj,
-      env: { TOPODB_BROKER_IDLE_MS: "500" },
+      env: { TOPODB_DAEMON_IDLE_MS: "500" },
       initTimeoutMs: 120_000,
     });
     sessions.push(session);
@@ -714,7 +704,7 @@ test("repairs an install whose platform binary is missing", async () => {
     );
   } finally {
     killAll(sessions);
-    // Wait out the (shortened) idle window so the broker exits and releases the
+    // Wait out the (shortened) idle window so the daemon exits and releases the
     // running topodb-mcp.exe that lives inside dataDir — see above.
     await sleep(3000);
     rmDir(dataDir);
@@ -722,12 +712,12 @@ test("repairs an install whose platform binary is missing", async () => {
   }
 });
 
-test("never runs a stale binary resolved from outside its own data dir", async () => {
+test("never runs a stale binary resolved from outside its own data dir", pinnedPredatesDaemon, async () => {
   // The bug AS IT ACTUALLY HAPPENED, end to end. Missing platform package in the
   // data dir + a stale copy of that package in an ANCESTOR node_modules.
   // `require.resolve` walks up, finds the stale one, and returns it. Resolution
   // SUCCEEDS -- so the shim's "not installed" error never fires, no repair is
-  // attempted, and the broker executes a topodb-mcp@0.0.3 while SERVER_VERSION,
+  // attempted, and the daemon executes a topodb-mcp@0.0.3 while SERVER_VERSION,
   // the installed shim, and npm all say 0.0.7. Nothing anywhere reports a
   // problem; the tools simply never appear.
   //
@@ -784,7 +774,7 @@ test("never runs a stale binary resolved from outside its own data dir", async (
     const session = await connectAndInit({
       dataDir,
       projectDir: proj,
-      env: { TOPODB_BROKER_IDLE_MS: "500" },
+      env: { TOPODB_DAEMON_IDLE_MS: "500" },
       initTimeoutMs: 120_000,
     });
     sessions.push(session);
@@ -802,13 +792,13 @@ test("never runs a stale binary resolved from outside its own data dir", async (
     );
   } finally {
     killAll(sessions);
-    await sleep(3000); // let the broker exit and release the .exe inside dataDir
+    await sleep(3000); // let the daemon exit and release the .exe inside dataDir
     rmDir(root);
     rmDir(proj);
   }
 });
 
-test("broker_idle_exits_and_releases_the_lock", async () => {
+test("daemon_idle_exits_and_releases_the_lock", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t4-data-");
   const proj = mkdtempSync(path.join(tmpdir(), "topodb-t4-proj-"));
   const dbPath = path.join(dataDir, "memory.redb");
@@ -816,20 +806,20 @@ test("broker_idle_exits_and_releases_the_lock", async () => {
   let session = null;
   let prober = null;
   try {
-    // A short, test-only idle window (see broker.js's TOPODB_BROKER_IDLE_MS) --
+    // A short, test-only idle window (the daemon's TOPODB_DAEMON_IDLE_MS) --
     // NOT the production 60s. A 60-second test would be worse than no test.
-    session = await connectAndInit({ dataDir, projectDir: proj, env: { TOPODB_BROKER_IDLE_MS: "1000" } });
+    session = await connectAndInit({ dataDir, projectDir: proj, env: { TOPODB_DAEMON_IDLE_MS: "1000" } });
     const info = await session.rpc("tools/call", { name: "db_info", arguments: {} });
     assert.ok(!info.error, `db_info errored: ${JSON.stringify(info)}`);
 
-    // Disconnect: the broker's client count drops to zero and its
+    // Disconnect: the daemon's connection count drops to zero and its
     // (shortened) idle timer arms.
     await killAndWaitForExit(session);
     session = null;
 
     // Bounded poll for the lock's release. Prove it the same way a second
     // Claude Code window's server would notice it: open the db directly with
-    // a plain topodb-mcp, no broker involved.
+    // a plain topodb-mcp, no daemon involved.
     const deadline = Date.now() + DEFAULT_RPC_TIMEOUT_MS;
     let opened = false;
     let lastErr;
@@ -852,7 +842,7 @@ test("broker_idle_exits_and_releases_the_lock", async () => {
       if (!opened) await sleep(300);
     }
 
-    assert.ok(opened, `expected the db to be openable directly after the broker's idle-exit; last error: ${lastErr?.message}`);
+    assert.ok(opened, `expected the db to be openable directly after the daemon's idle-exit; last error: ${lastErr?.message}`);
   } finally {
     if (session) killAll([session]);
     if (prober) killAll([prober]);
@@ -861,11 +851,11 @@ test("broker_idle_exits_and_releases_the_lock", async () => {
   }
 });
 
-test("degrades_visibly_when_memory_is_unavailable", async () => {
+test("degrades_visibly_when_memory_is_unavailable", needsDaemonBin, async () => {
   const dataDir = mkDataDir("topodb-t5-data-");
   const proj = mkdtempSync(path.join(tmpdir(), "topodb-t5-proj-"));
-  // Poison the db path itself so topodb-mcp -- and therefore every broker
-  // that tries to spawn it -- fails to start, without touching the network
+  // Poison the db path itself so topodb-mcp -- and therefore any daemon that
+  // tries to open it -- fails to start, without touching the network
   // (node_modules is already linked in by mkDataDir, so resolveServer()
   // succeeds; it is the SERVER that can't open, not the install).
   mkdirSync(path.join(dataDir, "memory.redb"));
@@ -874,12 +864,12 @@ test("degrades_visibly_when_memory_is_unavailable", async () => {
   try {
     session = launchSession({ dataDir, projectDir: proj });
 
-    // launch.js polls for ~5s (25 * 200ms) before giving up on ever reaching
-    // a broker and falling back to degraded.js -- budget generously for that.
+    // launch.js polls for ~10s (50 * 200ms) before giving up on ever reaching
+    // a daemon and falling back to degraded.js -- budget generously for that.
     const initMsg = await session.rpc(
       "initialize",
-      { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "broker-test", version: "0" } },
-      { timeoutMs: 15000 },
+      { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "daemon-test", version: "0" } },
+      { timeoutMs: 20000 },
     );
     assert.ok(!initMsg.error, `expected a successful (if degraded) initialize, got: ${JSON.stringify(initMsg)}`);
     assert.match(
@@ -904,212 +894,44 @@ test("degrades_visibly_when_memory_is_unavailable", async () => {
   }
 });
 
-test("cancelling_own_request_does_not_cancel_another_sessions_in_flight_request", async () => {
-  // C2. rmcp (crates/topodb-mcp's MCP runtime) looks up notifications/cancelled's
-  // params.requestId in the UPSTREAM id pool and cancels whatever it finds
-  // there. The broker rewrites every REQUEST's id before forwarding it
-  // upstream -- but before this fix, notifications/cancelled was forwarded
-  // verbatim, carrying the CLIENT's own id straight into upstream id-space.
-  // Two independent sessions routinely reuse the same small integers for
-  // their own ids (most JSON-RPC clients start counting at 1), so session A
-  // cancelling ITS OWN id can, by pure coincidence, equal the broker's
-  // upstream id for session B's unrelated in-flight request -- silently
-  // cancelling B's write. This test manufactures that exact collision on
-  // purpose (a real race can't be guaranteed to reproduce it on demand) using
-  // a fake upstream server (see mkFakeCancelServerDataDir) that never answers
-  // a "hold" call until cancelled or flushed, so both requests are
-  // deterministically still in flight when the cancel is sent.
-  const dataDir = mkFakeCancelServerDataDir("topodb-t6-data-");
-  const dbPath = path.join(dataDir, "memory.redb");
-  const args = ["--db", dbPath, "--scope", "t6scope", "--read-scopes", "t6scope,shared"];
-  const sock = socketPathFor(dbPath);
-
-  let broker = null;
-  let a = null;
-  let b = null;
-  try {
-    broker = spawn(process.execPath, [BROKER_JS, ...args], {
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, TOPODB_BROKER_IDLE_MS: "2000" },
-    });
-    let brokerErr = "";
-    broker.stderr.on("data", (d) => (brokerErr += d));
-
-    await connectSocketWithRetry(sock);
-
-    a = socketRpcClient(sock);
-    b = socketRpcClient(sock);
-
-    for (const s of [a, b]) {
-      const init = await s.rpc("initialize", {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "cancel-test", version: "0" },
-      }, { id: "init" });
-      assert.ok(!init.error, `initialize failed: ${JSON.stringify(init)}`);
-      s.notify("notifications/initialized");
-    }
-
-    // B's hold call: whatever upstream id the broker assigns it, we learn via
-    // the fake server's (test-only) echo.
-    const bHoldPromise = b.rpc("tools/call", { name: "hold" }, { id: "b-hold", timeoutMs: 15000 });
-    const bEcho = await b.waitForNotification((n) => n.method === "notifications/test-received" && n.params.name === "hold");
-    const upstreamOfB = bEcho.params.upstreamId;
-
-    // A sends ITS OWN request using, as its own client-space id, the exact
-    // number the broker just assigned to B upstream -- the natural collision
-    // this bug depends on. This becomes a DIFFERENT upstream id (global
-    // counter has moved on), which is exactly the point: A's client-space id
-    // and A's real upstream id now legitimately differ.
-    const aHoldPromise = a.rpc("tools/call", { name: "hold" }, { id: upstreamOfB, timeoutMs: 15000 });
-    // A correctly-fixed broker forgets a cancelled request's pending entry the
-    // moment it translates the cancel (so a stale late response from the
-    // server is never misdelivered to a client that already gave up on it) --
-    // so aHoldPromise is EXPECTED to never resolve. Swallow it here rather
-    // than asserting on it; it gets rejected for real when `a.close()` runs
-    // in `finally`.
-    aHoldPromise.catch(() => {});
-    const aEcho = await a.waitForNotification((n) => n.method === "notifications/test-received" && n.params.name === "hold" && n.params.upstreamId !== upstreamOfB);
-    const upstreamOfA = aEcho.params.upstreamId;
-
-    // A cancels "its own" id -- literally the id it used for the request
-    // above. A correct broker must translate this to A's REAL upstream id and
-    // must NEVER let the raw value (which equals B's real upstream id) reach
-    // the server.
-    a.notify("notifications/cancelled", { requestId: upstreamOfB });
-
-    // Give the (mis)routed cancel time to land, then inspect the fake
-    // server's OWN bookkeeping directly -- proof independent of whether any
-    // response ever reaches a client, which sidesteps the "a correctly
-    // cancelled request gets no further response" behavior above.
-    await sleep(500);
-    const counted = await b.rpc("tools/call", { name: "count_held" }, { id: "count", timeoutMs: 5000 });
-    assert.ok(!counted.error, `count_held errored: ${JSON.stringify(counted)}`);
-    const heldIds = counted.result.structuredContent.heldIds;
-    assert.ok(
-      heldIds.includes(upstreamOfB),
-      `session B's in-flight request was wrongly cancelled by session A's own cancel: held=${JSON.stringify(heldIds)} expected upstreamOfB=${upstreamOfB} still present (stderr: ${brokerErr})`,
-    );
-    assert.ok(
-      !heldIds.includes(upstreamOfA),
-      `session A's own cancel should have cancelled ITS OWN request (translation), not been dropped or misrouted: held=${JSON.stringify(heldIds)} expected upstreamOfA=${upstreamOfA} to be gone`,
-    );
-
-    // End-to-end confirmation: releasing whatever is still genuinely held
-    // must resolve B's original call normally, not with an error.
-    const flush = await b.rpc("tools/call", { name: "flush" }, { id: "flush", timeoutMs: 15000 });
-    assert.ok(!flush.error, `flush errored: ${JSON.stringify(flush)}`);
-    const resB = await bHoldPromise;
-    assert.ok(!resB.error, `session B's in-flight request was wrongly cancelled: ${JSON.stringify(resB)}`);
-    assert.equal(resB.result.structuredContent.status, "completed");
-  } finally {
-    if (a) a.close();
-    if (b) b.close();
-    if (broker) {
-      try {
-        broker.kill();
-      } catch {}
-    }
-    rmDir(dataDir);
-  }
-});
-
-test("broker_stops_accepting_connections_once_idle_exit_begins", async () => {
-  // C3(b). armIdleExit used to check clients.size === 0 and then call
-  // server.kill() WITHOUT ever closing the listening socket -- so the broker
-  // kept ACCEPTING new connections through the entire kill window (measured
-  // 6/24 trials where a connection was accepted and then yanked out from
-  // under the client). This test proves the fix: once the idle timer fires,
-  // the socket stops accepting connections.
-  //
-  // IMPORTANT: this test does NOT poll by repeatedly opening probe
-  // connections to the broker's socket. Every successful connection adds to
-  // `clients` and calls `clearTimeout(idleTimer)` (see listen()'s connection
-  // handler) -- a polling loop built that way perpetually re-arms the very
-  // idle timer it is trying to observe fire, and the timer then NEVER
-  // actually elapses. Instead this polls broker.log (plain file reads, no
-  // socket activity) for the "idle, closing listening socket" line broker.js
-  // logs at the exact point it calls srv.close() -- srv.close() stops
-  // accepting synchronously, so the very next connection attempt after that
-  // line appears must be refused.
-  const dataDir = mkDataDir("topodb-t7-data-");
-  const proj = mkdtempSync(path.join(tmpdir(), "topodb-t7-proj-"));
-  const logFile = path.join(dataDir, "broker.log");
-  let session = null;
-  try {
-    session = await connectAndInit({ dataDir, projectDir: proj, env: { TOPODB_BROKER_IDLE_MS: "600" } });
-    const info = await session.rpc("tools/call", { name: "db_info", arguments: {} });
-    assert.ok(!info.error, `db_info errored: ${JSON.stringify(info)}`);
-
-    const dbPath = path.join(dataDir, "memory.redb");
-    const sock = socketPathFor(dbPath);
-
-    // Disconnect: clients.size drops to 0 and the (shortened) idle timer arms.
-    await killAndWaitForExit(session);
-    session = null;
-
-    const deadline = Date.now() + DEFAULT_RPC_TIMEOUT_MS;
-    let sawCloseLog = false;
-    while (Date.now() < deadline && !sawCloseLog) {
-      try {
-        if (readFileSync(logFile, "utf8").includes("idle, closing listening socket")) {
-          sawCloseLog = true;
-          break;
-        }
-      } catch {
-        // log not written yet
-      }
-      await sleep(20);
-    }
-    assert.ok(sawCloseLog, "expected broker.log to record the idle-exit socket close within 8s");
-
-    // srv.close() stops accepting synchronously (before its callback ever
-    // runs), so a connection attempt made right after we observe the log line
-    // must be refused -- proving accept genuinely stopped, not merely "the
-    // whole process eventually vanished so of course connects fail."
-    const accepted = await new Promise((res) => {
-      const c = net.connect(sock);
-      c.on("connect", () => {
-        c.destroy();
-        res(true);
-      });
-      c.on("error", () => res(false));
-    });
-    assert.equal(accepted, false, "expected the broker to refuse a connection made right after idle-exit's socket close was logged");
-  } finally {
-    if (session) killAll([session]);
-    rmDir(dataDir);
-    rmDir(proj);
-  }
-});
-
-test("shim_degrades_instead_of_exiting_cleanly_when_broker_dies_mid_session", async () => {
-  // C3(a). launch.js's relay() used to do `conn.on("close", () => process.exit(0))`.
-  // Killing the broker mid-session made the shim exit CODE 0 -- which Claude
-  // Code reads as a clean, intentional shutdown: no degraded server, no
+test("shim_degrades_instead_of_exiting_cleanly_when_daemon_dies_mid_session", needsDaemonBin, async () => {
+  // C3(a). launch.js's relay() must NOT do `conn.on("close", () => process.exit(0))`:
+  // killing the daemon mid-session that way makes the shim exit CODE 0 -- which
+  // Claude Code reads as a clean, intentional shutdown: no degraded server, no
   // explanation, while the skill keeps telling the agent to call
-  // search_memories against a server that no longer exists. This test kills
-  // the REAL broker process out from under a live, already-initialized
-  // session and checks the shim survives and starts answering with an
-  // explanatory error instead of vanishing.
+  // search_memories against a server that no longer exists. This test kills the
+  // REAL daemon out from under a live, already-initialized session and checks
+  // the shim survives and starts answering with an explanatory error instead of
+  // vanishing.
+  //
+  // The daemon is spawned DIRECTLY here (not via launch.js) so this test owns
+  // its process handle and can kill it precisely -- the broker-era trick of
+  // scraping a pid out of broker.log is retired with the log. launch.js then
+  // finds that socket already up and connects to it instead of spawning its own.
   const dataDir = mkDataDir("topodb-t8-data-");
   const proj = mkdtempSync(path.join(tmpdir(), "topodb-t8-proj-"));
-  const logFile = path.join(dataDir, "broker.log");
+  const dbPath = path.join(dataDir, "memory.redb");
+  const scope = projectScopeId(proj);
+  const sock = socketPathFor(dbPath);
+  let daemon = null;
   let session = null;
   try {
+    // Idle-exit disabled (0 = never): this daemon must stay up until WE kill
+    // it, so an idle-exit can never masquerade as the mid-session death.
+    daemon = spawnDaemon(dbPath, scope, { TOPODB_DAEMON_IDLE_MS: "0" });
+    await connectSocketWithRetry(sock);
+
     session = await connectAndInit({ dataDir, projectDir: proj });
     const info = await session.rpc("tools/call", { name: "db_info", arguments: {} });
     assert.ok(!info.error, `db_info errored: ${JSON.stringify(info)}`);
 
-    // Find the REAL broker's pid from its own log line (see broker.js's
-    // "listening on ... (pid=...)") -- distinct from `session.child`, which is
-    // launch.js, a thin client of the broker, not the broker itself.
-    const logText = readFileSync(logFile, "utf8");
-    const m = logText.match(/listening on .*\(pid=(\d+)\)/);
-    assert.ok(m, `could not find the broker's pid in broker.log:\n${logText}`);
-    const brokerPid = Number(m[1]);
-
-    process.kill(brokerPid);
+    // Kill the daemon out from under the live session: the shim's socket
+    // closes and relay() must fall back to a degraded server, NOT exit 0.
+    await new Promise((resolve) => {
+      daemon.once("exit", () => resolve());
+      daemon.kill();
+    });
+    daemon = null;
 
     // Give the shim a moment to notice its socket closed, then keep using the
     // SAME session -- the exact scenario a live Claude Code window is in.
@@ -1117,13 +939,18 @@ test("shim_degrades_instead_of_exiting_cleanly_when_broker_dies_mid_session", as
     const afterDeath = await session.rpc("tools/call", { name: "db_info", arguments: {} }, { timeoutMs: 5000 });
 
     // THE assertion: the shim must still be running, not silently exited.
-    assert.equal(session.child.exitCode, null, "the shim must not have exited after the broker died mid-session");
-    assert.equal(session.child.signalCode, null, "the shim must not have exited after the broker died mid-session");
+    assert.equal(session.child.exitCode, null, "the shim must not have exited after the daemon died mid-session");
+    assert.equal(session.child.signalCode, null, "the shim must not have exited after the daemon died mid-session");
     // And it must say WHY memory is gone, not pretend the call succeeded.
-    assert.ok(afterDeath.error, `expected an explanatory error after the broker died, got: ${JSON.stringify(afterDeath)}`);
-    assert.match(afterDeath.error.message, /broker/i, "the error should explain the broker is what died");
+    assert.ok(afterDeath.error, `expected an explanatory error after the daemon died, got: ${JSON.stringify(afterDeath)}`);
+    assert.match(afterDeath.error.message, /daemon/i, "the error should explain the daemon is what died");
   } finally {
     if (session) killAll([session]);
+    if (daemon) {
+      try {
+        daemon.kill();
+      } catch {}
+    }
     rmDir(dataDir);
     rmDir(proj);
   }
