@@ -153,6 +153,34 @@ pub fn resolve_scope_str(
     }
 }
 
+/// Default busy-retry budget in milliseconds when neither the flag nor a
+/// valid env value is supplied. Mirrors topodb-mcp's default.
+pub const DEFAULT_LOCK_WAIT_MS: u64 = 3000;
+
+/// Resolve the busy-retry budget: an explicit `--lock-wait-ms` flag wins;
+/// otherwise `TOPODB_LOCK_WAIT_MS` is parsed. An unparseable env value is NOT
+/// a hard error — it warns and falls back to the default, matching topodb-mcp
+/// (a long-running config typo should not kill startup). Returns the resolved
+/// value plus an optional warning string for the caller to print — this module
+/// stays pure and never touches stderr itself.
+pub fn resolve_lock_wait_ms(flag: Option<u64>, env: Option<String>) -> (u64, Option<String>) {
+    if let Some(f) = flag {
+        return (f, None);
+    }
+    match env {
+        None => (DEFAULT_LOCK_WAIT_MS, None),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) => (v, None),
+            Err(_) => (
+                DEFAULT_LOCK_WAIT_MS,
+                Some(format!(
+                    "topodb: ignoring unparseable TOPODB_LOCK_WAIT_MS={raw:?}; using {DEFAULT_LOCK_WAIT_MS}"
+                )),
+            ),
+        },
+    }
+}
+
 fn parse_format(s: &str) -> Result<Format, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "json" => Ok(Format::Json),
@@ -344,6 +372,33 @@ mod tests {
                 .value,
             Format::Text
         );
+    }
+
+    #[test]
+    fn lock_wait_flag_wins_and_valid_env_parses() {
+        // flag wins even when env is set
+        let (v, warn) = resolve_lock_wait_ms(Some(500), Some("999".into()));
+        assert_eq!(v, 500);
+        assert!(warn.is_none());
+        // valid env parses through unchanged, no warning
+        let (v, warn) = resolve_lock_wait_ms(None, Some("999".into()));
+        assert_eq!(v, 999);
+        assert!(warn.is_none());
+        // unset env → default, no warning
+        let (v, warn) = resolve_lock_wait_ms(None, None);
+        assert_eq!(v, DEFAULT_LOCK_WAIT_MS);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn lock_wait_unparseable_env_warns_and_defaults() {
+        // The whole point: a bad env value must NOT error — it falls back to
+        // the default and surfaces a warning (aligned with topodb-mcp).
+        let (v, warn) = resolve_lock_wait_ms(None, Some("not-a-number".into()));
+        assert_eq!(v, DEFAULT_LOCK_WAIT_MS);
+        let warn = warn.expect("unparseable value should produce a warning");
+        assert!(warn.contains("TOPODB_LOCK_WAIT_MS"), "warn was: {warn}");
+        assert!(warn.contains("not-a-number"), "warn was: {warn}");
     }
 
     #[test]

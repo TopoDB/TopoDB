@@ -1,17 +1,24 @@
-//! `topodb-mcp` — a stdio MCP server exposing the TopoDB agent-memory engine.
+//! `topodb-mcp` — a stdio MCP server / resident daemon exposing the TopoDB agent-memory engine.
 //!
 //! Usage: `topodb-mcp --db <path> [--scope <ulid|shared>]
 //!         [--read-scopes <ulid|shared>[,...]] [--spec <spec.json>]
 //!         [--allow-unscoped-changes] [--embeddings <off|model>]
-//!         [--model-dir <path>] [--no-ort-download]` — see `config`'s module
-//! doc for what each flag controls.
+//!         [--model-dir <path>] [--no-ort-download] [--socket [PATH]]` — see
+//! `config`'s module doc for what each flag controls.
 //!
-//! The process speaks newline-delimited JSON-RPC over stdio (rmcp's `stdio`
-//! transport). stdout is reserved for the protocol; all diagnostics go to
-//! stderr.
+//! Without `--socket` (the default), the process speaks newline-delimited JSON-RPC
+//! over stdio (rmcp's `stdio` transport). stdout is reserved for the protocol; all
+//! diagnostics go to stderr.
+//!
+//! With `--socket [PATH]`, the process runs as a resident daemon: opens the DB,
+//! claims the exclusive lock via election, binds the socket endpoint, and serves
+//! multiple clients concurrently over that endpoint. Stdout is not used for
+//! protocol in this mode.
 
 mod config;
+mod daemon;
 mod embedder;
+mod socket_path;
 mod ort_fetch;
 mod server;
 
@@ -52,6 +59,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 parent.display()
             )
             .into());
+        }
+    }
+
+    // Daemon mode: --socket runs the resident server instead of stdio mode.
+    if config.socket.is_some() {
+        match daemon::serve(&config).await {
+            Ok(daemon::ServeOutcome::Served) => std::process::exit(0),
+            Ok(daemon::ServeOutcome::LostElection) => {
+                eprintln!("another daemon holds this db; exiting (lost election)");
+                std::process::exit(0);
+            }
+            Err(e) => return Err(format!("{e}").into()),
         }
     }
 

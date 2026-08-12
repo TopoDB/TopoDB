@@ -369,6 +369,7 @@ impl RememberRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedEntity {
     pub name: String,
     pub id: NodeId,
@@ -455,14 +456,23 @@ pub fn plan_remember(
                 let props =
                     merge_required_prop(ENTITY_NAME_PROP, PropValue::Str(name.clone()), None)
                         .map_err(ComposeError::Invalid)?;
+                // UpsertNode, not CreateNode: the plan-time `find_existing_entity`
+                // above found nothing, but a CONCURRENT writer may create the same
+                // entity between now and apply. The applier resolves this upsert
+                // against committed state atomically — if the entity now exists it
+                // collapses onto it and remaps this id (and the edge below) — so
+                // concurrent writers never fragment the graph into duplicate
+                // entities. `apply_upsert_remap` (post-submit) rewrites this
+                // entity's reported id/created if the collapse happened.
                 resolved.push(Resolved {
                     name: name.clone(),
                     id,
                     created: true,
-                    op: Some(Op::CreateNode {
+                    op: Some(Op::UpsertNode {
                         id,
                         scope: write_scope,
                         label: ENTITY_LABEL.into(),
+                        key_prop: ENTITY_NAME_PROP.into(),
                         props,
                     }),
                 });
@@ -549,10 +559,61 @@ pub fn plan_remember(
     })
 }
 
+/// Correct planned entities against an applier's upsert remap.
+///
+/// A `plan_remember` entity that had to be CREATED was emitted as an
+/// `UpsertNode`; if a concurrent writer already created that entity, the applier
+/// collapsed onto the surviving node and reported `(planned_id -> surviving_id)`
+/// in `AppliedBatch::remap`. This rewrites such an entity's reported `id` to the
+/// surviving node and flips `created` to false (this call did not create it).
+/// Entities that were not remapped (this writer won the race, or the entity
+/// pre-existed) are untouched. No-op when `remap` is empty (the common case).
+pub fn apply_upsert_remap(entities: &mut [PlannedEntity], remap: &[(NodeId, NodeId)]) {
+    if remap.is_empty() {
+        return;
+    }
+    let map: HashMap<NodeId, NodeId> = remap.iter().copied().collect();
+    for e in entities.iter_mut() {
+        if let Some(&surviving) = map.get(&e.id) {
+            e.id = surviving;
+            e.created = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use topodb::Op;
+
+    #[test]
+    fn apply_upsert_remap_rewrites_collapsed_entities_only() {
+        let planned_a = NodeId::new();
+        let surviving = NodeId::new();
+        let planned_b = NodeId::new();
+        let mut entities = vec![
+            PlannedEntity {
+                name: "A".into(),
+                id: planned_a,
+                created: true,
+            },
+            PlannedEntity {
+                name: "B".into(),
+                id: planned_b,
+                created: true,
+            },
+        ];
+        // Only A collapsed onto an existing node; B won its race.
+        apply_upsert_remap(&mut entities, &[(planned_a, surviving)]);
+        assert_eq!(entities[0].id, surviving, "collapsed entity takes surviving id");
+        assert!(!entities[0].created, "collapsed entity is not created by this call");
+        assert_eq!(entities[1].id, planned_b, "un-remapped entity is untouched");
+        assert!(entities[1].created, "un-remapped entity keeps created=true");
+        // Empty remap is a no-op.
+        let before = entities.clone();
+        apply_upsert_remap(&mut entities, &[]);
+        assert_eq!(entities, before);
+    }
 
     #[test]
     fn plan_supersede_is_public_and_stamps() {

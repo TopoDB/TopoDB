@@ -51,4 +51,27 @@ pub enum Op {
         /// derives valid_to.
         superseded_at: Option<i64>,
     },
+    /// Atomic find-or-create by a unique, equality-indexed prop. Resolved at
+    /// APPLY time (in the single applier's transaction, so it sees every
+    /// prior-committed and prior-same-group create): if a node with `label` and
+    /// `key_prop == props[key_prop]` already exists in `scope`, this op is
+    /// dropped and `id` is remapped to the existing node's id for the rest of
+    /// the batch (edges to `id` follow); otherwise it applies exactly like
+    /// `CreateNode { id, scope, label, props }`. This is the concurrency-safe
+    /// alternative to a plan-time find-then-CreateNode, which fragments the
+    /// graph under concurrent writers (two writers both read "absent" and each
+    /// create a node).
+    ///
+    /// INVARIANT: an `UpsertNode` is ALWAYS resolved into a plain `CreateNode`
+    /// (or dropped) before the op log is appended, so a stored/replayed log
+    /// never contains this variant — which is why it is placed LAST here: a
+    /// transient, apply-only op must never shift the postcard discriminants of
+    /// the persisted variants above it.
+    UpsertNode {
+        id: NodeId,
+        scope: Scope,
+        label: SmolStr,
+        key_prop: SmolStr,
+        props: Props,
+    },
 }

@@ -1465,6 +1465,12 @@ impl Storage {
             // (immutable — old and new scope/slot are always identical), needed to
             // key per-scope-id, per-slot postings/stats/docs (v3 FTS layout).
             let mut fts_edits: Vec<(u32, u64, Option<String>, Option<String>)> = Vec::new();
+            // Declared here (not in the table block below) so the append and the
+            // returned `AppliedBatch` can see them; the pre-pass inside the block
+            // fills them from ops rewritten against the open transaction tables.
+            let mut rewritten: Vec<Op> = Vec::with_capacity(resolved.len());
+            let mut upsert_remap: std::collections::HashMap<NodeId, NodeId> =
+                std::collections::HashMap::new();
             {
                 let mut nodes = tx.open_table(NODES).map_err(storage_err)?;
                 let mut edges = tx.open_table(EDGES).map_err(storage_err)?;
@@ -1484,7 +1490,59 @@ impl Storage {
                 let mut in_adj = tx.open_table(IN_ADJ).map_err(storage_err)?;
                 let mut prop_index = tx.open_table(PROP_INDEX).map_err(storage_err)?;
                 let mut label_index = tx.open_table(LABEL_INDEX).map_err(storage_err)?;
+
+                // Resolve UpsertNode → plain ops WITHIN this transaction, before
+                // the apply loop. A lookup here sees every node written by prior
+                // ops in this batch and by prior batches in the same group commit
+                // (they share `tx`); because the applier is single-threaded, that
+                // makes find-or-create atomic — concurrent writers targeting the
+                // same equality-indexed name all collapse onto the node the first
+                // one commits, and their edges remap onto it. `rewritten` (plain
+                // CreateNode/CreateEdge only) is what the loop applies AND what the
+                // op log stores, so replay never sees an UpsertNode.
                 for op in &resolved {
+                    match op {
+                        Op::UpsertNode {
+                            id,
+                            scope,
+                            label,
+                            key_prop,
+                            props,
+                        } => {
+                            let existing = match props.get(key_prop.as_str()) {
+                                Some(value) => lookup_indexed_node(
+                                    &prop_index,
+                                    &nodes,
+                                    &vectors,
+                                    &embedding_ref,
+                                    dicts,
+                                    scope_registry,
+                                    &self.spec,
+                                    label,
+                                    key_prop,
+                                    value,
+                                    *scope,
+                                )?,
+                                // No value for the key prop → cannot dedup; create.
+                                None => None,
+                            };
+                            match existing {
+                                Some(found) => {
+                                    upsert_remap.insert(*id, found);
+                                }
+                                None => rewritten.push(Op::CreateNode {
+                                    id: *id,
+                                    scope: *scope,
+                                    label: label.clone(),
+                                    props: props.clone(),
+                                }),
+                            }
+                        }
+                        other => rewritten.push(remap_op_node_ids(other, &upsert_remap)),
+                    }
+                }
+
+                for op in &rewritten {
                     // `pre` carries (id, scope, pre_slot, old_text). For CreateNode
                     // the scope comes from the op and the slot isn't allocated yet
                     // (resolved after `apply_op` below); for existing-node ops
@@ -1648,20 +1706,30 @@ impl Storage {
                     .unwrap_or(1)
                     .max(floor);
                 first_seq = next;
-                last_seq = next + resolved.len() as u64 - 1;
-                for (i, op) in resolved.iter().enumerate() {
-                    let bytes = postcard::to_allocvec(op)
-                        .map_err(|e| TopoError::Encoding(e.to_string()))?;
-                    table
-                        .insert(next + i as u64, bytes.as_slice())
-                        .map_err(storage_err)?;
+                if rewritten.is_empty() {
+                    // Every input op was an UpsertNode that deduped onto an
+                    // existing node, so there is nothing to append. Report an
+                    // empty half-open seq range `[next, next)`. Unreachable from
+                    // `remember` (it always carries a memory create or an edge),
+                    // but the applier must not underflow or claim a phantom seq.
+                    last_seq = next - 1;
+                } else {
+                    last_seq = next + rewritten.len() as u64 - 1;
+                    for (i, op) in rewritten.iter().enumerate() {
+                        let bytes = postcard::to_allocvec(op)
+                            .map_err(|e| TopoError::Encoding(e.to_string()))?;
+                        table
+                            .insert(next + i as u64, bytes.as_slice())
+                            .map_err(storage_err)?;
+                    }
                 }
             }
 
             Ok(AppliedBatch {
                 first_seq,
                 last_seq,
-                resolved,
+                resolved: rewritten,
+                remap: upsert_remap.into_iter().collect(),
             })
         })()
     }
@@ -2408,12 +2476,110 @@ impl Storage {
 pub struct AppliedBatch {
     pub first_seq: u64,
     pub last_seq: u64,
+    /// The plain ops actually applied and appended to the log — every
+    /// `UpsertNode` in the input has been rewritten to a `CreateNode` (new) or
+    /// dropped (reused), with node references remapped accordingly.
     pub resolved: Vec<Op>,
+    /// `(planned_id -> surviving_id)` for each `UpsertNode` that collapsed onto
+    /// an existing node. Empty for batches with no upsert reuse. Lets the
+    /// caller (e.g. `remember`) report the canonical id and a `created: false`
+    /// for an entity a concurrent writer had already created.
+    pub remap: Vec<(NodeId, NodeId)>,
 }
 
 /// Fills `CreateEdge.valid_from` / `CloseEdge.valid_to` with `Some(now_ms)`
 /// where the caller left them `None`. All other variants pass through
 /// unchanged. Idempotent: an already-resolved op (`Some(_)`) is left as-is.
+/// Rewrite every NodeId a non-create op REFERENCES through `remap` (an
+/// `UpsertNode`'s planned id → the surviving node's id). A `CreateNode`/
+/// `UpsertNode`'s own id is definitional, not a reference, so it is left alone;
+/// `CloseEdge` references an EdgeId, not a NodeId. Returns a clone unchanged
+/// when `remap` is empty (the common case).
+fn remap_op_node_ids(op: &Op, remap: &std::collections::HashMap<NodeId, NodeId>) -> Op {
+    if remap.is_empty() {
+        return op.clone();
+    }
+    let m = |id: NodeId| remap.get(&id).copied().unwrap_or(id);
+    match op {
+        Op::CreateEdge {
+            id,
+            scope,
+            ty,
+            from,
+            to,
+            props,
+            valid_from,
+            recorded_at,
+        } => Op::CreateEdge {
+            id: *id,
+            scope: *scope,
+            ty: ty.clone(),
+            from: m(*from),
+            to: m(*to),
+            props: props.clone(),
+            valid_from: *valid_from,
+            recorded_at: *recorded_at,
+        },
+        Op::SetNodeProps { id, props } => Op::SetNodeProps {
+            id: m(*id),
+            props: props.clone(),
+        },
+        Op::SetEmbedding { id, model, vector } => Op::SetEmbedding {
+            id: m(*id),
+            model: model.clone(),
+            vector: vector.clone(),
+        },
+        Op::RemoveNode { id } => Op::RemoveNode { id: m(*id) },
+        // A create defines a fresh id; CloseEdge keys on an EdgeId.
+        Op::CreateNode { .. } | Op::UpsertNode { .. } | Op::CloseEdge { .. } => op.clone(),
+    }
+}
+
+/// Find an existing node by an equality-indexed `(label, prop == value)` in
+/// `scope`, reading the still-open write transaction's tables (so it sees
+/// same-transaction prior writes). Returns the OLDEST match (smallest ULID) for
+/// deterministic collapse. `Ok(None)` when the prop is not equality-indexed,
+/// the prop key has never been interned, the value is not indexable, or nothing
+/// matches — in every case the caller falls back to creating the node.
+#[allow(clippy::too_many_arguments)]
+fn lookup_indexed_node(
+    prop_index: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    nodes: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    vectors: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    refs: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    dicts: &Dicts,
+    scopes: &ScopeRegistry,
+    spec: &IndexSpec,
+    label: &str,
+    prop: &str,
+    value: &crate::props::PropValue,
+    scope: Scope,
+) -> Result<Option<NodeId>, TopoError> {
+    if !spec
+        .equality
+        .iter()
+        .any(|c| c.label == label && c.prop == prop)
+    {
+        return Ok(None);
+    }
+    let Some(prop_key) = dicts.id_of(crate::dict::DictKind::PropKey, prop) else {
+        return Ok(None);
+    };
+    let Some(iv) = crate::index::IndexValue::of(value) else {
+        return Ok(None);
+    };
+    let slots = crate::prop_index::lookup(prop_index, prop_key, &iv)?;
+    let mut best: Option<NodeId> = None;
+    for slot in slots {
+        if let Some(rec) = read_node_by_slot(nodes, vectors, refs, dicts, scopes, slot)? {
+            if rec.label == label && rec.scope == scope {
+                best = Some(best.map_or(rec.id, |b| b.min(rec.id)));
+            }
+        }
+    }
+    Ok(best)
+}
+
 fn resolve_op(op: Op, now_ms: i64) -> Op {
     match op {
         Op::CreateEdge {
@@ -2871,6 +3037,16 @@ fn apply_op(
     hnsw_params: &HnswParams,
 ) -> Result<(), TopoError> {
     match op {
+        // UpsertNode is always resolved to a plain CreateNode (or dropped) by
+        // `resolve_upserts_in_txn` before the op loop calls `apply_op`, and the
+        // op log only ever stores those resolved plain ops, so neither the live
+        // path nor replay ever hands one here. Treat it as a hard invariant
+        // breach rather than silently mis-applying.
+        Op::UpsertNode { .. } => Err(TopoError::Encoding(
+            "internal: UpsertNode reached apply_op unresolved (should be rewritten to CreateNode \
+             before apply and never appended to the log)"
+                .into(),
+        )),
         Op::CreateNode {
             id,
             scope,

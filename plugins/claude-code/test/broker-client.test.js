@@ -17,7 +17,25 @@ import { serverArgs } from "../server-args.js";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LAUNCH_JS = path.join(HERE, "..", "launch.js");
 
-test("hook client connects, handshakes, and round-trips tool calls", async () => {
+// Same seam as daemon.test.js (each test FILE is its own process, so this must
+// be set here too): the pinned npm server predates `--socket`, so the shim can
+// only start a real daemon from a local cargo build. Skip these end-to-end
+// tests when it isn't built rather than watching them time out.
+import { existsSync } from "node:fs";
+const REPO_ROOT = path.join(HERE, "..", "..", "..");
+const DAEMON_BIN = path.join(
+  REPO_ROOT,
+  "target",
+  "debug",
+  process.platform === "win32" ? "topodb-mcp.exe" : "topodb-mcp",
+);
+const HAVE_DAEMON_BIN = existsSync(DAEMON_BIN);
+if (HAVE_DAEMON_BIN) process.env.TOPODB_MCP_SERVER_BIN = DAEMON_BIN;
+const needsDaemonBin = HAVE_DAEMON_BIN
+  ? {}
+  : { skip: "needs target/debug/topodb-mcp (cargo build): pinned npm server predates --socket" };
+
+test("hook client connects, handshakes, and round-trips tool calls", needsDaemonBin, async () => {
   const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-bc-"));
   const projectDir = mkdtempSync(path.join(tmpdir(), "topodb-proj-"));
   // A real shim starts the broker; we ride its socket like a hook would.
@@ -26,7 +44,10 @@ test("hook client connects, handshakes, and round-trips tool calls", async () =>
       ...process.env,
       CLAUDE_PLUGIN_DATA: dataDir,
       CLAUDE_PROJECT_DIR: projectDir,
-      TOPODB_BROKER_IDLE_MS: "5000",
+      // The Rust daemon reads TOPODB_DAEMON_IDLE_MS (not the retired broker's
+      // TOPODB_BROKER_IDLE_MS); set it so the detached daemon reaps promptly
+      // after this test kills its shim, rather than lingering 60s.
+      TOPODB_DAEMON_IDLE_MS: "2000",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });

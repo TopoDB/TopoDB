@@ -27,14 +27,12 @@ pub struct Cli {
     pub format: Option<FormatArg>,
     /// Milliseconds to wait (retrying with backoff) when another process
     /// holds the database file, before failing with kind "busy" / exit 3.
-    /// 0 = fail immediately.
-    #[arg(
-        long,
-        global = true,
-        env = "TOPODB_LOCK_WAIT_MS",
-        default_value_t = 3000
-    )]
-    pub lock_wait_ms: u64,
+    /// 0 = fail immediately. Also read from TOPODB_LOCK_WAIT_MS; an
+    /// unparseable env value warns and falls back to the default (3000). The
+    /// env var is resolved in `resolve::resolve_lock_wait_ms`, not by clap, so
+    /// a hand-typed typo in a long-running config never hard-errors.
+    #[arg(long, global = true)]
+    pub lock_wait_ms: Option<u64>,
     #[command(subcommand)]
     pub cmd: Command,
 }
@@ -490,6 +488,28 @@ pub enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Manage the resident `topodb-mcp --socket` daemon for this database.
+    /// The daemon multiplexes many CLI invocations, agent sessions, and plugins
+    /// onto one lock holder for true parallel read throughput. Commands like
+    /// `topodb daemon start` make it explicit (no implicit spawning), and
+    /// `topodb daemon stop` lets you shut it down before running admin commands
+    /// that require exclusive lock access (e.g., `migrate`).
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum DaemonCommand {
+    /// Report daemon socket path, liveness, and connection count (if obtainable).
+    Status,
+    /// Start a detached daemon process for this database. The escape hatch for
+    /// CLI-only workloads that want full throughput without a plugin session.
+    /// Blocks until the socket exists; returns immediately if one is already live.
+    Start,
+    /// Request daemon shutdown: asks the daemon to drain, close the socket,
+    /// and exit. Waits until the database lock is actually free before returning
+    /// (verify via a brief open attempt). Use this before running admin commands.
+    Stop,
 }
 
 /// The four mutually exclusive allen/Allen interval predicates (the engine's
