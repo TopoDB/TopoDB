@@ -14,6 +14,21 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### 0.0.16 — 2026-08-12
+
+#### Added
+
+- **`Op::UpsertNode`** — atomic find-or-create by an equality-indexed prop,
+  resolved inside the applier's transaction (so it sees prior committed and
+  prior same-group-commit state) and rewritten to a plain `CreateNode` (or
+  dropped, remapping its id onto the surviving node and its same-batch edges)
+  before the op log is appended. Concurrent writers naming the same entity now
+  collapse onto the first-committed node instead of fragmenting the graph into
+  duplicates. Appended LAST in the `Op` enum so it never shifts the postcard
+  discriminants of the persisted variants (existing `.redb` logs decode
+  unchanged; the variant never reaches the log). `AppliedBatch` gains `remap`
+  (`planned → surviving` node ids) so callers can report the canonical id.
+
 ### 0.0.15 — 2026-08-11
 
 #### Added
@@ -444,6 +459,22 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.13 — 2026-08-12
+
+#### Added
+
+- `apply_upsert_remap` — rewrites a `remember`/`create_entity` result's entity
+  ids and `created` flags against an applier upsert remap, so a caller never
+  gets an orphaned planned id when a concurrent writer created the entity first.
+- `lock_wait_budget_ms` + `DEFAULT_LOCK_WAIT_MS` — the shared
+  `TOPODB_LOCK_WAIT_MS` parse-and-default policy, single-sourced across the CLI,
+  the stdio MCP server, and the daemon so they cannot drift.
+
+#### Changed
+
+- `plan_remember` emits `Op::UpsertNode` (not `CreateNode`) for a newly created
+  entity, so concurrent same-name writes resolve atomically at apply time.
+
 ### 0.0.12 — 2026-08-11
 
 #### Added
@@ -623,6 +654,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-obsidian`
 
+### 0.0.5 — 2026-08-12
+
+#### Changed
+
+- Dependency-only bump (engine 0.0.16 / json 0.0.13); no functional change.
+
 ### 0.0.4 — 2026-08-11
 
 #### Changed
@@ -641,6 +678,25 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### 0.0.18 — 2026-08-12
+
+#### Added
+
+- **Resident daemon** (`topodb-mcp --socket [PATH]`) — serves the database over
+  a per-user unix socket so many agents (parallel subagents in one session AND
+  independent processes: other sessions, Bash-spawned CLI calls, hooks) read and
+  write one `.redb` at once. Each connection is its own rmcp session on one
+  shared `Db`: reads run concurrently on redb's MVCC, writes funnel into the
+  existing group-commit applier. Lifecycle: redb-lock election (only the winner
+  binds the socket), idle-exit after `TOPODB_DAEMON_IDLE_MS` (default 60s, `0` =
+  never), stale-socket reclaim, and a `topodb/hello` scope handshake with a
+  per-connection timeout and a `-32002` refusal (wedge defense). The socket
+  endpoint (`topodb-v1-<sha12>.sock`) is derived identically to the plugin's
+  `ipc.js`. Runs alongside the unchanged stdio mode; Windows named-pipe
+  transport is a follow-up (unix-only for now).
+- `remember` and `create_entity` emit `Op::UpsertNode`, so concurrent writers
+  naming the same entity no longer fragment the graph into duplicate nodes.
 
 ### 0.0.17 — 2026-08-11
 
@@ -1136,6 +1192,13 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## `topodb-sgh`
 
+### 0.0.6 — 2026-08-12
+
+#### Changed
+
+- Dependency-only bump (engine 0.0.16); no functional change. (Intermediate
+  0.0.3–0.0.5 were undocumented dep-only bumps.)
+
 ### 0.0.2 — 2026-08-04
 
 The first release of sgh as a provider-agnostic agent framework: everything
@@ -1326,6 +1389,20 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 ---
 
 ## `topodb-cli`
+
+### 0.0.13 — 2026-08-12
+
+#### Added
+
+- **Socket-first execution** — when a resident `topodb-mcp --socket` daemon
+  holds the database, the CLI routes memory commands to it as MCP tool calls
+  with output byte-identical to the direct in-process path (and falls back to a
+  direct open when no daemon is present), so a `topodb` call co-exists with a
+  session's daemon instead of failing `Busy` after the lock-wait budget. Adds a
+  `topodb daemon status|start|stop` control surface. `search` routes to
+  `search_memories` (richer recall ranking); `info`/`changes` stay direct-open.
+- `remember`/`create-entity` emit `Op::UpsertNode` for concurrency-safe
+  find-or-create (a concurrent same-name create no longer fragments the graph).
 
 ### 0.0.12 — 2026-08-11
 
