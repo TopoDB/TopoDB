@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-LABEL_W = 24
+LABEL_W = 32
 COL_W = 10
 
 

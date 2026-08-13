@@ -30,8 +30,10 @@ Report: `python -m lme.report results/<file>.json`
   a gold evidence session appears among the first k DISTINCT retrieved sessions).
 - `hybrid − vector` is the RRF fusion delta. Per-type rows show WHERE we win/lose.
 - `coverage@k` (in the JSON) matters only for multi-evidence question types.
-- Runs are deterministic given the dataset, model, and seed (per-question scopes
-  are derived from the question index), so two runs produce identical numbers.
+- Runs are deterministic given the dataset and model: per-question scopes are
+  derived from the question index and embeddings are cached, so two runs produce
+  identical numbers. (`--seed` is recorded in the manifest for provenance; it is
+  not currently wired into any RNG.)
 
 ## Caveats (see spec §9)
 - **The graph/PPR leg is inert here** — sessions are ingested as plain memories

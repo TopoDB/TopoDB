@@ -27,9 +27,9 @@ class Harness:
 
         Two passes so no back-reference indexing is assumed: create all memories
         (ids are positionally aligned to the commands), then set embeddings by
-        real id. A fresh per-question scope has no prior memories, so distinct
-        contents never dedup; identical trivial contents collapse to one node
-        (first session wins) — negligible for recall."""
+        real id. `create_memory` via `submit()` never dedups, so identical
+        contents still produce DISTINCT nodes; `id2session` therefore maps exactly
+        one entry per memory (the `setdefault` is a harmless safety net)."""
         contents = [c for (_, c, _) in mems]
         res = self._db.submit([ops.create_memory(c) for c in contents], default_scope=scope)
         ids = res["ids"]
