@@ -1,0 +1,28 @@
+[
+  {
+    "question_id": "q1",
+    "question_type": "single-session-user",
+    "question": "What is my dog's name?",
+    "answer": "Rex",
+    "haystack_session_ids": ["sess_a", "sess_b"],
+    "haystack_dates": ["2023-01-01", "2023-01-02"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "My dog is named Rex."},
+       {"role": "assistant", "content": "Nice, Rex is a great name."}],
+      [{"role": "user", "content": "I like hiking on weekends."}]
+    ],
+    "answer_session_ids": ["sess_a"]
+  },
+  {
+    "question_id": "q2_abs",
+    "question_type": "single-session-user_abs",
+    "question": "What is my cat's name?",
+    "answer": "No information available.",
+    "haystack_session_ids": ["sess_c"],
+    "haystack_dates": ["2023-02-01"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "I went to the store today."}]
+    ],
+    "answer_session_ids": []
+  }
+]
