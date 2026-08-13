@@ -2286,6 +2286,31 @@ fn daemon_start(db_path: &Path) -> ! {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+
+        // Null stdio for the daemon (above) is NOT enough on Windows: `std`
+        // spawns the child with bInheritHandles=TRUE to hand it those null
+        // handles, and our own std handles stay marked inheritable — a captured
+        // stdout (`out=$(topodb daemon start)`, or a test's `Command::output()`)
+        // is an inheritable pipe end. The detached daemon would inherit that
+        // pipe's write end and hold it open, so the capturing parent's read
+        // never reaches EOF and the capture hangs until the daemon itself dies.
+        // Clear the inherit flag on our std handles first so nothing leaks.
+        unsafe {
+            use std::os::windows::io::RawHandle;
+            extern "system" {
+                fn GetStdHandle(n_std_handle: u32) -> RawHandle;
+                fn SetHandleInformation(h: RawHandle, mask: u32, flags: u32) -> i32;
+            }
+            const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+            const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+            const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+            const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+            for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // A null/invalid std handle (e.g. no console) has nothing to
+                // clear; SetHandleInformation just fails and we ignore it.
+                let _ = SetHandleInformation(GetStdHandle(id), HANDLE_FLAG_INHERIT, 0);
+            }
+        }
     }
     let child = cmd
         .spawn()
