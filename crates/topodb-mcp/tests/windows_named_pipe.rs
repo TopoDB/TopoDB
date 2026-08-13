@@ -79,7 +79,10 @@ async fn windows_daemon_serves_over_a_named_pipe() {
         loop {
             let mut line = String::new();
             let n = reader.read_line(&mut line).await.expect("read");
-            assert!(n > 0, "daemon closed the pipe before replying to id {want_id}");
+            assert!(
+                n > 0,
+                "daemon closed the pipe before replying to id {want_id}"
+            );
             let msg: serde_json::Value = serde_json::from_str(line.trim()).expect("json line");
             if msg.get("id").and_then(|v| v.as_i64()) == Some(want_id) {
                 return msg;
@@ -123,7 +126,10 @@ async fn windows_daemon_serves_over_a_named_pipe() {
         .await
         .expect("write remember");
     let remembered = read_reply(&mut reader, 2).await;
-    assert!(remembered.get("error").is_none(), "remember failed: {remembered}");
+    assert!(
+        remembered.get("error").is_none(),
+        "remember failed: {remembered}"
+    );
 
     write_half
         .write_all(

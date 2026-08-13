@@ -57,11 +57,11 @@ use crate::socket_path::socket_path_for;
 // The connection-serving machinery (accept loop, per-connection rmcp session,
 // hello handshake, idle/shutdown lifecycle) is shared by both transports.
 #[cfg(any(unix, windows))]
+use rmcp::ServiceExt;
+#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(any(unix, windows))]
 use std::sync::Arc;
-#[cfg(any(unix, windows))]
-use rmcp::ServiceExt;
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(any(unix, windows))]
