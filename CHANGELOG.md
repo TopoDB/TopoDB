@@ -14,6 +14,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### 0.0.17 — 2026-08-12
+
+#### Changed
+
+- Dependency-only version bump for the 0.0.19 release; no functional change.
+
 ### 0.0.16 — 2026-08-12
 
 #### Added
@@ -459,6 +465,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.14 — 2026-08-12
+
+#### Changed
+
+- Dependency-only version bump for the 0.0.19 release; no functional change.
+
 ### 0.0.13 — 2026-08-12
 
 #### Added
@@ -654,6 +666,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-obsidian`
 
+### 0.0.6 — 2026-08-12
+
+#### Changed
+
+- Dependency-only bump (engine 0.0.17 / json 0.0.14); no functional change.
+
 ### 0.0.5 — 2026-08-12
 
 #### Changed
@@ -678,6 +696,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
 ---
 
 ## `topodb-mcp`
+
+### 0.0.19 — 2026-08-12
+
+#### Added
+
+- **Windows named-pipe transport** — the resident daemon (`--socket`) now serves
+  on Windows over a named pipe, not just unix domain sockets, so Windows gets the
+  same concurrent multi-agent daemon (per-connection rmcp sessions on one shared
+  `Db`, redb-lock election, idle-exit, hello handshake). The connection handler
+  is transport-generic; Windows needs no stale-inode reclaim (named pipes vanish
+  on process exit). Verified by a named-pipe smoke test on CI.
 
 ### 0.0.18 — 2026-08-12
 
@@ -1192,6 +1221,12 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## `topodb-sgh`
 
+### 0.0.7 — 2026-08-12
+
+#### Changed
+
+- Dependency-only bump (engine 0.0.17); no functional change.
+
 ### 0.0.6 — 2026-08-12
 
 #### Changed
@@ -1389,6 +1424,12 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 ---
 
 ## `topodb-cli`
+
+### 0.0.14 — 2026-08-12
+
+#### Changed
+
+- Dependency-only version bump for the 0.0.19 release; no functional change.
 
 ### 0.0.13 — 2026-08-12
 
