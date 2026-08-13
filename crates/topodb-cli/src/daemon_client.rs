@@ -32,11 +32,13 @@
 //! both processes resolve a given DB path to the same endpoint — the hash
 //! vectors pinned in the tests are the cross-crate contract.
 
-// The socket client is unix-only (Windows named-pipe support is a follow-up);
-// on Windows only `BusyDiagnosis` (the direct-open Busy message) is live, so the
-// rest of the module is legitimately dead there. Suppress dead-code noise on
-// non-unix rather than `#[cfg(unix)]`-gate every item individually.
-#![cfg_attr(not(unix), allow(dead_code))]
+// The socket client is live on unix (domain socket) AND Windows (named pipe):
+// the transport-specific seams (`connect_transport`/`set_timeouts` in `imp`,
+// plus `socket_present_at`/`probe_live`) are cfg'd per-OS, the framing above
+// them is shared. Only a platform that is neither unix nor Windows has no
+// transport, so `BusyDiagnosis` is all that lives there — suppress dead-code
+// noise only in that case rather than `#[cfg]`-gating every item individually.
+#![cfg_attr(not(any(unix, windows)), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 
@@ -180,17 +182,43 @@ pub enum Discovery {
 /// env: a test points it at a tempdir path it does or does not create.
 ///
 /// On Windows the endpoint is a named pipe with no filesystem inode to `stat`,
-/// and this crate has no std named-pipe client, so presence is reported
-/// `false` (fall through to direct open) until real named-pipe support lands.
+/// so presence is "can a client handle be opened?" — a successful open (dropped
+/// immediately) means the daemon is listening. `PIPE_BUSY` (all instances
+/// momentarily busy) still means a daemon is there, so it too reads present;
+/// `FILE_NOT_FOUND` means no daemon. Named pipes vanish when their owning
+/// process exits, so — unlike a unix `.sock` inode — an openable pipe implies a
+/// live owner, which is why [`probe_live`] shares this same probe on Windows.
 pub fn socket_present_at(endpoint: &Path) -> bool {
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         endpoint.exists()
     }
     #[cfg(windows)]
     {
+        pipe_openable(endpoint)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = endpoint;
         false
+    }
+}
+
+/// Windows presence/liveness probe: try to open a client handle to the pipe and
+/// drop it. `Ok` ⇒ a daemon is listening; `ERROR_PIPE_BUSY` (231) ⇒ a daemon is
+/// there but all instances are momentarily busy (still present); any other error
+/// (notably `FILE_NOT_FOUND`) ⇒ absent. The open connects then immediately drops,
+/// so it never sends a hello and is not counted as a session.
+#[cfg(windows)]
+fn pipe_openable(endpoint: &Path) -> bool {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(endpoint)
+    {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
     }
 }
 
@@ -200,14 +228,20 @@ pub fn socket_present_at(endpoint: &Path) -> bool {
 /// a unix socket). The probe connects and immediately drops, so it does not
 /// complete a hello and is not counted as a session.
 ///
-/// Windows: no std named-pipe client here, so reported `false` until named-pipe
-/// support lands (same limitation as [`socket_present_at`]).
+/// Windows: named pipes vanish when their owning process exits, so there is no
+/// stale-inode-vs-live-owner distinction to make — an openable pipe already
+/// implies a live daemon. The liveness probe is therefore the same open-and-drop
+/// as [`socket_present_at`].
 pub fn probe_live(endpoint: &Path) -> bool {
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         std::os::unix::net::UnixStream::connect(endpoint).is_ok()
     }
     #[cfg(windows)]
+    {
+        pipe_openable(endpoint)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = endpoint;
         false
@@ -380,24 +414,92 @@ impl BusyDiagnosis {
     }
 }
 
-// The socket round-trip (connect → hello → tools/call → unwrap) is implemented
-// on unix over `std::os::unix::net::UnixStream` with newline-delimited JSON
-// framing — the same framing the daemon uses over stdio. It is NOT yet wired
-// into `cli.rs` dispatch (a later step maps each `Command` to its tool call);
-// this type is the client half that step will drive.
-#[cfg(unix)]
+// The socket round-trip (connect → hello → tools/call → unwrap) uses
+// newline-delimited JSON framing — the same framing the daemon uses over stdio —
+// over a per-OS transport: a `std::os::unix::net::UnixStream` on unix, the named
+// pipe opened as a `std::fs::File` on Windows. Only the `connect_transport` and
+// `set_timeouts` seams differ per platform; everything above them is shared.
+// This client half is driven by `main.rs`'s socket-first dispatch.
+#[cfg(any(unix, windows))]
 pub use imp::{send_shutdown, DaemonClient};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod imp {
     use super::{hello_frame, unwrap_tool_result, DaemonError, HelloScopes};
     use std::io::{BufRead, BufReader, Write};
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::Duration;
 
+    /// The daemon transport: a blocking bidirectional byte stream to the
+    /// endpoint. On unix a connected domain socket; on Windows the named pipe
+    /// opened as a file (byte-mode duplex, matching the daemon's `ServerOptions`
+    /// default). Both implement `Read + Write` and a `try_clone` yielding an
+    /// independent handle to the same connection, so the framing code below is
+    /// transport-blind.
+    #[cfg(unix)]
+    type Transport = UnixStream;
+    #[cfg(windows)]
+    type Transport = std::fs::File;
+
     /// Client-side wedge defense: never block forever on a stuck daemon.
+    /// Unix-only — see [`set_timeouts`] for why Windows accepts no deadline.
+    #[cfg(unix)]
     const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Open a blocking connection to the daemon endpoint.
+    ///
+    /// Unix: `UnixStream::connect`. Windows: open the named pipe as a file,
+    /// retrying briefly on `ERROR_PIPE_BUSY` — the daemon pre-creates the next
+    /// instance before handing off the connected one, so a fresh instance is
+    /// normally ready, but a short bounded sleep-retry covers the handoff window
+    /// without pulling in `WaitNamedPipe`. `FILE_NOT_FOUND` (no daemon) is
+    /// returned as-is, becoming a `Transport` error the caller falls through on.
+    fn connect_transport(endpoint: &Path) -> std::io::Result<Transport> {
+        #[cfg(unix)]
+        {
+            UnixStream::connect(endpoint)
+        }
+        #[cfg(windows)]
+        {
+            const ERROR_PIPE_BUSY: i32 = 231;
+            let mut attempts = 0u32;
+            loop {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(endpoint)
+                {
+                    Ok(file) => return Ok(file),
+                    Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempts < 50 => {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+
+    /// Apply the read/write deadline to a freshly connected transport.
+    ///
+    /// Unix sets both socket timeouts to [`IO_TIMEOUT`]. Windows is a no-op: std
+    /// exposes no read/write deadline on a `File`-backed named pipe, and adding
+    /// `SetCommTimeouts`/overlapped I/O would pull in the winapi surface the
+    /// daemon design deliberately keeps out of the CLI. A wedged LOCAL daemon is
+    /// the only exposure and is rare, so an unbounded wait is accepted there
+    /// rather than a new dependency.
+    #[cfg(unix)]
+    fn set_timeouts(stream: &Transport) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    fn set_timeouts(_stream: &Transport) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Ask the daemon at `endpoint` to drain and exit.
     ///
@@ -408,11 +510,9 @@ mod imp {
     /// request, then wait for its response so the caller knows the daemon
     /// heard it (the actual exit is confirmed by watching the socket/lock).
     pub fn send_shutdown(endpoint: &Path) -> Result<(), DaemonError> {
-        let stream = UnixStream::connect(endpoint)
+        let stream = connect_transport(endpoint)
             .map_err(|e| DaemonError::Transport(format!("connect {}: {e}", endpoint.display())))?;
-        stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+        set_timeouts(&stream)
             .map_err(|e| DaemonError::Transport(format!("setting socket timeouts: {e}")))?;
         let mut reader = BufReader::new(
             stream
@@ -447,8 +547,8 @@ mod imp {
 
     /// A live, hello'd connection to the daemon, ready to issue tool calls.
     pub struct DaemonClient {
-        writer: UnixStream,
-        reader: BufReader<UnixStream>,
+        writer: Transport,
+        reader: BufReader<Transport>,
         next_id: i64,
     }
 
@@ -458,12 +558,10 @@ mod imp {
         /// any I/O error is a [`DaemonError::Transport`] — the caller's cue to
         /// fall through to direct open.
         pub fn connect(endpoint: &Path, scopes: &HelloScopes) -> Result<Self, DaemonError> {
-            let stream = UnixStream::connect(endpoint).map_err(|e| {
+            let stream = connect_transport(endpoint).map_err(|e| {
                 DaemonError::Transport(format!("connect {}: {e}", endpoint.display()))
             })?;
-            stream
-                .set_read_timeout(Some(IO_TIMEOUT))
-                .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+            set_timeouts(&stream)
                 .map_err(|e| DaemonError::Transport(format!("setting socket timeouts: {e}")))?;
             let reader = BufReader::new(
                 stream
@@ -587,7 +685,10 @@ mod tests {
     /// Serializes tests that mutate the process-global `XDG_RUNTIME_DIR` (which
     /// `socket_path_for` reads): under cargo's parallel harness a sibling test
     /// flipping it mid-body would change the derived path out from under this
-    /// one. Each holder saves and restores the prior value.
+    /// one. Each holder saves and restores the prior value. Only the unix
+    /// `XDG_RUNTIME_DIR`-based derivation tests use it; Windows derives the pipe
+    /// name without env, so the lock is dead there.
+    #[cfg(not(windows))]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(not(windows))]
