@@ -34,14 +34,17 @@
 //! 6. **Startup budget.** A startup that cannot open the DB within its budget
 //!    surfaces the error to the caller (nonzero exit) rather than lingering.
 
-// Socket serving is unix-only (Windows named-pipe support is a CI-tracked
-// follow-up); on non-unix, `serve` opens the DB then returns `Unsupported`, so
-// the accept-loop machinery (hello parsing, extra ServeOutcome/DaemonError
-// variants, some imports) is legitimately dead. Suppress that noise on non-unix
-// rather than `#[cfg(unix)]`-gate every item.
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+// Socket serving is implemented on unix (unix-domain sockets) and Windows
+// (named pipes); on any OTHER platform `serve` opens the DB then returns
+// `Unsupported`, so the accept-loop machinery is legitimately dead there.
+// Suppress that noise only on those exotic targets, so unix AND Windows both
+// get real dead-code lints.
+#![cfg_attr(not(any(unix, windows)), allow(dead_code, unused_imports))]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// `Path` is only referenced by the unix `bind_or_reclaim` signature.
+#[cfg(unix)]
+use std::path::Path;
 use std::time::Duration;
 
 use topodb::{Db, TopoError};
@@ -51,19 +54,23 @@ use crate::embedder::Embedder;
 use crate::server::TopoServer;
 use crate::socket_path::socket_path_for;
 
-#[cfg(unix)]
+// The connection-serving machinery (accept loop, per-connection rmcp session,
+// hello handshake, idle/shutdown lifecycle) is shared by both transports.
+#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Arc;
-
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rmcp::ServiceExt;
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(any(unix, windows))]
 use tokio::sync::Notify;
+
+// Transport-specific listener (the accepted stream's type is inferred and
+// handed straight to the generic `handle_conn`).
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 /// The first-frame key a client sends to announce its scopes. MUST match
 /// `HELLO_KEY` in `plugins/claude-code/ipc.js` and the broker.
@@ -72,11 +79,11 @@ const HELLO_KEY: &str = "topodb/hello";
 /// JSON-RPC error code for a connection that issued a request before ever
 /// sending a `topodb/hello`. Matches `broker.js`'s refusal so both servers
 /// speak the same dialect to an out-of-date client.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const HELLO_REFUSED_CODE: i32 = -32002;
 
 /// Human-readable body of the `-32002` refusal.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const HELLO_REFUSED_MSG: &str = "topodb daemon: this connection never sent a scope hello; \
      refusing to run the request under another project's scope \
      (restart the session; if it persists, the client and daemon are out of step)";
@@ -112,10 +119,11 @@ pub enum DaemonError {
     Bind(std::io::Error),
     /// `accept()` failed on the bound listener.
     Accept(std::io::Error),
-    /// Socket serving is not implemented on this platform yet (Windows named
-    /// pipes are CI-tracked follow-up work). Constructed only in the
-    /// `#[cfg(not(unix))]` `run_accept_loop`, hence dead on unix.
-    #[cfg_attr(unix, allow(dead_code))]
+    /// Socket serving isn't available on this platform (neither unix sockets
+    /// nor Windows named pipes). Constructed only in the
+    /// `#[cfg(not(any(unix, windows)))]` `run_accept_loop`, hence dead on both
+    /// unix and Windows.
+    #[cfg_attr(any(unix, windows), allow(dead_code))]
     Unsupported,
 }
 
@@ -435,15 +443,19 @@ async fn run_accept_loop(
 /// Serve one connection: read its hello (behavior 4), build a scoped handler,
 /// and hand the remainder of the stream to a fresh rmcp session. Detects and
 /// handles topodb/shutdown requests by draining and exiting.
-#[cfg(unix)]
-async fn handle_conn(
+#[cfg(any(unix, windows))]
+async fn handle_conn<S>(
     base: TopoServer,
-    stream: UnixStream,
+    stream: S,
     hello_timeout: Duration,
     shutdown_flag: Arc<AtomicBool>,
     shutdown_signal: Arc<Notify>,
-) {
-    let (read_half, write_half) = stream.into_split();
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    // `tokio::io::split` works for any AsyncRead+AsyncWrite — a `UnixStream` on
+    // unix, a `NamedPipeServer` on Windows — so this handler is transport-blind.
+    let (read_half, write_half) = tokio::io::split(stream);
     // The BufReader retains any bytes it read past the hello's newline (a
     // pipelined `initialize`), so nothing is lost when we hand it to rmcp.
     let mut reader = BufReader::new(read_half);
@@ -547,9 +559,100 @@ async fn handle_conn(
     }
 }
 
-/// Windows named-pipe serving is CI-tracked follow-up work; the unix socket
-/// path above is the only implemented transport for now.
-#[cfg(not(unix))]
+/// Windows accept loop over a named pipe. Mirrors the unix loop's lifecycle
+/// (per-connection rmcp session on the shared `Db`, idle-exit, durable shutdown
+/// flag, drain), but the transport is a `NamedPipeServer` instance rather than a
+/// `UnixListener`. Two Windows conveniences over unix: named pipes VANISH when
+/// the owning process exits (no stale inode to reclaim, nothing to unlink on
+/// exit), and `first_pipe_instance(true)` is a belt-and-suspenders bind guard on
+/// top of the redb-lock election that already elected us. To accept a client
+/// while still serving the previous one, a fresh instance is created up front.
+#[cfg(windows)]
+async fn run_accept_loop(
+    base: TopoServer,
+    db: Db,
+    endpoint: PathBuf,
+    idle_ms: u64,
+    hello_timeout: Duration,
+) -> Result<ServeOutcome, DaemonError> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let pipe_name = endpoint.into_os_string();
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+        .map_err(DaemonError::Bind)?;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let idle_gate = Arc::new(Notify::new());
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = Arc::new(Notify::new());
+    let idle = Duration::from_millis(idle_ms.max(1));
+
+    loop {
+        // Durable shutdown check FIRST (same rationale as the unix loop).
+        if shutdown_flag.load(Ordering::SeqCst) {
+            drop(server);
+            while active.load(Ordering::SeqCst) != 0 {
+                idle_gate.notified().await;
+            }
+            // Named pipes are reclaimed by the OS on process exit — nothing to
+            // unlink. Dropping `db` releases the redb lock.
+            drop(base);
+            drop(db);
+            return Ok(ServeOutcome::Served);
+        }
+
+        let idle_sleep = tokio::time::sleep(idle);
+        tokio::pin!(idle_sleep);
+
+        tokio::select! {
+            biased;
+
+            res = server.connect() => {
+                res.map_err(DaemonError::Accept)?;
+                // Hand off THIS connected instance; stand up the next one BEFORE
+                // spawning, so a client arriving mid-handoff is never refused.
+                let next = ServerOptions::new()
+                    .create(&pipe_name)
+                    .map_err(DaemonError::Bind)?;
+                let connected = std::mem::replace(&mut server, next);
+                active.fetch_add(1, Ordering::SeqCst);
+                let base = base.clone();
+                let active = active.clone();
+                let gate = idle_gate.clone();
+                let flag = shutdown_flag.clone();
+                let shutdown = shutdown_signal.clone();
+                tokio::spawn(async move {
+                    handle_conn(base, connected, hello_timeout, flag, shutdown).await;
+                    if active.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        gate.notify_one();
+                    }
+                });
+            }
+
+            _ = idle_gate.notified() => {}
+            _ = shutdown_signal.notified() => {}
+
+            _ = &mut idle_sleep, if idle_ms != 0 && active.load(Ordering::SeqCst) == 0 => {
+                // Idle: drop the pending instance to stop accepting, re-check.
+                drop(server);
+                if active.load(Ordering::SeqCst) == 0 {
+                    drop(base);
+                    drop(db);
+                    return Ok(ServeOutcome::Served);
+                }
+                // A connection slipped in; stand up a fresh instance and continue.
+                server = ServerOptions::new()
+                    .create(&pipe_name)
+                    .map_err(DaemonError::Bind)?;
+            }
+        }
+    }
+}
+
+/// Fallback for platforms that are neither unix nor Windows: no socket transport.
+#[cfg(not(any(unix, windows)))]
 async fn run_accept_loop(
     _base: TopoServer,
     _db: Db,
