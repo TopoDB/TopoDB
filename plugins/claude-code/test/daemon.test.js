@@ -689,16 +689,10 @@ test("repairs an install whose platform binary is missing", pinnedPredatesDaemon
       // the spawned launch.js must NOT be handed a native-binary override.
       // Empty string reads as unset in launch.js.
       //
-      // Both idle vars are set because launch.js is platform-split: unix spawns
-      // the Rust daemon (TOPODB_DAEMON_IDLE_MS), Windows spawns broker.js
-      // (TOPODB_BROKER_IDLE_MS). Whichever runs must reap FAST so its
-      // topodb-mcp(.exe) child releases the data dir before teardown deletes it
-      // — on Windows a still-running .exe can't be unlinked (EPERM).
-      env: {
-        TOPODB_DAEMON_IDLE_MS: "500",
-        TOPODB_BROKER_IDLE_MS: "500",
-        TOPODB_MCP_SERVER_BIN: "",
-      },
+      // A short daemon idle window so the daemon reaps FAST after launch.js is
+      // killed and releases the data dir before teardown deletes it — on Windows
+      // a still-running topodb-mcp.exe can't be unlinked (EPERM).
+      env: { TOPODB_DAEMON_IDLE_MS: "500", TOPODB_MCP_SERVER_BIN: "" },
       initTimeoutMs: 120_000,
     });
     sessions.push(session);
@@ -793,16 +787,10 @@ test("never runs a stale binary resolved from outside its own data dir", pinnedP
       // the spawned launch.js must NOT be handed a native-binary override.
       // Empty string reads as unset in launch.js.
       //
-      // Both idle vars are set because launch.js is platform-split: unix spawns
-      // the Rust daemon (TOPODB_DAEMON_IDLE_MS), Windows spawns broker.js
-      // (TOPODB_BROKER_IDLE_MS). Whichever runs must reap FAST so its
-      // topodb-mcp(.exe) child releases the data dir before teardown deletes it
-      // — on Windows a still-running .exe can't be unlinked (EPERM).
-      env: {
-        TOPODB_DAEMON_IDLE_MS: "500",
-        TOPODB_BROKER_IDLE_MS: "500",
-        TOPODB_MCP_SERVER_BIN: "",
-      },
+      // A short daemon idle window so the daemon reaps FAST after launch.js is
+      // killed and releases the data dir before teardown deletes it — on Windows
+      // a still-running topodb-mcp.exe can't be unlinked (EPERM).
+      env: { TOPODB_DAEMON_IDLE_MS: "500", TOPODB_MCP_SERVER_BIN: "" },
       initTimeoutMs: 120_000,
     });
     sessions.push(session);

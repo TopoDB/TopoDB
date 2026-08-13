@@ -14,7 +14,6 @@ import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { serverArgs, sessionScopes, SERVER_VERSION } from "./server-args.js";
 import { socketPathFor, helloFrame } from "./ipc.js";
 import { serveDegraded } from "./degraded.js";
@@ -400,43 +399,30 @@ try {
   conn = await tryConnect(sock);
 
   if (!conn) {
-    // No server on the socket yet — spawn one (or race another shim; redb's
+    // No daemon on the socket yet — spawn one (or race another shim; redb's
     // exclusive lock is the election, so the loser exits without binding and
-    // both shims connect to the winner). The mechanism is platform-split:
+    // both shims connect to the winner). `topodb-mcp --socket` owns the DB and
+    // multiplexes connections itself (one rmcp session per client), serving a
+    // unix domain socket on unix and a NAMED PIPE on Windows (server >= 0.0.19,
+    // which is why the pin below is load-bearing). broker.js is no longer on the
+    // launch path on any platform.
     //
-    //   * unix  → the Rust daemon (`topodb-mcp --socket`), which owns the DB
-    //     and multiplexes connections itself (one rmcp session per client).
-    //   * win32 → `broker.js`, which multiplexes a STDIO `topodb-mcp` over the
-    //     named pipe. The Rust daemon's socket serving is unix-only (Windows
-    //     named-pipe support is a follow-up), so falling back to the broker is
-    //     what keeps Windows sessions on working memory instead of degrading.
-    //     Remove this branch once the daemon serves named pipes.
-    if (process.platform === "win32") {
-      resolveServer(dataDir); // ensure the server is installed BEFORE the broker needs it
-      const brokerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "broker.js");
-      spawn(process.execPath, [brokerPath, ...args], {
+    // TOPODB_MCP_SERVER_BIN points at a NATIVE topodb-mcp binary (a local
+    // `cargo build` output) and bypasses npm resolution — the seam tests and
+    // dev builds use. Empty string means unset, so a test can opt a child back
+    // into real resolution.
+    const binOverride = process.env.TOPODB_MCP_SERVER_BIN;
+    if (binOverride) {
+      spawn(binOverride, ["--socket", sock, ...args], {
         detached: true,
         stdio: "ignore",
       }).unref();
     } else {
-      // TOPODB_MCP_SERVER_BIN points at a NATIVE topodb-mcp binary (a local
-      // `cargo build` output) and bypasses npm resolution — the seam tests and
-      // dev builds use when the pinned npm server would be resolved instead.
-      // Empty string means unset, so a test can opt a child back into real
-      // resolution.
-      const binOverride = process.env.TOPODB_MCP_SERVER_BIN;
-      if (binOverride) {
-        spawn(binOverride, ["--socket", sock, ...args], {
-          detached: true,
-          stdio: "ignore",
-        }).unref();
-      } else {
-        const shimPath = resolveServer(dataDir); // installs the server if needed; returns the topodb-mcp launcher
-        spawn(process.execPath, [shimPath, "--socket", sock, ...args], {
-          detached: true,
-          stdio: "ignore",
-        }).unref();
-      }
+      const shimPath = resolveServer(dataDir); // installs the server if needed; returns the topodb-mcp launcher
+      spawn(process.execPath, [shimPath, "--socket", sock, ...args], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
     }
 
     // 50 × 200ms = a 10s budget (the loop exits the moment the socket is
