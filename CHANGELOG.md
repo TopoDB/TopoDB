@@ -1425,6 +1425,19 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `topodb-cli`
 
+### Unreleased
+
+#### Added
+
+- **Windows named-pipe client** — socket-first execution now works on Windows,
+  not just unix. A `topodb <cmd>` routes to a resident `topodb-mcp --socket`
+  daemon over its named pipe (opened as a blocking file, no new dependency and
+  no async), closing the last Windows asymmetry: before this, a Windows CLI call
+  made while a session's daemon held the database fell through to a direct open
+  and failed `Busy`. `daemon status|start|stop` work on Windows too (`start`
+  spawns the daemon detached via `creation_flags`). Verified by a `cfg(windows)`
+  routing test on CI; unix behavior is unchanged.
+
 ### 0.0.14 — 2026-08-12
 
 #### Changed

@@ -11,6 +11,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Fail fast instead of burning the 6h default if a test wedges (e.g. a
+    # client blocking on an unresponsive daemon over a pipe with no read
+    # deadline). A cold Windows build + full test run is comfortably under this.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

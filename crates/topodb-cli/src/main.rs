@@ -10,9 +10,9 @@ use std::str::FromStr;
 use clap::Parser;
 use cli::{Cli, Command, DaemonCommand};
 // BusyDiagnosis is built on every platform (the Busy error path); DaemonClient
-// and Discovery are the unix socket client, used only under #[cfg(unix)].
+// and Discovery are the socket/named-pipe client, live on unix and Windows.
 use daemon_client::BusyDiagnosis;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use daemon_client::{DaemonClient, Discovery};
 use topodb::{
     Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
@@ -144,7 +144,7 @@ fn main() {
 
     // Socket-first dispatch: check if a daemon socket exists for this DB path,
     // and if the command can be routed to it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if is_daemon_routable(&cli.cmd) {
         if let Discovery::SocketPresent(endpoint) = daemon_client::discover(&db_path) {
             let scope_str = topodb_json::scope_label(&default_scope);
@@ -206,12 +206,12 @@ fn main() {
     let db = match db {
         Ok(db) => db,
         Err(TopoError::Busy) => {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             let socket_present = matches!(
                 daemon_client::discover(&db_path),
                 Discovery::SocketPresent(_)
             );
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             let socket_present = false;
 
             let diagnosis = BusyDiagnosis {
@@ -1693,7 +1693,7 @@ fn submit(db: &Db, default_scope: Scope, input: &str, pretty: bool) -> ! {
 /// Determine if a command can be routed to a daemon via MCP tools.
 /// Commands that lack direct MCP tool equivalents or are admin-only
 /// (require exclusive lock) fall through to direct open.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_daemon_routable(cmd: &Command) -> bool {
     match cmd {
         // create_entity's --always-create has no tool equivalent, so a
@@ -1735,7 +1735,7 @@ fn is_daemon_routable(cmd: &Command) -> bool {
 /// Pull one field out of a tool's structured result, defaulting to `null` if
 /// absent. Used where a tool wraps a collection (`{"nodes": [...]}`) that the
 /// direct CLI path prints unwrapped (a bare array), so routed output matches.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn unwrap_field(mut result: serde_json::Value, field: &str) -> serde_json::Value {
     result
         .get_mut(field)
@@ -1746,7 +1746,7 @@ fn unwrap_field(mut result: serde_json::Value, field: &str) -> serde_json::Value
 /// Attempt to route a command to the daemon via MCP tool calls.
 /// Returns the tool result JSON if successful; Err if the daemon cannot handle the command.
 /// The caller must output and exit.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn try_daemon_route(
     client: &mut DaemonClient,
     cmd: &Command,
@@ -2102,7 +2102,7 @@ fn try_daemon_route(
 /// `valid_*` fields (`valid_during`/`valid_overlaps` as `[from, until]` pairs,
 /// `valid_before`/`valid_after` as bare timestamps) — the daemon has no nested
 /// `valid_interval` object.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn insert_valid_interval(params: &mut serde_json::Value, interval: &Option<ValidInterval>) {
     if let Some(iv) = interval {
         match iv {
@@ -2123,13 +2123,13 @@ fn insert_valid_interval(params: &mut serde_json::Value, interval: &Option<Valid
 }
 
 /// Extend the DirectionArg enum with an as_str method for MCP calls.
-/// Used only by the socket-routing path (`try_daemon_route`), hence unix-only.
-#[cfg(unix)]
+/// Used only by the socket-routing path (`try_daemon_route`).
+#[cfg(any(unix, windows))]
 trait DirectionArgExt {
     fn as_str(&self) -> &'static str;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl DirectionArgExt for cli::DirectionArg {
     fn as_str(&self) -> &'static str {
         match self {
@@ -2141,13 +2141,13 @@ impl DirectionArgExt for cli::DirectionArg {
 }
 
 /// Extend the TimeAxisArg enum with an as_str method for MCP calls.
-/// Used only by the socket-routing path (`try_daemon_route`), hence unix-only.
-#[cfg(unix)]
+/// Used only by the socket-routing path (`try_daemon_route`).
+#[cfg(any(unix, windows))]
 trait TimeAxisArgExt {
     fn as_str(&self) -> &'static str;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl TimeAxisArgExt for cli::TimeAxisArg {
     fn as_str(&self) -> &'static str {
         match self {
@@ -2157,7 +2157,7 @@ impl TimeAxisArgExt for cli::TimeAxisArg {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn handle_daemon_command(db_path: &Path, cmd: DaemonCommand) -> ! {
     match cmd {
         DaemonCommand::Status => daemon_status(db_path),
@@ -2166,7 +2166,7 @@ fn handle_daemon_command(db_path: &Path, cmd: DaemonCommand) -> ! {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn handle_daemon_command(_db_path: &Path, _cmd: DaemonCommand) -> ! {
     output::fail(
         "rejected",
@@ -2175,7 +2175,7 @@ fn handle_daemon_command(_db_path: &Path, _cmd: DaemonCommand) -> ! {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn daemon_status(db_path: &Path) -> ! {
     let socket_path = daemon_client::socket_path_for(db_path);
     // A real connect probe, not mere file existence: a crashed daemon leaves a
@@ -2191,7 +2191,7 @@ fn daemon_status(db_path: &Path) -> ! {
     output::ok(&status, false);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn daemon_start(db_path: &Path) -> ! {
     use std::process::Command as ProcessCommand;
 
@@ -2215,15 +2215,37 @@ fn daemon_start(db_path: &Path) -> ! {
     let current_dir = current_exe
         .parent()
         .unwrap_or_else(|| Path::new("/usr/bin"));
-    let mcp_path = current_dir.join("topodb-mcp");
+    // The sibling binary carries the platform's executable extension.
+    #[cfg(windows)]
+    let mcp_name = "topodb-mcp.exe";
+    #[cfg(not(windows))]
+    let mcp_name = "topodb-mcp";
+    let mcp_path = current_dir.join(mcp_name);
 
     let mcp_binary = if mcp_path.exists() {
         mcp_path
     } else {
-        // Fall back to PATH
-        match ProcessCommand::new("which").arg("topodb-mcp").output() {
+        // Fall back to PATH: `which` on unix, `where` on Windows (which also
+        // resolves the .exe). Take the first line — `where` can print several.
+        #[cfg(windows)]
+        let finder = "where";
+        #[cfg(not(windows))]
+        let finder = "which";
+        match ProcessCommand::new(finder).arg("topodb-mcp").output() {
             Ok(output) if output.status.success() => {
-                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let path_str = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if path_str.is_empty() {
+                    output::fail(
+                        "rejected",
+                        "could not find topodb-mcp binary (checked same directory as CLI and PATH)",
+                        2,
+                    );
+                }
                 std::path::PathBuf::from(path_str)
             }
             _ => output::fail(
@@ -2242,15 +2264,55 @@ fn daemon_start(db_path: &Path) -> ! {
     //    forever with =0) instead of returning as soon as we print our JSON.
     //  * new process group: so a terminal SIGINT/SIGHUP to the CLI's group does
     //    not also kill the daemon we just launched to outlive this process.
-    use std::os::unix::process::CommandExt;
-    let child = ProcessCommand::new(&mcp_binary)
-        .arg("--db")
+    let mut cmd = ProcessCommand::new(&mcp_binary);
+    cmd.arg("--db")
         .arg(db_path)
         .arg("--socket")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
+        .stderr(std::process::Stdio::null());
+    // Detachment seam — the one genuinely per-OS bit of the spawn.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: no inherited console, so a console Ctrl-C to the
+        // CLI's group is not delivered to the daemon. CREATE_NEW_PROCESS_GROUP:
+        // its own group as a second guard. Mirrors launch.js's detached spawn.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+
+        // Null stdio for the daemon (above) is NOT enough on Windows: `std`
+        // spawns the child with bInheritHandles=TRUE to hand it those null
+        // handles, and our own std handles stay marked inheritable — a captured
+        // stdout (`out=$(topodb daemon start)`, or a test's `Command::output()`)
+        // is an inheritable pipe end. The detached daemon would inherit that
+        // pipe's write end and hold it open, so the capturing parent's read
+        // never reaches EOF and the capture hangs until the daemon itself dies.
+        // Clear the inherit flag on our std handles first so nothing leaks.
+        unsafe {
+            use std::os::windows::io::RawHandle;
+            extern "system" {
+                fn GetStdHandle(n_std_handle: u32) -> RawHandle;
+                fn SetHandleInformation(h: RawHandle, mask: u32, flags: u32) -> i32;
+            }
+            const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+            const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+            const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+            const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+            for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // A null/invalid std handle (e.g. no console) has nothing to
+                // clear; SetHandleInformation just fails and we ignore it.
+                let _ = SetHandleInformation(GetStdHandle(id), HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+    let child = cmd
         .spawn()
         .unwrap_or_else(|e| output::fail("internal", &format!("spawning topodb-mcp: {e}"), 1));
     // Deliberately do NOT wait on / reap this child: it is a detached daemon
@@ -2258,7 +2320,6 @@ fn daemon_start(db_path: &Path) -> ! {
     // without the Drop-time reap clippy's zombie_processes lint expects.
     std::mem::forget(child);
 
-    #[cfg(unix)]
     {
         // Minimal polling: wait up to 5 seconds for socket to appear
         use std::thread;
@@ -2291,7 +2352,7 @@ fn daemon_start(db_path: &Path) -> ! {
     output::ok(&result, false);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn daemon_stop(db_path: &Path) -> ! {
     let socket_path = daemon_client::socket_path_for(db_path);
 
