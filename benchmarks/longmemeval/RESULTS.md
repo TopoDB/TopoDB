@@ -30,14 +30,59 @@ Per-type recall (and the harder types) are in the JSON the harness writes.
 about **97%** of the time. With a stronger embedder (`text-embedding-3-large`),
 retrieval@5 rose to ~1.00 on a balanced sample.
 
-**A ranking finding worth noting:** the RRF hybrid slightly *underperforms* pure
-BM25 at R@1 (0.832 vs 0.857) — the vector leg dilutes a strong lexical signal at
-the very top rank. That's a concrete fusion-weighting lead, not a defect.
+**A ranking finding (now resolved):** at **session** granularity the RRF hybrid
+slightly *underperforms* pure BM25 at R@1 (0.832 vs 0.857) — the vector leg
+dilutes a strong lexical signal at the top rank. This was a fusion-weighting
+lead; investigating it showed it is **granularity-coupled** and closes itself at
+turn granularity (see "Turn granularity" and "Fusion weighting is
+granularity-coupled" below).
 
 Reproduce:
 ```
 python -m lme.run --data data/longmemeval_s.json --granularity session
 ```
+
+### Turn granularity beats session (the harness default)
+
+Ingesting each **turn** as its own memory (rather than the whole session as one
+memory) gives a focused per-turn embedding that avoids whole-session averaging —
+the "needle in a ~30k-token session" problem. Measured on a stratified sample
+(30/type × 6 types = 180 questions, MiniLM, graph off), session-level Recall@k,
+**session → turn**:
+
+| Leg | R@1 | R@3 | R@5 |
+|-----|-----|-----|-----|
+| vector | 0.717 → **0.839** (+0.122) | 0.872 → 0.939 (+0.067) | 0.900 → 0.978 (+0.078) |
+| hybrid | 0.794 → **0.883** (+0.089) | 0.944 → 0.956 (+0.011) | 0.956 → 0.978 (+0.022) |
+
+The gain is concentrated at **R@1** — exactly where the headroom is, since R@5 is
+already near-ceiling. Per-type, turn ≥ session everywhere except one marginal dip
+(multi-session vector R@1 −0.033, one question; hybrid flat there — plausible,
+since multi-session evidence spans sessions so per-turn fragmentation helps
+least). `single-session-assistant` is at ceiling (1.000) throughout. It is free:
+deterministic, no API. The only cost is more memories/embeddings per question at
+scale. **`lme.run` now defaults to `--granularity turn`.**
+
+### Fusion weighting is granularity-coupled (no reweighting win to ship)
+
+The text/vector RRF weights were the other R@1 lead. Sweeping them (Python-side
+RRF over the separately-exposed `search_text`/`search_vector` rankings, 120 q,
+`RRF_K=60`, text weight fixed at 1.0) shows the optimum **flips with
+granularity** — overall R@1:
+
+| vector weight → | text-only | 0.3 | 0.5 | equal (1.0) | 1.5 | vec-only |
+|---|---|---|---|---|---|---|
+| **session** | 0.817 | **0.833** | 0.800 | 0.742 | 0.733 | 0.650 |
+| **turn** | 0.808 | 0.850 | 0.850 | 0.875 | **0.883** | 0.825 |
+
+At session granularity a whole-session vector is a noisy average, so
+down-weighting it helps (0.742 → 0.833). At turn granularity the focused per-turn
+vector is precise, so equal weight is already near-optimal and up-weighting only
+nudges (+0.008, within noise). **Turn granularity subsumes the fusion-weighting
+lead**: it fixes the R@1 dilution at the source, so the engine's equal-weight
+default is the right choice at the new default granularity — no reweighting and
+no engine change is warranted. (`single-session-preference` is the most
+vector-sensitive type: R@1 0.35 text-only → 0.75 vector-favoring.)
 
 ---
 
@@ -72,9 +117,10 @@ limited by the reader stage — an under-tuned generic reader prompt (the 0.13 o
 preference is a prompt artifact) and coarse session-granularity context
 (~30k-token needle-in-haystack).
 
-**Not yet run:** the full 500 with GPT-4o, a per-type / official-style reader
-prompt, and turn-granularity context — each expected to raise the number without
-changing the memory engine.
+**Not yet run:** the full 500 with GPT-4o and a per-type / official-style reader
+prompt. Turn-granularity context (now the retrieval default — see above) is the
+finer-context half of this and is expected to help the reader; the reader-prompt
+half is the remaining lever, neither of which changes the memory engine.
 
 ---
 
