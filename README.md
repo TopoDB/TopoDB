@@ -119,9 +119,28 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 - Providers: `claude`-CLI, Anthropic API, any OpenAI-compatible endpoint; agent nodes opt into TopoDB memory via `tools: [topodb]` (node-scoped MCP bridge — the memory db unlocks between tool nodes)
 - Claude Code plugin: `/sgh:plan`, `/sgh:run`, `/sgh:lifecycle`, `/sgh:show`
 
-**Planned:** multi-scope reads over the CLI · API stabilization (0.1) · reproducible benchmarks
+**Planned:** multi-scope reads over the CLI · API stabilization (0.1)
 
 **Never — by principle:** LLM calls inside the engine (principle 4) · a server process as a prerequisite (principle 5)
+
+## Benchmarks
+
+Principle 3, made concrete. On [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
+(a long-term-memory benchmark, 500 questions), TopoDB's retrieval surfaces the
+gold evidence session in the **top-5 ~97% of the time** — session-level
+Recall@5 of **0.968** (text / hybrid), on the full set with a held-constant
+embedder so the number reflects *ranking*, not embedder choice:
+
+| Leg | R@1 | R@3 | R@5 | R@10 |
+|-----|-----|-----|-----|------|
+| text (BM25)     | 0.857 | 0.947 | 0.968 | 0.987 |
+| vector          | 0.760 | 0.891 | 0.919 | 0.966 |
+| hybrid (RRF)    | 0.832 | 0.951 | 0.968 | 0.983 |
+
+The harness, methodology, per-type breakdown, and a preliminary end-to-end
+QA-accuracy pass live in
+[`benchmarks/longmemeval/`](benchmarks/longmemeval/RESULTS.md) — reproducible
+with one command, no competitor figures claimed.
 
 ## Crates
 
