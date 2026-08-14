@@ -78,9 +78,69 @@ changing the memory engine.
 
 ---
 
+## Graph-leg activation experiment (neutral — no headroom)
+
+The recall runs above ingest each session as a flat memory, so the graph/PPR
+leg is inert. This experiment (`--graph`, `lme/extract.py`) *activates* it
+**deterministically and offline**: extract proper-noun entities per session and
+lay down cross-session `Memory--co_mention-->Memory` edges so the hybrid leg's
+1-hop PPR fires. The hypothesis was that corroboration across sessions sharing an
+entity would sharpen R@1 on the hard types (multi-session, temporal).
+
+**Result: with the extractor and graph weight tuned, the graph leg is neutral —
+it matches the graph-off baseline and adds no lift.** Getting there required
+fixing two real mistakes that first produced a spurious *catastrophic* result
+(R@1 collapsing to ~0). The investigation is the interesting part:
+
+**Mistake 1 — a promiscuous extractor.** The first proper-noun heuristic captured
+sentence-initial common words (`use`, `make`, `consider`, contractions like
+`i'm`) as entities. On real conversational text that built a *near-complete*
+graph (~330 entities / ~1,600 co_mention edges per ~50-session question), so the
+PPR neighborhood spanned the whole haystack. Fix: a corpus-level **truecasing
+filter** — keep a surface form only if it is capitalized in ≥85% of its
+occurrences (genuine proper nouns are; sentence-initial verbs are not), drop
+contractions and single letters. Entities per question dropped ~313 → ~77.
+
+**Mistake 2 — an over-aggressive graph weight.** The Python binding hardcoded the
+engine default `graph_weight = 0.5` (half of text/vector at 1.0 each). That is
+strong enough to *reorder an already-correct* text+vector ranking: because the
+PPR list excludes its own seeds, a gold session that is already a top hit gets
+leapfrogged by its non-seed neighbors. Sweeping the weight (now exposed on
+`topodb-py`'s `recall`) shows the cliff:
+
+| graph_weight | multi-session R@1 | temporal-reasoning R@1 |
+|---|---|---|
+| off (baseline) | 0.750 | 0.750 |
+| 0.5 (old default) | **0.083** | **0.000** |
+| 0.2 | 0.667 | 0.750 |
+| 0.1 | 0.750 | 0.750 |
+| ≤0.05 | 0.750 | 0.750 |
+
+At `graph_weight ≤ 0.1` the harm is gone and recall returns to baseline — but it
+does **not exceed** it. Enabling the co-seed **corroboration** weight (also now
+exposed; a mild multiplicative tie-breaker) changed nothing across 0.0–1.0: it
+cannot overcome the PPR gap once a hit has been demoted.
+
+**Conclusion.** The catastrophic drop was *our* two bugs, not evidence that
+graphs hurt. Corrected, the deterministic co_mention graph leg is **neutral on
+LongMemEval-S** — and neutral is the ceiling here, because retrieval is already
+~0.97 R@5 (see above): there is no headroom for a corroboration graph to raise
+R@1. A graph leg would only pay off in a harder retrieval regime (weaker
+embedder, larger/among-distractor haystacks) or with *selective* LLM
+entity/relation extraction (what Mem0/Zep do). The harness now defaults to the
+safe `graph_weight = 0.1`; the engine's own 0.5 default is untouched. Product
+recall path is unchanged — this is opt-in benchmark scaffolding.
+
+Reproduce: `python -m lme.run --data data/longmemeval_s.json --granularity
+session --limit 50 --legs vector,hybrid --k 1,3,5 [--graph-weight 0.1]` (runs
+both graph modes). Results JSON (gitignored): `results/graph-leg-limit50.json`.
+
+---
+
 ## Honest scope
 
-- The graph/PPR leg is **inert** here (sessions ingested as plain memories with
+- The graph/PPR leg is **inert** in the core recall runs above (sessions
+  ingested as plain memories with
   no entities), so `hybrid` = text+vector RRF. Entity extraction is a future
   lever.
 - Recall vectors are host-computed to isolate ranking; QA uses API embeddings.
