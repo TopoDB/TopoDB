@@ -127,9 +127,9 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 
 Principle 3, made concrete. On [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
 (a long-term-memory benchmark, 500 questions), TopoDB's retrieval surfaces the
-gold evidence session in the **top-5 ~97% of the time** — session-level
-Recall@5 of **0.968** (text / hybrid), on the full set with a held-constant
-embedder so the number reflects *ranking*, not embedder choice:
+gold evidence session in the **top-5 ~97% of the time**, with a held-constant
+embedder so the number reflects *ranking*, not embedder choice. Full set,
+session granularity:
 
 | Leg | R@1 | R@3 | R@5 | R@10 |
 |-----|-----|-----|-----|------|
@@ -137,8 +137,20 @@ embedder so the number reflects *ranking*, not embedder choice:
 | vector          | 0.760 | 0.891 | 0.919 | 0.966 |
 | hybrid (RRF)    | 0.832 | 0.951 | 0.968 | 0.983 |
 
-The harness, methodology, per-type breakdown, and a preliminary end-to-end
-QA-accuracy pass live in
+**The remaining headroom is at R@1, and it's an ingestion choice.** Storing each
+*turn* as its own memory (now the harness default) instead of the whole session
+gives a focused per-turn embedding rather than a whole-session average — on a
+stratified 180-question sample that lifts hybrid R@1 by **+0.09** and vector R@1
+by **+0.12**.
+
+Honest benchmarks means reporting the duds too: a deterministic co_mention
+**graph leg is neutral** here (retrieval is already near-ceiling, so a
+corroboration graph has no headroom to add), and the best text/vector **fusion
+weight flips with granularity** — turn granularity subsumes that lead rather
+than stacking with it. Both are written up in full.
+
+The harness, methodology, per-type breakdown, the turn-vs-session and
+fusion-weight studies, and a preliminary end-to-end QA-accuracy pass live in
 [`benchmarks/longmemeval/`](benchmarks/longmemeval/RESULTS.md) — reproducible
 with one command, no competitor figures claimed.
 
