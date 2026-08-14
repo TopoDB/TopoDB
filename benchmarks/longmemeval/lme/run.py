@@ -167,7 +167,12 @@ def run(cfg: RunConfig, embedder) -> dict:
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="LongMemEval-S recall harness")
     p.add_argument("--data", required=True)
-    p.add_argument("--granularity", action="append", choices=["session", "turn"], default=None)
+    p.add_argument(
+        "--granularity", action="append", choices=["session", "turn"], default=None,
+        help="Ingest unit. Repeatable. Default: turn — measured to beat session at "
+             "R@1 (a focused per-turn embedding avoids whole-session averaging; see "
+             "RESULTS.md). Pass '--granularity session --granularity turn' to compare.",
+    )
     p.add_argument("--k", default="1,3,5,10")
     p.add_argument("--legs", default="text,vector,hybrid")
     p.add_argument("--limit", type=int, default=None)
@@ -194,7 +199,7 @@ def main(argv=None) -> None:
     )
     args = p.parse_args(argv)
 
-    granularities = args.granularity or ["session", "turn"]
+    granularities = args.granularity or ["turn"]
     ks = [int(x) for x in args.k.split(",")]
     legs = args.legs.split(",")
     # Default (neither flag): run BOTH so one invocation yields the comparison.

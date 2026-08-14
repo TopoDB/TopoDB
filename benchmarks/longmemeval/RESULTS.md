@@ -39,6 +39,27 @@ Reproduce:
 python -m lme.run --data data/longmemeval_s.json --granularity session
 ```
 
+### Turn granularity beats session (the harness default)
+
+Ingesting each **turn** as its own memory (rather than the whole session as one
+memory) gives a focused per-turn embedding that avoids whole-session averaging —
+the "needle in a ~30k-token session" problem. Measured on a stratified sample
+(30/type × 6 types = 180 questions, MiniLM, graph off), session-level Recall@k,
+**session → turn**:
+
+| Leg | R@1 | R@3 | R@5 |
+|-----|-----|-----|-----|
+| vector | 0.717 → **0.839** (+0.122) | 0.872 → 0.939 (+0.067) | 0.900 → 0.978 (+0.078) |
+| hybrid | 0.794 → **0.883** (+0.089) | 0.944 → 0.956 (+0.011) | 0.956 → 0.978 (+0.022) |
+
+The gain is concentrated at **R@1** — exactly where the headroom is, since R@5 is
+already near-ceiling. Per-type, turn ≥ session everywhere except one marginal dip
+(multi-session vector R@1 −0.033, one question; hybrid flat there — plausible,
+since multi-session evidence spans sessions so per-turn fragmentation helps
+least). `single-session-assistant` is at ceiling (1.000) throughout. It is free:
+deterministic, no API. The only cost is more memories/embeddings per question at
+scale. **`lme.run` now defaults to `--granularity turn`.**
+
 ---
 
 ## End-to-end QA accuracy (preliminary)
@@ -72,9 +93,10 @@ limited by the reader stage — an under-tuned generic reader prompt (the 0.13 o
 preference is a prompt artifact) and coarse session-granularity context
 (~30k-token needle-in-haystack).
 
-**Not yet run:** the full 500 with GPT-4o, a per-type / official-style reader
-prompt, and turn-granularity context — each expected to raise the number without
-changing the memory engine.
+**Not yet run:** the full 500 with GPT-4o and a per-type / official-style reader
+prompt. Turn-granularity context (now the retrieval default — see above) is the
+finer-context half of this and is expected to help the reader; the reader-prompt
+half is the remaining lever, neither of which changes the memory engine.
 
 ---
 
