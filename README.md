@@ -127,21 +127,21 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 
 Principle 3, made concrete. On [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
 (a long-term-memory benchmark, 500 questions), TopoDB's retrieval surfaces the
-gold evidence session in the **top-5 ~97% of the time**, with a held-constant
-embedder so the number reflects *ranking*, not embedder choice. Full set,
-session granularity:
+gold evidence session in the **top-5 ~99% of the time** — hybrid Recall@5 of
+**0.987** — with a held-constant embedder so the number reflects *ranking*, not
+embedder choice. Full set, turn granularity (the harness default):
 
 | Leg | R@1 | R@3 | R@5 | R@10 |
 |-----|-----|-----|-----|------|
-| text (BM25)     | 0.857 | 0.947 | 0.968 | 0.987 |
-| vector          | 0.760 | 0.891 | 0.919 | 0.966 |
-| hybrid (RRF)    | 0.832 | 0.951 | 0.968 | 0.983 |
+| text (BM25)     | 0.872 | 0.932 | 0.953 | 0.979 |
+| vector          | 0.864 | 0.953 | 0.977 | 0.989 |
+| hybrid (RRF)    | 0.894 | 0.966 | 0.987 | 0.996 |
 
-**The remaining headroom is at R@1, and it's an ingestion choice.** Storing each
-*turn* as its own memory (now the harness default) instead of the whole session
-gives a focused per-turn embedding rather than a whole-session average — on a
-stratified 180-question sample that lifts hybrid R@1 by **+0.09** and vector R@1
-by **+0.12**.
+**Granularity is the lever.** Storing each *turn* as its own memory rather than
+the whole session — a focused per-turn embedding instead of a whole-session
+average — is what puts R@1 here: on the full set it lifts hybrid R@1 from 0.832
+to **0.894** and vector R@1 from 0.760 to **0.864** over session-granularity
+ingestion.
 
 Honest benchmarks means reporting the duds too: a deterministic co_mention
 **graph leg is neutral** here (retrieval is already near-ceiling, so a

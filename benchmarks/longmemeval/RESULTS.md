@@ -13,33 +13,36 @@ Metric definitions and caveats: see `README.md` and the design spec.
 ## Retrieval recall (the core, reproducible result)
 
 Session-level Recall@k — a hit means a gold evidence session appears among the
-first *k* distinct retrieved sessions. Full 500 questions, **session
-granularity**, host-computed **all-MiniLM-L6-v2** (384-d) vectors fed to the
-engine (this isolates *ranking*, not embedder choice). 470 graded; 30 abstention
-excluded.
+first *k* distinct retrieved sessions. Full 500 questions, **turn granularity**
+(the harness default — see below), host-computed **all-MiniLM-L6-v2** (384-d)
+vectors fed to the engine (this isolates *ranking*, not embedder choice). 470
+graded; 30 abstention excluded.
 
 | Leg | R@1 | R@3 | R@5 | R@10 |
 |-----|-----|-----|-----|------|
-| text (BM25)      | 0.857 | 0.947 | 0.968 | 0.987 |
-| vector (MiniLM)  | 0.760 | 0.891 | 0.919 | 0.966 |
-| hybrid (RRF)     | 0.832 | 0.951 | 0.968 | 0.983 |
+| text (BM25)      | 0.872 | 0.932 | 0.953 | 0.979 |
+| vector (MiniLM)  | 0.864 | 0.953 | 0.977 | 0.989 |
+| hybrid (RRF)     | 0.894 | 0.966 | 0.987 | 0.996 |
 
-Per-type recall (and the harder types) are in the JSON the harness writes.
+For reference, the same full set at **session granularity** — text 0.857 /
+vector 0.760 / hybrid 0.832 at R@1 (R@5 0.968 / 0.919 / 0.968). Per-type recall
+is in the JSON the harness writes.
 
-**What this shows.** TopoDB's retrieval surfaces the gold evidence in the top-5
-about **97%** of the time. With a stronger embedder (`text-embedding-3-large`),
-retrieval@5 rose to ~1.00 on a balanced sample.
+**What this shows.** At turn granularity TopoDB's retrieval surfaces the gold
+evidence in the top-5 **~99%** of the time (hybrid R@5 0.987), and hybrid now
+*leads* every leg at R@1 (0.894). With a stronger embedder
+(`text-embedding-3-large`), retrieval@5 rose to ~1.00 on a balanced sample.
 
-**A ranking finding (now resolved):** at **session** granularity the RRF hybrid
-slightly *underperforms* pure BM25 at R@1 (0.832 vs 0.857) — the vector leg
-dilutes a strong lexical signal at the top rank. This was a fusion-weighting
-lead; investigating it showed it is **granularity-coupled** and closes itself at
-turn granularity (see "Turn granularity" and "Fusion weighting is
-granularity-coupled" below).
+**A ranking finding (resolved by granularity):** at **session** granularity the
+RRF hybrid slightly *underperforms* pure BM25 at R@1 (0.832 vs 0.857) — the
+vector leg dilutes a strong lexical signal at the top rank. That lead turned out
+to be **granularity-coupled**: at turn granularity the per-turn vector is precise
+rather than diluting, so hybrid R@1 (0.894) overtakes text (0.872). See "Turn
+granularity" and "Fusion weighting is granularity-coupled" below.
 
-Reproduce:
+Reproduce (turn is the default; add `--granularity session` to compare):
 ```
-python -m lme.run --data data/longmemeval_s.json --granularity session
+python -m lme.run --data data/longmemeval_s.json
 ```
 
 ### Turn granularity beats session (the harness default)
@@ -62,6 +65,11 @@ since multi-session evidence spans sessions so per-turn fragmentation helps
 least). `single-session-assistant` is at ceiling (1.000) throughout. It is free:
 deterministic, no API. The only cost is more memories/embeddings per question at
 scale. **`lme.run` now defaults to `--granularity turn`.**
+
+Confirmed on the **full 500** (not just the stratified sample): hybrid R@1
+0.832 → **0.894**, vector R@1 0.760 → **0.864**, hybrid R@5 0.968 → **0.987** —
+the same R@1-concentrated lift the table above measured. Those are the numbers
+in the headline "Retrieval recall" table.
 
 ### Fusion weighting is granularity-coupled (no reweighting win to ship)
 
