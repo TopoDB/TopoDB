@@ -66,14 +66,24 @@ def _session_text(s: Session) -> str:
 
 def memory_texts(q: Question, granularity: str) -> list[tuple[str, str]]:
     """(session_id, content) pairs to ingest as memories."""
-    out: list[tuple[str, str]] = []
+    return [(sid, content) for sid, _date, content in memory_records(q, granularity)]
+
+
+def memory_records(q: Question, granularity: str) -> list[tuple[str, str | None, str]]:
+    """(session_id, date, content) triples to ingest as memories.
+
+    ``date`` is the raw per-session haystack date string (or None when the
+    dataset omits it); downstream ingest parses it to Unix ms and leaves
+    ``valid_from`` open when it is missing or unparseable (spec §5.3, §4).
+    """
+    out: list[tuple[str, str | None, str]] = []
     if granularity == "session":
         for s in q.sessions:
-            out.append((s.id, _session_text(s)))
+            out.append((s.id, s.date, _session_text(s)))
     elif granularity == "turn":
         for s in q.sessions:
             for t in s.turns:
-                out.append((s.id, f"{t.role}: {t.content}"))
+                out.append((s.id, s.date, f"{t.role}: {t.content}"))
     else:
         raise ValueError(f"unknown granularity: {granularity!r}")
     return out

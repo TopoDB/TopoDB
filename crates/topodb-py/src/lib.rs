@@ -297,7 +297,7 @@ impl TopoDB {
         convert::scored_to_py(py, hits)
     }
 
-    #[pyo3(signature = (scopes, query, k, vector=None, expansions=None, graph_boost=false, labels=None, now_ms=None))]
+    #[pyo3(signature = (scopes, query, k, vector=None, expansions=None, graph_boost=false, labels=None, now_ms=None, corroboration_weight=0.0, graph_weight=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall(
         &self,
@@ -310,6 +310,8 @@ impl TopoDB {
         graph_boost: bool,
         labels: Option<Vec<String>>,
         now_ms: Option<i64>,
+        corroboration_weight: f32,
+        graph_weight: Option<f32>,
     ) -> PyResult<PyObject> {
         let db = self.db(py)?;
         let mut q = topodb::RecallQuery::new(convert::parse_scopes(py, scopes)?, query, k);
@@ -318,6 +320,10 @@ impl TopoDB {
         q.graph_boost = graph_boost;
         q.labels = labels;
         q.options.now_ms = now_ms;
+        q.corroboration_weight = corroboration_weight;
+        if let Some(w) = graph_weight {
+            q.graph_weight = w;
+        }
         let hits = py
             .allow_threads(|| db.recall(&q))
             .map_err(|e| errors::to_py(py, e))?;
