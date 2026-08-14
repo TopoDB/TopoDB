@@ -3009,6 +3009,7 @@ dependencies = [
  "smol_str",
  "tempfile",
  "thiserror 2.0.18",
+ "topodb-json",
  "ulid",
 ]
 
