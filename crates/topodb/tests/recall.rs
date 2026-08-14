@@ -32,6 +32,21 @@ use topodb::*;
 /// instead of silently returning "settled" — a masked timeout previously
 /// surfaced as a confusing assertion mismatch with no diagnostic trail.
 fn settle_counters(db: &Db, watch: NodeId) {
+    settle_counters_inner(db, watch, None);
+}
+
+/// Like `settle_counters` but first waits for the counter to REACH `target`
+/// before trusting stability. A stable reading *below* the expected post-bump
+/// value is the classic false positive that flaked this suite on Windows: the
+/// async bumper simply had not flushed yet, and "unchanged for N polls" cannot
+/// distinguish "not bumped yet" from "drained". Callers that just queued a
+/// known number of bumps pass the expected post-bump count as a lower bound
+/// (`>=`, so incidental leg reads that bump further still settle).
+fn settle_counters_reaching(db: &Db, watch: NodeId, target: u64) {
+    settle_counters_inner(db, watch, Some(target));
+}
+
+fn settle_counters_inner(db: &Db, watch: NodeId, target: Option<u64>) {
     /// Comfortably past the bumper's 100ms `recv_timeout` tick, so each poll
     /// has a real chance to observe a flush if one is pending.
     const POLL: Duration = Duration::from_millis(150);
@@ -54,15 +69,24 @@ fn settle_counters(db: &Db, watch: NodeId) {
     let mut history = vec![last];
 
     loop {
-        if stable_count >= REQUIRED_STABLE {
-            return; // agreed across REQUIRED_STABLE polls past the bumper's tick: drained
+        // A `target` gates stability: only trust "stable" once the counter has
+        // climbed to at least the expected post-bump value, so we never settle
+        // on a pre-flush plateau (stable-at-the-old-value is indistinguishable
+        // from stable-at-the-new-value without this check — the Windows flake).
+        let reached = match target {
+            None => true,
+            Some(t) => last.is_some_and(|c| c >= t),
+        };
+        if reached && stable_count >= REQUIRED_STABLE {
+            return; // reached target (if any) and agreed across REQUIRED_STABLE polls: drained
         }
         if start.elapsed() >= DEADLINE {
             panic!(
-                "settle_counters on {watch:?} never reached {REQUIRED_STABLE} \
-                 consecutive stable reads within {DEADLINE:?} (needed \
-                 {stable_count}); observed sequence: {history:?} — the bumper \
-                 or applier is starved far beyond its normal ~100ms tick"
+                "settle_counters on {watch:?} (target {target:?}) never reached \
+                 {REQUIRED_STABLE} consecutive stable reads at/above target within \
+                 {DEADLINE:?} (needed {stable_count}); observed sequence: \
+                 {history:?} — the bumper or applier is starved far beyond its \
+                 normal ~100ms tick"
             );
         }
         std::thread::sleep(POLL);
@@ -744,10 +768,18 @@ fn access_boost_lifts_a_frequently_read_node() {
     );
     let second = unboosted[1].0.id;
     assert!(second == a_id || second == b_id);
+    // Baseline BEFORE the manual bumps, so we can wait for them to actually
+    // land — not merely for the counter to stop changing (which it also does
+    // before the async bumper flushes; that plateau was the Windows flake).
+    let before = db
+        .access_stats(&scopes(), second)
+        .ok()
+        .flatten()
+        .map_or(0, |s| s.access_count);
     for _ in 0..8 {
         let _ = db.node(&scopes(), second);
     }
-    settle_counters(&db, second);
+    settle_counters_reaching(&db, second, before + 8);
     let out = db
         .recall(&topodb::RecallQuery {
             access_weight: 1.0,
@@ -770,10 +802,15 @@ fn recency_and_access_factors_multiply() {
     // must lift the old node past it — proving the two factors compose
     // multiplicatively rather than one overwriting the other.
     let (_dir, db, old_id, fresh_id) = corpus_with_backdated_and_fresh_memory("shared term");
+    let before = db
+        .access_stats(&scopes(), old_id)
+        .ok()
+        .flatten()
+        .map_or(0, |s| s.access_count);
     for _ in 0..32 {
         let _ = db.node(&scopes(), old_id);
     }
-    settle_counters(&db, old_id);
+    settle_counters_reaching(&db, old_id, before + 32);
     let mut base = topodb::RecallQuery::new(scopes(), "shared term", 10);
     base.options.recency_weight = 0.9;
     // Pin "now" to the fresh node's mint time: the old node's age is then
