@@ -172,7 +172,39 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
     let idle_ms = parse_idle_ms(std::env::var("TOPODB_DAEMON_IDLE_MS").ok().as_deref());
     let hello_ms = parse_hello_ms(std::env::var("TOPODB_DAEMON_HELLO_MS").ok().as_deref());
 
+    spawn_hygiene_tick(&db, config);
+
     run_accept_loop(base, db, endpoint, idle_ms, Duration::from_millis(hello_ms)).await
+}
+
+/// Spawns the daemon's low-frequency hygiene tick: the SAME catch-up boot
+/// runs, but with `allow_heavy = true` so the heavy re-ingest work boot
+/// defers gets a chance to run while the daemon happens to be resident.
+/// Genuinely best-effort — the daemon idle-exits in ~60s by default, so this
+/// rarely fires; each task's `META` `last_run` gate makes a tick a no-op
+/// when nothing is due, so it never duplicates the CLI/server catch-up.
+///
+/// Deliberately a bare `tokio::spawn` with its own interval, independent of
+/// the accept loop's idle-gate/shutdown machinery: it must never count as
+/// "activity" that keeps a connectionless daemon alive, and it must never be
+/// able to crash the daemon (every catch-up error is swallowed inside
+/// [`crate::onboard_boot::tick_once`]).
+fn spawn_hygiene_tick(db: &Db, config: &Config) {
+    let tick_db = db.clone();
+    let tick_scope = config.default_scope;
+    let tick_schedule = crate::onboard_boot::resolve_schedule(&config.db_path);
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_secs(300));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            iv.tick().await;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            crate::onboard_boot::tick_once(&tick_db, tick_scope, &tick_schedule, now_ms);
+        }
+    });
 }
 
 /// Open the DB with the same spec/upgrade/busy-retry policy `main.rs` uses for
