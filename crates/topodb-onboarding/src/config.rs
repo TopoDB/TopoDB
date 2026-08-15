@@ -161,7 +161,14 @@ fn ensure_entry_defaults(schedule_table: &mut toml::Table, name: &str, default: 
 /// overwritten. Unknown keys/tables in `existing_text` are preserved as-is
 /// (modulo `toml`'s re-serialization, which does not retain comments).
 pub fn render_merged(existing_text: &str, updates: &OnboardingUpdates) -> String {
-    let mut table: toml::Table = toml::from_str(existing_text).unwrap_or_default();
+    let mut table: toml::Table = match toml::from_str(existing_text) {
+        Ok(table) => table,
+        // Non-empty text that fails to parse is a malformed/hand-edited file:
+        // refuse to clobber it with a fresh defaults-only file.
+        Err(_) if !existing_text.trim().is_empty() => return existing_text.to_string(),
+        // Empty or whitespace-only: no config yet, start fresh.
+        Err(_) => toml::Table::new(),
+    };
 
     if !table.contains_key("db") {
         if let Some(db) = &updates.db {
@@ -232,5 +239,18 @@ mod tests {
         assert_eq!(c.schedule.purge.interval_secs, 86_400); // filled default
         assert_eq!(c.onboarding_version, Some(1)); // stamped
         assert!(out.contains("custom_key")); // unknown key preserved
+    }
+
+    #[test]
+    fn render_merged_refuses_to_clobber_malformed_file() {
+        let existing = "db = \"/my/db.redb\"\nthis is not [ valid toml\n";
+        let updates = OnboardingUpdates {
+            db: Some("/default/db.redb".into()),
+            scope: Some("shared".into()),
+            onboarding_version: 1,
+            ensure_schedule_defaults: true,
+        };
+        let out = render_merged(existing, &updates);
+        assert_eq!(out, existing);
     }
 }
