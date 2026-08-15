@@ -1,5 +1,6 @@
 mod cli;
 mod daemon_client;
+mod init;
 mod output;
 mod resolve;
 
@@ -151,6 +152,28 @@ fn main() {
         };
         print!("{text}");
         std::process::exit(0);
+    }
+
+    // `init` scaffolds the db itself (and the config that governs its own
+    // resolution), so it must run before the direct-open path below —
+    // opening here would just contend with the create it's about to do.
+    if let Command::Init {
+        if_needed,
+        force,
+        no_daemon,
+        no_clients,
+    } = &cli.cmd
+    {
+        init::run_init(init::InitArgs {
+            db_path: db_path.clone(),
+            scope: default_scope,
+            if_needed: *if_needed,
+            force: *force,
+            no_daemon: *no_daemon,
+            no_clients: *no_clients,
+            lock_wait_ms,
+            pretty: cli.pretty,
+        });
     }
 
     // Socket-first dispatch: check if a daemon socket exists for this DB path,
@@ -450,6 +473,7 @@ fn main() {
         Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
         Command::Daemon(_) => unreachable!("daemon subcommands exit before the direct open"),
         Command::Conventions { .. } => unreachable!("conventions exits before the direct open"),
+        Command::Init { .. } => unreachable!("init exits before the direct open"),
     }
 }
 

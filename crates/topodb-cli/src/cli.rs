@@ -504,6 +504,23 @@ pub enum Command {
         #[arg(long)]
         pointer: bool,
     },
+    /// Initialize onboarding: scaffold the db + .topodb.toml + CONVENTIONS.md,
+    /// inject the memory-usage pointer into config-only clients' rules files,
+    /// run overdue hygiene, and start the daemon.
+    Init {
+        /// Fast path for repeat/agent invocation: no-op if onboarding_version already current.
+        #[arg(long)]
+        if_needed: bool,
+        /// Re-run every step, ignoring the version marker.
+        #[arg(long)]
+        force: bool,
+        /// Skip starting the daemon.
+        #[arg(long)]
+        no_daemon: bool,
+        /// Skip config-only client rules-file injection.
+        #[arg(long)]
+        no_clients: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Clone)]
