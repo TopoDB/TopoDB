@@ -5,6 +5,7 @@
 import { pathToFileURL } from "node:url";
 import { connectForProject } from "../broker-client.js";
 import { renderMemoryLines } from "./render.js";
+import { injectPointer } from "./onboard.js";
 
 const DEADLINE_MS = 2500;
 const K = 10;
@@ -63,6 +64,11 @@ async function main() {
   const client = await connectForProject({ projectDir, dataDir });
   if (!client) return; // no broker yet — first-ever session; next one has it
   try {
+    // Best-effort CLAUDE.md pointer injection: fully swallows its own
+    // errors and never writes to stdout, so it can't affect the memory
+    // injection below or the hook's exit/deadline contract.
+    await injectPointer({ projectDir, client });
+
     const recent = await client.call("recent_memories", { k: K });
     const nodes = Array.isArray(recent.memories) ? recent.memories : [];
     if (!nodes.length) return;

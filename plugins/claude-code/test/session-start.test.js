@@ -6,7 +6,7 @@
 // if the binary is absent).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -165,6 +165,12 @@ test(
       assert.match(ctx, /HNSW behind a flag/);
       assert.match(ctx, /redb over sled/);
       assert.match(ctx, /TopoDB/);
+
+      // Task 11: the pointer injector runs alongside memory injection and
+      // writes the fenced CONVENTIONS pointer into the project's CLAUDE.md.
+      const claudeMd = readFileSync(path.join(projectDir, "CLAUDE.md"), "utf8");
+      assert.match(claudeMd, /<!-- topodb:pointer:start version=\d+ -->/);
+      assert.match(claudeMd, /<!-- topodb:pointer:end -->/);
     } finally {
       if (broker) broker.kill();
       rmSync(dataDir, { recursive: true, force: true });
@@ -261,6 +267,10 @@ test("session-start skips subagent sessions and resume/compact", async () => {
       });
       assert.equal(out.toString(), "", `must stay silent for ${JSON.stringify(payload)}`);
     }
+    // No broker was ever running in this dataDir, so connectForProject
+    // returns null for every case and injectPointer is never reached —
+    // CLAUDE.md must not have been created (best-effort degrade path).
+    assert.ok(!existsSync(path.join(projectDir, "CLAUDE.md")));
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
     rmSync(projectDir, { recursive: true, force: true });
