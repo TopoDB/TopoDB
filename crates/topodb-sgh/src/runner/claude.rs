@@ -20,13 +20,16 @@ pub struct McpWiring {
 /// Build the command-line arguments for invoking `claude -p`.
 ///
 /// Returns a vector of arguments suitable for `std::process::Command`.
-/// Includes the prompt, allowedTools (with optional bash grants and MCP tools),
-/// output format, and model if specified.
+/// Includes the prompt, allowedTools (with optional bash grants, web tools, and
+/// MCP tools), output format, and model if specified.
 ///
 /// Structured output (--output-format json) is what makes a denied tool visible at all:
 /// in plain-text mode a blocked tool call is indistinguishable from a completed one,
 /// since both exit 0 with prose on stdout. This ensures that when a node's Write is
 /// denied, we can detect it in the JSON response's permission_denials field.
+///
+/// The `web` parameter appends `,WebFetch,WebSearch` to allowedTools (read-only web
+/// access, additive on Read/Write/Edit); `false` leaves the argv untouched.
 ///
 /// The `mcp` parameter adds `mcp__topodb` to allowedTools and `--mcp-config <path>` to argv;
 /// `None` keeps the argv byte-identical to the legacy behavior.
@@ -34,6 +37,7 @@ pub fn build_argv(
     prompt: String,
     model: Option<String>,
     bash_grants: &[String],
+    web: bool,
     mcp: Option<&McpWiring>,
 ) -> Vec<String> {
     let mut argv = vec!["claude".to_string(), "-p".to_string(), prompt];
@@ -46,6 +50,12 @@ pub fn build_argv(
     let mut allowed_tools = "Read,Write,Edit".to_string();
     for grant in bash_grants {
         allowed_tools.push_str(&format!(",Bash({}:*)", grant));
+    }
+    // Read-only web access, additive like the bash grants above. Both tools
+    // are granted together (a single boolean flag) — a node doing web research
+    // typically needs to both search and fetch.
+    if web {
+        allowed_tools.push_str(",WebFetch,WebSearch");
     }
     // `mcp__topodb` grants the whole topodb server's tools (decision: full
     // surface). Additive like everything else in --allowedTools; the server
@@ -156,6 +166,7 @@ pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
 pub struct ClaudeCodeCli {
     pub model: Option<String>,
     pub bash_grants: Vec<String>,
+    pub web: bool,
     pub mcp: Option<McpWiring>,
 }
 
@@ -194,6 +205,7 @@ impl CliCodec for ClaudeCodeCli {
             build_prompt(req),
             self.model.clone(),
             &self.bash_grants,
+            self.web,
             node_mcp,
         )
     }
@@ -227,10 +239,16 @@ pub struct ClaudeCodeRunner {
 }
 
 impl ClaudeCodeRunner {
-    pub fn new(model: Option<String>, bash_grants: Vec<String>, mcp: Option<McpWiring>) -> Self {
+    pub fn new(
+        model: Option<String>,
+        bash_grants: Vec<String>,
+        web: bool,
+        mcp: Option<McpWiring>,
+    ) -> Self {
         let codec = ClaudeCodeCli {
             model,
             bash_grants,
+            web,
             mcp,
         };
         ClaudeCodeRunner {
