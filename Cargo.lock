@@ -3382,6 +3382,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "topodb-onboarding"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "toml",
+ "topodb",
+ "topodb-json",
+]
+
+[[package]]
 name = "topodb-py"
 version = "0.0.1"
 dependencies = [
