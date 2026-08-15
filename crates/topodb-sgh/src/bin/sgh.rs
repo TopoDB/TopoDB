@@ -53,6 +53,7 @@ fn validate_provider_flags(
     base_url: &Option<String>,
     agent_bash_used: bool,
     agent_web_used: bool,
+    agent_all_tools_used: bool,
     model: &Option<String>,
 ) {
     if base_url.is_some() && provider != Provider::Openai {
@@ -68,6 +69,12 @@ fn validate_provider_flags(
     if agent_web_used && provider != Provider::ClaudeCode {
         eprintln!(
             "error: --agent-web applies only to --provider claude-code (HTTP providers get their tools differently)"
+        );
+        std::process::exit(2);
+    }
+    if agent_all_tools_used && provider != Provider::ClaudeCode {
+        eprintln!(
+            "error: --agent-all-tools applies only to --provider claude-code (HTTP providers get their tools differently)"
         );
         std::process::exit(2);
     }
@@ -161,6 +168,17 @@ enum Cmd {
         /// web research is denied and blocks.
         #[arg(long = "agent-web")]
         agent_web: bool,
+        /// Grant agent nodes the FULL, UNRESTRICTED tool surface: every tool,
+        /// any argument (via `--dangerously-skip-permissions`). Supersedes
+        /// --agent-bash/--agent-web (no need to enumerate prefixes), and makes
+        /// a residual denied tool call advisory rather than failing the node.
+        /// This removes sgh's narrow-grant safety rail — an agent prompt can run
+        /// any shell command — so it is opt-in and echoed loudly at the approval
+        /// gate, which becomes the control. Use it when narrow prefix grants
+        /// (`cd … && cargo`, env-prefixed commands) keep tripping the
+        /// deny-as-failure rail. Applies only to --provider claude-code.
+        #[arg(long = "agent-all-tools")]
+        agent_all_tools: bool,
         /// Supply agent nodes with the TopoDB MCP server: the full server
         /// command (binary + args), e.g.
         /// "--agent-mcp '/abs/topodb-mcp --db /abs/memory.redb --scope <ulid>'".
@@ -249,6 +267,14 @@ enum Cmd {
         /// --provider claude-code. Echoed at the approval gate.
         #[arg(long = "agent-web")]
         agent_web: bool,
+        /// Grant agent nodes the FULL, UNRESTRICTED tool surface: every tool,
+        /// any argument (via `--dangerously-skip-permissions`). Supersedes
+        /// --agent-bash/--agent-web and makes a residual denied tool call
+        /// advisory rather than failing the node. Removes sgh's narrow-grant
+        /// safety rail, so it is opt-in and echoed loudly at the approval gate.
+        /// Applies only to --provider claude-code.
+        #[arg(long = "agent-all-tools")]
+        agent_all_tools: bool,
         /// Supply agent nodes with the TopoDB MCP server: the full server
         /// command (binary + args).
         #[arg(long = "agent-mcp")]
@@ -1214,6 +1240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             yes_including_revisions,
             agent_bash,
             agent_web,
+            agent_all_tools,
             agent_mcp,
             command_timeout,
             agent_timeout,
@@ -1231,6 +1258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 yes_including_revisions,
                 agent_bash,
                 agent_web,
+                agent_all_tools,
                 agent_mcp,
                 command_timeout,
                 agent_timeout,
@@ -1272,6 +1300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             yes,
             agent_bash,
             agent_web,
+            agent_all_tools,
             agent_mcp,
             command_timeout,
             agent_timeout,
@@ -1285,6 +1314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 yes,
                 agent_bash,
                 agent_web,
+                agent_all_tools,
                 agent_mcp,
                 command_timeout,
                 agent_timeout,
@@ -1327,6 +1357,7 @@ fn run_cmd(
     yes_including_revisions: bool,
     agent_bash: Vec<String>,
     agent_web: bool,
+    agent_all_tools: bool,
     agent_mcp: Option<String>,
     command_timeout: u64,
     agent_timeout: u64,
@@ -1373,6 +1404,7 @@ fn run_cmd(
         &base_url,
         !agent_bash.is_empty(),
         agent_web,
+        agent_all_tools,
         &model,
     );
     #[cfg(not(feature = "claude-code"))]
@@ -1421,9 +1453,15 @@ fn run_cmd(
             None => None,
         };
         Some(BuiltRunner::Claude(
-            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), agent_web, mcp_wiring)
-                .with_deadline(agent_timeout)
-                .with_cancel(cancel.clone()),
+            ClaudeCodeRunner::new(
+                model.clone(),
+                agent_bash.clone(),
+                agent_web,
+                mcp_wiring,
+                agent_all_tools,
+            )
+            .with_deadline(agent_timeout)
+            .with_cancel(cancel.clone()),
         ))
     } else {
         None
@@ -1483,6 +1521,15 @@ fn run_cmd(
 
         if agent_web {
             println!("\nAgent nodes may use WebFetch, WebSearch (additive; read-only web access).");
+        }
+
+        if agent_all_tools {
+            println!(
+                "\n⚠  UNRESTRICTED: agent nodes get EVERY tool with ANY argument \
+                 (--dangerously-skip-permissions).\n   Narrow --agent-bash/--agent-web grants \
+                 are superseded and denials are advisory. Agent prompts are ungated — this gate \
+                 is the only control."
+            );
         }
 
         print_unconstrained(&current);
@@ -1772,6 +1819,7 @@ fn resume_cmd(
     yes: bool,
     agent_bash: Vec<String>,
     agent_web: bool,
+    agent_all_tools: bool,
     agent_mcp: Option<String>,
     command_timeout: u64,
     agent_timeout: u64,
@@ -1801,6 +1849,7 @@ fn resume_cmd(
         &base_url,
         !agent_bash.is_empty(),
         agent_web,
+        agent_all_tools,
         &model,
     );
     #[cfg(not(feature = "claude-code"))]
@@ -1830,9 +1879,15 @@ fn resume_cmd(
             None => None,
         };
         Some(BuiltRunner::Claude(
-            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), agent_web, mcp_wiring)
-                .with_deadline(agent_timeout)
-                .with_cancel(cancel.clone()),
+            ClaudeCodeRunner::new(
+                model.clone(),
+                agent_bash.clone(),
+                agent_web,
+                mcp_wiring,
+                agent_all_tools,
+            )
+            .with_deadline(agent_timeout)
+            .with_cancel(cancel.clone()),
         ))
     } else {
         None
@@ -2117,7 +2172,7 @@ fn plan_cmd(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_timeout = Duration::from_secs(agent_timeout);
     // Flag rails before anything else, same as `run`.
-    validate_provider_flags(provider, &base_url, false, false, &model);
+    validate_provider_flags(provider, &base_url, false, false, false, &model);
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");

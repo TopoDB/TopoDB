@@ -79,7 +79,7 @@ fn denied_write() -> &'static str {
 
 #[test]
 fn a_denied_tool_is_a_failure_even_though_claude_reports_success() {
-    match interpret_result(denied_write(), false) {
+    match interpret_result(denied_write(), false, true) {
         NodeOutcome::Denied { .. } => {}
         NodeOutcome::Succeeded { output } => {
             panic!("a node whose Write was denied did no work, got success: {output}")
@@ -90,7 +90,7 @@ fn a_denied_tool_is_a_failure_even_though_claude_reports_success() {
 
 #[test]
 fn a_denial_failure_names_the_tool_that_was_blocked() {
-    match interpret_result(denied_write(), false) {
+    match interpret_result(denied_write(), false, true) {
         NodeOutcome::Denied { tool } => {
             assert_eq!(tool, "Write", "the tool field must name the denied tool")
         }
@@ -109,7 +109,7 @@ fn multiple_denied_tools_are_comma_joined() {
             {"tool_name": "Bash", "tool_use_id": "toolu_02", "tool_input": {"command": "rm -rf /"}}
         ]
     }"#;
-    match interpret_result(multi_denial_json, false) {
+    match interpret_result(multi_denial_json, false, true) {
         NodeOutcome::Denied { tool } => assert_eq!(
             tool, "Write, Bash",
             "multiple denied tools must be comma-joined in input order"
@@ -127,7 +127,7 @@ fn a_clean_run_yields_the_result_field_not_the_raw_json() {
         "permission_denials": []
     }"#;
     assert_eq!(
-        interpret_result(json, false),
+        interpret_result(json, false, true),
         NodeOutcome::Succeeded {
             output: "PONG".to_string()
         }
@@ -142,7 +142,7 @@ fn an_api_error_is_a_failure() {
         "result": "overloaded",
         "permission_denials": []
     }"#;
-    match interpret_result(json, false) {
+    match interpret_result(json, false, true) {
         NodeOutcome::Failed { .. } => {}
         other => panic!("expected failure, got {other:?}"),
     }
@@ -150,7 +150,7 @@ fn an_api_error_is_a_failure() {
 
 #[test]
 fn unparseable_output_is_a_failure_rather_than_silent_success() {
-    match interpret_result("not json at all", false) {
+    match interpret_result("not json at all", false, true) {
         NodeOutcome::Failed { .. } => {}
         other => panic!("unreadable output proves nothing about the work, got {other:?}"),
     }
@@ -209,7 +209,7 @@ fn interpret_result_unwraps_wrapped_json_when_json_is_expected() {
         serde_json::to_string("Here is the result:\n```json\n{\"tests_added\":7}\n```").unwrap();
     let env = envelope(&result);
     assert_eq!(
-        interpret_result(&env, true),
+        interpret_result(&env, true, true),
         NodeOutcome::Succeeded {
             output: "{\"tests_added\":7}".to_string()
         },
@@ -224,7 +224,7 @@ fn interpret_result_leaves_prose_alone_when_no_json_is_expected() {
     let result = serde_json::to_string("A prose summary { with a brace } inside.").unwrap();
     let env = envelope(&result);
     assert_eq!(
-        interpret_result(&env, false),
+        interpret_result(&env, false, true),
         NodeOutcome::Succeeded {
             output: "A prose summary { with a brace } inside.".to_string()
         }
@@ -237,7 +237,7 @@ fn interpret_result_leaves_prose_alone_when_no_json_is_expected() {
 
 #[test]
 fn build_argv_with_no_grants_includes_base_allowed_tools() {
-    let argv = build_argv("Test prompt".to_string(), None, &[], false, None);
+    let argv = build_argv("Test prompt".to_string(), None, &[], false, None, false);
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -253,6 +253,7 @@ fn build_argv_with_single_grant_appends_bash_grant() {
         &["topodb".to_string()],
         false,
         None,
+        false,
     );
     let idx = argv
         .iter()
@@ -269,6 +270,7 @@ fn build_argv_with_multiple_grants_appends_all_in_order() {
         &["topodb".to_string(), "cargo".to_string()],
         false,
         None,
+        false,
     );
     let idx = argv
         .iter()
@@ -288,6 +290,7 @@ fn build_argv_with_model_includes_model_flag() {
         &[],
         false,
         None,
+        false,
     );
     let has_model = argv
         .iter()
@@ -302,7 +305,7 @@ fn build_argv_with_model_includes_model_flag() {
 
 #[test]
 fn build_argv_includes_base_flags() {
-    let argv = build_argv("Test prompt".to_string(), None, &[], false, None);
+    let argv = build_argv("Test prompt".to_string(), None, &[], false, None, false);
     assert!(
         argv.iter().any(|arg| arg == "-p"),
         "argv should include -p flag"
@@ -330,6 +333,7 @@ fn build_argv_full_order_empty_grants_with_model() {
         &[],
         false,
         None,
+        false,
     );
     assert_eq!(
         argv,
@@ -355,6 +359,7 @@ fn build_argv_full_order_one_grant_no_model() {
         &["topodb".to_string()],
         false,
         None,
+        false,
     );
     assert_eq!(
         argv,
@@ -634,7 +639,7 @@ fn build_argv_with_mcp_appends_config_and_tool() {
     let mcp = McpWiring {
         config_path: "/tmp/sgh-mcp.json".to_string(),
     };
-    let argv = build_argv("p".to_string(), None, &[], false, Some(&mcp));
+    let argv = build_argv("p".to_string(), None, &[], false, Some(&mcp), false);
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(argv[at + 1], "Read,Write,Edit,mcp__topodb");
     let mc = argv.iter().position(|a| a == "--mcp-config").unwrap();
@@ -643,7 +648,14 @@ fn build_argv_with_mcp_appends_config_and_tool() {
 
 #[test]
 fn build_argv_without_mcp_is_byte_identical_to_today() {
-    let argv = build_argv("p".to_string(), None, &["topodb".to_string()], false, None);
+    let argv = build_argv(
+        "p".to_string(),
+        None,
+        &["topodb".to_string()],
+        false,
+        None,
+        false,
+    );
     assert_eq!(
         argv,
         vec![
@@ -672,6 +684,7 @@ fn build_argv_mcp_composes_with_bash_grants_and_model() {
         &["topodb".to_string()],
         false,
         Some(&mcp),
+        false,
     );
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(argv[at + 1], "Read,Write,Edit,Bash(topodb:*),mcp__topodb");
@@ -685,14 +698,14 @@ fn build_argv_mcp_composes_with_bash_grants_and_model() {
 
 #[test]
 fn build_argv_with_web_appends_web_tools() {
-    let argv = build_argv("p".to_string(), None, &[], true, None);
+    let argv = build_argv("p".to_string(), None, &[], true, None, false);
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(argv[at + 1], "Read,Write,Edit,WebFetch,WebSearch");
 }
 
 #[test]
 fn build_argv_without_web_omits_web_tools() {
-    let argv = build_argv("p".to_string(), None, &[], false, None);
+    let argv = build_argv("p".to_string(), None, &[], false, None, false);
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(argv[at + 1], "Read,Write,Edit");
 }
@@ -708,10 +721,67 @@ fn build_argv_web_composes_with_bash_grants_and_mcp() {
         &["topodb".to_string()],
         true,
         Some(&mcp),
+        false,
     );
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(
         argv[at + 1],
         "Read,Write,Edit,Bash(topodb:*),WebFetch,WebSearch,mcp__topodb"
     );
+}
+
+// --- build_argv all-tools (unrestricted) mode -----------------------------
+//
+// `--agent-all-tools` passes `--dangerously-skip-permissions` so an agent node
+// may use every tool with any argument. The enumerated `--allowedTools` (and
+// the bash/web grants it would carry) is omitted — bypass makes it moot.
+
+#[test]
+fn build_argv_all_tools_bypasses_permissions_and_omits_allowed_tools() {
+    // Even with bash + web grants set, all_tools supersedes them: no
+    // --allowedTools at all, just the bypass flag.
+    let argv = build_argv(
+        "p".to_string(),
+        None,
+        &["cargo".to_string()],
+        true,
+        None,
+        true,
+    );
+    assert!(
+        argv.iter().any(|a| a == "--dangerously-skip-permissions"),
+        "all_tools must pass the bypass flag: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|a| a == "--allowedTools"),
+        "all_tools must omit the enumerated --allowedTools: {argv:?}"
+    );
+    // Output is still JSON so denials/results remain machine-readable.
+    assert!(argv
+        .windows(2)
+        .any(|w| w[0] == "--output-format" && w[1] == "json"));
+}
+
+#[test]
+fn build_argv_all_tools_still_emits_mcp_config() {
+    // Bypass permits mcp__topodb without enumerating it, but the server still
+    // has to be spawned from the config file.
+    let mcp = McpWiring {
+        config_path: "/tmp/c.json".to_string(),
+    };
+    let argv = build_argv("p".to_string(), None, &[], false, Some(&mcp), true);
+    assert!(argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+    assert!(argv.iter().any(|a| a == "--mcp-config"));
+    assert!(!argv.iter().any(|a| a == "--allowedTools"));
+}
+
+#[test]
+fn interpret_result_denial_is_advisory_when_not_fatal() {
+    // Under all-tools mode denials should not occur, but if one does it must
+    // not fail a node whose real work already landed: deny_fatal=false makes
+    // the denial advisory and the result is interpreted normally.
+    match interpret_result(denied_write(), false, false) {
+        NodeOutcome::Succeeded { .. } => {}
+        other => panic!("a non-fatal denial must not fail the node, got {other:?}"),
+    }
 }

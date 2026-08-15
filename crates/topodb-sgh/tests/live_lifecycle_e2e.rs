@@ -150,6 +150,8 @@ fn lifecycle_graph_actions_match_verdicts_live() {
         Some(McpWiring {
             config_path: config.to_string_lossy().into_owned(),
         }),
+        // no unrestricted mode — production parity: no --agent-all-tools
+        false,
     );
     let commands = ShellCommandRunner::new(Duration::from_secs(120));
     let run_db = topodb::Db::open(dir.path().join("run.redb")).unwrap();
