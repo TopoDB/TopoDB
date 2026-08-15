@@ -2,4 +2,4 @@
  * purpose (same philosophy as the repo's pin-vs-crate guard): a server
  * upgrade that adds or removes tools must go red HERE, deliberately, not
  * drift silently — bump it alongside the `@topodb/topodb-mcp` dependency. */
-export const EXPECTED_TOOL_COUNT = 31;
+export const EXPECTED_TOOL_COUNT = 32;
