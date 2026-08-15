@@ -3,7 +3,9 @@
 .claude-checkpoint.md
 Claude Docs/
 .superpowers/
-docs/
+# docs/ is local working notes by default, EXCEPT published user-facing pages.
+docs/*
+!docs/agent-clients.md
 
 # Specs and plans are working notes, kept locally only.
 specs/

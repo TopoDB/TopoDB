@@ -65,6 +65,11 @@ claude mcp add topodb --transport stdio -- topodb-mcp --db /path/to/agent.redb
 
 On [Pi](https://pi.dev) it is one command: `pi install npm:@topodb/pi`.
 
+Using another agent client — Codex CLI, OpenCode, Cursor, Windsurf, Zed, or
+Cline? `topodb-mcp` works with any MCP client; see
+[`docs/agent-clients.md`](docs/agent-clients.md) for a copy-paste config per
+client (and how memory scoping works without the Claude Code plugin).
+
 Inside Claude Code specifically, skip `cargo` and `claude mcp add` entirely —
 install the plugin, which manages the server (including fetching it) for you:
 
