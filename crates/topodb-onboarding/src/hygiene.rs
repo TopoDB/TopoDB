@@ -56,9 +56,10 @@ pub struct CatchUpReport {
     /// Tasks that were due and actually ran (including the `Reingest` stub
     /// when `allow_heavy` was set).
     pub ran: Vec<Task>,
-    /// Tasks that were due but deferred (currently only `Reingest` when
-    /// `!allow_heavy`) — their `last_run` was NOT advanced, so they stay
-    /// due until a caller runs catch-up with `allow_heavy: true`.
+    /// Tasks that were due but deferred (currently only a DUE `Reingest`
+    /// when `!allow_heavy`; a disabled/not-due `Reingest` is skipped
+    /// entirely, never deferred) — their `last_run` was NOT advanced, so
+    /// they stay due until a caller runs catch-up with `allow_heavy: true`.
     pub deferred: Vec<Task>,
     /// Count of lifecycle decay candidates surfaced by the most recent
     /// `Lifecycle` run this call (0 if `Lifecycle` wasn't due/run).
@@ -122,10 +123,12 @@ fn set_last_run(db: &Db, task: Task, now_ms: i64) -> Result<(), ComposeError> {
 /// operates on the whole op log).
 ///
 /// `Compact`, `Purge`, and `Lifecycle` are bounded, so they always run
-/// when due. `Reingest` is heavy: unless `allow_heavy` is set, a due
-/// `Reingest` is pushed to `report.deferred` and its `last_run` is left
-/// untouched, so the next catch-up call (e.g. once a background daemon is
-/// willing to pay the heavy cost) still sees it as due.
+/// when due. `Reingest` is heavy: a disabled/not-due `Reingest` is skipped
+/// entirely (neither ran nor deferred); a DUE `Reingest` is deferred
+/// unless `allow_heavy` is set — with `!allow_heavy` it's pushed to
+/// `report.deferred` and its `last_run` is left untouched, so the next
+/// catch-up call (e.g. once a background daemon is willing to pay the
+/// heavy cost) still sees it as due.
 pub fn run_catch_up(
     db: &Db,
     scope: Scope,
@@ -140,21 +143,23 @@ pub fn run_catch_up(
     let scopes = topodb_json::scope_to_scope_set(scope);
 
     // `Reingest` gets bespoke handling rather than folding into the `due`
-    // loop below: while it's off by default (`Schedule::defaults()` has it
-    // disabled — nothing to re-ingest until a source is configured), a
-    // catch-up call with `!allow_heavy` still needs to surface "heavy work
-    // is being skipped" to the caller so a daemon/CLI can decide whether to
-    // re-run with `allow_heavy: true`. So the defer signal is unconditional
-    // on `allow_heavy`, independent of whether the schedule/interval would
-    // otherwise call it due; only the *run* path (allow_heavy == true)
-    // respects `due` (and thus `enabled`), since running the (stub) heavy
-    // task before it's configured/scheduled would be pointless.
-    if !allow_heavy {
-        report.deferred.push(Task::Reingest);
-    } else if due.contains(&Task::Reingest) {
-        // TODO(reingest): wire obsidian/OKF refresh
-        set_last_run(db, Task::Reingest, now_ms)?;
-        report.ran.push(Task::Reingest);
+    // loop below: it's off by default (`Schedule::defaults()` has it
+    // disabled — nothing to re-ingest until a source is configured), and a
+    // disabled/not-due `Reingest` is skipped entirely (neither ran nor
+    // deferred). A DUE `Reingest` is deferred unless `allow_heavy` is set:
+    // with `!allow_heavy` it's pushed to `report.deferred` and its
+    // `last_run` is left untouched so it stays due for a later heavy run;
+    // with `allow_heavy` it runs (the stub) and its `last_run` advances.
+    if due.contains(&Task::Reingest) {
+        if allow_heavy {
+            // TODO(reingest): wire obsidian/OKF refresh
+            set_last_run(db, Task::Reingest, now_ms)?;
+            report.ran.push(Task::Reingest);
+        } else {
+            // heavy work deferred to a daemon/allow_heavy caller; last_run
+            // left as-is
+            report.deferred.push(Task::Reingest);
+        }
     }
 
     for task in due.into_iter().filter(|t| *t != Task::Reingest) {
@@ -239,8 +244,27 @@ mod tests {
         let now = 1_000_000_000i64;
         let rep = run_catch_up(&db, scope, &Schedule::defaults(), now, false).unwrap();
         assert!(rep.ran.contains(&Task::Compact));
-        assert!(rep.deferred.contains(&Task::Reingest));
+        assert!(!rep.deferred.contains(&Task::Reingest)); // disabled by default => skipped
         let lr = db.get_meta(Task::Compact.meta_key()).unwrap().unwrap();
         assert_eq!(String::from_utf8(lr).unwrap().parse::<i64>().unwrap(), now);
+    }
+
+    #[test]
+    fn catch_up_defers_due_reingest_then_runs_with_allow_heavy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(&dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let scope = Scope::Shared;
+        let now = 1_000_000_000i64;
+
+        let mut schedule = Schedule::defaults();
+        schedule.reingest.enabled = true;
+
+        let rep = run_catch_up(&db, scope, &schedule, now, false).unwrap();
+        assert!(rep.deferred.contains(&Task::Reingest));
+        assert!(db.get_meta(Task::Reingest.meta_key()).unwrap().is_none());
+
+        let rep = run_catch_up(&db, scope, &schedule, now, true).unwrap();
+        assert!(rep.ran.contains(&Task::Reingest));
+        assert!(db.get_meta(Task::Reingest.meta_key()).unwrap().is_some());
     }
 }
