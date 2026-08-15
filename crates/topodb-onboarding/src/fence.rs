@@ -43,6 +43,7 @@ pub fn upsert_fence(existing: &str, block: &str, version: u32) -> (String, Fence
                 .unwrap_or(&existing[end_full..]);
             let mut out = String::new();
             out.push_str(&existing[..s]);
+            // Caller-supplied block is always terminated by exactly one '\n' (from content::pointer_block), so safe to strip.
             out.push_str(block.trim_end_matches('\n'));
             out.push('\n');
             out.push_str(tail);
@@ -89,6 +90,24 @@ mod tests {
     fn skips_on_corrupted_single_marker() {
         let existing = format!("x\n{START}1 -->\nno end marker here\n");
         let (out, o) = upsert_fence(&existing, &block(1), 1);
+        assert!(matches!(o, FenceOutcome::Skipped));
+        assert_eq!(out, existing);
+    }
+    #[test]
+    fn malformed_version_parses_as_zero_and_gets_replaced() {
+        // Version string "abc" is non-numeric, so it parses as 0 (older than any version >= 1)
+        let existing = format!("top\n{START}abc -->\nGARBLED\n{END}\nbottom\n");
+        let (out, o) = upsert_fence(&existing, &block(2), 2);
+        assert!(matches!(o, FenceOutcome::Replaced));
+        assert!(out.contains("BODY v2"));
+        assert!(!out.contains("GARBLED"));
+        assert!(out.contains("top\n") && out.contains("bottom\n"));
+    }
+    #[test]
+    fn reversed_markers_order_is_skipped() {
+        // END marker appears before START marker (both present but out of order)
+        let existing = format!("{END}\n{START}1 -->\nBODY v1\n{END}\n");
+        let (out, o) = upsert_fence(&existing, &block(2), 2);
         assert!(matches!(o, FenceOutcome::Skipped));
         assert_eq!(out, existing);
     }
