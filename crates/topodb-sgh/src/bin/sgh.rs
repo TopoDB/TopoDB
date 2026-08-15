@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1572,6 +1573,21 @@ fn run_cmd(
         // whether or not a prompt follows, so a --yes run is never
         // silent about the widened surface — no separate stderr echo.
         if needs_prompt(is_revision, yes, yes_including_revisions) {
+            // A non-interactive stdin (piped, /dev/null, a background job)
+            // makes `read_line` return EOF immediately, which the check below
+            // would read as "not y" and silently abort with exit 0 —
+            // indistinguishable from a clean run. Refuse explicitly instead.
+            // This matters most for a replan revision (`is_revision`), whose
+            // model-authored commands a human must see: --yes does not cover
+            // revisions, so an unattended replan must stop here, not sail on.
+            if !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "error: approval required but stdin is not interactive. \
+                     Re-run with --yes (or --yes-including-revisions for replan \
+                     revisions) to approve without a prompt."
+                );
+                return Ok(2);
+            }
             println!("\nProceed? [y/N]");
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
@@ -2000,6 +2016,18 @@ fn resume_cmd(
     // `is_revision` is always false and `yes_including_revisions` is always
     // false.
     if needs_prompt(false, yes, false) {
+        // A non-interactive stdin (piped, /dev/null, a background job) makes
+        // `read_line` return EOF immediately, which the check below would read
+        // as "not y" and silently abort with exit 0 — indistinguishable from a
+        // clean run to a caller. Refuse explicitly instead, pointing at the
+        // flag that authorizes an unattended resume.
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "error: approval required but stdin is not interactive. \
+                 Re-run with --yes to approve this graph non-interactively."
+            );
+            return Ok(2);
+        }
         println!("\nProceed? [y/N]");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
