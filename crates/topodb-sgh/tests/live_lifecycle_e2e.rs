@@ -145,6 +145,8 @@ fn lifecycle_graph_actions_match_verdicts_live() {
         Some("haiku".to_string()),
         // no bash grants — production parity: /sgh:lifecycle passes no --agent-bash
         vec![],
+        // no web access — production parity: /sgh:lifecycle passes no --agent-web
+        false,
         Some(McpWiring {
             config_path: config.to_string_lossy().into_owned(),
         }),

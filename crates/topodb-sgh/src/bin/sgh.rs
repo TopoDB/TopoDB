@@ -44,13 +44,15 @@ impl std::fmt::Display for Provider {
     }
 }
 
-/// Validate the `--provider`/`--base-url`/`--agent-bash` combination shared by
+/// Validate the `--provider`/`--base-url`/`--agent-bash`/`--agent-web`
+/// combination shared by
 /// `run`, `resume`, and `plan`. Must run before any file IO — these are flag rails, not
 /// graph-dependent checks. Exits the process with code 2 on violation.
 fn validate_provider_flags(
     provider: Provider,
     base_url: &Option<String>,
     agent_bash_used: bool,
+    agent_web_used: bool,
     model: &Option<String>,
 ) {
     if base_url.is_some() && provider != Provider::Openai {
@@ -60,6 +62,12 @@ fn validate_provider_flags(
     if agent_bash_used && provider != Provider::ClaudeCode {
         eprintln!(
             "error: --agent-bash applies only to --provider claude-code (HTTP providers execute no shell)"
+        );
+        std::process::exit(2);
+    }
+    if agent_web_used && provider != Provider::ClaudeCode {
+        eprintln!(
+            "error: --agent-web applies only to --provider claude-code (HTTP providers get their tools differently)"
         );
         std::process::exit(2);
     }
@@ -146,6 +154,13 @@ enum Cmd {
         /// --agent-bash /abs/path/topodb, not --agent-bash topodb.
         #[arg(long = "agent-bash")]
         agent_bash: Vec<String>,
+        /// Grant agent nodes read-only web access — the WebFetch and WebSearch
+        /// tools. Additive on top of Read/Write/Edit; applies only to
+        /// --provider claude-code (HTTP providers get their tools differently).
+        /// Echoed at the approval gate. Without it, an agent node that needs
+        /// web research is denied and blocks.
+        #[arg(long = "agent-web")]
+        agent_web: bool,
         /// Supply agent nodes with the TopoDB MCP server: the full server
         /// command (binary + args), e.g.
         /// "--agent-mcp '/abs/topodb-mcp --db /abs/memory.redb --scope <ulid>'".
@@ -229,6 +244,11 @@ enum Cmd {
         /// prefix (repeatable). Additive on top of Read/Write/Edit.
         #[arg(long = "agent-bash")]
         agent_bash: Vec<String>,
+        /// Grant agent nodes read-only web access — the WebFetch and WebSearch
+        /// tools. Additive on top of Read/Write/Edit; applies only to
+        /// --provider claude-code. Echoed at the approval gate.
+        #[arg(long = "agent-web")]
+        agent_web: bool,
         /// Supply agent nodes with the TopoDB MCP server: the full server
         /// command (binary + args).
         #[arg(long = "agent-mcp")]
@@ -1193,6 +1213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             yes,
             yes_including_revisions,
             agent_bash,
+            agent_web,
             agent_mcp,
             command_timeout,
             agent_timeout,
@@ -1209,6 +1230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 yes,
                 yes_including_revisions,
                 agent_bash,
+                agent_web,
                 agent_mcp,
                 command_timeout,
                 agent_timeout,
@@ -1249,6 +1271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_url,
             yes,
             agent_bash,
+            agent_web,
             agent_mcp,
             command_timeout,
             agent_timeout,
@@ -1261,6 +1284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model,
                 yes,
                 agent_bash,
+                agent_web,
                 agent_mcp,
                 command_timeout,
                 agent_timeout,
@@ -1302,6 +1326,7 @@ fn run_cmd(
     yes: bool,
     yes_including_revisions: bool,
     agent_bash: Vec<String>,
+    agent_web: bool,
     agent_mcp: Option<String>,
     command_timeout: u64,
     agent_timeout: u64,
@@ -1343,7 +1368,13 @@ fn run_cmd(
     // must run before the graph file is even read — a bad flag
     // combination is a rail violation, not something that depends
     // on the graph.
-    validate_provider_flags(provider, &base_url, !agent_bash.is_empty(), &model);
+    validate_provider_flags(
+        provider,
+        &base_url,
+        !agent_bash.is_empty(),
+        agent_web,
+        &model,
+    );
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");
@@ -1390,7 +1421,7 @@ fn run_cmd(
             None => None,
         };
         Some(BuiltRunner::Claude(
-            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
+            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), agent_web, mcp_wiring)
                 .with_deadline(agent_timeout)
                 .with_cancel(cancel.clone()),
         ))
@@ -1448,6 +1479,10 @@ fn run_cmd(
             for grant in &grants {
                 println!("  {grant}:*");
             }
+        }
+
+        if agent_web {
+            println!("\nAgent nodes may use WebFetch, WebSearch (additive; read-only web access).");
         }
 
         print_unconstrained(&current);
@@ -1736,6 +1771,7 @@ fn resume_cmd(
     model: Option<String>,
     yes: bool,
     agent_bash: Vec<String>,
+    agent_web: bool,
     agent_mcp: Option<String>,
     command_timeout: u64,
     agent_timeout: u64,
@@ -1760,7 +1796,13 @@ fn resume_cmd(
             std::process::exit(2);
         }
     }
-    validate_provider_flags(provider, &base_url, !agent_bash.is_empty(), &model);
+    validate_provider_flags(
+        provider,
+        &base_url,
+        !agent_bash.is_empty(),
+        agent_web,
+        &model,
+    );
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");
@@ -1788,7 +1830,7 @@ fn resume_cmd(
             None => None,
         };
         Some(BuiltRunner::Claude(
-            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), mcp_wiring)
+            ClaudeCodeRunner::new(model.clone(), agent_bash.clone(), agent_web, mcp_wiring)
                 .with_deadline(agent_timeout)
                 .with_cancel(cancel.clone()),
         ))
@@ -1857,6 +1899,10 @@ fn resume_cmd(
         for grant in &grants {
             println!("  {grant}:*");
         }
+    }
+
+    if agent_web {
+        println!("\nAgent nodes may use WebFetch, WebSearch (additive; read-only web access).");
     }
 
     print_unconstrained(&current);
@@ -2071,7 +2117,7 @@ fn plan_cmd(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_timeout = Duration::from_secs(agent_timeout);
     // Flag rails before anything else, same as `run`.
-    validate_provider_flags(provider, &base_url, false, &model);
+    validate_provider_flags(provider, &base_url, false, false, &model);
     #[cfg(not(feature = "claude-code"))]
     if provider == Provider::ClaudeCode {
         eprintln!("error: this sgh was built without the claude-code feature");

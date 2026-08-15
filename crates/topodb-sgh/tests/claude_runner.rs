@@ -237,7 +237,7 @@ fn interpret_result_leaves_prose_alone_when_no_json_is_expected() {
 
 #[test]
 fn build_argv_with_no_grants_includes_base_allowed_tools() {
-    let argv = build_argv("Test prompt".to_string(), None, &[], None);
+    let argv = build_argv("Test prompt".to_string(), None, &[], false, None);
     let idx = argv
         .iter()
         .position(|arg| arg == "--allowedTools")
@@ -251,6 +251,7 @@ fn build_argv_with_single_grant_appends_bash_grant() {
         "Test prompt".to_string(),
         None,
         &["topodb".to_string()],
+        false,
         None,
     );
     let idx = argv
@@ -266,6 +267,7 @@ fn build_argv_with_multiple_grants_appends_all_in_order() {
         "Test prompt".to_string(),
         None,
         &["topodb".to_string(), "cargo".to_string()],
+        false,
         None,
     );
     let idx = argv
@@ -284,6 +286,7 @@ fn build_argv_with_model_includes_model_flag() {
         "Test prompt".to_string(),
         Some("claude-opus".to_string()),
         &[],
+        false,
         None,
     );
     let has_model = argv
@@ -299,7 +302,7 @@ fn build_argv_with_model_includes_model_flag() {
 
 #[test]
 fn build_argv_includes_base_flags() {
-    let argv = build_argv("Test prompt".to_string(), None, &[], None);
+    let argv = build_argv("Test prompt".to_string(), None, &[], false, None);
     assert!(
         argv.iter().any(|arg| arg == "-p"),
         "argv should include -p flag"
@@ -325,6 +328,7 @@ fn build_argv_full_order_empty_grants_with_model() {
         "Do the thing".to_string(),
         Some("claude-opus".to_string()),
         &[],
+        false,
         None,
     );
     assert_eq!(
@@ -349,6 +353,7 @@ fn build_argv_full_order_one_grant_no_model() {
         "Fix the code".to_string(),
         None,
         &["topodb".to_string()],
+        false,
         None,
     );
     assert_eq!(
@@ -629,7 +634,7 @@ fn build_argv_with_mcp_appends_config_and_tool() {
     let mcp = McpWiring {
         config_path: "/tmp/sgh-mcp.json".to_string(),
     };
-    let argv = build_argv("p".to_string(), None, &[], Some(&mcp));
+    let argv = build_argv("p".to_string(), None, &[], false, Some(&mcp));
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
     assert_eq!(argv[at + 1], "Read,Write,Edit,mcp__topodb");
     let mc = argv.iter().position(|a| a == "--mcp-config").unwrap();
@@ -638,7 +643,7 @@ fn build_argv_with_mcp_appends_config_and_tool() {
 
 #[test]
 fn build_argv_without_mcp_is_byte_identical_to_today() {
-    let argv = build_argv("p".to_string(), None, &["topodb".to_string()], None);
+    let argv = build_argv("p".to_string(), None, &["topodb".to_string()], false, None);
     assert_eq!(
         argv,
         vec![
@@ -665,6 +670,7 @@ fn build_argv_mcp_composes_with_bash_grants_and_model() {
         "p".to_string(),
         Some("haiku".to_string()),
         &["topodb".to_string()],
+        false,
         Some(&mcp),
     );
     let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
@@ -673,4 +679,39 @@ fn build_argv_mcp_composes_with_bash_grants_and_model() {
     assert!(argv
         .windows(2)
         .any(|w| w[0] == "--model" && w[1] == "haiku"));
+}
+
+// --- build_argv web grant -------------------------------------------------
+
+#[test]
+fn build_argv_with_web_appends_web_tools() {
+    let argv = build_argv("p".to_string(), None, &[], true, None);
+    let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+    assert_eq!(argv[at + 1], "Read,Write,Edit,WebFetch,WebSearch");
+}
+
+#[test]
+fn build_argv_without_web_omits_web_tools() {
+    let argv = build_argv("p".to_string(), None, &[], false, None);
+    let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+    assert_eq!(argv[at + 1], "Read,Write,Edit");
+}
+
+#[test]
+fn build_argv_web_composes_with_bash_grants_and_mcp() {
+    let mcp = McpWiring {
+        config_path: "/tmp/c.json".to_string(),
+    };
+    let argv = build_argv(
+        "p".to_string(),
+        None,
+        &["topodb".to_string()],
+        true,
+        Some(&mcp),
+    );
+    let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+    assert_eq!(
+        argv[at + 1],
+        "Read,Write,Edit,Bash(topodb:*),WebFetch,WebSearch,mcp__topodb"
+    );
 }

@@ -90,6 +90,7 @@ nodes:
     let runner = ClaudeCodeRunner::new(
         Some("haiku".to_string()),
         vec![],
+        false,
         Some(McpWiring {
             config_path: config.to_string_lossy().into_owned(),
         }),
