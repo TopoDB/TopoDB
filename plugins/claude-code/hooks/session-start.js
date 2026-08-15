@@ -112,14 +112,16 @@ async function main() {
         }),
       );
     }
-
+  } finally {
     // Best-effort CLAUDE.md pointer injection: fully swallows its own
     // errors and never writes to stdout, so it can't affect the memory
-    // injection above or the hook's exit/deadline contract. Runs last so
-    // the secondary onboarding feature never eats the deadline budget
-    // ahead of the primary memory-injection work.
-    await injectPointer({ projectDir, client });
-  } finally {
+    // injection above or the hook's exit/deadline contract. Runs in the
+    // finally block (before client.close()) so it fires on every path,
+    // including an empty memory store or a recent_memories throw — those
+    // are exactly the fresh-install case the onboarding pointer exists for.
+    try {
+      await injectPointer({ projectDir, client });
+    } catch { /* onboarding injection is best-effort; never break the hook */ }
     client.close();
   }
 }

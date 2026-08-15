@@ -3,6 +3,10 @@
 
 /// Bump when the conventions template or schedule defaults change. Gates the
 /// global-scaffold fast-path and the fence `version=N`.
+///
+/// Coupled to `templates/CONVENTIONS.md`'s own `version:` header only by
+/// convention, not by the type system — bump BOTH together. See
+/// `template_version_matches_onboarding_version` below, which pins them.
 pub const ONBOARDING_VERSION: u32 = 1;
 
 const CONVENTIONS_MD: &str = include_str!("../templates/CONVENTIONS.md");
@@ -83,6 +87,26 @@ mod tests {
         )));
         assert!(b.trim_end().ends_with("<!-- topodb:pointer:end -->"));
         assert!(b.contains(pointer_body().trim()));
+    }
+
+    /// `ensure_conventions_file` decides whether to rewrite CONVENTIONS.md by
+    /// parsing the TEMPLATE's own `version:` header, not by reading
+    /// `ONBOARDING_VERSION` directly (see `template_version = parse_version_line(template)`
+    /// above, falling back to `ONBOARDING_VERSION` only if the header is
+    /// missing/malformed). That fallback means a header/const mismatch would
+    /// silently NOT fail loudly at that call site — it would just make
+    /// refresh compare against the wrong number. Pin the two together here so
+    /// bumping one without the other fails a test instead of failing silently
+    /// in the field.
+    #[test]
+    fn template_version_matches_onboarding_version() {
+        let template_version = parse_version_line(conventions_markdown())
+            .expect("CONVENTIONS.md template must have a parsable `version:` header");
+        assert_eq!(
+            template_version, ONBOARDING_VERSION,
+            "templates/CONVENTIONS.md's `version:` header must match ONBOARDING_VERSION \
+             in content.rs — bump both together"
+        );
     }
 
     #[test]

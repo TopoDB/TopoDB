@@ -228,6 +228,57 @@ test(
   },
 );
 
+test(
+  "session-start hook injects the CLAUDE.md pointer even when the memory store is empty",
+  { skip: !existsSync(LOCAL_SERVER) && "build topodb-mcp first: cargo build -p topodb-mcp" },
+  async () => {
+    // Task 11 fix: a fresh project has zero memories, so recent_memories
+    // returns an empty list and the hook's memory-injection branch bails
+    // out early. Before the fix, injectPointer sat AFTER that early return
+    // inside the same try block, so it never ran — the onboarding pointer,
+    // whose whole purpose is the fresh-install case, was skipped in
+    // exactly the fresh-install case. Moving it into `finally` fixes this;
+    // this test seeds NOTHING and asserts CLAUDE.md still gets the fence.
+    const dataDir = mkLocalServerDataDir("topodb-sse-");
+    const projectDir = mkdtempSync(path.join(tmpdir(), "topodb-ssep-"));
+    const args = serverArgs({ projectDir, dataDir });
+    const dbPath = args[args.indexOf("--db") + 1];
+    const sock = socketPathFor(dbPath);
+    let broker = null;
+    try {
+      broker = spawn(process.execPath, [BROKER_JS, ...args], {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, TOPODB_BROKER_IDLE_MS: "5000", TOPODB_MCP_LOCAL_BIN: LOCAL_SERVER },
+      });
+      let brokerErr = "";
+      broker.stderr.on("data", (d) => (brokerErr += d));
+      await connectSocketWithRetry(sock);
+
+      // No seeding at all — the store is empty.
+      const stdinPayload = JSON.stringify({
+        session_id: "s1", cwd: projectDir, hook_event_name: "SessionStart", source: "startup",
+      });
+      const out = execFileSync(process.execPath, [path.join(HERE, "..", "hooks", "session-start.js")], {
+        input: stdinPayload,
+        env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: projectDir },
+        timeout: 10000,
+      }).toString();
+
+      // Empty store: no memory context is emitted on stdout.
+      assert.equal(out, "", `expected no stdout for an empty store; broker stderr: ${brokerErr}`);
+
+      // But the onboarding pointer must still land in CLAUDE.md.
+      const claudeMd = readFileSync(path.join(projectDir, "CLAUDE.md"), "utf8");
+      assert.match(claudeMd, /<!-- topodb:pointer:start version=\d+ -->/);
+      assert.match(claudeMd, /<!-- topodb:pointer:end -->/);
+    } finally {
+      if (broker) broker.kill();
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  },
+);
+
 test("session-start hook degrades silently with no broker running", async () => {
   const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-ss3-"));
   const projectDir = mkdtempSync(path.join(tmpdir(), "topodb-ss3p-"));
