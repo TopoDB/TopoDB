@@ -71,16 +71,6 @@ fn acquire_lock(lock_path: &Path, wait_ms: u64) -> Result<LockGuard, ()> {
     }
 }
 
-/// Parses the leading `version: N` line emitted at the top of
-/// `CONVENTIONS.md` (both the template and whatever is already on disk).
-fn parse_version_line(text: &str) -> Option<u32> {
-    text.lines().find_map(|l| {
-        l.trim()
-            .strip_prefix("version:")
-            .and_then(|rest| rest.trim().parse::<u32>().ok())
-    })
-}
-
 fn step_write_config(config_path: &Path, db_path: &Path, scope_str: &str) -> Result<(), String> {
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
     let updates = topodb_onboarding::OnboardingUpdates {
@@ -91,23 +81,6 @@ fn step_write_config(config_path: &Path, db_path: &Path, scope_str: &str) -> Res
     };
     let new_text = topodb_onboarding::render_merged(&existing, &updates);
     std::fs::write(config_path, new_text).map_err(|e| e.to_string())
-}
-
-/// Writes `CONVENTIONS.md` if missing, or if the existing file's `version:`
-/// line is older than the template's. Returns whether it wrote.
-fn step_write_conventions(conventions_path: &Path) -> Result<bool, String> {
-    let template = topodb_onboarding::conventions_markdown();
-    let template_version = parse_version_line(template).unwrap_or(0);
-    let existing_version = std::fs::read_to_string(conventions_path).ok_or_none_on_missing()?;
-    let existing_version = existing_version.and_then(|t| parse_version_line(&t));
-    let needs_write = match existing_version {
-        None => true,
-        Some(v) => v < template_version,
-    };
-    if needs_write {
-        std::fs::write(conventions_path, template).map_err(|e| e.to_string())?;
-    }
-    Ok(needs_write)
 }
 
 /// Small helper trait so a missing-file `read_to_string` reads as "no
@@ -195,7 +168,6 @@ pub fn run_init(args: InitArgs) -> ! {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let config_path = config_dir.join(".topodb.toml");
-    let conventions_path = config_dir.join("CONVENTIONS.md");
     let lock_path = config_dir.join(".topodb.init.lock");
 
     // Fast path: no writes, no lock — just a read of the marker.
@@ -268,7 +240,7 @@ pub fn run_init(args: InitArgs) -> ! {
     }
 
     // Step 3: CONVENTIONS.md (write if missing/older).
-    match step_write_conventions(&conventions_path) {
+    match topodb_onboarding::ensure_conventions_file(&config_dir).map_err(|e| e.to_string()) {
         Ok(wrote) => {
             steps.push(serde_json::json!({"step": "conventions", "ok": true, "wrote": wrote}))
         }

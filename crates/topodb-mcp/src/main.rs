@@ -18,6 +18,7 @@
 mod config;
 mod daemon;
 mod embedder;
+mod onboard_boot;
 mod ort_fetch;
 mod server;
 mod socket_path;
@@ -116,6 +117,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None => Db::open_with(&config.db_path, config::default_spec()),
         }
     })?;
+    // Best-effort install-time onboarding: ensure CONVENTIONS.md sits next
+    // to the db and catch up on overdue hygiene. `topodb-mcp` is spawned by
+    // every code client, so server boot is the one client-agnostic trigger
+    // — and since the resident daemon idle-exits in ~60s, this is the
+    // PRIMARY hygiene path, not a backup. Never allowed to fail or slow
+    // boot (see `onboard_boot`'s module doc).
+    let onboard_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    onboard_boot::run_boot_onboarding(&db, &config.db_path, config.default_scope, onboard_now_ms);
     // `--embeddings off` (case-insensitive) => permanently disabled.
     // Omitted, OR `--embeddings auto` (case-insensitive) => auto (start with
     // the default model) — "auto" is accepted as an explicit spelling of the

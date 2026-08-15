@@ -1,5 +1,7 @@
 mod content;
-pub use content::{conventions_markdown, pointer_block, pointer_body, ONBOARDING_VERSION};
+pub use content::{
+    conventions_markdown, ensure_conventions_file, pointer_block, pointer_body, ONBOARDING_VERSION,
+};
 
 mod fence;
 pub use fence::{upsert_fence, FenceOutcome};
