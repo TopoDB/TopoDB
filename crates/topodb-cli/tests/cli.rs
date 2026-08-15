@@ -100,6 +100,19 @@ fn default_db_path_fails_when_home_unset() {
 }
 
 #[test]
+fn conventions_pointer_matches_crate_constant() {
+    let out = bin().args(["conventions", "--pointer"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(s, topodb_onboarding::pointer_block());
+    assert!(s.contains("topodb:pointer:start"));
+}
+
+#[test]
 fn db_from_env_var() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("env.redb");

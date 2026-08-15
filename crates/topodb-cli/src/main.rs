@@ -142,6 +142,17 @@ fn main() {
         handle_daemon_command(&db_path, daemon_cmd.clone());
     }
 
+    // Conventions prints onboarding text without needing a database.
+    if let Command::Conventions { pointer } = &cli.cmd {
+        let text = if *pointer {
+            topodb_onboarding::pointer_block()
+        } else {
+            topodb_onboarding::conventions_markdown().to_string()
+        };
+        print!("{text}");
+        std::process::exit(0);
+    }
+
     // Socket-first dispatch: check if a daemon socket exists for this DB path,
     // and if the command can be routed to it.
     #[cfg(any(unix, windows))]
@@ -438,6 +449,7 @@ fn main() {
         } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
         Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
         Command::Daemon(_) => unreachable!("daemon subcommands exit before the direct open"),
+        Command::Conventions { .. } => unreachable!("conventions exits before the direct open"),
     }
 }
 

@@ -496,6 +496,14 @@ pub enum Command {
     /// that require exclusive lock access (e.g., `migrate`).
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    /// Print the canonical onboarding conventions (CONVENTIONS.md body), or
+    /// with --pointer just the fenced pointer block clients inject into their
+    /// rules file.
+    Conventions {
+        /// Print only the fenced pointer block instead of the full body.
+        #[arg(long)]
+        pointer: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Clone)]
