@@ -33,40 +33,58 @@ pub struct McpWiring {
 ///
 /// The `mcp` parameter adds `mcp__topodb` to allowedTools and `--mcp-config <path>` to argv;
 /// `None` keeps the argv byte-identical to the legacy behavior.
+///
+/// The `all_tools` parameter is the opt-in unrestricted surface: when `true`,
+/// `--dangerously-skip-permissions` is passed and the enumerated `--allowedTools`
+/// (plus the `bash_grants`/`web` grants, which it supersedes) is omitted — the
+/// agent node may use every tool with any argument. This is the escape hatch for
+/// runs where narrow prefix grants (`cd … && cargo`, env-prefixed commands, etc.)
+/// keep tripping the deny-as-failure rail. It removes sgh's narrow-grant safety
+/// rail, so it is opt-in and echoed loudly at the approval gate; the gate is the
+/// control in this mode. `--mcp-config` is still emitted when `mcp` is set (bypass
+/// permits `mcp__topodb` without enumerating it).
 pub fn build_argv(
     prompt: String,
     model: Option<String>,
     bash_grants: &[String],
     web: bool,
     mcp: Option<&McpWiring>,
+    all_tools: bool,
 ) -> Vec<String> {
     let mut argv = vec!["claude".to_string(), "-p".to_string(), prompt];
 
-    // Claude Code permission-rule syntax: Bash(<prefix>:*) is the documented
-    // prefix-matching rule form used in settings allowlists (the same grammar
-    // as settings.json "permissions.allow" entries). Verified against Claude
-    // Code's permission-rules documentation; the repo itself has no prior
-    // allowedTools usage to mirror.
-    let mut allowed_tools = "Read,Write,Edit".to_string();
-    for grant in bash_grants {
-        allowed_tools.push_str(&format!(",Bash({}:*)", grant));
-    }
-    // Read-only web access, additive like the bash grants above. Both tools
-    // are granted together (a single boolean flag) — a node doing web research
-    // typically needs to both search and fetch.
-    if web {
-        allowed_tools.push_str(",WebFetch,WebSearch");
-    }
-    // `mcp__topodb` grants the whole topodb server's tools (decision: full
-    // surface). Additive like everything else in --allowedTools; the server
-    // itself is spawned by claude from the --mcp-config file, so sgh never
-    // owns an MCP server process.
-    if mcp.is_some() {
-        allowed_tools.push_str(",mcp__topodb");
-    }
+    if all_tools {
+        // Bypass all permission checks: every tool, any argument. The
+        // enumerated allowedTools below (and the bash/web grants) would only
+        // restrict — under bypass they are moot, so they are omitted entirely.
+        argv.push("--dangerously-skip-permissions".to_string());
+    } else {
+        // Claude Code permission-rule syntax: Bash(<prefix>:*) is the documented
+        // prefix-matching rule form used in settings allowlists (the same grammar
+        // as settings.json "permissions.allow" entries). Verified against Claude
+        // Code's permission-rules documentation; the repo itself has no prior
+        // allowedTools usage to mirror.
+        let mut allowed_tools = "Read,Write,Edit".to_string();
+        for grant in bash_grants {
+            allowed_tools.push_str(&format!(",Bash({}:*)", grant));
+        }
+        // Read-only web access, additive like the bash grants above. Both tools
+        // are granted together (a single boolean flag) — a node doing web research
+        // typically needs to both search and fetch.
+        if web {
+            allowed_tools.push_str(",WebFetch,WebSearch");
+        }
+        // `mcp__topodb` grants the whole topodb server's tools (decision: full
+        // surface). Additive like everything else in --allowedTools; the server
+        // itself is spawned by claude from the --mcp-config file, so sgh never
+        // owns an MCP server process.
+        if mcp.is_some() {
+            allowed_tools.push_str(",mcp__topodb");
+        }
 
-    argv.push("--allowedTools".to_string());
-    argv.push(allowed_tools);
+        argv.push("--allowedTools".to_string());
+        argv.push(allowed_tools);
+    }
 
     argv.push("--output-format".to_string());
     argv.push("json".to_string());
@@ -101,7 +119,16 @@ pub fn build_argv(
 /// A reply containing no JSON object is left untouched and fails there,
 /// honestly. When JSON is not expected (e.g. a survey node returning prose),
 /// the result is never altered.
-pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
+///
+/// `deny_fatal` controls what a `permission_denials` entry means. In the
+/// default narrow-grant mode it is `true`: a denied tool call fails the node,
+/// because a denied Write changed nothing and trusting the exit code would
+/// record a no-op as done. Under the unrestricted (`--agent-all-tools`) mode it
+/// is `false`: bypass should permit everything, so any residual denial is
+/// advisory — the node's `result` is interpreted normally and correctness is
+/// left to downstream schema validation, rather than failing a node whose real
+/// work (via Write/Edit) already landed over a stray denied call.
+pub fn interpret_result(stdout: &str, expects_json: bool, deny_fatal: bool) -> NodeOutcome {
     let v: serde_json::Value = match serde_json::from_str(stdout.trim()) {
         Ok(v) => v,
         Err(e) => {
@@ -128,7 +155,7 @@ pub fn interpret_result(stdout: &str, expects_json: bool) -> NodeOutcome {
         })
         .unwrap_or_default();
 
-    if !denied.is_empty() {
+    if !denied.is_empty() && deny_fatal {
         return NodeOutcome::Denied {
             tool: denied.join(", "),
         };
@@ -168,6 +195,9 @@ pub struct ClaudeCodeCli {
     pub bash_grants: Vec<String>,
     pub web: bool,
     pub mcp: Option<McpWiring>,
+    /// Opt-in unrestricted tool surface (`--agent-all-tools`). Supersedes the
+    /// bash/web grants and makes residual denials advisory. See [`build_argv`].
+    pub all_tools: bool,
 }
 
 impl CliCodec for ClaudeCodeCli {
@@ -207,6 +237,7 @@ impl CliCodec for ClaudeCodeCli {
             &self.bash_grants,
             self.web,
             node_mcp,
+            self.all_tools,
         )
     }
 
@@ -230,7 +261,11 @@ impl CliCodec for ClaudeCodeCli {
         }
 
         let stdout = String::from_utf8(stdout.to_vec()).map_err(|_| RunnerError::Utf8)?;
-        Ok(interpret_result(&stdout, req.output_schema.is_some()))
+        Ok(interpret_result(
+            &stdout,
+            req.output_schema.is_some(),
+            !self.all_tools,
+        ))
     }
 }
 
@@ -244,12 +279,14 @@ impl ClaudeCodeRunner {
         bash_grants: Vec<String>,
         web: bool,
         mcp: Option<McpWiring>,
+        all_tools: bool,
     ) -> Self {
         let codec = ClaudeCodeCli {
             model,
             bash_grants,
             web,
             mcp,
+            all_tools,
         };
         ClaudeCodeRunner {
             inner: CliPrintRunner::new(Box::new(codec)),

@@ -94,6 +94,7 @@ nodes:
         Some(McpWiring {
             config_path: config.to_string_lossy().into_owned(),
         }),
+        false,
     );
 
     // Mirror bin/sgh.rs's Run wiring: store + executor over a run db.
