@@ -317,32 +317,74 @@ pub fn run_init(args: InitArgs) -> ! {
         errors.push("hygiene: skipped (db not open)".to_string());
     }
 
-    // Step 6: daemon (best-effort; not test-critical, callers pass --no-daemon).
+    // Step 6: daemon (best-effort; not test-critical, callers pass
+    // --no-daemon). Hygiene already ran in step 5, so a failed/slow daemon
+    // start is a bonus, not a fatal `init` step — its failure is recorded
+    // in `steps`/`warnings` but never pushed into the fatal `errors` vec.
+    let mut warnings: Vec<String> = Vec::new();
     if !args.no_daemon {
         match try_start_daemon(&args.db_path) {
             Ok(()) => steps.push(serde_json::json!({"step": "daemon", "ok": true})),
             Err(e) => {
                 steps.push(serde_json::json!({"step": "daemon", "ok": false, "error": e}));
-                errors.push(format!("daemon: {e}"));
+                warnings.push(format!("daemon: {e}"));
             }
         }
     }
 
     drop(_lock);
 
+    let has_fatal_errors = !errors.is_empty();
+
     let summary = serde_json::json!({
-        "status": if errors.is_empty() { "ok" } else { "error" },
+        "status": if has_fatal_errors { "error" } else { "ok" },
         "onboarding_version": topodb_onboarding::ONBOARDING_VERSION,
         "db": args.db_path.display().to_string(),
         "config": config_path.display().to_string(),
         "steps": steps,
         "errors": errors,
+        "warnings": warnings,
     });
 
-    if errors.is_empty() {
+    if !has_fatal_errors {
         output::ok(&summary, args.pretty);
     } else {
-        eprintln!("{summary}");
-        std::process::exit(1);
+        let text = if args.pretty {
+            serde_json::to_string_pretty(&summary).unwrap_or_else(|_| summary.to_string())
+        } else {
+            summary.to_string()
+        };
+        eprintln!("{text}");
+        std::process::exit(init_exit_code(args.if_needed, has_fatal_errors));
+    }
+}
+
+/// Process exit code for `init`. `--if-needed` never hard-fails a client
+/// startup, so it always exits 0 regardless of step errors; a full `init`
+/// exits non-zero when any fatal step failed.
+fn init_exit_code(if_needed: bool, has_fatal_errors: bool) -> i32 {
+    if if_needed {
+        0
+    } else if has_fatal_errors {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::init_exit_code;
+
+    #[test]
+    fn if_needed_always_exits_zero() {
+        assert_eq!(init_exit_code(true, true), 0);
+        assert_eq!(init_exit_code(true, false), 0);
+    }
+
+    #[test]
+    fn full_init_exits_one_on_fatal_error() {
+        assert_eq!(init_exit_code(false, true), 1);
+        assert_eq!(init_exit_code(false, false), 0);
     }
 }
