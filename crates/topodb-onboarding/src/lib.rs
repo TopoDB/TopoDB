@@ -8,4 +8,5 @@ mod config;
 pub use config::{
     parse, render_merged, OnboardingConfig, OnboardingUpdates, Schedule, ScheduleEntry,
 };
-// later tasks re-export hygiene modules here
+mod hygiene;
+pub use hygiene::{due_tasks, run_catch_up, CatchUpReport, Task};
