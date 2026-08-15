@@ -3,4 +3,9 @@ pub use content::{conventions_markdown, pointer_block, pointer_body, ONBOARDING_
 
 mod fence;
 pub use fence::{upsert_fence, FenceOutcome};
-// later tasks re-export config, hygiene modules here
+
+mod config;
+pub use config::{
+    parse, render_merged, OnboardingConfig, OnboardingUpdates, Schedule, ScheduleEntry,
+};
+// later tasks re-export hygiene modules here
