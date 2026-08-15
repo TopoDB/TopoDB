@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import { TopodbServer, recordingEnabled } from "./server-handle.ts";
 import { EpisodeBuffer, extractText, isUsed, buildEpisodeBatch, toRetrievalRecord } from "./recorder.ts";
 import { ensurePolicyVersion } from "./policy.ts";
+import { injectPointer } from "./onboard.ts";
 
 /** One spaced retry for the episode flush. Idle release invites transient
  * lock contention at exactly flush time (another process may grab the db
@@ -30,6 +31,17 @@ export default function (pi: ExtensionAPI): void {
   const memContents = new Map<string, string>(); // memory id -> content seen at retrieval
   let policyId: string | undefined;
   let policyResolved = false;
+  let onboarded = false;
+
+  pi.on("session_start", async (_ev, ctx) => {
+    if (onboarded) return;
+    onboarded = true;
+    try {
+      await injectPointer(ctx.cwd, server);
+    } catch {
+      /* never break boot */
+    }
+  });
 
   pi.registerTool({
     name: "topodb",
