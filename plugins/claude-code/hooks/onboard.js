@@ -34,7 +34,8 @@ export function upsertFence(existing, block, version) {
   if (s !== -1 && e !== -1 && e > s) {
     const after = existing.slice(s + START_PREFIX.length);
     const m = after.match(/^[0-9]+/);
-    const existingVersion = m ? parseInt(m[0], 10) : 0;
+    let existingVersion = m ? parseInt(m[0], 10) : 0;
+    if (!Number.isInteger(existingVersion) || existingVersion > 4294967295) existingVersion = 0;
     if (existingVersion >= version) {
       return { text: existing, outcome: "unchanged" };
     }
@@ -83,7 +84,7 @@ function atomicWrite(file, contents) {
 export async function injectPointer({ projectDir, client }) {
   if (!client) return;
   try {
-    const res = await client.call("onboarding_pointer", {});
+    const res = await client.call("onboarding_pointer", {}, 800);
     const block = res?.pointer;
     const version = res?.version;
     if (typeof block !== "string" || typeof version !== "number") return;

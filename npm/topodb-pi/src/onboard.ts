@@ -40,7 +40,8 @@ export function upsertFence(
   if (s !== -1 && e !== -1 && e > s) {
     const after = existing.slice(s + START_PREFIX.length);
     const m = after.match(/^[0-9]+/);
-    const existingVersion = m ? parseInt(m[0], 10) : 0;
+    let existingVersion = m ? parseInt(m[0], 10) : 0;
+    if (!Number.isInteger(existingVersion) || existingVersion > 4294967295) existingVersion = 0;
     if (existingVersion >= version) {
       return { text: existing, outcome: "unchanged" };
     }

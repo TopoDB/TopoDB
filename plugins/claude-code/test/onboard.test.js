@@ -50,6 +50,15 @@ test("upsertFence: malformed version parses as zero and gets replaced", () => {
   assert.ok(text.includes("top\n") && text.includes("bottom\n"));
 });
 
+test("upsertFence: oversized (> u32::MAX) version parses as zero and gets replaced (Rust parity)", () => {
+  const existing = `top\n${START}99999999999 -->\nGARBLED\n${END}\nbottom\n`;
+  const { text, outcome } = upsertFence(existing, block(5), 5);
+  assert.equal(outcome, "replaced");
+  assert.ok(text.includes("BODY v5"));
+  assert.ok(!text.includes("GARBLED"));
+  assert.ok(text.includes("top\n") && text.includes("bottom\n"));
+});
+
 test("upsertFence: reversed markers order is skipped", () => {
   const existing = `${END}\n${START}1 -->\nBODY v1\n${END}\n`;
   const { text, outcome } = upsertFence(existing, block(2), 2);

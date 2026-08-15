@@ -64,11 +64,6 @@ async function main() {
   const client = await connectForProject({ projectDir, dataDir });
   if (!client) return; // no broker yet — first-ever session; next one has it
   try {
-    // Best-effort CLAUDE.md pointer injection: fully swallows its own
-    // errors and never writes to stdout, so it can't affect the memory
-    // injection below or the hook's exit/deadline contract.
-    await injectPointer({ projectDir, client });
-
     const recent = await client.call("recent_memories", { k: K });
     const nodes = Array.isArray(recent.memories) ? recent.memories : [];
     if (!nodes.length) return;
@@ -117,6 +112,13 @@ async function main() {
         }),
       );
     }
+
+    // Best-effort CLAUDE.md pointer injection: fully swallows its own
+    // errors and never writes to stdout, so it can't affect the memory
+    // injection above or the hook's exit/deadline contract. Runs last so
+    // the secondary onboarding feature never eats the deadline budget
+    // ahead of the primary memory-injection work.
+    await injectPointer({ projectDir, client });
   } finally {
     client.close();
   }
