@@ -172,6 +172,25 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
     let idle_ms = parse_idle_ms(std::env::var("TOPODB_DAEMON_IDLE_MS").ok().as_deref());
     let hello_ms = parse_hello_ms(std::env::var("TOPODB_DAEMON_HELLO_MS").ok().as_deref());
 
+    // Best-effort install-time onboarding: ensure CONVENTIONS.md sits next to
+    // the db and catch up on overdue hygiene, ONCE at daemon startup — the
+    // same call the stdio path makes in `main.rs`. Socket/daemon mode is the
+    // path the Claude Code plugin's broker always spawns, so without this
+    // call CC users never got CONVENTIONS.md nor boot-time hygiene: the
+    // periodic tick below is a bonus on top of a resident daemon, not a
+    // substitute for the once-at-startup run. Never allowed to fail or slow
+    // boot (see `onboard_boot`'s module doc).
+    let onboard_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    crate::onboard_boot::run_boot_onboarding(
+        &db,
+        &config.db_path,
+        config.default_scope,
+        onboard_now_ms,
+    );
+
     spawn_hygiene_tick(&db, config);
 
     run_accept_loop(base, db, endpoint, idle_ms, Duration::from_millis(hello_ms)).await
