@@ -1383,7 +1383,16 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `@topodb/pi` (Pi extension)
 
-### Unreleased
+### 0.0.7 — 2026-08-16
+
+#### Changed
+
+- **Bundles `@topodb/topodb-mcp` 0.0.20** (was 0.0.17) — the republished
+  server with the `onboarding_pointer` tool (32 tools). The pinned tool count
+  (`test/tool-count.ts`) moves 31 → 32 with the dependency, verified against
+  the published server via `npm ci`.
+
+### 0.0.6 — 2026-08-11
 
 #### Added
 
