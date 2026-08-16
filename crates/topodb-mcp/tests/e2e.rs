@@ -45,11 +45,12 @@ fn end_to_end_scenario_over_stdio() {
     let tools = server.tools_list(DEFAULT_TIMEOUT);
     assert_eq!(
         tools.len(),
-        31,
-        "expected exactly 31 tools (db_info + 15 read + 15 write), got: {tools:#?}"
+        32,
+        "expected exactly 32 tools (db_info + onboarding_pointer + 15 read + 15 write), got: {tools:#?}"
     );
     for name in [
         "db_info",
+        "onboarding_pointer",
         "get_node",
         "find_by_prop",
         "search_memories",
@@ -94,6 +95,21 @@ fn end_to_end_scenario_over_stdio() {
             "{name} must carry a non-empty description"
         );
     }
+
+    // `onboarding_pointer` needs no db access and no arguments — a code
+    // client (CC plugin, pi) reaches TopoDB only via this MCP server, so it
+    // fetches the canonical onboarding pointer text through this tool.
+    let pointer = server.call_tool_ok("onboarding_pointer", serde_json::json!({}), DEFAULT_TIMEOUT);
+    assert_eq!(
+        pointer.get("pointer").and_then(|v| v.as_str()),
+        Some(topodb_onboarding::pointer_block().as_str()),
+        "onboarding_pointer should return the canonical pointer block: {pointer:#?}"
+    );
+    assert_eq!(
+        pointer.get("version").and_then(|v| v.as_u64()),
+        Some(topodb_onboarding::ONBOARDING_VERSION as u64),
+        "onboarding_pointer should return ONBOARDING_VERSION: {pointer:#?}"
+    );
 
     // --- Step 2: create_entity {name: "ada"} -> id A -------------------
     let created = server.call_tool_ok(

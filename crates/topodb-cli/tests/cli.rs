@@ -100,6 +100,19 @@ fn default_db_path_fails_when_home_unset() {
 }
 
 #[test]
+fn conventions_pointer_matches_crate_constant() {
+    let out = bin().args(["conventions", "--pointer"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(s, topodb_onboarding::pointer_block());
+    assert!(s.contains("topodb:pointer:start"));
+}
+
+#[test]
 fn db_from_env_var() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("env.redb");
@@ -4534,4 +4547,68 @@ fn decision_kind_stamps_filters_and_is_in_the_error_vocabulary() {
             "vocabulary missing for {args:?}: {all}"
         );
     }
+}
+
+#[test]
+fn init_scaffolds_db_config_conventions_and_agents() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let out = bin_home(home.path())
+        .current_dir(proj.path())
+        .args(["init", "--no-daemon"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // global scaffold
+    let topodb_dir = home.path().join(".topodb");
+    assert!(topodb_dir.join("memory.redb").exists());
+    assert!(topodb_dir.join(".topodb.toml").exists());
+    assert!(topodb_dir.join("CONVENTIONS.md").exists());
+    // project-local AGENTS.md fence
+    let agents = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
+    assert!(agents.contains("topodb:pointer:start"));
+}
+
+#[test]
+fn init_if_needed_is_noop_after_first_run() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    bin_home(home.path())
+        .current_dir(proj.path())
+        .args(["init", "--no-daemon"])
+        .output()
+        .unwrap();
+    let conv = home.path().join(".topodb").join("CONVENTIONS.md");
+    let mtime1 = std::fs::metadata(&conv).unwrap().modified().unwrap();
+    let out = bin_home(home.path())
+        .current_dir(proj.path())
+        .args(["init", "--if-needed", "--no-daemon"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let mtime2 = std::fs::metadata(&conv).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime1, mtime2,
+        "if-needed must not rewrite after marker matches"
+    );
+}
+
+#[test]
+fn init_refreshes_existing_windsurfrules_but_not_missing() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join(".windsurfrules"), "# my windsurf rules\n").unwrap();
+    bin_home(home.path())
+        .current_dir(proj.path())
+        .args(["init", "--no-daemon"])
+        .output()
+        .unwrap();
+    let ws = std::fs::read_to_string(proj.path().join(".windsurfrules")).unwrap();
+    assert!(ws.contains("topodb:pointer:start"));
+    assert!(ws.contains("# my windsurf rules")); // preserved
+    assert!(!proj.path().join(".cursor").join("rules").exists()); // not created
 }

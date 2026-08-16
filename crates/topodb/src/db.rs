@@ -63,6 +63,16 @@ enum Job {
         keep_from: u64,
         reply: Sender<Result<(), TopoError>>,
     },
+    /// Writes an arbitrary key/value pair into the `META` table on the
+    /// applier thread (the sole redb writer). Broadcasts nothing — `META`
+    /// writes are out-of-band from the scoped node/edge graph and its
+    /// change feed — and replies the storage result so the caller blocks
+    /// until the write has committed.
+    Meta {
+        key: String,
+        value: Vec<u8>,
+        reply: Sender<Result<(), TopoError>>,
+    },
 }
 
 /// A handle to an open database. Cloning shares the same underlying storage
@@ -363,6 +373,12 @@ impl Db {
                         // never NODES/EDGES — so there is nothing to
                         // broadcast.
                         let _ = reply.send(storage_for_applier.compact_ops_through(keep_from));
+                    }
+                    Job::Meta { key, value, reply } => {
+                        // Runs on the applier (sole redb writer). Touches
+                        // only META — never NODES/EDGES — so there is
+                        // nothing to broadcast.
+                        let _ = reply.send(storage_for_applier.write_meta(&key, &value));
                     }
                 }
             }
@@ -668,6 +684,35 @@ impl Db {
         let tx = self.sender().ok_or(TopoError::Closed)?;
         tx.send(Job::Compact {
             keep_from,
+            reply: reply_tx,
+        })
+        .map_err(|_| TopoError::Closed)?;
+        reply_rx.recv().map_err(|_| TopoError::Closed)?
+    }
+
+    /// Reads a key from the `META` table — persistent key/value storage
+    /// outside the scoped node/edge graph. `None` if the key was never set.
+    /// Reads don't need the applier (redb read txns don't race the single
+    /// writer), so this goes straight to `Storage`.
+    ///
+    /// Reserved keys (`format_version`, `hnsw_params`, `index_spec`) are
+    /// readable through this too, but callers should namespace their own
+    /// keys (e.g. `onboarding:<name>`) to avoid colliding with them.
+    pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, TopoError> {
+        self.inner.storage.read_meta(key)
+    }
+
+    /// Writes a key into the `META` table. Runs on the applier thread (the
+    /// sole redb writer), blocking until the write has committed —
+    /// `Closed` after shutdown, same contract as [`submit`](Db::submit).
+    ///
+    /// See [`get_meta`](Db::get_meta) for the reserved-key caveat.
+    pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<(), TopoError> {
+        let (reply_tx, reply_rx) = bounded(1);
+        let tx = self.sender().ok_or(TopoError::Closed)?;
+        tx.send(Job::Meta {
+            key: key.to_string(),
+            value: value.to_vec(),
             reply: reply_tx,
         })
         .map_err(|_| TopoError::Closed)?;
@@ -1746,6 +1791,27 @@ mod tests {
             db.inner.subs.lock().unwrap().len(),
             0,
             "disconnected sender must be pruned"
+        );
+    }
+
+    #[test]
+    fn meta_roundtrip_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.redb");
+        {
+            let db = Db::open_with(&path, IndexSpec::default()).unwrap();
+            assert_eq!(db.get_meta("onboarding:test").unwrap(), None);
+            db.set_meta("onboarding:test", b"hello").unwrap();
+            assert_eq!(
+                db.get_meta("onboarding:test").unwrap().as_deref(),
+                Some(&b"hello"[..])
+            );
+        }
+        // reopen — value persisted
+        let db = Db::open_stored(&path).unwrap();
+        assert_eq!(
+            db.get_meta("onboarding:test").unwrap().as_deref(),
+            Some(&b"hello"[..])
         );
     }
 }

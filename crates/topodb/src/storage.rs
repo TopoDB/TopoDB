@@ -790,6 +790,38 @@ impl Storage {
         Ok(())
     }
 
+    /// Reads an arbitrary key out of `META`. Public surface for this is
+    /// `Db::get_meta`; reads never need the applier (no other writer can
+    /// race a redb read txn), so this runs directly against `self.db`.
+    /// `TableDoesNotExist` (a brand-new file, before any write has opened
+    /// `META`) is treated as "key absent", matching `open_with`'s handling
+    /// of a missing/empty table on first open.
+    pub(crate) fn read_meta(&self, key: &str) -> Result<Option<Vec<u8>>, TopoError> {
+        let txn = self.db.begin_read().map_err(storage_err)?;
+        let table = match txn.open_table(META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(storage_err(e)),
+        };
+        Ok(table
+            .get(key)
+            .map_err(storage_err)?
+            .map(|v| v.value().to_vec()))
+    }
+
+    /// Writes an arbitrary key into `META`. Public surface for this is
+    /// `Db::set_meta`, routed through the applier's `Job::Meta` so this
+    /// runs on the sole redb-writer thread like every other mutating path.
+    pub(crate) fn write_meta(&self, key: &str, value: &[u8]) -> Result<(), TopoError> {
+        let txn = self.db.begin_write().map_err(storage_err)?;
+        {
+            let mut table = txn.open_table(META).map_err(storage_err)?;
+            table.insert(key, value).map_err(storage_err)?;
+        }
+        txn.commit().map_err(storage_err)?;
+        Ok(())
+    }
+
     /// Reconciles the on-disk text AND equality indexes with the `IndexSpec`
     /// this storage was opened with, and persists the full spec under META
     /// `"index_spec"`.

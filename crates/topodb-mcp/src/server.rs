@@ -842,6 +842,17 @@ struct EmbeddingsInfo {
     status: EmbedderStatus,
 }
 
+#[derive(Debug, Serialize, JsonSchema)]
+struct OnboardingPointerResult {
+    /// The canonical onboarding pointer block (`topodb_onboarding::pointer_block()`),
+    /// including its fence markers — write it verbatim into the host's
+    /// conventions/instructions file.
+    pointer: String,
+    /// `topodb_onboarding::ONBOARDING_VERSION` — bump-detection anchor: a
+    /// pointer block already present with a lower version is stale.
+    version: u32,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GetNodeParams {
@@ -2328,6 +2339,16 @@ impl TopoServer {
                 model: self.embedder.model_name(),
                 status: self.embedder.status(),
             },
+        }))
+    }
+
+    #[tool(
+        description = "Canonical onboarding pointer text + version for hosts (like this MCP server's own clients) that can't run the topodb CLI. Write `pointer` verbatim into the host's conventions/instructions file; `version` tracks topodb_onboarding::ONBOARDING_VERSION for staleness checks. No db access."
+    )]
+    fn onboarding_pointer(&self) -> Result<Json<OnboardingPointerResult>, ErrorData> {
+        Ok(Json(OnboardingPointerResult {
+            pointer: topodb_onboarding::pointer_block(),
+            version: topodb_onboarding::ONBOARDING_VERSION,
         }))
     }
 

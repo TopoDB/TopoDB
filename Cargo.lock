@@ -3319,6 +3319,7 @@ dependencies = [
  "topodb",
  "topodb-json",
  "topodb-obsidian",
+ "topodb-onboarding",
 ]
 
 [[package]]
@@ -3351,6 +3352,7 @@ dependencies = [
  "topodb",
  "topodb-json",
  "topodb-obsidian",
+ "topodb-onboarding",
  "ureq",
  "zip",
 ]
@@ -3392,6 +3394,16 @@ dependencies = [
  "topodb",
  "topodb-json",
  "topodb-obsidian",
+]
+
+[[package]]
+name = "topodb-onboarding"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "toml",
+ "topodb",
+ "topodb-json",
 ]
 
 [[package]]

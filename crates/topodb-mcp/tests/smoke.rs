@@ -28,14 +28,15 @@ fn handshake_and_tools_list_exposes_all_tools() {
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
 
-    // db_info + 15 read tools + 15 write tools = 31 total.
+    // db_info + onboarding_pointer + 15 read tools + 15 write tools = 32 total.
     assert_eq!(
         tools.len(),
-        31,
-        "expected exactly 31 tools, got: {tools:#?}"
+        32,
+        "expected exactly 32 tools, got: {tools:#?}"
     );
     for name in [
         "db_info",
+        "onboarding_pointer",
         "get_node",
         "find_by_prop",
         "search_memories",

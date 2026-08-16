@@ -5,6 +5,7 @@
 import { pathToFileURL } from "node:url";
 import { connectForProject } from "../broker-client.js";
 import { renderMemoryLines } from "./render.js";
+import { injectPointer } from "./onboard.js";
 
 const DEADLINE_MS = 2500;
 const K = 10;
@@ -112,6 +113,15 @@ async function main() {
       );
     }
   } finally {
+    // Best-effort CLAUDE.md pointer injection: fully swallows its own
+    // errors and never writes to stdout, so it can't affect the memory
+    // injection above or the hook's exit/deadline contract. Runs in the
+    // finally block (before client.close()) so it fires on every path,
+    // including an empty memory store or a recent_memories throw — those
+    // are exactly the fresh-install case the onboarding pointer exists for.
+    try {
+      await injectPointer({ projectDir, client });
+    } catch { /* onboarding injection is best-effort; never break the hook */ }
     client.close();
   }
 }
