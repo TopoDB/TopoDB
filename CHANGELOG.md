@@ -14,6 +14,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb` (engine)
 
+### 0.0.18 — 2026-08-16
+
+#### Added
+
+- **Public `Db::get_meta`/`Db::set_meta`** over the engine's META table — a
+  small typed key/value surface on the durable META store, so callers outside
+  the engine (the onboarding hygiene catch-up) can persist and read
+  bookkeeping (last-run timestamps, lifecycle-candidate counts) without a
+  side file. Reserved engine keys (`format_version`, `hnsw_params`,
+  `index_spec`) remain engine-owned.
+
 ### 0.0.17 — 2026-08-12
 
 #### Changed
@@ -465,6 +476,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.0.15 — 2026-08-16
+
+#### Changed
+
+- Dependency-only version bump for the 0.0.20 release; no functional change.
+
 ### 0.0.14 — 2026-08-12
 
 #### Changed
@@ -666,6 +683,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-obsidian`
 
+### 0.0.7 — 2026-08-16
+
+#### Changed
+
+- Dependency-only bump (engine 0.0.18 / json 0.0.15); no functional change.
+
 ### 0.0.6 — 2026-08-12
 
 #### Changed
@@ -695,7 +718,40 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ---
 
+## `topodb-okf`
+
+### 0.0.2 — 2026-08-16
+
+First published release of the crate.
+
+#### Added
+
+- **`topodb-okf`** — new crate: Open Knowledge Format (OKF v0.2) bundle ⇄ graph.
+  Ingests an OKF bundle into the property graph (notes → memories, mappings →
+  entities/links) and seeds a bundle back out, with a report of what was
+  created vs. matched. Built on the shared `topodb`/`topodb-json` surfaces.
+
+---
+
 ## `topodb-mcp`
+
+### 0.0.20 — 2026-08-16
+
+#### Added
+
+- **`onboarding_pointer` tool** — returns the canonical CONVENTIONS pointer
+  text and its version, so a client (Claude Code, Pi) can fetch the pointer to
+  inject into `CLAUDE.md`/`AGENTS.md` without hard-coding the wording. This is
+  the 32nd tool; clients that pin an exact tool count must move to 32.
+- **Server-startup onboarding** — on boot the server ensures a `CONVENTIONS.md`
+  exists and runs a bounded hygiene catch-up (compaction / purge / lifecycle
+  candidates, each gated on its own due computation), then persists last-run
+  state via the engine's META store. Runs in stdio mode and, as of this
+  release, also in socket/daemon mode (the Claude Code path), so the daemon
+  isn't skipped.
+- **Daemon hygiene tick** — a best-effort periodic hygiene pass while the
+  daemon is resident, so a long-lived session keeps its store tidy without a
+  separate cron.
 
 ### 0.0.19 — 2026-08-12
 
@@ -1221,6 +1277,22 @@ No engine or tool-surface changes. This release exists to ship a fix in the **np
 
 ## `topodb-sgh`
 
+### 0.0.8 — 2026-08-16
+
+#### Added
+
+- **`--agent-web`** — grants agent nodes a read-only web tool surface
+  (fetch/search) for research fan-outs, alongside the existing `--agent-bash`.
+- **`--agent-all-tools`** — grants agent nodes the full tool surface in one
+  flag, for research/test fan-outs that need everything.
+
+#### Fixed
+
+- **`resume` advances all DAG waves** and refuses a silent non-interactive
+  abort — a resumed run now drives every remaining wave to completion instead
+  of stalling after the first, and surfaces a hard error rather than exiting
+  quietly when it cannot proceed unattended.
+
 ### 0.0.7 — 2026-08-12
 
 #### Changed
@@ -1425,10 +1497,18 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `topodb-cli`
 
-### Unreleased
+### 0.0.15 — 2026-08-16
 
 #### Added
 
+- **`topodb init`** — scaffolds a store: writes `CONVENTIONS.md`, a
+  non-clobbering `.topodb.toml` (config-only injection with a `[schedule]`
+  block), and runs the onboarding hygiene catch-up. `--if-needed` always
+  exits 0 (safe to call unconditionally from a hook); a failed daemon start
+  is non-fatal.
+- **`topodb conventions [--pointer]`** — prints the canonical CONVENTIONS
+  document, or just the pointer text with `--pointer`, so a client can inject
+  the same pointer the MCP `onboarding_pointer` tool returns.
 - **Windows named-pipe client** — socket-first execution now works on Windows,
   not just unix. A `topodb <cmd>` routes to a resident `topodb-mcp --socket`
   daemon over its named pipe (opened as a blocking file, no new dependency and

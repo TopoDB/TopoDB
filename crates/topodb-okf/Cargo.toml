@@ -1,6 +1,6 @@
 [package]
 name = "topodb-okf"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -15,8 +15,8 @@ categories = ["database"]
 dist = false
 
 [dependencies]
-topodb = { path = "../topodb", version = "0.0.17" }
-topodb-json = { path = "../topodb-json", version = "0.0.14" }
+topodb = { path = "../topodb", version = "0.0.18" }
+topodb-json = { path = "../topodb-json", version = "0.0.15" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yaml is unmaintained upstream but is the workspace's existing YAML
@@ -27,4 +27,4 @@ serde_yaml = "0.9"
 tempfile = "3"
 # Seed selection reuses obsidian's `select_by_query`/`select_by_entity`
 # unchanged (design §Seed), so tests build the working set through them.
-topodb-obsidian = { path = "../topodb-obsidian", version = "0.0.6" }
+topodb-obsidian = { path = "../topodb-obsidian", version = "0.0.7" }
