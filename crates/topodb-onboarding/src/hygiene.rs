@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn catch_up_runs_compact_and_advances_last_run() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_with(&dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let db = Db::open_with(dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
         let scope = Scope::Shared;
         let now = 1_000_000_000i64;
         let rep = run_catch_up(&db, scope, &Schedule::defaults(), now, false).unwrap();
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn catch_up_defers_due_reingest_then_runs_with_allow_heavy() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_with(&dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let db = Db::open_with(dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
         let scope = Scope::Shared;
         let now = 1_000_000_000i64;
 
