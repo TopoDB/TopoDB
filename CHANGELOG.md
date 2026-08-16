@@ -1451,6 +1451,39 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## Claude Code plugin
 
+### 0.1.8 — 2026-08-16
+
+#### Added
+
+- **Install-time onboarding** — on session start the plugin injects the
+  canonical CONVENTIONS pointer into the project's `CLAUDE.md` (fetched from
+  the server's `onboarding_pointer` tool), even on an empty store, so a new
+  agent learns the memory conventions without manual setup. The pointer's
+  version is pinned to the server's `ONBOARDING_VERSION`.
+
+#### Changed
+
+- **Pins `@topodb/topodb-mcp` 0.0.20** (engine 0.0.18) — the republished
+  server carrying the `onboarding_pointer` tool (32 tools) and server-boot
+  onboarding that now runs in socket/daemon mode too (the plugin's path).
+
+### 0.1.7 — 2026-08-13
+
+#### Changed
+
+- **Pins `@topodb/topodb-mcp` 0.0.19** and routes `launch.js` through the
+  resident daemon on **all** platforms — Windows gets the named-pipe daemon,
+  so `broker.js` leaves the launch path entirely (it remains only as the
+  session-start/subagent-start hook-test stdio seeder).
+
+### 0.1.6 — 2026-08-13
+
+#### Changed
+
+- **Pins `@topodb/topodb-mcp` 0.0.18** (resident daemon + atomic
+  find-or-create `Op::UpsertNode`). Interim Windows broker-fallback so the
+  Windows plugin keeps memory while the named-pipe daemon lands in 0.1.7.
+
 ### 0.1.5 — 2026-08-11
 
 #### Changed
