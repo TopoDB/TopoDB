@@ -735,6 +735,20 @@ First published release of the crate.
 
 ## `topodb-mcp`
 
+### Unreleased
+
+#### Added
+
+- **Scheduled reingest of configured sources** — `[[reingest.source]]` entries
+  in `.topodb.toml` (`kind = "obsidian" | "okf"`, `path`, optional `scope`) are
+  re-ingested by the resident daemon's `allow_heavy` hygiene tick. Source paths
+  resolve against the config file's directory (`~` expands to the platform
+  home). Text-only in v1 (no embedder). Each source is attempted independently:
+  a whole-source failure (missing path, walk error) is surfaced in the report,
+  never fatal, and `reingest`'s `last_run` advances after attempting all, so a
+  misconfigured path retries next interval rather than every tick. `topodb init`
+  resolves the same sources but leaves the heavy work deferred.
+
 ### 0.0.20 — 2026-08-16
 
 #### Added
