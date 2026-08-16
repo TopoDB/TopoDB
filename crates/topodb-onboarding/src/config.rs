@@ -10,6 +10,33 @@
 //! user comments in the existing file are not preserved across a merge. This
 //! is a known, accepted limitation (see task-4 brief).
 
+/// Which ingest layer a reingest source uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Obsidian,
+    Okf,
+}
+
+impl SourceKind {
+    fn parse(s: &str) -> Option<SourceKind> {
+        match s {
+            "obsidian" => Some(SourceKind::Obsidian),
+            "okf" => Some(SourceKind::Okf),
+            _ => None,
+        }
+    }
+}
+
+/// One `[[reingest.source]]` entry: a vault/bundle to re-ingest on schedule.
+/// `path` is as-written (resolved against the config dir later); `scope`
+/// overrides the catch-up write scope for this source when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReingestSource {
+    pub kind: SourceKind,
+    pub path: String,
+    pub scope: Option<String>,
+}
+
 /// One scheduled maintenance task's config: whether it runs, and how often.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduleEntry {
@@ -62,6 +89,7 @@ pub struct OnboardingConfig {
     pub scope: Option<String>,
     pub onboarding_version: Option<u32>,
     pub schedule: Schedule,
+    pub sources: Vec<ReingestSource>,
 }
 
 /// Updates to merge into an existing `.topodb.toml`.
@@ -124,11 +152,36 @@ pub fn parse(toml_text: &str) -> OnboardingConfig {
         lifecycle: entry_from_table(sub("lifecycle"), defaults.lifecycle),
     };
 
+    let sources = table
+        .get("reingest")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("source"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let t = item.as_table()?;
+                    let kind = SourceKind::parse(t.get("kind")?.as_str()?)?;
+                    let path = t.get("path")?.as_str()?.to_string();
+                    if path.is_empty() {
+                        return None;
+                    }
+                    let scope = t
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    Some(ReingestSource { kind, path, scope })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     OnboardingConfig {
         db,
         scope,
         onboarding_version,
         schedule,
+        sources,
     }
 }
 
@@ -239,6 +292,47 @@ mod tests {
         assert_eq!(c.schedule.purge.interval_secs, 86_400); // filled default
         assert_eq!(c.onboarding_version, Some(1)); // stamped
         assert!(out.contains("custom_key")); // unknown key preserved
+    }
+
+    #[test]
+    fn parses_reingest_sources_array() {
+        let text = "\
+[[reingest.source]]
+kind = \"obsidian\"
+path = \"~/notes/vault\"
+
+[[reingest.source]]
+kind = \"okf\"
+path = \"./knowledge\"
+scope = \"shared\"
+";
+        let c = parse(text);
+        assert_eq!(c.sources.len(), 2);
+        assert_eq!(c.sources[0].kind, SourceKind::Obsidian);
+        assert_eq!(c.sources[0].path, "~/notes/vault");
+        assert_eq!(c.sources[0].scope, None);
+        assert_eq!(c.sources[1].kind, SourceKind::Okf);
+        assert_eq!(c.sources[1].path, "./knowledge");
+        assert_eq!(c.sources[1].scope.as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn drops_malformed_sources_and_defaults_empty() {
+        // unknown kind, empty path, and missing path are all dropped
+        let text = "\
+[[reingest.source]]
+kind = \"nope\"
+path = \"/x\"
+
+[[reingest.source]]
+kind = \"obsidian\"
+path = \"\"
+
+[[reingest.source]]
+kind = \"okf\"
+";
+        assert!(parse(text).sources.is_empty());
+        assert!(parse("").sources.is_empty());
     }
 
     #[test]

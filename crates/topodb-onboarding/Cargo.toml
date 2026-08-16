@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 topodb = { path = "../topodb" }
 topodb-json = { path = "../topodb-json" }
+topodb-obsidian = { path = "../topodb-obsidian" }
+topodb-okf = { path = "../topodb-okf" }
 toml = "0.8"
 
 [dev-dependencies]
