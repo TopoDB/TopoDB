@@ -3384,6 +3384,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "topodb-okf"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "topodb",
+ "topodb-json",
+ "topodb-obsidian",
+]
+
+[[package]]
 name = "topodb-onboarding"
 version = "0.0.0"
 dependencies = [

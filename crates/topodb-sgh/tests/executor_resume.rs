@@ -101,6 +101,77 @@ fn a_succeeded_node_is_not_re_executed_in_parallel_mode() {
     assert_eq!(report2.succeeded, vec!["a".to_string(), "b".to_string()]);
 }
 
+/// Regression: a resume under the PARALLEL scheduler must advance every wave
+/// of the DAG in a single invocation, not just the first. The bug: the claim
+/// pass marks a node `Skipped` the moment any dependency is in a terminal-but-
+/// not-`Succeeded` state (`any_dead`). On resume, a dependency carried a STALE
+/// terminal state from the prior run — so a node whose dep was `Skipped` last
+/// time got reaped before that dep had a chance to re-run this time, and the
+/// run halted one wave short. Chain a→b→c→d: run 1 is cancelled right after
+/// `a`, so b, c and d all land `Skipped`. Resume (max_inflight=2, everything
+/// now succeeds) must complete b, c AND d — not stop after b and c, leaving d
+/// stranded as Skipped by c's stale prior-run state.
+#[test]
+fn parallel_resume_advances_all_waves_not_just_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("t.redb")).unwrap();
+    let g = Graph::from_yaml(
+        "version: 1\ngoal: g\nnodes:\n\
+         - {id: a, kind: agent, prompt: p, budget: {retries: 0, repairs: 0}}\n\
+         - {id: b, kind: agent, prompt: p, needs: [a], budget: {retries: 0, repairs: 0}}\n\
+         - {id: c, kind: agent, prompt: p, needs: [b], budget: {retries: 0, repairs: 0}}\n\
+         - {id: d, kind: agent, prompt: p, needs: [c], budget: {retries: 0, repairs: 0}}\n",
+    )
+    .unwrap();
+    let v = validate(&g).unwrap();
+
+    // Run 1 (parallel): `a` succeeds then cancels, so b, c, d land as Skipped
+    // with ZERO attempts — re-runnable on resume, none of their budget spent.
+    // (Using a budget-consuming failure here would make b legitimately
+    // exhausted and correctly non-re-runnable, which is a different case.)
+    let store = RunStore::create(&db, "rw", &v, 1).unwrap();
+    let cancel = CancelToken::new();
+    let runner1 = SucceedThenCancel { token: &cancel };
+    let mut ex1 = Executor::new(store, v, &runner1)
+        .with_cancel(cancel.clone())
+        .with_max_inflight(2);
+    let report1 = ex1.run(10).unwrap();
+    assert_eq!(report1.succeeded, vec!["a".to_string()]);
+    assert_eq!(
+        report1.skipped,
+        vec!["b".to_string(), "c".to_string(), "d".to_string()]
+    );
+
+    // Resume: everything now succeeds. One invocation must finish the DAG.
+    let (store2, v2) = RunStore::open(&db, "rw").unwrap();
+    let runner2 = MockRunner::new();
+    let mut ex2 = Executor::new(store2, v2, &runner2).with_max_inflight(2);
+    let report2 = ex2.run(20).unwrap();
+
+    assert_eq!(
+        report2.succeeded,
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string()
+        ],
+        "a single parallel resume must advance every wave — d must not be \
+         stranded as Skipped by b's/c's stale prior-run states"
+    );
+    assert!(
+        report2.skipped.is_empty(),
+        "nothing left skipped: {report2:?}"
+    );
+    // a was already Succeeded and must not re-run; b/c/d re-run exactly once.
+    let mut calls = runner2.calls();
+    calls.sort();
+    assert_eq!(
+        calls,
+        vec!["b".to_string(), "c".to_string(), "d".to_string()]
+    );
+}
+
 /// `b` is interrupted before it ever gets a single attempt (simulated via
 /// `SucceedThenCancel`, see its doc comment) — it lands in run 1 as
 /// `Skipped`, not `Blocked`, with zero recorded attempts. This is

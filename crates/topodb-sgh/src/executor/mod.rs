@@ -262,6 +262,27 @@ impl<'r> Executor<'r> {
             );
         }
 
+        // Resume hygiene: a prior run of this same store may have left nodes
+        // in a terminal-but-not-`Succeeded` state (`Blocked`/`Skipped`) or a
+        // mid-flight state (`Ready`/`Running`/`Failed`/`Recovering`) if it was
+        // interrupted. Reset every non-`Succeeded` node back to `Pending` so
+        // this run re-derives its fate from scratch. Without this, the parallel
+        // scheduler (`run_parallel`) reads a dependency's STALE terminal state
+        // during its claim pass and marks the dependent `Skipped` before the
+        // dependency has had its chance to re-run — so a resume advances only
+        // one wave of the DAG per invocation. On a FRESH run every node is
+        // already `Pending`, so this loop writes nothing: no store write, no
+        // clock tick, no event — the sequential loop's bit-identical schedule
+        // is unchanged.
+        let reset_order = self.shared.graph.topo_order.clone();
+        for id in &reset_order {
+            let st = self.shared.store.state(id)?;
+            if st != NodeState::Succeeded && st != NodeState::Pending {
+                let t = tick(&self.shared);
+                self.shared.store.set_state(id, NodeState::Pending, t)?;
+            }
+        }
+
         if self.shared.max_inflight == 1 {
             // Topological order makes a single forward pass sufficient:
             // every dependency is resolved (or has failed and been
