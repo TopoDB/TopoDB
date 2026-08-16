@@ -35,23 +35,41 @@ fn ensure_conventions(db_path: &Path) {
 }
 
 fn run_hygiene_catch_up(db: &Db, db_path: &Path, scope: Scope, now_ms: i64) {
-    let schedule = resolve_schedule(db_path);
+    let (schedule, sources) = resolve_config(db_path);
 
-    if let Err(e) = topodb_onboarding::run_catch_up(db, scope, &schedule, now_ms, false) {
+    if let Err(e) = topodb_onboarding::run_catch_up(db, scope, &schedule, &sources, now_ms, false) {
         eprintln!("topodb-mcp: boot onboarding: hygiene catch-up: {e:?}");
     }
 }
 
-/// Resolves the hygiene schedule for a db: the nearest `.topodb.toml`
-/// walking up from `db_path`'s parent, parsed for its `[schedule]` table, or
-/// [`topodb_onboarding::Schedule::defaults`] if none is found or it fails to
-/// parse/read. Shared by the boot catch-up above and the resident daemon's
-/// background tick (`daemon::serve`), so the two paths never drift.
-pub(crate) fn resolve_schedule(db_path: &Path) -> topodb_onboarding::Schedule {
-    nearest_topodb_toml(db_path)
-        .and_then(|p| std::fs::read_to_string(&p).ok())
-        .map(|text| topodb_onboarding::parse(&text).schedule)
-        .unwrap_or_else(topodb_onboarding::Schedule::defaults)
+/// Resolves the hygiene schedule AND the resolved reingest sources for a db:
+/// the nearest `.topodb.toml` walking up from `db_path`'s parent, parsed for
+/// its `[schedule]` table and `[[reingest.source]]` array (source paths
+/// resolved against the toml's own directory), or defaults if none is found or
+/// it fails to parse/read. Shared by the boot catch-up above and the resident
+/// daemon's background tick (`daemon::serve`), so the two paths never drift.
+pub(crate) fn resolve_config(
+    db_path: &Path,
+) -> (
+    topodb_onboarding::Schedule,
+    Vec<topodb_onboarding::ResolvedSource>,
+) {
+    match nearest_topodb_toml(db_path) {
+        Some(toml_path) => match std::fs::read_to_string(&toml_path) {
+            Ok(text) => {
+                let cfg = topodb_onboarding::parse(&text);
+                let base_dir = toml_path.parent().unwrap_or_else(|| Path::new("."));
+                let sources = topodb_onboarding::resolve_sources(
+                    base_dir,
+                    topodb_onboarding::env_home().as_deref(),
+                    &cfg.sources,
+                );
+                (cfg.schedule, sources)
+            }
+            Err(_) => (topodb_onboarding::Schedule::defaults(), Vec::new()),
+        },
+        None => (topodb_onboarding::Schedule::defaults(), Vec::new()),
+    }
 }
 
 /// The resident daemon's periodic hygiene tick body — the same catch-up as
@@ -63,9 +81,10 @@ pub(crate) fn tick_once(
     db: &Db,
     scope: Scope,
     schedule: &topodb_onboarding::Schedule,
+    sources: &[topodb_onboarding::ResolvedSource],
     now_ms: i64,
 ) {
-    let _ = topodb_onboarding::run_catch_up(db, scope, schedule, now_ms, true);
+    let _ = topodb_onboarding::run_catch_up(db, scope, schedule, sources, now_ms, true);
 }
 
 /// Walks from `db_path`'s parent directory upward looking for the nearest
@@ -145,26 +164,27 @@ mod tests {
             .is_none());
 
         let t0 = now_ms();
-        tick_once(&db, Scope::Shared, &schedule, t0);
+        tick_once(&db, Scope::Shared, &schedule, &[], t0);
         let first_run = db.get_meta("onboarding:last_run:compact").unwrap();
         assert!(first_run.is_some());
 
         // Same instant again: nothing new is due, so this must be a no-op.
-        tick_once(&db, Scope::Shared, &schedule, t0);
+        tick_once(&db, Scope::Shared, &schedule, &[], t0);
         let second_run = db.get_meta("onboarding:last_run:compact").unwrap();
         assert_eq!(second_run, first_run);
     }
 
     #[test]
-    fn resolve_schedule_falls_back_to_defaults_without_a_config() {
+    fn resolve_config_falls_back_to_defaults_without_a_config() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("memory.redb");
-        let resolved = resolve_schedule(&db_path);
-        assert_eq!(resolved, topodb_onboarding::Schedule::defaults());
+        let (schedule, sources) = resolve_config(&db_path);
+        assert_eq!(schedule, topodb_onboarding::Schedule::defaults());
+        assert!(sources.is_empty());
     }
 
     #[test]
-    fn resolve_schedule_finds_nearest_topodb_toml() {
+    fn resolve_config_finds_nearest_topodb_toml() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".topodb.toml"), "").unwrap();
         let nested = root.path().join("a").join("b");
@@ -173,8 +193,23 @@ mod tests {
 
         // An empty config parses to the default schedule too, but exercises
         // the walk-and-parse path rather than the "no file found" path.
-        let resolved = resolve_schedule(&db_path);
-        assert_eq!(resolved, topodb_onboarding::Schedule::defaults());
+        let (schedule, _sources) = resolve_config(&db_path);
+        assert_eq!(schedule, topodb_onboarding::Schedule::defaults());
+    }
+
+    #[test]
+    fn resolve_config_returns_sources_resolved_against_toml_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".topodb.toml"),
+            "[[reingest.source]]\nkind = \"okf\"\npath = \"./bundle\"\n",
+        )
+        .unwrap();
+        let db_path = root.path().join("memory.redb");
+
+        let (_schedule, sources) = resolve_config(&db_path);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, root.path().join("./bundle"));
     }
 
     #[test]

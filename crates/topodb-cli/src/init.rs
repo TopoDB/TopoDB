@@ -268,11 +268,16 @@ pub fn run_init(args: InitArgs) -> ! {
     if let Some(db) = &db {
         let cfg_text = std::fs::read_to_string(&config_path).unwrap_or_default();
         let cfg = topodb_onboarding::parse(&cfg_text);
+        let sources = topodb_onboarding::resolve_sources(
+            &config_dir,
+            topodb_onboarding::env_home().as_deref(),
+            &cfg.sources,
+        );
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        match topodb_onboarding::run_catch_up(db, args.scope, &cfg.schedule, now_ms, false) {
+        match topodb_onboarding::run_catch_up(db, args.scope, &cfg.schedule, &sources, now_ms, false) {
             Ok(report) => steps.push(serde_json::json!({
                 "step": "hygiene",
                 "ok": true,

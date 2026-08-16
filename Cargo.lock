@@ -3404,6 +3404,8 @@ dependencies = [
  "toml",
  "topodb",
  "topodb-json",
+ "topodb-obsidian",
+ "topodb-okf",
 ]
 
 [[package]]
