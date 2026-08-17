@@ -182,6 +182,7 @@ def test_evaluate_scores_legs_with_injected_workspace_and_encoder(tmp_path):
     assert out["manifest"]["n_instances"] == 1
     assert out["manifest"]["instance_ids"] == ["t-1"]
     assert out["gold_dist"] == {1: 1}   # one instance with exactly 1 gold file
+    assert out["unretrievable"] == {"full": 0, "any": 0}
 
 def test_parse_args_limit_and_out():
     from swe.run import parse_args
@@ -194,3 +195,20 @@ def test_parse_args_defaults():
     ns = parse_args([])
     assert ns.limit is None
     assert ns.out == "results/swelocalize.json"
+
+def test_evaluate_counts_unretrievable_gold_for_created_files(tmp_path):
+    from swe.run import evaluate
+    from swe.data import Instance
+    repo = tmp_path / "repo2"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "core.py").write_text("def f(x):\n    return x\n")
+    # gold names a file that does NOT exist at base_commit (patch would create it)
+    inst = Instance("t-2", "org/pkg", "deadbeef",
+                    "add new module", gold_files={"pkg/newmod.py"})
+    out = evaluate([inst],
+                   workspace=lambda i: str(repo),
+                   encoder=lambda texts: [[1.0, 0.0] for _ in texts],
+                   ks=(1,), depth=5, legs=("text",),
+                   db_dir=str(tmp_path / "dbs2"))
+    assert out["unretrievable"] == {"full": 1, "any": 1}
+    assert out["results"]["text"]["any@1"] == 0.0   # unretrievable -> hard zero

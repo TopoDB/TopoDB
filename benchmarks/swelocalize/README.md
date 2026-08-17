@@ -38,6 +38,11 @@ clones are preserved across runs (clones are expensive and reusable).
 - Metric rewards matching the **gold patch's** files — one valid fix site, not
   every place the bug could be fixed. `any@k` is a proxy for correct
   localization.
+- Gold files that the patch **creates** do not exist at `base_commit`, so they
+  can never be retrieved and those instances score 0 on every leg. This is a
+  uniform floor across legs (so cross-leg comparison is unaffected), and each
+  run reports the count as `unretrievable` (`full` = all gold absent, `any` =
+  at least one gold file absent).
 - Import resolution is best-effort `ast`: dynamic imports, `__init__`
   re-exports, star-imports, and conditional imports may be missed.
 - Vector leg is mean-pooled per file; max-pool via per-chunk nodes is a future

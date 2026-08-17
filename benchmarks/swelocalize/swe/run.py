@@ -46,9 +46,12 @@ def evaluate(instances, workspace, encoder, *, ks=(1, 3, 5, 10), depth=10,
     os.makedirs(db_dir, exist_ok=True)
     per_leg = {leg: [] for leg in legs}
     gold_dist = {}
+    unretrievable_full = 0   # every gold file absent from the base_commit corpus -> guaranteed 0
+    unretrievable_any = 0    # >=1 gold file absent (e.g. a file the patch creates)
     for inst in instances:
         root = workspace(inst)
         files_raw = iter_py_files(root)               # [(rel, content)]
+        corpus_paths = {rel for (rel, _c) in files_raw}
         graph = build_import_graph(files_raw)
         files = [(rel, content, _file_vector(content, encoder))
                  for (rel, content) in files_raw]
@@ -59,6 +62,11 @@ def evaluate(instances, workspace, encoder, *, ks=(1, 3, 5, 10), depth=10,
         id2path = h.index(scope, files, graph)
         gold = set(inst.gold_files)
         gold_dist[len(gold)] = gold_dist.get(len(gold), 0) + 1
+        missing = gold - corpus_paths
+        if missing:
+            unretrievable_any += 1
+            if missing == gold:
+                unretrievable_full += 1
         for leg in legs:
             retrieved = h.retrieve(scope, inst.problem_statement, query_vec,
                                    leg, depth, id2path)
@@ -66,7 +74,8 @@ def evaluate(instances, workspace, encoder, *, ks=(1, 3, 5, 10), depth=10,
     results = {leg: aggregate(rows, list(ks)) for leg, rows in per_leg.items()}
     manifest = build_manifest(model_tag, ks, depth, graph_weight, legs,
                               len(instances), [i.instance_id for i in instances])
-    return {"results": results, "manifest": manifest, "gold_dist": gold_dist}
+    return {"results": results, "manifest": manifest, "gold_dist": gold_dist,
+            "unretrievable": {"full": unretrievable_full, "any": unretrievable_any}}
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="swe.run")
@@ -116,6 +125,7 @@ def main(argv=None):
     print(format_table(out["results"], out["manifest"]["ks"]))
     print("\nmanifest:", json.dumps(out["manifest"], indent=2))
     print("gold-file distribution:", out["gold_dist"])
+    print("unretrievable gold (files absent at base_commit):", out["unretrievable"])
 
 if __name__ == "__main__":
     main()
