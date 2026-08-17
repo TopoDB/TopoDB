@@ -206,6 +206,17 @@ pub fn run_catch_up(
                     candidates.len().to_string().as_bytes(),
                 )
                 .map_err(ComposeError::Engine)?;
+                // Stash the candidate ids (not just the count) so an agent can
+                // review them without re-running `lifecycle_candidates`. ULIDs
+                // are fixed-width and comma-free, so a comma-joined list
+                // round-trips unambiguously (empty when there are none).
+                let ids = candidates
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                db.set_meta("onboarding:lifecycle_candidate_ids", ids.as_bytes())
+                    .map_err(ComposeError::Engine)?;
                 set_last_run(db, task, now_ms)?;
                 report.ran.push(task);
             }
@@ -251,6 +262,25 @@ mod tests {
         assert!(!rep.deferred.contains(&Task::Reingest)); // disabled by default => skipped
         let lr = db.get_meta(Task::Compact.meta_key()).unwrap().unwrap();
         assert_eq!(String::from_utf8(lr).unwrap().parse::<i64>().unwrap(), now);
+    }
+
+    #[test]
+    fn catch_up_stashes_lifecycle_candidate_ids_not_just_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let now = 1_000_000_000i64;
+        // Lifecycle is enabled by default, so it runs on this catch-up.
+        run_catch_up(&db, Scope::Shared, &Schedule::defaults(), &[], now, false).unwrap();
+        // Both the count and the id list are stashed (empty id list on a fresh
+        // store, but the key is present so a consumer can read it).
+        assert!(db
+            .get_meta("onboarding:lifecycle_candidates")
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_meta("onboarding:lifecycle_candidate_ids")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
