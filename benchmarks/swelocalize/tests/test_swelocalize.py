@@ -154,3 +154,31 @@ def test_format_table_has_row_per_leg_and_header():
     assert any(l.startswith("text") for l in lines)
     assert any(l.startswith("graph") for l in lines)
     assert "any@5" in lines[0] and "mrr" in lines[0]
+
+def test_evaluate_scores_legs_with_injected_workspace_and_encoder(tmp_path):
+    from swe.run import evaluate
+    from swe.data import Instance
+
+    # Build a toy repo on disk; the injected workspace returns its root.
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "core.py").write_text("def crash_on_empty(x):\n    return x[0]\n")
+    (repo / "pkg" / "util.py").write_text("def helper():\n    return 1\n")
+
+    inst = Instance("t-1", "org/pkg", "deadbeef",
+                    "crash on empty input in core", gold_files={"pkg/core.py"})
+
+    # Deterministic fake encoder: 2-d, keys off a substring so 'core' ranks itself.
+    def encoder(texts):
+        return [[1.0, 0.0] if "crash_on_empty" in t or "crash on empty" in t
+                else [0.0, 1.0] for t in texts]
+
+    out = evaluate([inst],
+                   workspace=lambda i: str(repo),
+                   encoder=encoder,
+                   ks=(1,), depth=5, legs=("text",),
+                   db_dir=str(tmp_path / "dbs"))
+    assert out["results"]["text"]["any@1"] == 1.0
+    assert out["manifest"]["n_instances"] == 1
+    assert out["manifest"]["instance_ids"] == ["t-1"]
+    assert out["gold_dist"] == {1: 1}   # one instance with exactly 1 gold file
