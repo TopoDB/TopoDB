@@ -95,7 +95,13 @@ pub fn run_reingest(
             match s.kind {
                 SourceKind::Obsidian => {
                     match topodb_obsidian::ingest_vault(
-                        db, &s.path, write_scope, &lookup, now_ms, false, None,
+                        db,
+                        &s.path,
+                        write_scope,
+                        &lookup,
+                        now_ms,
+                        false,
+                        None,
                     ) {
                         Ok(r) => ReingestReport {
                             kind: s.kind,
@@ -107,7 +113,10 @@ pub fn run_reingest(
                             errors: r
                                 .errors
                                 .into_iter()
-                                .map(|e| ReingestFileError { file: e.file, reason: e.reason })
+                                .map(|e| ReingestFileError {
+                                    file: e.file,
+                                    reason: e.reason,
+                                })
                                 .collect(),
                         },
                         Err(reason) => whole_source_error(s.kind, path, reason),
@@ -115,7 +124,13 @@ pub fn run_reingest(
                 }
                 SourceKind::Okf => {
                     match topodb_okf::ingest_okf(
-                        db, &s.path, write_scope, &lookup, now_ms, false, None,
+                        db,
+                        &s.path,
+                        write_scope,
+                        &lookup,
+                        now_ms,
+                        false,
+                        None,
                     ) {
                         Ok(r) => ReingestReport {
                             kind: s.kind,
@@ -127,7 +142,10 @@ pub fn run_reingest(
                             errors: r
                                 .errors
                                 .into_iter()
-                                .map(|e| ReingestFileError { file: e.file, reason: e.reason })
+                                .map(|e| ReingestFileError {
+                                    file: e.file,
+                                    reason: e.reason,
+                                })
                                 .collect(),
                         },
                         Err(reason) => whole_source_error(s.kind, path, reason),
@@ -163,7 +181,11 @@ mod tests {
     use topodb::{Db, Scope};
 
     fn src(kind: SourceKind, path: &str) -> ReingestSource {
-        ReingestSource { kind, path: path.to_string(), scope: None }
+        ReingestSource {
+            kind,
+            path: path.to_string(),
+            scope: None,
+        }
     }
 
     fn open_db(dir: &std::path::Path) -> Db {
@@ -179,7 +201,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let vault = tmp.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
-        write(&vault.join("a.md"), "---\nkind: semantic\n---\nRedb is the storage engine.\n");
+        write(
+            &vault.join("a.md"),
+            "---\nkind: semantic\n---\nRedb is the storage engine.\n",
+        );
         let db = open_db(tmp.path());
 
         let resolved = vec![ResolvedSource {
@@ -238,7 +263,10 @@ mod tests {
         let out = resolve_sources(
             Path::new("/proj"),
             None,
-            &[src(SourceKind::Okf, "/abs/bundle"), src(SourceKind::Okf, "~/x")],
+            &[
+                src(SourceKind::Okf, "/abs/bundle"),
+                src(SourceKind::Okf, "~/x"),
+            ],
         );
         assert_eq!(out[0].path, PathBuf::from("/abs/bundle"));
         assert_eq!(out[1].path, PathBuf::from("/proj/~/x")); // ~ left literal, joined to base

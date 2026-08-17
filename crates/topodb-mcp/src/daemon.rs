@@ -221,7 +221,13 @@ fn spawn_hygiene_tick(db: &Db, config: &Config) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            crate::onboard_boot::tick_once(&tick_db, tick_scope, &tick_schedule, &tick_sources, now_ms);
+            crate::onboard_boot::tick_once(
+                &tick_db,
+                tick_scope,
+                &tick_schedule,
+                &tick_sources,
+                now_ms,
+            );
         }
     });
 }

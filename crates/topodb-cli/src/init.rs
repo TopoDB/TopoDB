@@ -277,7 +277,14 @@ pub fn run_init(args: InitArgs) -> ! {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        match topodb_onboarding::run_catch_up(db, args.scope, &cfg.schedule, &sources, now_ms, false) {
+        match topodb_onboarding::run_catch_up(
+            db,
+            args.scope,
+            &cfg.schedule,
+            &sources,
+            now_ms,
+            false,
+        ) {
             Ok(report) => steps.push(serde_json::json!({
                 "step": "hygiene",
                 "ok": true,
