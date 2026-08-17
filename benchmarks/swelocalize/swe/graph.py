@@ -42,8 +42,12 @@ def build_import_graph(files: list) -> dict:
                     dotted = node.module or ""
                     is_relative = False
                 if dotted:
-                    # For relative imports with names, skip the base module (only import the named targets)
-                    if not (is_relative and node.names):
+                    # Bare `from . import X` (no module): `dotted` is the package
+                    # dir itself, so linking its __init__.py is spurious noise —
+                    # skip it and rely on the named-target candidates below. But
+                    # `from .util import X` (module present) must still link the
+                    # `.util` module, so only skip when node.module is None.
+                    if not (is_relative and node.module is None):
                         targets.extend(_module_to_candidates(dotted))
                     # `from pkg import name` may target pkg/name.py too.
                     for alias in node.names:

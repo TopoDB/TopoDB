@@ -91,6 +91,15 @@ def test_build_import_graph_resolves_absolute_and_relative():
     assert g["pkg/util.py"] == {"pkg/base.py"}      # relative `from . import base`
     assert g["pkg/base.py"] == set()
 
+def test_build_import_graph_relative_import_with_module():
+    files = [
+        ("pkg/__init__.py", ""),
+        ("pkg/core.py", "from .util import helper\n"),
+        ("pkg/util.py", "def helper():\n    return 1\n"),
+    ]
+    g = build_import_graph(files)
+    assert g["pkg/core.py"] == {"pkg/util.py"}   # `.util` module edge kept
+
 def test_build_import_graph_ignores_unresolved():
     files = [("a.py", "import totally_not_here\n")]
     assert build_import_graph(files) == {"a.py": set()}
