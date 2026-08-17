@@ -211,7 +211,7 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
 fn spawn_hygiene_tick(db: &Db, config: &Config) {
     let tick_db = db.clone();
     let tick_scope = config.default_scope;
-    let tick_schedule = crate::onboard_boot::resolve_schedule(&config.db_path);
+    let (tick_schedule, tick_sources) = crate::onboard_boot::resolve_config(&config.db_path);
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(300));
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -221,7 +221,13 @@ fn spawn_hygiene_tick(db: &Db, config: &Config) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            crate::onboard_boot::tick_once(&tick_db, tick_scope, &tick_schedule, now_ms);
+            crate::onboard_boot::tick_once(
+                &tick_db,
+                tick_scope,
+                &tick_schedule,
+                &tick_sources,
+                now_ms,
+            );
         }
     });
 }

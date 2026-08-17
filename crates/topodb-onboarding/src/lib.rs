@@ -12,3 +12,9 @@ pub use config::{
 };
 mod hygiene;
 pub use hygiene::{due_tasks, run_catch_up, CatchUpReport, Task};
+
+mod reingest;
+pub use config::{ReingestSource, SourceKind};
+pub use reingest::{
+    env_home, resolve_sources, run_reingest, ReingestFileError, ReingestReport, ResolvedSource,
+};

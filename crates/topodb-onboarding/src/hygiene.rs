@@ -64,6 +64,9 @@ pub struct CatchUpReport {
     /// Count of lifecycle decay candidates surfaced by the most recent
     /// `Lifecycle` run this call (0 if `Lifecycle` wasn't due/run).
     pub surfaced_candidates: usize,
+    /// Per-source normalized reports from a `Reingest` run this call (empty
+    /// unless `Reingest` was due and ran under `allow_heavy`).
+    pub reingest: Vec<crate::reingest::ReingestReport>,
 }
 
 /// Retained-floor for `Compact`: never compact away the most recent
@@ -133,6 +136,7 @@ pub fn run_catch_up(
     db: &Db,
     scope: Scope,
     schedule: &Schedule,
+    sources: &[crate::reingest::ResolvedSource],
     now_ms: i64,
     allow_heavy: bool,
 ) -> Result<CatchUpReport, ComposeError> {
@@ -152,7 +156,7 @@ pub fn run_catch_up(
     // with `allow_heavy` it runs (the stub) and its `last_run` advances.
     if due.contains(&Task::Reingest) {
         if allow_heavy {
-            // TODO(reingest): wire obsidian/OKF refresh
+            report.reingest = crate::reingest::run_reingest(db, sources, scope, now_ms);
             set_last_run(db, Task::Reingest, now_ms)?;
             report.ran.push(Task::Reingest);
         } else {
@@ -242,7 +246,7 @@ mod tests {
         let db = Db::open_with(dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
         let scope = Scope::Shared;
         let now = 1_000_000_000i64;
-        let rep = run_catch_up(&db, scope, &Schedule::defaults(), now, false).unwrap();
+        let rep = run_catch_up(&db, scope, &Schedule::defaults(), &[], now, false).unwrap();
         assert!(rep.ran.contains(&Task::Compact));
         assert!(!rep.deferred.contains(&Task::Reingest)); // disabled by default => skipped
         let lr = db.get_meta(Task::Compact.meta_key()).unwrap().unwrap();
@@ -259,12 +263,43 @@ mod tests {
         let mut schedule = Schedule::defaults();
         schedule.reingest.enabled = true;
 
-        let rep = run_catch_up(&db, scope, &schedule, now, false).unwrap();
+        // A source pointing at an empty (but existing) vault dir: reingest runs
+        // cleanly, zero memories, no errors.
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let sources = vec![crate::reingest::ResolvedSource {
+            kind: crate::config::SourceKind::Obsidian,
+            path: vault,
+            scope: None,
+        }];
+
+        let rep = run_catch_up(&db, scope, &schedule, &sources, now, false).unwrap();
         assert!(rep.deferred.contains(&Task::Reingest));
+        assert!(rep.reingest.is_empty());
         assert!(db.get_meta(Task::Reingest.meta_key()).unwrap().is_none());
 
-        let rep = run_catch_up(&db, scope, &schedule, now, true).unwrap();
+        let rep = run_catch_up(&db, scope, &schedule, &sources, now, true).unwrap();
         assert!(rep.ran.contains(&Task::Reingest));
+        assert_eq!(rep.reingest.len(), 1);
+        assert!(db.get_meta(Task::Reingest.meta_key()).unwrap().is_some());
+    }
+
+    #[test]
+    fn reingest_advances_last_run_even_when_a_source_path_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let now = 1_000_000_000i64;
+        let mut schedule = Schedule::defaults();
+        schedule.reingest.enabled = true;
+        let sources = vec![crate::reingest::ResolvedSource {
+            kind: crate::config::SourceKind::Okf,
+            path: dir.path().join("nope"),
+            scope: None,
+        }];
+        let rep = run_catch_up(&db, Scope::Shared, &schedule, &sources, now, true).unwrap();
+        assert!(rep.ran.contains(&Task::Reingest));
+        assert_eq!(rep.reingest.len(), 1);
+        assert_eq!(rep.reingest[0].errors.len(), 1);
         assert!(db.get_meta(Task::Reingest.meta_key()).unwrap().is_some());
     }
 }
