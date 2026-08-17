@@ -1,8 +1,12 @@
 """Per-instance orchestration: checkout -> corpus -> embed -> graph -> index ->
 score each leg. All network/git/model I/O is injected (workspace, encoder) so
 this module is pure and testable."""
+import argparse
 import hashlib
+import json
 import os
+import shutil
+import subprocess
 from ulid import ULID
 
 from swe.corpus import iter_py_files, chunk_file
@@ -63,3 +67,55 @@ def evaluate(instances, workspace, encoder, *, ks=(1, 3, 5, 10), depth=10,
     manifest = build_manifest(model_tag, ks, depth, graph_weight, legs,
                               len(instances), [i.instance_id for i in instances])
     return {"results": results, "manifest": manifest, "gold_dist": gold_dist}
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(prog="swe.run")
+    p.add_argument("--limit", type=int, default=None,
+                   help="evaluate only the first N instances (subset-first)")
+    p.add_argument("--out", type=str, default="results/swelocalize.json")
+    p.add_argument("--graph-weight", type=float, default=0.1)
+    return p.parse_args(argv)
+
+def git_workspace(cache_dir):
+    os.makedirs(cache_dir, exist_ok=True)
+    def workspace(inst):
+        dest = os.path.join(cache_dir, inst.repo.replace("/", "_"))
+        if not os.path.isdir(os.path.join(dest, ".git")):
+            subprocess.run(["git", "clone", "--quiet",
+                            f"https://github.com/{inst.repo}.git", dest], check=True)
+        subprocess.run(["git", "-C", dest, "checkout", "--quiet", inst.base_commit],
+                       check=True)
+        return dest
+    return workspace
+
+def minilm_encoder():
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    return lambda texts: [list(map(float, v))
+                          for v in model.encode(texts, show_progress_bar=False)]
+
+def main(argv=None):
+    from swe.data import load_instances
+    from swe.report import format_table
+    ns = parse_args(argv)
+    instances = load_instances()
+    if ns.limit is not None:
+        instances = instances[:ns.limit]
+    db_dir = ".cache/dbs"
+    # Clear db_dir to ensure each run starts clean (prevents double-indexing when re-running)
+    shutil.rmtree(db_dir, ignore_errors=True)
+    os.makedirs(db_dir, exist_ok=True)
+    out = evaluate(instances,
+                   workspace=git_workspace(".cache/repos"),
+                   encoder=minilm_encoder(),
+                   graph_weight=ns.graph_weight,
+                   db_dir=db_dir)
+    os.makedirs(os.path.dirname(ns.out) or ".", exist_ok=True)
+    with open(ns.out, "w") as f:
+        json.dump(out, f, indent=2, default=lambda o: sorted(o) if isinstance(o, set) else str(o))
+    print(format_table(out["results"], out["manifest"]["ks"]))
+    print("\nmanifest:", json.dumps(out["manifest"], indent=2))
+    print("gold-file distribution:", out["gold_dist"])
+
+if __name__ == "__main__":
+    main()

@@ -182,3 +182,15 @@ def test_evaluate_scores_legs_with_injected_workspace_and_encoder(tmp_path):
     assert out["manifest"]["n_instances"] == 1
     assert out["manifest"]["instance_ids"] == ["t-1"]
     assert out["gold_dist"] == {1: 1}   # one instance with exactly 1 gold file
+
+def test_parse_args_limit_and_out():
+    from swe.run import parse_args
+    ns = parse_args(["--limit", "30", "--out", "results/run.json"])
+    assert ns.limit == 30
+    assert ns.out == "results/run.json"
+
+def test_parse_args_defaults():
+    from swe.run import parse_args
+    ns = parse_args([])
+    assert ns.limit is None
+    assert ns.out == "results/swelocalize.json"
