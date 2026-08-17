@@ -124,3 +124,20 @@ def test_aggregate_means():
     agg = aggregate(per, ks=[1])
     assert agg["any@1"] == 0.5
     assert agg["mrr"] == (1.0 + 0.5) / 2
+
+def test_harness_indexes_and_retrieves_by_path(tmp_path):
+    from swe.store import Harness
+    db = str(tmp_path / "swe.redb")
+    h = Harness(db)
+    # 3 files; toy 2-d vectors; core imports util.
+    files = [
+        ("pkg/core.py", "def crash_on_empty(x):\n    return x[0]\n", [1.0, 0.0]),
+        ("pkg/util.py", "def helper():\n    return 1\n", [0.0, 1.0]),
+        ("pkg/base.py", "VALUE = 7\n", [0.5, 0.5]),
+    ]
+    graph = {"pkg/core.py": {"pkg/util.py"}, "pkg/util.py": set(), "pkg/base.py": set()}
+    id2path = h.index("00000000000000000000000000", files, graph)
+    assert set(id2path.values()) == {"pkg/core.py", "pkg/util.py", "pkg/base.py"}
+    hits = h.retrieve("00000000000000000000000000",
+                      "crash on empty input", [1.0, 0.0], "text", 3, id2path)
+    assert "pkg/core.py" in hits
