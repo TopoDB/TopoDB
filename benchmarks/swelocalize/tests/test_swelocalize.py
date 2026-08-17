@@ -240,3 +240,33 @@ def test_evaluate_caches_embeddings_across_instances(tmp_path):
     # 2 unique files (1 chunk each) embedded once = 2 texts, cached for
     # instance 2; + 1 query embedding per instance = 2. Total = 4 (not 6).
     assert calls["texts"] == 4
+
+
+def test_evaluate_indexes_once_per_repo(tmp_path):
+    """Two instances of the SAME repo must build ONE shared store (indexed at a
+    reference checkout), not one per instance -- otherwise each instance rebuilds
+    the whole repo's text+vector index (the ~350s/instance floor). Both instances
+    are still scored against that shared store."""
+    import os as _os
+    from swe.run import evaluate
+    from swe.data import Instance
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "core.py").write_text("def crash_on_empty(x):\n    return x[0]\n")
+    (repo / "pkg" / "util.py").write_text("def helper():\n    return 1\n")
+
+    insts = [
+        Instance("org__pkg-1", "org/pkg", "c1", "crash on empty core",
+                 gold_files={"pkg/core.py"}),
+        Instance("org__pkg-2", "org/pkg", "c2", "helper util issue",
+                 gold_files={"pkg/util.py"}),
+    ]
+    db_dir = tmp_path / "dbs"
+    out = evaluate(insts, workspace=lambda i: str(repo),
+                   encoder=lambda texts: [[1.0, 0.0] for _ in texts],
+                   ks=(1,), depth=5, legs=("text",), db_dir=str(db_dir))
+    # One .redb for the shared repo, not two.
+    assert len([f for f in _os.listdir(db_dir) if f.endswith(".redb")]) == 1
+    # Both instances still scored.
+    assert out["gold_dist"] == {1: 2}
+    assert out["manifest"]["n_instances"] == 2

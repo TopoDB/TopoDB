@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections import OrderedDict
 from ulid import ULID
 
 from swe.corpus import iter_py_files, chunk_file
@@ -50,7 +51,8 @@ def _embed_files(files_raw, encoder, cache) -> list:
     return [(rel, content, cache[hashes[i]])
             for i, (rel, content) in enumerate(files_raw)]
 
-def build_manifest(model_tag, ks, depth, graph_weight, legs, n_instances, instance_ids):
+def build_manifest(model_tag, ks, depth, graph_weight, legs, n_instances,
+                   instance_ids, reference_commits=None):
     return {
         "model_tag": model_tag,
         "ks": list(ks),
@@ -61,42 +63,64 @@ def build_manifest(model_tag, ks, depth, graph_weight, legs, n_instances, instan
         "n_instances": n_instances,
         "instance_ids": list(instance_ids),
         "import_resolution": "ast best-effort; stdlib/third-party/dynamic dropped",
+        # Index-once-per-repo approximation: a repo is indexed ONCE at a
+        # reference checkout (the first instance's base_commit, recorded here)
+        # and every instance of that repo is scored against it. Instances whose
+        # own base_commit differs see slightly drifted file contents; a gold
+        # file absent from the reference corpus is counted in `unretrievable`.
+        "reference_strategy": "index-once-per-repo; reference = first instance base_commit",
+        "reference_commits": dict(reference_commits or {}),
     }
 
 def evaluate(instances, workspace, encoder, *, ks=(1, 3, 5, 10), depth=10,
              graph_weight=0.1, legs=("text", "vector", "hybrid", "graph"),
              db_dir, model_tag="minilm-l6-v2"):
+    """Index each repo ONCE (at its first instance's base_commit) and score every
+    instance of that repo against the shared store. This trades a small, disclosed
+    fidelity loss (content drift between an instance's own commit and the
+    reference) for an ~N-instances-per-repo speedup, since the whole text+vector
+    index build is the per-instance floor."""
     os.makedirs(db_dir, exist_ok=True)
+    # Group instances by repo, preserving first-seen (dataset) order.
+    by_repo = OrderedDict()
+    for inst in instances:
+        by_repo.setdefault(inst.repo, []).append(inst)
+
     per_leg = {leg: [] for leg in legs}
     gold_dist = {}
-    unretrievable_full = 0   # every gold file absent from the base_commit corpus -> guaranteed 0
-    unretrievable_any = 0    # >=1 gold file absent (e.g. a file the patch creates)
-    embed_cache = {}         # content sha256 -> file vector, reused across instances
-    for inst in instances:
-        root = workspace(inst)
-        files_raw = iter_py_files(root)               # [(rel, content)]
+    unretrievable_full = 0   # every gold file absent from the reference corpus -> guaranteed 0
+    unretrievable_any = 0    # >=1 gold file absent (patch-created OR dropped by reference drift)
+    embed_cache = {}         # content sha256 -> file vector, reused across repos
+    reference_commits = {}   # repo -> the base_commit used as its reference index
+    for repo, insts in by_repo.items():
+        ref = insts[0]                       # reference instance for this repo
+        reference_commits[repo] = ref.base_commit
+        root = workspace(ref)                # checkout the reference commit ONCE
+        files_raw = iter_py_files(root)      # [(rel, content)]
         corpus_paths = {rel for (rel, _c) in files_raw}
         graph = build_import_graph(files_raw)
         files = _embed_files(files_raw, encoder, embed_cache)
-        query_vec = encoder([inst.problem_statement])[0]
-        scope = _scope_for(inst.instance_id)
-        db_path = os.path.join(db_dir, inst.instance_id.replace("/", "_") + ".redb")
+        scope = _scope_for(repo)
+        db_path = os.path.join(db_dir, repo.replace("/", "_") + ".redb")
         h = Harness(db_path, model_tag=model_tag, graph_weight=graph_weight)
-        id2path = h.index(scope, files, graph)
-        gold = set(inst.gold_files)
-        gold_dist[len(gold)] = gold_dist.get(len(gold), 0) + 1
-        missing = gold - corpus_paths
-        if missing:
-            unretrievable_any += 1
-            if missing == gold:
-                unretrievable_full += 1
-        for leg in legs:
-            retrieved = h.retrieve(scope, inst.problem_statement, query_vec,
-                                   leg, depth, id2path)
-            per_leg[leg].append({"retrieved": retrieved, "gold": gold})
+        id2path = h.index(scope, files, graph)   # index ONCE per repo
+        for inst in insts:
+            query_vec = encoder([inst.problem_statement])[0]
+            gold = set(inst.gold_files)
+            gold_dist[len(gold)] = gold_dist.get(len(gold), 0) + 1
+            missing = gold - corpus_paths
+            if missing:
+                unretrievable_any += 1
+                if missing == gold:
+                    unretrievable_full += 1
+            for leg in legs:
+                retrieved = h.retrieve(scope, inst.problem_statement, query_vec,
+                                       leg, depth, id2path)
+                per_leg[leg].append({"retrieved": retrieved, "gold": gold})
     results = {leg: aggregate(rows, list(ks)) for leg, rows in per_leg.items()}
     manifest = build_manifest(model_tag, ks, depth, graph_weight, legs,
-                              len(instances), [i.instance_id for i in instances])
+                              len(instances), [i.instance_id for i in instances],
+                              reference_commits)
     return {"results": results, "manifest": manifest, "gold_dist": gold_dist,
             "unretrievable": {"full": unretrievable_full, "any": unretrievable_any}}
 
