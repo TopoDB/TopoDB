@@ -185,20 +185,24 @@ pub fn parse(toml_text: &str) -> OnboardingConfig {
     }
 }
 
-fn ensure_entry_defaults(schedule_table: &mut toml::Table, name: &str, default: ScheduleEntry) {
-    let entry = schedule_table
-        .entry(name.to_string())
+/// Get (or create) the sub-table under `key`, coercing a present-but-non-table
+/// value to a fresh empty table. Returns a `&mut` to it. The single home of the
+/// "entry-or-insert then coerce to `&mut Table`" dance.
+fn subtable_mut<'a>(table: &'a mut toml::Table, key: &str) -> &'a mut toml::Table {
+    let entry = table
+        .entry(key.to_string())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let entry_table = match entry {
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::Table::new());
+    }
+    match entry {
         toml::Value::Table(t) => t,
-        _ => {
-            *entry = toml::Value::Table(toml::Table::new());
-            match entry {
-                toml::Value::Table(t) => t,
-                _ => unreachable!(),
-            }
-        }
-    };
+        _ => unreachable!("coerced to a table immediately above"),
+    }
+}
+
+fn ensure_entry_defaults(schedule_table: &mut toml::Table, name: &str, default: ScheduleEntry) {
+    let entry_table = subtable_mut(schedule_table, name);
     entry_table
         .entry("enabled".to_string())
         .or_insert_with(|| toml::Value::Boolean(default.enabled));
@@ -241,19 +245,7 @@ pub fn render_merged(existing_text: &str, updates: &OnboardingUpdates) -> String
 
     if updates.ensure_schedule_defaults {
         let defaults = Schedule::defaults();
-        let schedule_entry = table
-            .entry("schedule".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let schedule_table = match schedule_entry {
-            toml::Value::Table(t) => t,
-            _ => {
-                *schedule_entry = toml::Value::Table(toml::Table::new());
-                match schedule_entry {
-                    toml::Value::Table(t) => t,
-                    _ => unreachable!(),
-                }
-            }
-        };
+        let schedule_table = subtable_mut(&mut table, "schedule");
         ensure_entry_defaults(schedule_table, "compact", defaults.compact);
         ensure_entry_defaults(schedule_table, "purge", defaults.purge);
         ensure_entry_defaults(schedule_table, "reingest", defaults.reingest);
