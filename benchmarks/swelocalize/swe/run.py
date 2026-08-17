@@ -18,14 +18,37 @@ def _scope_for(instance_id: str) -> str:
     digest = hashlib.sha256(instance_id.encode()).digest()[:16]
     return str(ULID.from_bytes(digest))
 
-def _file_vector(content: str, encoder) -> list:
-    """Mean-pool chunk embeddings into one per-file vector. Phase-1 choice:
-    keeps nodes == files == graph nodes. max-pool-via-chunk-nodes is a
-    documented future refinement (README)."""
-    chunks = chunk_file(content) or [content or ""]
-    vecs = encoder(chunks)
-    dim = len(vecs[0])
-    return [sum(v[j] for v in vecs) / len(vecs) for j in range(dim)]
+def _embed_files(files_raw, encoder, cache) -> list:
+    """Turn [(rel, content)] into [(rel, content, vector)], mean-pooling chunk
+    embeddings into one per-file vector (keeps nodes == files == graph nodes;
+    max-pool-via-chunk-nodes is a documented future refinement).
+
+    Two throughput levers, both load-bearing for a real multi-repo run:
+      * content-hash cache: each unique file content is embedded ONCE and
+        reused across instances/repos. SWE-bench-Lite's ~300 instances span
+        only ~12 repos and most files are byte-identical across a repo's
+        commits, so without this every instance re-embeds its whole repo
+        (measured ~10 min/instance on the Intel dev Mac -> ~5 h for 30).
+      * single batched encode: all uncached chunks in a repo go through ONE
+        encoder() call so sentence-transformers batches them, instead of one
+        small call per file."""
+    hashes = [hashlib.sha256(c.encode("utf-8")).hexdigest() for (_r, c) in files_raw]
+    all_chunks = []
+    todo = []  # (file_index, chunk_start, chunk_count) for uncached files
+    for i, (_rel, content) in enumerate(files_raw):
+        if hashes[i] in cache:
+            continue
+        chunks = chunk_file(content) or [content or ""]
+        todo.append((i, len(all_chunks), len(chunks)))
+        all_chunks.extend(chunks)
+    if all_chunks:
+        vecs = encoder(all_chunks)  # one batched call for the whole repo
+        for (i, start, n) in todo:
+            seg = vecs[start:start + n]
+            dim = len(seg[0])
+            cache[hashes[i]] = [sum(v[j] for v in seg) / len(seg) for j in range(dim)]
+    return [(rel, content, cache[hashes[i]])
+            for i, (rel, content) in enumerate(files_raw)]
 
 def build_manifest(model_tag, ks, depth, graph_weight, legs, n_instances, instance_ids):
     return {
@@ -48,13 +71,13 @@ def evaluate(instances, workspace, encoder, *, ks=(1, 3, 5, 10), depth=10,
     gold_dist = {}
     unretrievable_full = 0   # every gold file absent from the base_commit corpus -> guaranteed 0
     unretrievable_any = 0    # >=1 gold file absent (e.g. a file the patch creates)
+    embed_cache = {}         # content sha256 -> file vector, reused across instances
     for inst in instances:
         root = workspace(inst)
         files_raw = iter_py_files(root)               # [(rel, content)]
         corpus_paths = {rel for (rel, _c) in files_raw}
         graph = build_import_graph(files_raw)
-        files = [(rel, content, _file_vector(content, encoder))
-                 for (rel, content) in files_raw]
+        files = _embed_files(files_raw, encoder, embed_cache)
         query_vec = encoder([inst.problem_statement])[0]
         scope = _scope_for(inst.instance_id)
         db_path = os.path.join(db_dir, inst.instance_id.replace("/", "_") + ".redb")

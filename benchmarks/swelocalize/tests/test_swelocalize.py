@@ -212,3 +212,31 @@ def test_evaluate_counts_unretrievable_gold_for_created_files(tmp_path):
                    db_dir=str(tmp_path / "dbs2"))
     assert out["unretrievable"] == {"full": 1, "any": 1}
     assert out["results"]["text"]["any@1"] == 0.0   # unretrievable -> hard zero
+
+
+def test_evaluate_caches_embeddings_across_instances(tmp_path):
+    """Two instances share a repo (identical file contents). Each unique file
+    content must be embedded ONCE (cache hit on the second instance), not
+    re-embedded per instance -- otherwise a 30-instance run re-embeds every
+    repo N times. Query strings are embedded per instance (1 each)."""
+    from swe.run import evaluate
+    from swe.data import Instance
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "core.py").write_text("def f(x):\n    return x\n")
+    (repo / "pkg" / "util.py").write_text("def g():\n    return 1\n")
+
+    calls = {"texts": 0}
+    def encoder(texts):
+        calls["texts"] += len(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+    insts = [
+        Instance("i-1", "org/pkg", "c1", "fix core", gold_files={"pkg/core.py"}),
+        Instance("i-2", "org/pkg", "c2", "fix util", gold_files={"pkg/util.py"}),
+    ]
+    evaluate(insts, workspace=lambda i: str(repo), encoder=encoder,
+             ks=(1,), depth=5, legs=("text",), db_dir=str(tmp_path / "dbs"))
+    # 2 unique files (1 chunk each) embedded once = 2 texts, cached for
+    # instance 2; + 1 query embedding per instance = 2. Total = 4 (not 6).
+    assert calls["texts"] == 4
