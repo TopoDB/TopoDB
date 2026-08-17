@@ -2,6 +2,7 @@ import os
 from swe.data import parse_gold_files, load_instances, Instance
 from swe.corpus import iter_py_files, chunk_file
 from swe.graph import build_import_graph
+from swe.metrics import hit_at_k, reciprocal_rank, aggregate
 
 def test_load_instances_shapes_rows_and_derives_gold():
     rows = [{
@@ -103,3 +104,23 @@ def test_build_import_graph_relative_import_with_module():
 def test_build_import_graph_ignores_unresolved():
     files = [("a.py", "import totally_not_here\n")]
     assert build_import_graph(files) == {"a.py": set()}
+
+def test_hit_at_k_any_and_all():
+    retrieved = ["a.py", "b.py", "c.py"]
+    assert hit_at_k(retrieved, {"c.py"}, 3, "any") == 1
+    assert hit_at_k(retrieved, {"c.py"}, 2, "any") == 0
+    assert hit_at_k(retrieved, {"a.py", "c.py"}, 3, "all") == 1
+    assert hit_at_k(retrieved, {"a.py", "c.py"}, 2, "all") == 0
+
+def test_reciprocal_rank():
+    assert reciprocal_rank(["a.py", "b.py"], {"b.py"}) == 0.5
+    assert reciprocal_rank(["a.py"], {"z.py"}) == 0.0
+
+def test_aggregate_means():
+    per = [
+        {"retrieved": ["a.py"], "gold": {"a.py"}},
+        {"retrieved": ["x.py", "b.py"], "gold": {"b.py"}},
+    ]
+    agg = aggregate(per, ks=[1])
+    assert agg["any@1"] == 0.5
+    assert agg["mrr"] == (1.0 + 0.5) / 2
