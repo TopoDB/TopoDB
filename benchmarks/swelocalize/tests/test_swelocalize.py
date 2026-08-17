@@ -67,3 +67,13 @@ def test_chunk_file_splits_at_top_level_and_never_empty():
 def test_chunk_file_falls_back_on_unparseable():
     chunks = chunk_file("def broken(:\n  pass\n", max_lines=1)
     assert len(chunks) >= 1
+
+def test_chunk_file_preserves_leading_header_and_comments():
+    src = "#!/usr/bin/env python3\n# license header\n\ndef f():\n    return 1\n"
+    assert "".join(chunk_file(src, max_lines=60)) == src
+
+def test_chunk_file_preserves_content_between_statements():
+    src = "def f0():\n    return 0\n\n# between defs\ndef f1():\n    return 1\n"
+    joined = "".join(chunk_file(src, max_lines=2))
+    assert "# between defs" in joined
+    assert joined == src

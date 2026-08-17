@@ -11,45 +11,47 @@ def iter_py_files(root: str) -> list:
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
             try:
-                content = open(full, "r", encoding="utf-8", errors="replace").read()
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
             except OSError:
                 continue
             out.append((rel, content))
     out.sort(key=lambda pc: pc[0])
     return out
 
-def _window(lines: list, max_lines: int) -> list:
-    return ["\n".join(lines[i:i + max_lines]) + "\n"
-            for i in range(0, len(lines), max_lines)]
-
 def chunk_file(content: str, max_lines: int = 60) -> list:
+    """Split file text into <= max_lines-line chunks, breaking at top-level ast
+    statement boundaries. Coverage is COMPLETE: every character of `content`
+    (shebangs, license headers, comments, and blank lines between or after
+    statements) lands in exactly one chunk — nothing is dropped, so the embedded
+    corpus indexes the whole file. Falls back to fixed line windows when the file
+    does not parse or a single top-level node exceeds max_lines."""
+    if not content:
+        return []
     if not content.strip():
-        return [content] if content else []
-    lines = content.splitlines()
+        return [content]
+    lines = content.splitlines(keepends=True)
+    total = len(lines)
+
+    def window(seg: list) -> list:
+        return ["".join(seg[i:i + max_lines]) for i in range(0, len(seg), max_lines)]
+
     try:
         tree = ast.parse(content)
     except SyntaxError:
-        return _window(lines, max_lines)
-    # Group top-level statements into <= max_lines-line chunks.
-    bounds = []  # (start_line, end_line) 1-indexed inclusive
-    for node in tree.body:
-        start = node.lineno
-        end = getattr(node, "end_lineno", start)
-        bounds.append((start, end))
-    if not bounds:
-        return _window(lines, max_lines)
-    chunks, cur_start, cur_end = [], bounds[0][0], bounds[0][1]
-    for start, end in bounds[1:]:
-        if end - cur_start + 1 <= max_lines:
-            cur_end = end
-        else:
-            chunks.extend(_emit(lines, cur_start, cur_end, max_lines))
-            cur_start, cur_end = start, end
-    chunks.extend(_emit(lines, cur_start, cur_end, max_lines))
-    return chunks or _window(lines, max_lines)
+        return window(lines)
+    cuts = sorted({getattr(n, "end_lineno", n.lineno) for n in tree.body})
+    if not cuts:
+        return window(lines)
 
-def _emit(lines: list, start: int, end: int, max_lines: int) -> list:
-    seg = lines[start - 1:end]
-    if len(seg) <= max_lines:
-        return ["\n".join(seg) + "\n"]
-    return _window(seg, max_lines)
+    chunks: list = []
+    start = 1   # 1-indexed next unconsumed line
+    last = 0    # last cut that fit in the current chunk
+    for cut in cuts:
+        if cut - start + 1 > max_lines and last >= start:
+            chunks.extend(window(lines[start - 1:last]))
+            start = last + 1
+        last = cut
+    if start <= total:
+        chunks.extend(window(lines[start - 1:total]))
+    return chunks or [content]
