@@ -141,3 +141,16 @@ def test_harness_indexes_and_retrieves_by_path(tmp_path):
     hits = h.retrieve("00000000000000000000000000",
                       "crash on empty input", [1.0, 0.0], "text", 3, id2path)
     assert "pkg/core.py" in hits
+
+def test_format_table_has_row_per_leg_and_header():
+    from swe.report import format_table
+    results = {
+        "text":   {"any@1": 0.5, "any@5": 0.9, "all@1": 0.4, "all@5": 0.8, "mrr": 0.6},
+        "graph":  {"any@1": 0.6, "any@5": 0.95, "all@1": 0.5, "all@5": 0.85, "mrr": 0.7},
+    }
+    table = format_table(results, ks=[1, 5])
+    lines = table.splitlines()
+    assert lines[0].split()[:1] == ["leg"]
+    assert any(l.startswith("text") for l in lines)
+    assert any(l.startswith("graph") for l in lines)
+    assert "any@5" in lines[0] and "mrr" in lines[0]
