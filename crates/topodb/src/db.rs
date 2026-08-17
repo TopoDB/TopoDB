@@ -706,8 +706,18 @@ impl Db {
     /// sole redb writer), blocking until the write has committed —
     /// `Closed` after shutdown, same contract as [`submit`](Db::submit).
     ///
-    /// See [`get_meta`](Db::get_meta) for the reserved-key caveat.
+    /// The engine-owned keys (`format_version`, `hnsw_params`, `index_spec`)
+    /// are **rejected** with [`TopoError::Rejected`]: clobbering them would
+    /// corrupt format/index bookkeeping the engine maintains. Namespace your
+    /// own keys (e.g. `onboarding:<name>`) to stay clear of them; reads via
+    /// [`get_meta`](Db::get_meta) remain open.
     pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<(), TopoError> {
+        const RESERVED: [&str; 3] = ["format_version", "hnsw_params", "index_spec"];
+        if RESERVED.contains(&key) {
+            return Err(TopoError::Rejected(format!(
+                "META key {key:?} is reserved for the engine and cannot be set via set_meta"
+            )));
+        }
         let (reply_tx, reply_rx) = bounded(1);
         let tx = self.sender().ok_or(TopoError::Closed)?;
         tx.send(Job::Meta {
@@ -1812,6 +1822,25 @@ mod tests {
         assert_eq!(
             db.get_meta("onboarding:test").unwrap().as_deref(),
             Some(&b"hello"[..])
+        );
+    }
+
+    #[test]
+    fn set_meta_rejects_engine_reserved_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path().join("m.redb"), IndexSpec::default()).unwrap();
+        for key in ["format_version", "hnsw_params", "index_spec"] {
+            let err = db.set_meta(key, b"x").unwrap_err();
+            assert!(
+                matches!(err, TopoError::Rejected(_)),
+                "expected Rejected for reserved key {key:?}, got {err:?}"
+            );
+        }
+        // A namespaced key next to a reserved one still writes.
+        db.set_meta("index_spec:mine", b"ok").unwrap();
+        assert_eq!(
+            db.get_meta("index_spec:mine").unwrap().as_deref(),
+            Some(&b"ok"[..])
         );
     }
 }
