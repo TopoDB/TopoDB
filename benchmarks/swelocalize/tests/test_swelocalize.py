@@ -1,6 +1,7 @@
 import os
 from swe.data import parse_gold_files, load_instances, Instance
 from swe.corpus import iter_py_files, chunk_file
+from swe.graph import build_import_graph
 
 def test_load_instances_shapes_rows_and_derives_gold():
     rows = [{
@@ -77,3 +78,19 @@ def test_chunk_file_preserves_content_between_statements():
     joined = "".join(chunk_file(src, max_lines=2))
     assert "# between defs" in joined
     assert joined == src
+
+def test_build_import_graph_resolves_absolute_and_relative():
+    files = [
+        ("pkg/__init__.py", ""),
+        ("pkg/core.py", "from pkg.util import helper\nimport os\n"),
+        ("pkg/util.py", "from . import base\n"),
+        ("pkg/base.py", "x = 1\n"),
+    ]
+    g = build_import_graph(files)
+    assert g["pkg/core.py"] == {"pkg/util.py"}     # `import os` dropped (stdlib)
+    assert g["pkg/util.py"] == {"pkg/base.py"}      # relative `from . import base`
+    assert g["pkg/base.py"] == set()
+
+def test_build_import_graph_ignores_unresolved():
+    files = [("a.py", "import totally_not_here\n")]
+    assert build_import_graph(files) == {"a.py": set()}
