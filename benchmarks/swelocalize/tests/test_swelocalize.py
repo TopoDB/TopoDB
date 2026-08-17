@@ -22,3 +22,12 @@ def test_parse_gold_files_ignores_dev_null_for_new_files():
         "@@ -0,0 +1 @@\n+hello\n"
     )
     assert parse_gold_files(patch) == {"new.py"}
+
+def test_parse_gold_files_skips_deleted_file_target():
+    patch = (
+        "diff --git a/gone.py b/gone.py\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n-x\n"
+    )
+    assert parse_gold_files(patch) == set()
