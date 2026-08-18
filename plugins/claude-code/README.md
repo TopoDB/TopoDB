@@ -171,9 +171,10 @@ Set these environment variables to control plugin behavior:
 - `TOPODB_CAPTURE_NUDGE=0|off` — suppress the stop-capture nudge (the
   suggestion to use `remember`/`create_memory` to ensure session artifacts
   are saved when closing a session without any explicit memory writes).
-- `TOPODB_HOOK_DEBUG=1` — log hook execution details to stderr (socket
-  connects, spool writes, errors). Useful for debugging issues with
-  session capture or memory injection.
+- `TOPODB_HOOK_DEBUG=1` — make the retrieval `PostToolUse` hook dump the
+  raw payload it received to `episodes/debug-last-payload.json` in the plugin
+  data dir, so the true `tool_output`/`tool_response` shape can be pinned
+  when debugging episode capture. Nothing else reads this variable.
 
 ## What this plugin does not do
 
