@@ -14,6 +14,7 @@ pub mod redact;
 pub mod report;
 pub mod segment;
 pub mod spool;
+pub mod tier;
 
 pub use blob::{blob_path, get_blob, hash_hex, put_blob};
 pub use derive::{
@@ -30,6 +31,7 @@ pub use paths::{warehouse_dir_for_db, Layout};
 pub use rebuild::{rebuild, RebuildReport};
 pub use report::Status;
 pub use spool::DrainReport;
+pub use tier::{tier, TierReport};
 
 /// Tunables (spec §8 `[warehouse]`), with the spec defaults.
 #[derive(Debug, Clone, PartialEq)]
