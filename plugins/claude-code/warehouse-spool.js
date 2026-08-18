@@ -93,3 +93,11 @@ export function markerEvent({ type, sessionId, scope, nodeIds = [], nowMs = Date
   if (nodeIds.length) marker.node_ids = nodeIds.map(String);
   return { id: newUlid(nowMs), ts: nowMs, host: "", kind: "marker", v: 1, marker };
 }
+
+export function tryMarker({ dataDir, env, projectDir, sessionId, type, nodeIds = [], sessionScopes }) {
+  try {
+    if (!dataDir || !sessionId || !projectDir || warehouseDisabled(env)) return;
+    const { scope } = sessionScopes({ projectDir });
+    appendSpool(dataDir, sessionId, markerEvent({ type, sessionId, scope, nodeIds }), env);
+  } catch { /* best-effort */ }
+}
