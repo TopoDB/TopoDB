@@ -11,6 +11,7 @@ members = [
     "crates/topodb-obsidian",
     "crates/topodb-onboarding",
     "crates/topodb-okf",
+    "crates/topodb-warehouse",
 ]
 
 # The profile that 'dist' will build with
