@@ -53,8 +53,13 @@ pub fn mirror(
         Err(e) => return Err(e.into()),
     };
     if changes.is_empty() {
-        rep.to_seq = since.saturating_sub(1);
-        m.save(layout)?;
+        rep.to_seq = rep.from_seq.saturating_sub(1);
+        if let Some(gap) = &rep.gap {
+            // Nothing survives above the compaction floor: advance the watermark
+            // past the gap so idle ticks stop re-recording it.
+            m.save(layout)?;
+            db.set_meta(MIRRORED_SEQ_KEY, gap.to.to_string().as_bytes())?;
+        }
         return Ok(rep);
     }
     let events: Vec<Event> = changes
@@ -144,5 +149,25 @@ mod tests {
         assert_eq!(r.gap, Some(crate::manifest::MirrorGap { from: 1, to: 3 }));
         assert_eq!((r.from_seq, r.to_seq, r.events), (4, 5, 2));
         assert_eq!(wh.manifest.gaps.len(), 1);
+    }
+
+    #[test]
+    fn gap_with_empty_tail_advances_watermark_once() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Db::open_with(t.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let mut wh = Warehouse::open(&t.path().join("w"), WarehouseConfig::default()).unwrap();
+        create(&db, 3);
+        db.compact_ops(4).unwrap(); // keep_from == current_seq + 1 legally empties the log
+        let r = wh.mirror(&db, 100).unwrap();
+        assert_eq!(r.gap, Some(crate::manifest::MirrorGap { from: 1, to: 3 }));
+        assert_eq!((r.from_seq, r.to_seq, r.events), (4, 3, 0));
+        assert_eq!(mirrored_seq(&db).unwrap(), 3);
+        let r2 = wh.mirror(&db, 101).unwrap();
+        assert_eq!((r2.gap, r2.events), (None, 0));
+        assert_eq!(wh.manifest.gaps.len(), 1);
+        // and new ops after the gap mirror normally
+        create(&db, 1);
+        let r3 = wh.mirror(&db, 102).unwrap();
+        assert_eq!((r3.from_seq, r3.to_seq, r3.events), (4, 4, 1));
     }
 }
