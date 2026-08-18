@@ -9,6 +9,7 @@ topodb = { path = "../topodb" }
 topodb-json = { path = "../topodb-json" }
 topodb-obsidian = { path = "../topodb-obsidian" }
 topodb-okf = { path = "../topodb-okf" }
+topodb-warehouse = { path = "../topodb-warehouse" }
 toml = "0.8"
 
 [dev-dependencies]

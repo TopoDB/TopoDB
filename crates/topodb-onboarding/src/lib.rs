@@ -8,7 +8,8 @@ pub use fence::{upsert_fence, FenceOutcome};
 
 mod config;
 pub use config::{
-    parse, render_merged, OnboardingConfig, OnboardingUpdates, Schedule, ScheduleEntry,
+    parse, render_merged, resolve_warehouse, OnboardingConfig, OnboardingUpdates, Schedule,
+    ScheduleEntry, WarehouseSection,
 };
 mod hygiene;
 pub use hygiene::{due_tasks, run_catch_up, CatchUpReport, Task};
