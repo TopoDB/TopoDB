@@ -2,6 +2,7 @@
 //! spec `2026-08-18-context-warehouse-design.md`). Layer on the engine, no LLM.
 pub mod blob;
 pub mod chunk;
+pub mod derive;
 pub mod event;
 pub mod ids;
 pub mod lineage;
@@ -14,6 +15,10 @@ pub mod segment;
 pub mod spool;
 
 pub use blob::{blob_path, get_blob, hash_hex, put_blob};
+pub use derive::{
+    derive, derived_by_stamp, DeriveReport, EmbedFn, ARTIFACT_LABEL, CHUNK_LABEL, DERIVED_BY_PROP,
+    DERIVE_VERSION, EVIDENCE_EDGE, HAS_CHUNK_EDGE,
+};
 pub use event::{
     Artifact, ArtifactType, Event, Kind, Marker, MarkerType, OpEvent, Redaction, Source,
     EVENT_VERSION,
