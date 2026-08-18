@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod paths;
 pub mod redact;
 pub mod segment;
+pub mod spool;
 
 pub use blob::{blob_path, get_blob, hash_hex, put_blob};
 pub use event::{
@@ -14,6 +15,7 @@ pub use event::{
 };
 pub use manifest::{Manifest, MirrorGap, SegmentEntry, Tier, MANIFEST_VERSION, RECENT_IDS_CAP};
 pub use paths::{warehouse_dir_for_db, Layout};
+pub use spool::DrainReport;
 
 /// Tunables (spec §8 `[warehouse]`), with the spec defaults.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,5 +75,47 @@ impl From<std::io::Error> for WarehouseError {
 impl From<topodb::TopoError> for WarehouseError {
     fn from(e: topodb::TopoError) -> Self {
         WarehouseError::Engine(e)
+    }
+}
+
+/// An open warehouse directory: layout + manifest + config.
+pub struct Warehouse {
+    pub layout: Layout,
+    pub manifest: Manifest,
+    pub config: WarehouseConfig,
+}
+impl Warehouse {
+    pub fn open(dir: &std::path::Path, config: WarehouseConfig) -> std::io::Result<Self> {
+        let layout = Layout::new(dir.to_path_buf());
+        layout.ensure()?;
+        let manifest = Manifest::load_or_init(&layout)?;
+        Ok(Warehouse {
+            layout,
+            manifest,
+            config,
+        })
+    }
+    pub fn save(&self) -> std::io::Result<()> {
+        self.manifest.save(&self.layout)
+    }
+    pub fn drain(&mut self, now_ms: i64) -> std::io::Result<DrainReport> {
+        let r = spool::drain(&self.layout, &mut self.manifest, &self.config, now_ms)?;
+        self.maybe_roll(now_ms)?;
+        Ok(r)
+    }
+    /// Seals the open segment when it is over `segment_mb` or from a previous UTC day.
+    pub fn maybe_roll(&mut self, now_ms: i64) -> std::io::Result<()> {
+        let roll = self
+            .manifest
+            .open_entry()
+            .is_some_and(|e| segment::should_roll(e, now_ms, self.config.segment_mb));
+        if roll {
+            segment::seal_open(&self.layout, &mut self.manifest)?;
+            self.save()?;
+        }
+        Ok(())
+    }
+    pub fn events(&self) -> std::io::Result<Vec<Event>> {
+        segment::all_events(&self.layout, &self.manifest)
     }
 }
