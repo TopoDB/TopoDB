@@ -4,6 +4,7 @@ pub mod blob;
 pub mod event;
 pub mod manifest;
 pub mod paths;
+pub mod redact;
 pub mod segment;
 
 pub use blob::{blob_path, get_blob, hash_hex, put_blob};
