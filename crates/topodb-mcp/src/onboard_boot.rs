@@ -10,9 +10,16 @@
 //! error (including a panic from either step) is swallowed, with at most a
 //! stderr note — never a `Result` that propagates to `main`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use topodb::{Db, Scope};
+
+/// Resolved hygiene configuration: schedule, sources, and optional warehouse.
+pub(crate) struct ResolvedHygiene {
+    pub schedule: topodb_onboarding::Schedule,
+    pub sources: Vec<topodb_onboarding::ResolvedSource>,
+    pub warehouse: Option<(PathBuf, topodb_warehouse::WarehouseConfig)>,
+}
 
 /// Runs onboarding's boot-time side effects against an already-open `db`.
 /// Never panics or returns an error to the caller.
@@ -34,41 +41,88 @@ fn ensure_conventions(db_path: &Path) {
     }
 }
 
-fn run_hygiene_catch_up(db: &Db, db_path: &Path, scope: Scope, now_ms: i64) {
-    let (schedule, sources) = resolve_config(db_path);
+fn hygiene_warehouse<'a>(
+    r: &ResolvedHygiene,
+    embed: Option<topodb_warehouse::EmbedFn<'a>>,
+) -> Option<topodb_onboarding::HygieneWarehouse<'a>> {
+    r.warehouse
+        .as_ref()
+        .map(|(dir, config)| topodb_onboarding::HygieneWarehouse {
+            dir: dir.clone(),
+            config: config.clone(),
+            embed,
+        })
+}
 
-    if let Err(e) = topodb_onboarding::run_catch_up(db, scope, &schedule, &sources, now_ms, false) {
+fn run_hygiene_catch_up(db: &Db, db_path: &Path, scope: Scope, now_ms: i64) {
+    let r = resolve_config(db_path);
+    let wh = hygiene_warehouse(&r, None);
+    if let Err(e) = topodb_onboarding::run_catch_up_with(
+        db,
+        scope,
+        &r.schedule,
+        &r.sources,
+        now_ms,
+        false,
+        wh.as_ref(),
+    ) {
         eprintln!("topodb-mcp: boot onboarding: hygiene catch-up: {e:?}");
+    }
+    // Ensure warehouse mirroring is initialized even on fresh databases
+    if wh.is_some()
+        && db
+            .get_meta(topodb_warehouse::MIRRORED_SEQ_KEY)
+            .unwrap_or_default()
+            .is_none()
+    {
+        let _ = db.set_meta(topodb_warehouse::MIRRORED_SEQ_KEY, b"0");
     }
 }
 
-/// Resolves the hygiene schedule AND the resolved reingest sources for a db:
+/// Resolves the hygiene schedule, sources, and warehouse configuration for a db:
 /// the nearest `.topodb.toml` walking up from `db_path`'s parent, parsed for
-/// its `[schedule]` table and `[[reingest.source]]` array (source paths
-/// resolved against the toml's own directory), or defaults if none is found or
-/// it fails to parse/read. Shared by the boot catch-up above and the resident
+/// its `[schedule]` table, `[[reingest.source]]` array (source paths
+/// resolved against the toml's own directory), and `[warehouse]` section
+/// (path resolved relative to toml), or defaults if none is found or
+/// it fails to parse/read. Shared by the boot catch-up and the resident
 /// daemon's background tick (`daemon::serve`), so the two paths never drift.
-pub(crate) fn resolve_config(
-    db_path: &Path,
-) -> (
-    topodb_onboarding::Schedule,
-    Vec<topodb_onboarding::ResolvedSource>,
-) {
-    match nearest_topodb_toml(db_path) {
-        Some(toml_path) => match std::fs::read_to_string(&toml_path) {
-            Ok(text) => {
-                let cfg = topodb_onboarding::parse(&text);
-                let base_dir = toml_path.parent().unwrap_or_else(|| Path::new("."));
-                let sources = topodb_onboarding::resolve_sources(
-                    base_dir,
-                    topodb_onboarding::env_home().as_deref(),
-                    &cfg.sources,
-                );
-                (cfg.schedule, sources)
-            }
-            Err(_) => (topodb_onboarding::Schedule::defaults(), Vec::new()),
+pub(crate) fn resolve_config(db_path: &Path) -> ResolvedHygiene {
+    let env_dir = std::env::var("TOPODB_WAREHOUSE_DIR").ok();
+    let env_switch = std::env::var("TOPODB_WAREHOUSE").ok();
+    let (cfg, base_dir) = match nearest_topodb_toml(db_path) {
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(text) => (
+                topodb_onboarding::parse(&text),
+                p.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| Path::new(".").to_path_buf()),
+            ),
+            Err(_) => (
+                topodb_onboarding::parse(""),
+                db_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            ),
         },
-        None => (topodb_onboarding::Schedule::defaults(), Vec::new()),
+        None => (
+            topodb_onboarding::parse(""),
+            db_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+        ),
+    };
+    let sources = topodb_onboarding::resolve_sources(
+        &base_dir,
+        topodb_onboarding::env_home().as_deref(),
+        &cfg.sources,
+    );
+    let warehouse = topodb_onboarding::resolve_warehouse(
+        db_path,
+        &cfg.warehouse,
+        &base_dir,
+        env_dir.as_deref(),
+        env_switch.as_deref(),
+    );
+    ResolvedHygiene {
+        schedule: cfg.schedule,
+        sources,
+        warehouse,
     }
 }
 
@@ -80,11 +134,20 @@ pub(crate) fn resolve_config(
 pub(crate) fn tick_once(
     db: &Db,
     scope: Scope,
-    schedule: &topodb_onboarding::Schedule,
-    sources: &[topodb_onboarding::ResolvedSource],
+    r: &ResolvedHygiene,
+    embed: Option<topodb_warehouse::EmbedFn<'_>>,
     now_ms: i64,
 ) {
-    let _ = topodb_onboarding::run_catch_up(db, scope, schedule, sources, now_ms, true);
+    let wh = hygiene_warehouse(r, embed);
+    let _ = topodb_onboarding::run_catch_up_with(
+        db,
+        scope,
+        &r.schedule,
+        &r.sources,
+        now_ms,
+        true,
+        wh.as_ref(),
+    );
 }
 
 /// Walks from `db_path`'s parent directory upward looking for the nearest
@@ -156,7 +219,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("memory.redb");
         let db = Db::open_with(&db_path, topodb_json::default_spec()).unwrap();
-        let schedule = topodb_onboarding::Schedule::defaults();
+        let resolved = ResolvedHygiene {
+            schedule: topodb_onboarding::Schedule::defaults(),
+            sources: vec![],
+            warehouse: None,
+        };
 
         assert!(db
             .get_meta("onboarding:last_run:compact")
@@ -164,12 +231,12 @@ mod tests {
             .is_none());
 
         let t0 = now_ms();
-        tick_once(&db, Scope::Shared, &schedule, &[], t0);
+        tick_once(&db, Scope::Shared, &resolved, None, t0);
         let first_run = db.get_meta("onboarding:last_run:compact").unwrap();
         assert!(first_run.is_some());
 
         // Same instant again: nothing new is due, so this must be a no-op.
-        tick_once(&db, Scope::Shared, &schedule, &[], t0);
+        tick_once(&db, Scope::Shared, &resolved, None, t0);
         let second_run = db.get_meta("onboarding:last_run:compact").unwrap();
         assert_eq!(second_run, first_run);
     }
@@ -178,9 +245,9 @@ mod tests {
     fn resolve_config_falls_back_to_defaults_without_a_config() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("memory.redb");
-        let (schedule, sources) = resolve_config(&db_path);
-        assert_eq!(schedule, topodb_onboarding::Schedule::defaults());
-        assert!(sources.is_empty());
+        let r = resolve_config(&db_path);
+        assert_eq!(r.schedule, topodb_onboarding::Schedule::defaults());
+        assert!(r.sources.is_empty());
     }
 
     #[test]
@@ -193,8 +260,8 @@ mod tests {
 
         // An empty config parses to the default schedule too, but exercises
         // the walk-and-parse path rather than the "no file found" path.
-        let (schedule, _sources) = resolve_config(&db_path);
-        assert_eq!(schedule, topodb_onboarding::Schedule::defaults());
+        let r = resolve_config(&db_path);
+        assert_eq!(r.schedule, topodb_onboarding::Schedule::defaults());
     }
 
     #[test]
@@ -207,9 +274,9 @@ mod tests {
         .unwrap();
         let db_path = root.path().join("memory.redb");
 
-        let (_schedule, sources) = resolve_config(&db_path);
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].path, root.path().join("./bundle"));
+        let r = resolve_config(&db_path);
+        assert_eq!(r.sources.len(), 1);
+        assert_eq!(r.sources[0].path, root.path().join("./bundle"));
     }
 
     #[test]
@@ -222,5 +289,41 @@ mod tests {
 
         let found = nearest_topodb_toml(&db_path).unwrap();
         assert_eq!(found, root.path().join(".topodb.toml"));
+    }
+
+    #[test]
+    fn boot_drains_and_mirrors_into_warehouse_next_to_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.redb");
+        let db = Db::open_with(&db_path, topodb_json::default_spec()).unwrap();
+        run_boot_onboarding(&db, &db_path, Scope::Shared, 1_000_000_000);
+        assert!(dir
+            .path()
+            .join("memory.warehouse")
+            .join("MANIFEST.json")
+            .is_file());
+        assert!(db
+            .get_meta(topodb_warehouse::MIRRORED_SEQ_KEY)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn resolve_config_reads_warehouse_section_and_env_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".topodb.toml"),
+            "[warehouse]\nenabled = false\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("memory.redb");
+        assert!(resolve_config(&db_path).warehouse.is_none());
+        std::fs::write(
+            dir.path().join(".topodb.toml"),
+            "[warehouse]\npath = \"wh\"\n",
+        )
+        .unwrap();
+        let r = resolve_config(&db_path);
+        assert_eq!(r.warehouse.as_ref().unwrap().0, dir.path().join("wh"));
     }
 }

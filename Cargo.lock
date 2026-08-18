@@ -3385,6 +3385,7 @@ dependencies = [
  "topodb-json",
  "topodb-obsidian",
  "topodb-onboarding",
+ "topodb-warehouse",
  "ureq",
  "zip",
 ]

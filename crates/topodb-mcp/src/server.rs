@@ -828,6 +828,8 @@ struct DbInfo {
     /// comment) — this field makes that live status (and
     /// `--embeddings`/`--model-dir`'s effect) observable via `db_info`.
     embeddings: EmbeddingsInfo,
+    /// Warehouse (enabled/path/mirrored_seq/spool_backlog).
+    warehouse: WarehouseInfo,
 }
 
 /// `db_info`'s embedding-subsystem sub-payload (see [`DbInfo::embeddings`]).
@@ -840,6 +842,18 @@ struct DbInfo {
 struct EmbeddingsInfo {
     model: String,
     status: EmbedderStatus,
+}
+
+/// `db_info`'s warehouse sub-payload.
+#[derive(Debug, Serialize, JsonSchema)]
+struct WarehouseInfo {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirrored_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spool_backlog: Option<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2318,13 +2332,14 @@ struct SubmitBatchResult {
 #[tool_router]
 impl TopoServer {
     #[tool(
-        description = "Report the open database's path, op-log current_seq (the get_changes anchor), default write scope, default read set, and embedding model/status. Call first to confirm wiring. Passing default_scope as a read call's own scope NARROWS that read to one scope — the default read set can be wider."
+        description = "Report database path, current_seq (get_changes anchor), default scope/read_scopes, embeddings, and warehouse (enabled/path/mirrored_seq). Call first to confirm wiring."
     )]
     fn db_info(&self) -> Result<Json<DbInfo>, ErrorData> {
         let current_seq = self
             .db
             .current_seq()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let resolved = crate::onboard_boot::resolve_config(std::path::Path::new(&self.db_path));
         Ok(Json(DbInfo {
             path: self.db_path.clone(),
             current_seq,
@@ -2338,6 +2353,22 @@ impl TopoServer {
             embeddings: EmbeddingsInfo {
                 model: self.embedder.model_name(),
                 status: self.embedder.status(),
+            },
+            warehouse: match resolved.warehouse {
+                None => WarehouseInfo {
+                    enabled: false,
+                    path: None,
+                    mirrored_seq: None,
+                    spool_backlog: None,
+                },
+                Some((dir, _)) => WarehouseInfo {
+                    enabled: true,
+                    path: Some(dir.display().to_string()),
+                    mirrored_seq: topodb_warehouse::mirrored_seq(&self.db).ok(),
+                    spool_backlog: std::fs::read_dir(dir.join("spool"))
+                        .ok()
+                        .map(|rd| rd.filter_map(|e| e.ok()).count()),
+                },
             },
         }))
     }

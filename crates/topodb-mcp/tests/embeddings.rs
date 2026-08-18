@@ -16,6 +16,13 @@ fn embeddings_off_reports_status_and_search_still_works() {
 
     let info = server.call_tool_ok("db_info", serde_json::json!({}), DEFAULT_TIMEOUT);
     assert_eq!(info["embeddings"]["status"], "off", "{info:#?}");
+    // Warehouse should be enabled by default with a path ending in .warehouse
+    assert_eq!(info["warehouse"]["enabled"], true, "{info:#?}");
+    let warehouse_path = info["warehouse"]["path"].as_str().unwrap_or("");
+    assert!(
+        warehouse_path.ends_with(".warehouse"),
+        "warehouse path should end with .warehouse: {warehouse_path}"
+    );
 
     let m = server.call_tool_ok(
         "create_memory",
