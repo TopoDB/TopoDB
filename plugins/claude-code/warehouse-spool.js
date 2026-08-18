@@ -51,7 +51,7 @@ export function responseText(toolName, toolInput, resp) {
   if (Array.isArray(resp)) return firstText(resp);
   if (typeof resp !== "object") return String(resp);
   if (resp.file && typeof resp.file.content === "string") return resp.file.content;
-  if (typeof resp.stdout === "string") return resp.stdout + (resp.stderr ? "[stderr]\n" + resp.stderr : "");
+  if (typeof resp.stdout === "string") return resp.stdout + (resp.stderr ? "\n[stderr]\n" + resp.stderr : "");
   for (const k of ["content", "result", "output", "text"]) {
     const v = resp[k];
     if (typeof v === "string") return v;

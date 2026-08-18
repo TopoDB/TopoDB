@@ -32,8 +32,8 @@ test("artifactEvent maps tools to artifact types and applies the hard cap", () =
   const read = artifactEvent({ ...base, toolName: "Read", toolInput: { file_path: "/p/a.rs" }, toolResponse: { type: "text", file: { filePath: "/p/a.rs", content: "fn a(){}" } } });
   assert.equal(read.kind, "artifact"); assert.equal(read.artifact.type, "file_read"); assert.equal(read.artifact.locator, "/p/a.rs");
   assert.equal(read.artifact.content, "fn a(){}"); assert.equal(read.source.tool, "Read"); assert.equal(read.source.scope, base.scope);
-  const bash = artifactEvent({ ...base, toolName: "Bash", toolInput: { command: "ls" }, toolResponse: { stdout: "x\n", stderr: "warn" } });
-  assert.equal(bash.artifact.type, "command"); assert.equal(bash.artifact.locator, "ls"); assert.match(bash.artifact.content, /x\n\[stderr\]\nwarn/);
+  const bash = artifactEvent({ ...base, toolName: "Bash", toolInput: { command: "ls" }, toolResponse: { stdout: "x", stderr: "warn" } });
+  assert.equal(bash.artifact.type, "command"); assert.equal(bash.artifact.locator, "ls"); assert.equal(bash.artifact.content, "x\n[stderr]\nwarn");
   const edit = artifactEvent({ ...base, toolName: "Edit", toolInput: { file_path: "/p/a.rs", old_string: "a", new_string: "b" }, toolResponse: {} });
   assert.equal(edit.artifact.type, "diff"); assert.match(edit.artifact.content, /-a\n\+b/);
   const write = artifactEvent({ ...base, toolName: "Write", toolInput: { file_path: "/p/n.rs", content: "new" }, toolResponse: {} });
