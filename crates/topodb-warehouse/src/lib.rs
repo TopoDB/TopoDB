@@ -3,6 +3,7 @@
 pub mod blob;
 pub mod event;
 pub mod manifest;
+pub mod mirror;
 pub mod paths;
 pub mod redact;
 pub mod segment;
@@ -14,6 +15,7 @@ pub use event::{
     EVENT_VERSION,
 };
 pub use manifest::{Manifest, MirrorGap, SegmentEntry, Tier, MANIFEST_VERSION, RECENT_IDS_CAP};
+pub use mirror::{mirrored_seq, MirrorReport, MIRRORED_SEQ_KEY};
 pub use paths::{warehouse_dir_for_db, Layout};
 pub use spool::DrainReport;
 
@@ -131,5 +133,10 @@ impl Warehouse {
     }
     pub fn events(&self) -> std::io::Result<Vec<Event>> {
         segment::all_events(&self.layout, &self.manifest)
+    }
+    pub fn mirror(&mut self, db: &topodb::Db, now_ms: i64) -> Result<MirrorReport, WarehouseError> {
+        let r = mirror::mirror(db, &self.layout, &mut self.manifest, now_ms)?;
+        self.maybe_roll(now_ms)?;
+        Ok(r)
     }
 }
