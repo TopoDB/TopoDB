@@ -4612,3 +4612,71 @@ fn init_refreshes_existing_windsurfrules_but_not_missing() {
     assert!(ws.contains("# my windsurf rules")); // preserved
     assert!(!proj.path().join(".cursor").join("rules").exists()); // not created
 }
+
+#[test]
+fn warehouse_status_drain_derive_rebuild_verify_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.redb");
+    // Create .topodb.toml with spool_min_age_ms = 0 for testing (otherwise new files are deferred for 2s)
+    std::fs::write(
+        dir.path().join(".topodb.toml"),
+        "[warehouse]\nspool_min_age_ms = 0\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let mut v: Vec<&str> = vec!["--db", db.to_str().unwrap()];
+        v.extend_from_slice(args);
+        let mut cmd = bin();
+        cmd.current_dir(dir.path());
+        cmd.args(&v).output().unwrap()
+    };
+    let r = run(&[
+        "remember",
+        "--content",
+        "warehouse cli fact",
+        "--entity",
+        "cli",
+    ]);
+    assert!(
+        r.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // status without a db open still works and reports the sibling path
+    let s = run(&["warehouse", "status"]);
+    assert!(
+        s.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&s.stdout).unwrap();
+    assert!(v["path"].as_str().unwrap().ends_with("t.warehouse"));
+    // spool an artifact by hand, drain (also mirrors), derive
+    let spool = dir.path().join("t.warehouse").join("spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    std::fs::write(spool.join("s.jsonl"), r#"{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","ts":1,"kind":"artifact","source":{"harness":"cli-test","session":"s","scope":"shared","tool":"Read"},"artifact":{"type":"file_read","locator":"/f.rs","content":"fn cli() {}\n"}}"#).unwrap();
+    let d = run(&["warehouse", "drain"]);
+    let v: serde_json::Value = serde_json::from_slice(&d.stdout).unwrap();
+    assert_eq!(v["drain"]["events"], 1);
+    assert!(v["mirror"]["to_seq"].as_u64().unwrap() >= 1);
+    let dv = run(&["warehouse", "derive"]);
+    let v: serde_json::Value = serde_json::from_slice(&dv.stdout).unwrap();
+    assert_eq!(v["artifacts_created"], 1);
+    let out = dir.path().join("rebuilt.redb");
+    let rb = run(&["warehouse", "rebuild", out.to_str().unwrap()]);
+    assert!(
+        rb.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rb.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&rb.stdout).unwrap();
+    assert!(v["ops_replayed"].as_u64().unwrap() >= 1);
+    assert!(out.is_file());
+    let vf = run(&["warehouse", "verify"]);
+    let v: serde_json::Value = serde_json::from_slice(&vf.stdout).unwrap();
+    assert_eq!(v["problems"].as_array().unwrap().len(), 0);
+    let t = run(&["warehouse", "tier"]);
+    assert!(t.status.success());
+    let sh = run(&["warehouse", "show", "b3:nope"]);
+    assert_eq!(sh.status.code(), Some(2));
+}

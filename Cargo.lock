@@ -3344,6 +3344,7 @@ name = "topodb-cli"
 version = "0.0.15"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -3352,6 +3353,7 @@ dependencies = [
  "topodb-json",
  "topodb-obsidian",
  "topodb-onboarding",
+ "topodb-warehouse",
 ]
 
 [[package]]
