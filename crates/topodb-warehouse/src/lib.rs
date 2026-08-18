@@ -1,12 +1,16 @@
 //! Context warehouse: the bronze tier under `<db>.warehouse/` (see the design
 //! spec `2026-08-18-context-warehouse-design.md`). Layer on the engine, no LLM.
+pub mod blob;
 pub mod event;
+pub mod manifest;
 pub mod paths;
 
+pub use blob::{blob_path, get_blob, hash_hex, put_blob};
 pub use event::{
     Artifact, ArtifactType, Event, Kind, Marker, MarkerType, OpEvent, Redaction, Source,
     EVENT_VERSION,
 };
+pub use manifest::{Manifest, MirrorGap, SegmentEntry, Tier, MANIFEST_VERSION, RECENT_IDS_CAP};
 pub use paths::{warehouse_dir_for_db, Layout};
 
 /// Tunables (spec §8 `[warehouse]`), with the spec defaults.
