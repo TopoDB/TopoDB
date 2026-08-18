@@ -269,4 +269,30 @@ mod tests {
         assert_eq!((rep.events, rep.deferred_files), (0, 1));
         assert!(wh.layout.spool.join("a.jsonl").is_file());
     }
+
+    #[test]
+    fn reopen_recovers_dedup_ids_from_open_segment_after_crash_before_manifest_save() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("w");
+        {
+            let mut wh = Warehouse::open(&dir, cfg()).unwrap();
+            write_spool(&wh, "a.jsonl", &[art("01A", 1, "x")]);
+            wh.drain(5).unwrap();
+            // simulate a crash that happened after the segment append but before
+            // the manifest save: forget the ids and persist that older state
+            wh.manifest.recent_ids.clear();
+            wh.manifest = {
+                let mut m = crate::manifest::Manifest::new_with_host(wh.manifest.host_id.clone());
+                m.segments = wh.manifest.segments.clone();
+                m.scopes = wh.manifest.scopes.clone();
+                m
+            };
+            wh.save().unwrap();
+        }
+        let mut wh = Warehouse::open(&dir, cfg()).unwrap();
+        write_spool(&wh, "a-again.jsonl", &[art("01A", 1, "x")]); // the spool file survived the crash
+        let rep = wh.drain(6).unwrap();
+        assert_eq!((rep.events, rep.duplicates), (0, 1));
+        assert_eq!(wh.events().unwrap().len(), 1);
+    }
 }

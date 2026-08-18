@@ -85,10 +85,24 @@ pub struct Warehouse {
     pub config: WarehouseConfig,
 }
 impl Warehouse {
+    /// Opens the warehouse, loading its manifest and seeding the dedup id set
+    /// from any events already durable in the open segment. This closes the
+    /// crash window between `segment::append_events` and `manifest::save`:
+    /// if a crash occurs after events are appended but before the manifest is
+    /// saved, the ids are recovered from the segment on re-open, preventing
+    /// duplicates when those events are re-drained.
     pub fn open(dir: &std::path::Path, config: WarehouseConfig) -> std::io::Result<Self> {
         let layout = Layout::new(dir.to_path_buf());
         layout.ensure()?;
-        let manifest = Manifest::load_or_init(&layout)?;
+        let mut manifest = Manifest::load_or_init(&layout)?;
+        // Close the crash window between segment append and manifest save:
+        // any ids already durable in the open segment count as seen.
+        if let Some(e) = manifest.open_entry().cloned() {
+            let (evs, _) = segment::read_segment(&layout, &e)?;
+            for ev in evs {
+                manifest.note_id(&ev.id);
+            }
+        }
         Ok(Warehouse {
             layout,
             manifest,
