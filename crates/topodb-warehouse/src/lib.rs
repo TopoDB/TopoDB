@@ -1,7 +1,9 @@
 //! Context warehouse: the bronze tier under `<db>.warehouse/` (see the design
 //! spec `2026-08-18-context-warehouse-design.md`). Layer on the engine, no LLM.
 pub mod blob;
+pub mod chunk;
 pub mod event;
+pub mod ids;
 pub mod manifest;
 pub mod mirror;
 pub mod paths;
