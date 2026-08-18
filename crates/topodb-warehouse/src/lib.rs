@@ -4,6 +4,7 @@ pub mod blob;
 pub mod chunk;
 pub mod event;
 pub mod ids;
+pub mod lineage;
 pub mod manifest;
 pub mod mirror;
 pub mod paths;
