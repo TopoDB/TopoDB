@@ -68,15 +68,6 @@ fn run_hygiene_catch_up(db: &Db, db_path: &Path, scope: Scope, now_ms: i64) {
     ) {
         eprintln!("topodb-mcp: boot onboarding: hygiene catch-up: {e:?}");
     }
-    // Ensure warehouse mirroring is initialized even on fresh databases
-    if wh.is_some()
-        && db
-            .get_meta(topodb_warehouse::MIRRORED_SEQ_KEY)
-            .unwrap_or_default()
-            .is_none()
-    {
-        let _ = db.set_meta(topodb_warehouse::MIRRORED_SEQ_KEY, b"0");
-    }
 }
 
 /// Resolves the hygiene schedule, sources, and warehouse configuration for a db:

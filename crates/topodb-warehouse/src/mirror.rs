@@ -59,6 +59,9 @@ pub fn mirror(
             // past the gap so idle ticks stop re-recording it.
             m.save(layout)?;
             db.set_meta(MIRRORED_SEQ_KEY, gap.to.to_string().as_bytes())?;
+        } else if db.get_meta(MIRRORED_SEQ_KEY)?.is_none() {
+            // Initialize the watermark when it does not exist yet (empty op log case).
+            db.set_meta(MIRRORED_SEQ_KEY, rep.to_seq.to_string().as_bytes())?;
         }
         return Ok(rep);
     }
@@ -169,5 +172,20 @@ mod tests {
         create(&db, 1);
         let r3 = wh.mirror(&db, 102).unwrap();
         assert_eq!((r3.from_seq, r3.to_seq, r3.events), (4, 4, 1));
+    }
+
+    #[test]
+    fn mirror_on_empty_log_initializes_watermark_to_zero() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Db::open_with(t.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        let mut wh = Warehouse::open(&t.path().join("w"), WarehouseConfig::default()).unwrap();
+        assert!(db.get_meta(MIRRORED_SEQ_KEY).unwrap().is_none());
+        let r = wh.mirror(&db, 100).unwrap();
+        assert_eq!((r.from_seq, r.to_seq, r.events, r.gap), (1, 0, 0, None));
+        assert_eq!(
+            db.get_meta(MIRRORED_SEQ_KEY).unwrap().as_deref(),
+            Some(b"0".as_slice())
+        );
+        assert_eq!(mirrored_seq(&db).unwrap(), 0);
     }
 }
