@@ -12,7 +12,10 @@ pub use config::{
     ScheduleEntry, WarehouseSection,
 };
 mod hygiene;
-pub use hygiene::{due_tasks, run_catch_up, CatchUpReport, Task};
+pub use hygiene::{
+    due_tasks, run_catch_up, run_catch_up_with, CatchUpReport, HygieneWarehouse, Task,
+    WarehouseHygieneReport,
+};
 
 mod reingest;
 pub use config::{ReingestSource, SourceKind};
