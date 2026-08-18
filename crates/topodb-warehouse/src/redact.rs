@@ -71,6 +71,12 @@ fn shannon_bits_per_char(s: &str) -> f64 {
         .sum()
 }
 
+/// Path-like: two or more '/' separators and no segment long enough to be a
+/// secret on its own. A base64 blob with one '/' still gets redacted.
+fn looks_like_path(tok: &str) -> bool {
+    tok.matches('/').count() >= 2 && tok.split('/').all(|seg| seg.len() < 32)
+}
+
 fn entropy_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[A-Za-z0-9+/=_\-]{32,}").expect("valid regex"))
@@ -117,7 +123,7 @@ pub fn redact(text: &str) -> RedactOutcome {
         if is_hashlike(tok)
             || prev == Some('/')
             || prev == Some(':')
-            || tok.contains('/')
+            || looks_like_path(tok)
             || shannon_bits_per_char(tok) < 4.0
         {
             continue;
@@ -202,5 +208,15 @@ mod tests {
         let o = redact(concat!("a=AKIA", "IOSFODNN7EXAMPLE b=AKIA", "IOSFODNN7EXAMPLE"));
         assert_eq!(classes(&o), vec![("aws".to_string(), 2)]);
         assert!(o.text.contains("«redacted:aws:20»"));
+    }
+
+    #[test]
+    fn entropy_token_with_a_slash_is_still_redacted_but_paths_are_not() {
+        let o = redact("key Qm9v/8dK2pL5xR7wT1yU3zA6bC4nM0eF9gH");
+        assert!(o.text.contains("«redacted:entropy:"), "{}", o.text);
+        let p = "path /Users/drew/TopoDB/crates/topodb-warehouse/src/segment.rs";
+        let o2 = redact(p);
+        assert_eq!(o2.text, p);
+        assert!(o2.redactions.is_empty());
     }
 }
