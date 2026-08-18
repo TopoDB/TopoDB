@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod mirror;
 pub mod paths;
 pub mod redact;
+pub mod report;
 pub mod segment;
 pub mod spool;
 
@@ -17,6 +18,7 @@ pub use event::{
 pub use manifest::{Manifest, MirrorGap, SegmentEntry, Tier, MANIFEST_VERSION, RECENT_IDS_CAP};
 pub use mirror::{mirrored_seq, MirrorReport, MIRRORED_SEQ_KEY};
 pub use paths::{warehouse_dir_for_db, Layout};
+pub use report::Status;
 pub use spool::DrainReport;
 
 /// Tunables (spec §8 `[warehouse]`), with the spec defaults.
