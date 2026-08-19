@@ -12,6 +12,7 @@
     "render.js": "f722dd712c837440d551d6b5d1f5c01016380ba834553e086115ff371d59111a",
     "scope-id.js": "abda1e8ccf4babf5cd12cd50b70862402d061b99dce00def3b9f4376a72bb39d",
     "server-args.js": "7f2f797c0c523aa99f17d7761bc2c03e7e671682727a17fc9cee1cb3595999f8",
-    "warehouse-spool.js": "1721c4857739a2ffae5bd999aebc09c2ad489858ff84a25f46d98db9b809b35b"
+    "tool-map.js": "e5ea51079bbbcfcf5831d17e57e73053b2a9af23f22add5e9da08a84a558d505",
+    "warehouse-spool.js": "f13d92c82f17cbabf7a39a1099b14104e2a45659306a0c9d652452ef7ed7fee8"
   }
 }
