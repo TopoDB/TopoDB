@@ -5,8 +5,10 @@ description: Use when the user refers to past work, decisions, or people ("what 
 
 # topodb memory
 
-Every session has a memory: a graph of memories and entities, spanning **this
-project** plus a **`shared`** layer that crosses projects.
+Every chat has a memory: a graph of memories and entities, spanning **this
+project** plus a **`shared`** layer that crosses projects. Cursor injects up
+to 8 recent project memories when a chat starts — they are the headlines, not
+the whole store.
 
 ## Recall before you guess
 
