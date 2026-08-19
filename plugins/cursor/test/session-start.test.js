@@ -27,11 +27,27 @@ test("no daemon: emits only the env frame, writes a session_start marker, exits 
     assert.equal(evs[0].marker.type, "session_start"); assert.equal(evs[0].marker.harness, "cursor");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test("background agents, garbage stdin, and TOPODB_RECORDING=0-with-warehouse-off produce no output", () => {
+test("background agents and garbage stdin produce no output", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "cur-ss-"));
   try {
     assert.equal(run({ session_id: "b", is_background_agent: true, workspace_roots: [dir] }, { TOPODB_PLUGIN_DATA: dir }), "");
     assert.equal(run("not json", { TOPODB_PLUGIN_DATA: dir }), "");
+    assert.ok(!existsSync(path.join(dir, "memory.warehouse")));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test("TOPODB_WAREHOUSE=0 keeps the env frame but writes no spool marker", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cur-ss-"));
+  try {
+    const out = run({ session_id: "k1", workspace_roots: [dir] }, { TOPODB_PLUGIN_DATA: dir, TOPODB_WAREHOUSE: "0" });
+    assert.deepEqual(JSON.parse(out), { env: { TOPODB_SESSION_ID: "k1" } });
+    assert.ok(!existsSync(path.join(dir, "memory.warehouse")));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test("TOPODB_RECORDING=0 keeps the env frame but writes no spool marker", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cur-ss-"));
+  try {
+    const out = run({ session_id: "k2", workspace_roots: [dir] }, { TOPODB_PLUGIN_DATA: dir, TOPODB_RECORDING: "0" });
+    assert.deepEqual(JSON.parse(out), { env: { TOPODB_SESSION_ID: "k2" } });
     assert.ok(!existsSync(path.join(dir, "memory.warehouse")));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
