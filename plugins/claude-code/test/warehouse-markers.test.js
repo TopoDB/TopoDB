@@ -15,8 +15,10 @@ function runHook(script, payload, env) {
 function markers(dataDir) {
   const dir = path.join(warehouseDir(dataDir, {}), "spool");
   const out = [];
-  try { for (const f of readdirSync(dir)) for (const l of readFileSync(path.join(dir, f), "utf8").split("\n")) if (l) { const e = JSON.parse(l); if (e.kind === "marker") out.push(e.marker); } } catch {}
-  return out;
+  try { for (const f of readdirSync(dir)) for (const l of readFileSync(path.join(dir, f), "utf8").split("\n")) if (l) { const e = JSON.parse(l); if (e.kind === "marker") out.push(e); } } catch {}
+  // One spool file per hook process; pids (hence readdir order) are not
+  // monotonic on Windows, so order by event time, not filename.
+  return out.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map((e) => e.marker);
 }
 
 test("session-start/end and mark-captured write markers into the spool", () => {

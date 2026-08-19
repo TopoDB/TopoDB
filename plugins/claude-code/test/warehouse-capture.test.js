@@ -17,7 +17,9 @@ function spooled(dataDir) {
   const dir = path.join(warehouseDir(dataDir, {}), "spool");
   let out = [];
   try { for (const f of readdirSync(dir)) out.push(...readFileSync(path.join(dir, f), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))); } catch {}
-  return out;
+  // One spool file per hook process; pids (hence readdir order) are not
+  // monotonic on Windows, so order by event time, not filename.
+  return out.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 test("newUlid is 26 chars, monotonic-ish, and simpleDiff marks lines", () => {
