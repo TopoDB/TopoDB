@@ -167,6 +167,13 @@ pub fn tier(db: &Db, wh: &mut Warehouse, now_ms: i64) -> Result<TierReport, Ware
             e.archived = true;
             e.tier = Tier::Expired;
             rep.segments_stripped += 1;
+            // Save right after this transition rather than only once at the
+            // end: if the process dies partway through a batch of segment
+            // transitions, the manifest reflects exactly the transitions
+            // that actually happened on disk (see segment::read_segment's
+            // archived-flag/file-location tolerance for the narrow window
+            // between the rewrite above and this save).
+            wh.save()?;
         } else if age_days > cfg.warm_days as i64 && !entry.archived {
             let from = segment_path(&wh.layout, &entry);
             let to_entry = {
@@ -182,6 +189,7 @@ pub fn tier(db: &Db, wh: &mut Warehouse, now_ms: i64) -> Result<TierReport, Ware
             e.archived = true;
             e.tier = Tier::Cold;
             rep.segments_archived += 1;
+            wh.save()?;
         }
     }
     wh.save()?;

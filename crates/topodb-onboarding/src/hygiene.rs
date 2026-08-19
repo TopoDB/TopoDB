@@ -297,11 +297,23 @@ pub fn run_catch_up_with(
             Task::Compact => {
                 let current = db.current_seq().map_err(ComposeError::Engine)?;
                 let mut keep_from = current.saturating_sub(RETAIN);
-                // Clamp Compact to never go below the warehouse's mirrored_seq + 1.
-                if warehouse.is_some() {
-                    keep_from = keep_from
-                        .min(topodb_warehouse::mirrored_seq(db).map_err(ComposeError::Engine)? + 1);
-                }
+                // Clamp Compact to never go below the warehouse's
+                // mirrored_seq + 1 — not just when a `Warehouse` handle was
+                // passed to this call (e.g. `topodb init`'s `run_catch_up`
+                // has none), but whenever the watermark META key already
+                // exists, so an un-mirrored tail written by some OTHER
+                // process/call is never compacted away out from under it.
+                let clamp = if warehouse.is_some()
+                    || db
+                        .get_meta(topodb_warehouse::MIRRORED_SEQ_KEY)
+                        .map_err(ComposeError::Engine)?
+                        .is_some()
+                {
+                    Some(topodb_warehouse::mirrored_seq(db).map_err(ComposeError::Engine)? + 1)
+                } else {
+                    None
+                };
+                keep_from = clamp.map_or(keep_from, |c| keep_from.min(c));
                 match db.compact_ops(keep_from) {
                     Ok(()) => {}
                     // Already below the retained floor: nothing to do,
@@ -576,5 +588,40 @@ mod tests {
             Err(topodb::TopoError::Compacted { .. })
         ));
         assert!(db.ops_since(db.current_seq().unwrap() - RETAIN + 1).is_ok());
+    }
+
+    #[test]
+    fn compact_is_clamped_to_mirrored_seq_even_without_a_warehouse_handle() {
+        // `topodb init` calls `run_catch_up` (no `HygieneWarehouse` passed)
+        // and could otherwise compact away ops the warehouse hasn't mirrored
+        // yet, whenever the watermark META key already exists from some
+        // other process/call.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path().join("m.redb"), topodb_json::default_spec()).unwrap();
+        for _ in 0..(RETAIN as usize + 50) {
+            let mut p = topodb::Props::new();
+            p.insert("content".into(), topodb::PropValue::Str("x".into()));
+            db.submit(vec![topodb::Op::CreateNode {
+                id: topodb::NodeId::new(),
+                scope: Scope::Shared,
+                label: "Memory".into(),
+                props: p,
+            }])
+            .unwrap();
+        }
+        let now = 1_000_000_000i64;
+        db.set_meta(topodb_warehouse::MIRRORED_SEQ_KEY, b"10")
+            .unwrap();
+        // No `Some(&wh)` here — this is the `run_catch_up` (no-warehouse) path.
+        let rep = run_catch_up(&db, Scope::Shared, &Schedule::defaults(), &[], now, false).unwrap();
+        assert!(rep.ran.contains(&Task::Compact));
+        assert!(matches!(
+            db.ops_since(10),
+            Err(topodb::TopoError::Compacted { .. })
+        ));
+        assert!(
+            db.ops_since(11).is_ok(),
+            "clamp held without a warehouse handle: nothing at/after mirrored_seq+1 was compacted"
+        );
     }
 }

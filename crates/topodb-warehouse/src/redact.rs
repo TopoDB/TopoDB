@@ -33,7 +33,16 @@ fn rules() -> &'static [Rule] {
             r("google", r"\bAIza[0-9A-Za-z_\-]{35}", 0),
             r("stripe", r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b", 0),
             r("bearer", r"(?i)\b(?:bearer|authorization:)\s+(?:bearer\s+)?([A-Za-z0-9._\-+/=]{16,})", 1),
-            r("kv", r#"(?i)\b(?:[A-Z0-9_]*(?:password|passwd|secret|token|api_key|apikey|access_key)[A-Z0-9_]*)\s*[=:]\s*["']?([^\s"'`,;]{8,})"#, 1),
+            r(
+                "kv",
+                r#"(?i)["']?(?:[A-Z0-9_]*(?:password|passwd|pass|pwd|secret|secret_key|token|access_token|refresh_token|client_secret|api_key|apikey|access_key|private_key|auth|credentials?)[A-Z0-9_]*)["']?\s*[=:]\s*["']?([^\s"'`,;]{8,})"#,
+                1,
+            ),
+            r(
+                "url-cred",
+                r"[a-z][a-z0-9+.\-]*://[^/\s:@]+:([^@\s/]+)@",
+                1,
+            ),
         ]
     })
 }
@@ -164,6 +173,9 @@ mod tests {
             ("pem", "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"),
             ("kv", "password=hunter2hunter2"),
             ("kv", "OPENAI_API_KEY=abcdefghijklmnopqrstuvwxyz0123456789ABCD"),
+            ("kv", r#"{"password": "hunter2hunter2"}"#),
+            ("kv", "SMTP_PASS=abcdefgh12"),
+            ("url-cred", "postgres://drew:s3cretpass@db.host/x"),
         ];
         for (class, input) in cases {
             let o = redact(input);
@@ -181,6 +193,14 @@ mod tests {
     }
 
     #[test]
+    fn url_cred_redacts_password_but_keeps_the_host() {
+        let o = redact("postgres://drew:s3cretpass@db.host/x");
+        assert!(o.text.contains("«redacted:url-cred:"), "{}", o.text);
+        assert!(o.text.contains("db.host/x"), "{}", o.text);
+        assert!(o.text.contains("drew:"), "{}", o.text); // username survives
+    }
+
+    #[test]
     fn high_entropy_token_is_redacted() {
         let o = redact("blob 9f8s7d6f5g4h3j2k1l0zXcVbNmQwErTyUiOpAsDf");
         assert!(o.text.contains("«redacted:entropy:"));
@@ -195,6 +215,8 @@ mod tests {
             "This is a perfectly ordinary sentence about the warehouse design.",
             "path /Users/drew/TopoDB/crates/topodb-warehouse/src/segment.rs",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // low entropy
+            "auth flow uses tokens",                    // "auth"/"tokens" w/o a kv separator
+            "the credentials system needs review",      // no separator
         ];
         for k in keep {
             let o = redact(k);

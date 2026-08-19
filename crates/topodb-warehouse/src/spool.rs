@@ -1,10 +1,24 @@
 //! Drain: spool/*.jsonl -> redact -> hash -> inline|blob|pointer -> open segment (spec §6.2).
 use crate::blob::{hash_hex, put_blob};
-use crate::event::{parse_lines, Event, Kind};
+use crate::event::{parse_lines, Event, Kind, Redaction};
 use crate::manifest::Manifest;
 use crate::redact::{redact, REDACT_VERSION};
 use crate::{Layout, WarehouseConfig};
 use serde::Serialize;
+
+/// Merges `src` redaction counts into `dst`, aggregating by class (same
+/// accounting as `redact::bump`) rather than replacing wholesale — needed
+/// because `prepare_artifact` now redacts both `locator` and `content` into
+/// the same `a.redactions` vec.
+fn merge_redactions(dst: &mut Vec<Redaction>, src: Vec<Redaction>) {
+    for r in src {
+        if let Some(d) = dst.iter_mut().find(|d| d.class == r.class) {
+            d.count += r.count;
+        } else {
+            dst.push(r);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DrainReport {
@@ -35,12 +49,22 @@ fn prepare_artifact(
         return Ok(false);
     };
     let mut wrote_blob = false;
+    if cfg.redact {
+        // Command artifacts carry the full command line (secrets and all) in
+        // `locator`; redact it too, not just `content`.
+        let o = redact(&a.locator);
+        if !o.redactions.is_empty() {
+            a.redacted = true;
+            merge_redactions(&mut a.redactions, o.redactions);
+        }
+        a.locator = o.text;
+    }
     if let Some(content) = a.content.take() {
         let content = if cfg.redact {
             let o = redact(&content);
             if !o.redactions.is_empty() {
                 a.redacted = true;
-                a.redactions = o.redactions;
+                merge_redactions(&mut a.redactions, o.redactions);
             }
             o.text
         } else {
@@ -201,6 +225,24 @@ mod tests {
         assert_eq!(a.bytes as usize, a.content.as_ref().unwrap().len());
         assert_eq!(evs[0].host, wh.manifest.host_id); // host filled from manifest
         assert!(wh.manifest.scopes.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn drain_redacts_the_artifact_locator_too() {
+        let t = tempfile::tempdir().unwrap();
+        let mut wh = Warehouse::open(&t.path().join("w"), cfg()).unwrap();
+        let mut ev = art("01A", 1, "ok\n");
+        ev.artifact.as_mut().unwrap().locator = "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEFghiJKLmnoPQRstuVWXyz0123456789' https://x".into();
+        write_spool(&wh, "s.jsonl", &[ev]);
+        wh.drain(100).unwrap();
+        let evs = wh.events().unwrap();
+        let a = evs[0].artifact.as_ref().unwrap();
+        assert!(
+            a.locator.contains("«redacted:bearer:"),
+            "locator: {}",
+            a.locator
+        );
+        assert!(a.redacted);
     }
 
     #[test]

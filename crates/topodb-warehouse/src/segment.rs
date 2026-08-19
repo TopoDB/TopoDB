@@ -19,6 +19,22 @@ pub fn segment_path(layout: &Layout, e: &SegmentEntry) -> PathBuf {
     dir.join(format!("{}.jsonl.lz4", e.name))
 }
 
+/// The OTHER directory a sealed segment could live in, if `e.archived`
+/// disagrees with where the file actually landed (e.g. a crash between the
+/// archive rename and the manifest save in `tier`). `None` for an unsealed
+/// (open) entry, which only ever lives in `segments/`.
+fn alt_segment_path(layout: &Layout, e: &SegmentEntry) -> Option<PathBuf> {
+    if !e.sealed {
+        return None;
+    }
+    let dir = if e.archived {
+        &layout.segments
+    } else {
+        &layout.archive
+    };
+    Some(dir.join(format!("{}.jsonl.lz4", e.name)))
+}
+
 pub fn should_roll(e: &SegmentEntry, now_ms: i64, segment_mb: u64) -> bool {
     e.bytes > segment_mb.saturating_mul(1024 * 1024) || now_ms.div_euclid(86_400_000) != e.day
 }
@@ -69,7 +85,18 @@ pub fn append_events(
 }
 
 /// Seals the open segment: lz4-frame compress, blake3 the compressed file,
-/// mark sealed, delete the raw file. Returns the sealed name (None if nothing open).
+/// mark sealed, save the MANIFEST, THEN delete the raw file. Returns the
+/// sealed name (None if nothing open).
+///
+/// Order matters for crash safety: the sealed `.lz4` is written durably
+/// (tmp+rename) and the manifest entry updated (`sealed`, `blake3`, `bytes`)
+/// and SAVED to disk before the raw `.jsonl` is removed. If the process dies
+/// between the rename and the raw removal, both files exist on next open,
+/// but the manifest already says `sealed`/points at the `.lz4`, so nothing
+/// is lost — `read_segment`/`verify` read the sealed file. Deleting the raw
+/// file before saving the manifest would risk losing events if the process
+/// died before `m.save` (manifest still says unsealed but the raw file, its
+/// only readable form, is gone).
 pub fn seal_open(layout: &Layout, m: &mut Manifest) -> std::io::Result<Option<String>> {
     let Some(entry) = m.open_entry_mut() else {
         return Ok(None);
@@ -95,6 +122,7 @@ pub fn seal_open(layout: &Layout, m: &mut Manifest) -> std::io::Result<Option<St
     entry.sealed = true;
     entry.bytes = compressed.len() as u64;
     let name = entry.name.clone();
+    m.save(layout)?;
     if raw.is_file() {
         std::fs::remove_file(&raw)?;
     }
@@ -102,7 +130,18 @@ pub fn seal_open(layout: &Layout, m: &mut Manifest) -> std::io::Result<Option<St
 }
 
 pub fn read_segment(layout: &Layout, e: &SegmentEntry) -> std::io::Result<(Vec<Event>, usize)> {
-    let p = segment_path(layout, e);
+    let mut p = segment_path(layout, e);
+    if !p.is_file() {
+        // The manifest's `archived` flag and the file's actual location can
+        // disagree after a crash between an archive move and the manifest
+        // save (see `tier`'s per-transition `wh.save()`). Try the other
+        // directory before giving up.
+        if let Some(alt) = alt_segment_path(layout, e) {
+            if alt.is_file() {
+                p = alt;
+            }
+        }
+    }
     if !p.is_file() {
         return Ok((Vec::new(), 0));
     }
@@ -148,7 +187,14 @@ pub fn verify(layout: &Layout, m: &Manifest) -> Vec<VerifyProblem> {
         .iter()
         .filter(|e| e.sealed && e.deleted_at.is_none())
     {
-        let p = segment_path(layout, e);
+        let mut p = segment_path(layout, e);
+        if !p.is_file() {
+            if let Some(alt) = alt_segment_path(layout, e) {
+                if alt.is_file() {
+                    p = alt;
+                }
+            }
+        }
         match std::fs::read(&p) {
             Err(err) => out.push(VerifyProblem {
                 segment: e.name.clone(),
@@ -260,6 +306,32 @@ mod tests {
         assert!(should_roll(&e, 1000, 64));
         e.bytes = 0;
         assert!(should_roll(&e, 86_400_000 + 1, 64)); // next UTC day
+    }
+
+    #[test]
+    fn read_segment_tolerates_archived_flag_and_file_location_disagreeing() {
+        let (_t, l, mut m) = setup();
+        append_events(&l, &mut m, &[ev(1), ev(2)], 2).unwrap();
+        let name = seal_open(&l, &mut m).unwrap().unwrap();
+        let e = m.segments.iter().find(|s| s.name == name).unwrap().clone();
+        assert!(!e.archived);
+        // Simulate a crash between an archive move (tier's rename) and the
+        // manifest save that would have flipped `archived = true`: move the
+        // file into archive/ by hand, but leave the manifest entry saying
+        // `archived: false` (still pointing at segments/).
+        let from = segment_path(&l, &e); // segments/<name>.jsonl.lz4
+        let mut archived_entry = e.clone();
+        archived_entry.archived = true;
+        let to = segment_path(&l, &archived_entry); // archive/<name>.jsonl.lz4
+        std::fs::rename(&from, &to).unwrap();
+        assert!(!from.is_file() && to.is_file());
+
+        // read_segment must still find the events despite the disagreement.
+        let (evs, bad) = read_segment(&l, &e).unwrap();
+        assert_eq!((evs.len(), bad), (2, 0));
+        // verify must still find the file and not report it unreadable.
+        let problems = verify(&l, &m);
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     #[test]

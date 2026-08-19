@@ -157,7 +157,16 @@ pub fn derive(
         ids.insert((g.scope.clone(), g.hash.clone()), id);
         let mut ops: Vec<Op> = Vec::new();
         match db.node(&set, id) {
-            Some(existing) if existing.props.get(DERIVED_BY_PROP) == Some(&s(&stamp)) => {
+            // Any existing Artifact node at this id — regardless of its
+            // `derived_by` stamp — is treated as already-derived. Without
+            // `--rederive` we never remove/recreate it: a stamp mismatch
+            // (e.g. daemon derive with an embedder, then a plain CLI
+            // `derive`) would otherwise emit RemoveNode+CreateNode for the
+            // same id in one batch, which the engine rejects, and would
+            // collide chunk ids too. Stamp migration is exclusively
+            // `--rederive`'s job (its removal runs in separate batches, see
+            // `remove_derived` above).
+            Some(existing) => {
                 // update sighting stats if they moved
                 let last = existing.props.get("last_seen").cloned();
                 if last != Some(PropValue::DateTime(g.last_seen)) {
@@ -171,11 +180,7 @@ pub fn derive(
                     rep.artifacts_updated += 1;
                 }
             }
-            existing => {
-                if existing.is_some() {
-                    ops.push(Op::RemoveNode { id });
-                    rep.removed += 1;
-                }
+            None => {
                 let mut props = Props::new();
                 props.insert("type".into(), s(kind_str(&g.kind)));
                 props.insert("locator".into(), s(&g.locator));

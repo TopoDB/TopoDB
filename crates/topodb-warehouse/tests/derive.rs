@@ -263,6 +263,68 @@ fn rederive_replaces_derived_state_with_identical_ids_and_no_embedder_changes_st
 }
 
 #[test]
+fn derive_with_a_different_stamp_does_not_fail_or_recreate_without_rederive() {
+    let (_t, db, mut wh) = setup();
+    let m1 = memory(&db, "fact");
+    spool(
+        &wh,
+        "a.jsonl",
+        &[
+            art(
+                "a1",
+                2,
+                "x",
+                "hello world\n",
+                "Read",
+                ArtifactType::FileRead,
+            ),
+            marker("m1", 3, MarkerType::MemoryWrite, vec![m1.to_string()]),
+        ],
+    );
+    wh.drain(10).unwrap();
+    let scopes = topodb_json::scopes_to_scope_set(&[scope(), Scope::Shared]);
+
+    // First: plain CLI-style derive (no embedder) -> stamp warehouse/1/none.
+    let rep1 = derive(&db, &wh, None, 20, false).unwrap();
+    assert_eq!(rep1.artifacts_created, 1);
+    let a_before = db.nodes_by_label_unbumped(&scopes, ARTIFACT_LABEL)[0].clone();
+    assert_eq!(
+        a_before.props.get("derived_by"),
+        Some(&PropValue::Str(derived_by_stamp(None)))
+    );
+    let chunks_before = db.nodes_by_label_unbumped(&scopes, CHUNK_LABEL).len();
+
+    // Then: daemon-style derive with an embedder -> would-be stamp
+    // warehouse/1/e2, but WITHOUT --rederive this must not fail or
+    // remove/recreate the existing node.
+    let embed = |_t: &str| Some(("e2".to_string(), vec![0.5, 0.5]));
+    let rep2 = derive(&db, &wh, Some(&embed), 30, false).unwrap();
+    assert_eq!(rep2.artifacts_created, 0);
+    assert_eq!(rep2.removed, 0);
+    let a_after = db.nodes_by_label_unbumped(&scopes, ARTIFACT_LABEL)[0].clone();
+    assert_eq!(a_after.id, a_before.id);
+    assert_eq!(
+        a_after.props.get("derived_by"),
+        Some(&PropValue::Str(derived_by_stamp(None))),
+        "stamp must NOT migrate without --rederive"
+    );
+    assert_eq!(
+        db.nodes_by_label_unbumped(&scopes, CHUNK_LABEL).len(),
+        chunks_before,
+        "chunk count unchanged"
+    );
+
+    // Finally: rederive=true migrates the stamp (existing rederive semantics).
+    let rep3 = derive(&db, &wh, Some(&embed), 40, true).unwrap();
+    assert!(rep3.removed >= 1);
+    let a_final = db.nodes_by_label_unbumped(&scopes, ARTIFACT_LABEL)[0].clone();
+    assert_eq!(
+        a_final.props.get("derived_by"),
+        Some(&PropValue::Str(derived_by_stamp(Some("e2"))))
+    );
+}
+
+#[test]
 fn pointer_only_artifacts_get_a_node_but_no_chunks_and_unknown_memory_ids_are_skipped() {
     let (_t, db, mut wh) = setup();
     wh.config.max_artifact_kb = 0; // everything pointer-only
