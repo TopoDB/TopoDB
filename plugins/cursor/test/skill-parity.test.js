@@ -11,7 +11,7 @@ test("the tool-facing part of SKILL.md matches the Claude Code plugin's (deliber
 });
 test("rules and commands exist with the expected frontmatter", () => {
   const rule = readFileSync(path.join(ROOT, "rules", "topodb-memory.mdc"), "utf8");
-  assert.match(rule, /^---\n[\s\S]*alwaysApply: true[\s\S]*\n---\n/);
+  assert.match(rule, /^---\r?\n[\s\S]*alwaysApply: true[\s\S]*\r?\n---\r?\n/); // \r? — Windows autocrlf checkouts
   assert.match(rule, /search_memories/); assert.match(rule, /remember/);
   for (const c of ["recall.md", "remember.md"]) assert.ok(existsSync(path.join(ROOT, "commands", c)));
   for (const d of ["rules", "skills", "commands"]) assert.ok(!existsSync(path.join(ROOT, d, ".gitkeep")));
