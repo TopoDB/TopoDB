@@ -83,6 +83,10 @@ memory model and the risks it accepts (one database shared across every
 project; the scope id is keyed to the absolute project path, so it does not
 follow a repo across clones or machines).
 
+**Cursor:** `plugins/cursor/` — same behavior, installable from this repo via
+Cursor's marketplace import; shares the database with the Claude Code plugin
+when both are installed.
+
 To embed the engine directly in a Rust process, see the
 [`topodb` crate example](crates/topodb/README.md) — the same graph, ops,
 and scoped recall as a library call.
