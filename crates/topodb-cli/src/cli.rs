@@ -521,6 +521,32 @@ pub enum Command {
         #[arg(long)]
         no_clients: bool,
     },
+    /// Context warehouse: raw session artifacts + mirrored op log under
+    /// `<db>.warehouse/`, and the derived Artifact/Chunk/evidence graph.
+    #[command(subcommand)]
+    Warehouse(WarehouseCommand),
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum WarehouseCommand {
+    /// Per-tier counts, spool backlog, mirror watermark (no db open needed).
+    Status,
+    /// Land spooled events into segments and mirror new engine ops.
+    Drain,
+    /// Derive Artifact/Chunk nodes + evidence edges from segments.
+    Derive {
+        /// Drop and rebuild all derived nodes/edges (new embedder or rule).
+        #[arg(long)]
+        rederive: bool,
+    },
+    /// Move aged artifacts/segments down the tiers.
+    Tier,
+    /// Replay op events into a fresh db file at OUT (must not exist).
+    Rebuild { out: std::path::PathBuf },
+    /// Re-hash sealed segments against MANIFEST.
+    Verify,
+    /// Print an artifact's stored text by hash (blob or segment).
+    Show { hash: String },
 }
 
 #[derive(clap::Subcommand, Clone)]

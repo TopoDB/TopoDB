@@ -12,6 +12,15 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ---
 
+## Unreleased
+
+### Added
+
+- **Context warehouse** (`topodb-warehouse`, spec 2026-08-18): append-only, content-addressed log of raw session artifacts + mirrored engine ops under `<db>.warehouse/`; deterministic derive to `Artifact`/`Chunk` nodes with `evidence` lineage to memories; `rebuild` a redb from segments; hot/warm/cold/expired tiering; redaction. `topodb warehouse {status|drain|derive|tier|rebuild|verify|show}`; `[warehouse]` + `schedule.warehouse_*` in `.topodb.toml`; hygiene tasks drain (light), derive (heavy, daemon), tier (light); op-log compaction is clamped to the mirrored watermark; `db_info.warehouse`. Claude Code plugin: `warehouse-capture` PostToolUse hook + session/memory-write markers (`TOPODB_WAREHOUSE=0`, `TOPODB_WAREHOUSE_DIR`).
+- `topodb-json`: stock text index now includes `(Chunk, text)`; the previous stock default upgrades automatically.
+
+---
+
 ## `topodb` (engine)
 
 ### 0.0.18 — 2026-08-16

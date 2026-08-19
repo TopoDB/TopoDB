@@ -4,7 +4,7 @@ A direct-embedded, script-friendly command-line interface over a [TopoDB](https:
 agent-memory database file. JSON in, JSON out, predictable exit codes — no server process, no
 network hop.
 
-Status: **v1** — the full read/write surface (19 commands). See [v1 limitations](#v1-limitations).
+Status: **v1** — the full read/write surface (26 commands). See [v1 limitations](#v1-limitations).
 
 ## Install
 
@@ -34,7 +34,7 @@ var for the former).
 
 ## Commands
 
-All 19 subcommands, in scaffold + write + read order:
+All 26 subcommands, in scaffold + write + read + warehouse order:
 
 | Command | Key flags | Output |
 |---|---|---|
@@ -60,6 +60,13 @@ All 19 subcommands, in scaffold + write + read order:
 | `set-embedding <id>` | positional node id, `--model <name>`, `--vector <json-float-array>` (both required) | `{"seq": <seq>}` |
 | `search-vector` | `--model <name>`, `--vector <json-float-array>` (both required), `--k <n>` (default 10), `--candidate <id>` (repeatable) | `[ {"node":..., "score": f}, ... ]` |
 | `submit [input]` | positional path to a JSON command array, or `-`/omitted for stdin | `{"ids": [...]}` |
+| `warehouse status` | — | `{"path", "tiers": [...], "spool_files": ..., "mirror_seq": ...}` |
+| `warehouse drain` | — | `{"drain": {...}, "mirror": {...}}` |
+| `warehouse derive` | `--rederive` (optional, default false) | `{"artifacts_created": ..., "chunks_created": ...}` |
+| `warehouse tier` | — | `{"archived": ..., "evicted": ...}` |
+| `warehouse rebuild <out>` | positional output db path (must not exist) | `{"ops_replayed": ...}` |
+| `warehouse verify` | — | `{"problems": [...]}` |
+| `warehouse show <hash>` | positional blob/segment hash | `{"hash": ..., "text": ...}` |
 
 Notes on individual commands:
 
@@ -139,6 +146,24 @@ Notes on individual commands:
   truncated tail.
 - **`compact`**: drops every op-log entry with `seq < --keep-from`.
 - **`submit [input]`**: submit a JSON array of batch commands atomically. Each command has an `op` field (the command type) and type-specific fields. `#N` in an id field is 0-indexed: `#0` refers to the first command's produced id, `#1` to the second command's produced id, etc. Reads from `input` file path, or stdin if `-` or omitted. This matches `submit_batch` in `topodb-mcp`.
+
+### Warehouse
+
+The context warehouse (`<db>.warehouse/`) holds raw session artifacts + mirrored op log, with derived Artifact/Chunk/evidence lineage.
+
+| Command | Requires db open | Notes |
+|---|---|---|
+| `warehouse status` | No | Per-tier counts, spool backlog, mirror watermark; exits before database lock attempt. |
+| `warehouse verify` | No | Re-hash sealed segments against manifest; exits before database lock attempt. |
+| `warehouse show <hash>` | No | Lookup artifact text by hash (blob or segment); exits before database lock attempt. |
+| `warehouse drain` | Yes | Land spooled events into segments and mirror new engine ops. With a live daemon holding the db, returns busy/exit 3. |
+| `warehouse derive` | Yes | Derive Artifact/Chunk nodes + evidence edges from segments. With a live daemon holding the db, returns busy/exit 3. |
+| `warehouse tier` | Yes | Move aged artifacts/segments down the tiers. With a live daemon holding the db, returns busy/exit 3. |
+| `warehouse rebuild <out>` | Yes | Replay op events into a fresh db file at OUT (must not exist). With a live daemon holding the db, returns busy/exit 3. |
+
+When the daemon holds the database lock, drain/derive/tier/rebuild commands return exit code 3 (busy) — that is the intended contract. The daemon's tick does drain/derive/tier itself; use `warehouse status` to inspect progress without blocking the daemon.
+
+The three read-only commands (status/verify/show) never open the database and run regardless of daemon state.
 
 ## Exit-code contract
 

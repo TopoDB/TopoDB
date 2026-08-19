@@ -18,6 +18,10 @@
       {
         "matcher": "mcp__(plugin_topodb_)?topodb__(remember|create_memory)",
         "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/mark-captured.js" }]
+      },
+      {
+        "matcher": "^(Read|Bash|Edit|Write|MultiEdit|Grep|Glob|WebFetch)$",
+        "hooks": [{ "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/warehouse-capture.js" }]
       }
     ],
     "SessionEnd": [

@@ -6,6 +6,8 @@ import { pathToFileURL } from "node:url";
 import { connectForProject } from "../broker-client.js";
 import { renderMemoryLines } from "./render.js";
 import { injectPointer } from "./onboard.js";
+import { sessionScopes } from "../server-args.js";
+import { tryMarker } from "../warehouse-spool.js";
 
 const DEADLINE_MS = 2500;
 const K = 10;
@@ -60,6 +62,8 @@ async function main() {
   const dataDir = process.env.CLAUDE_PLUGIN_DATA;
   const projectDir = process.env.CLAUDE_PROJECT_DIR ?? payload.cwd;
   if (!dataDir || !projectDir) return;
+
+  tryMarker({ dataDir, env: process.env, projectDir, sessionId: payload.session_id, type: "session_start", sessionScopes });
 
   const client = await connectForProject({ projectDir, dataDir });
   if (!client) return; // no broker yet — first-ever session; next one has it

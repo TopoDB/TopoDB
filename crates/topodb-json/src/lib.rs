@@ -122,6 +122,12 @@ pub const SYNONYM_LABEL: &str = "Synonym";
 pub const SYNONYM_TERM_PROP: &str = "term";
 pub const SYNONYM_EXPANSION_PROP: &str = "expansion";
 
+/// Warehouse-derived nodes (crate `topodb-warehouse`): an `Artifact` is one
+/// raw thing a session touched; a `Chunk` is a text-indexed window of it.
+pub const ARTIFACT_LABEL: &str = "Artifact";
+pub const CHUNK_LABEL: &str = "Chunk";
+pub const CHUNK_TEXT_PROP: &str = "text";
+
 /// The ONE canonical default [`IndexSpec`] for TopoDB's built-in write shapes,
 /// shared by every front end (`topodb-mcp` when `--spec` is omitted;
 /// `topodb-cli` when it creates a brand-new db file). Declares equality on
@@ -178,6 +184,11 @@ pub fn default_spec() -> IndexSpec {
                 label: ALIAS_LABEL.into(),
                 prop: ALIAS_NAME_PROP.into(),
             },
+            // Warehouse chunks are BM25-searchable when opted in via labels:["Chunk"].
+            PropIndex {
+                label: CHUNK_LABEL.into(),
+                prop: CHUNK_TEXT_PROP.into(),
+            },
         ],
     }
 }
@@ -198,7 +209,7 @@ fn stock_generations() -> Vec<IndexSpec> {
             prop: MEMORY_CONTENT_PROP.into(),
         }],
     };
-    // g1: g0 + text (Entity, name).
+    // g1 (0.0.9..0.0.15): g0 + text (Entity, name).
     let g1 = IndexSpec {
         equality: g0.equality.clone(),
         text: vec![
@@ -212,7 +223,42 @@ fn stock_generations() -> Vec<IndexSpec> {
             },
         ],
     };
-    vec![g0, g1]
+    // g2 (0.0.15..): + Alias/Synonym equality, Memory content_hash, Alias text.
+    let g2 = IndexSpec {
+        equality: vec![
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+            PropIndex {
+                label: ALIAS_LABEL.into(),
+                prop: ALIAS_NAME_PROP.into(),
+            },
+            PropIndex {
+                label: SYNONYM_LABEL.into(),
+                prop: SYNONYM_TERM_PROP.into(),
+            },
+            PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_HASH_PROP.into(),
+            },
+        ],
+        text: vec![
+            PropIndex {
+                label: MEMORY_LABEL.into(),
+                prop: MEMORY_CONTENT_PROP.into(),
+            },
+            PropIndex {
+                label: ENTITY_LABEL.into(),
+                prop: ENTITY_NAME_PROP.into(),
+            },
+            PropIndex {
+                label: ALIAS_LABEL.into(),
+                prop: ALIAS_NAME_PROP.into(),
+            },
+        ],
+    };
+    vec![g0, g1, g2]
 }
 
 /// Maps a db's persisted spec forward when — and only when — it is exactly a
@@ -1237,5 +1283,26 @@ mod tests {
         assert_eq!(upgraded_spec(v0), default_spec());
         assert_eq!(upgraded_spec(v1), default_spec());
         assert_eq!(upgraded_spec(default_spec()), default_spec());
+    }
+
+    #[test]
+    fn default_spec_text_indexes_chunk_text_and_previous_default_upgrades() {
+        let spec = default_spec();
+        assert!(spec
+            .text
+            .iter()
+            .any(|p| p.label == CHUNK_LABEL && p.prop == CHUNK_TEXT_PROP));
+        // the pre-warehouse stock default (g2) must upgrade to the current one
+        let g2 = IndexSpec {
+            equality: spec.equality.clone(),
+            text: spec
+                .text
+                .iter()
+                .filter(|p| p.label != CHUNK_LABEL)
+                .cloned()
+                .collect(),
+        };
+        assert_ne!(g2, spec);
+        assert_eq!(upgraded_spec(g2), spec);
     }
 }

@@ -4,7 +4,9 @@
 // stdout, exit 0 always.
 import { readFileSync } from "node:fs";
 import { connectForProject } from "../broker-client.js";
-import { readState, deleteState, sweepStale, extractText, isUsed, buildEpisodeBatch } from "../recorder.js";
+import { readState, deleteState, sweepStale, extractText, isUsed, buildEpisodeBatch, normalizeToolResult } from "../recorder.js";
+import { sessionScopes } from "../server-args.js";
+import { tryMarker } from "../warehouse-spool.js";
 
 function recordingDisabled(env) {
   const v = (env.TOPODB_RECORDING ?? "").toLowerCase();
@@ -46,6 +48,8 @@ async function main() {
   if (p.agent_id || p.agent_type) return;
   const dataDir = process.env.CLAUDE_PLUGIN_DATA;
   if (!dataDir) return;
+
+  tryMarker({ dataDir, env: process.env, projectDir: process.env.CLAUDE_PROJECT_DIR ?? p.cwd, sessionId: p.session_id, type: "session_end", sessionScopes });
 
   sweepStale(dataDir); // crashed sessions' leftovers, any time we're here
 

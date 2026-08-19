@@ -1,0 +1,103 @@
+// warehouse-spool.js — pure helpers for landing raw context into the
+// warehouse spool (spec §6.1). Redaction/size policy is the Rust drain's job.
+import { appendFileSync, mkdirSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import path from "node:path";
+import { encodeUlid } from "./scope-id.js";
+
+export const SPOOL_HARD_CAP = 4 * 1024 * 1024;
+export const HARNESS = "claude-code";
+const off = (v) => { const s = String(v ?? "").toLowerCase(); return s === "0" || s === "off"; };
+export function warehouseDisabled(env) { return off(env.TOPODB_RECORDING) || off(env.TOPODB_WAREHOUSE); }
+export function warehouseDir(dataDir, env) {
+  const o = env?.TOPODB_WAREHOUSE_DIR;
+  return o && String(o).trim() ? String(o) : path.join(dataDir, "memory.warehouse");
+}
+export function newUlid(nowMs = Date.now()) {
+  const b = new Uint8Array(16);
+  let t = BigInt(Math.max(0, Math.floor(nowMs)));
+  for (let i = 5; i >= 0; i--) { b[i] = Number(t & 0xffn); t >>= 8n; }
+  b.set(randomBytes(10), 6);
+  return encodeUlid(b);
+}
+export function spoolPath(dataDir, sessionId, env) {
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_");
+  return path.join(warehouseDir(dataDir, env), "spool", `${safe}-${process.pid}.jsonl`);
+}
+export function appendSpool(dataDir, sessionId, event, env) {
+  const p = spoolPath(dataDir, sessionId, env);
+  mkdirSync(path.dirname(p), { recursive: true });
+  appendFileSync(p, JSON.stringify(event) + "\n");
+}
+export function simpleDiff(oldStr, newStr) {
+  const o = String(oldStr ?? "").split("\n"), n = String(newStr ?? "").split("\n");
+  if (o.length && o[o.length - 1] === "") o.pop();
+  if (n.length && n[n.length - 1] === "") n.pop();
+  let head = 0; while (head < o.length && head < n.length && o[head] === n[head]) head++;
+  let tail = 0; while (tail < o.length - head && tail < n.length - head && o[o.length - 1 - tail] === n[n.length - 1 - tail]) tail++;
+  const lines = ["--- old", "+++ new"];
+  for (const l of o.slice(head, o.length - tail)) lines.push("-" + l);
+  for (const l of n.slice(head, n.length - tail)) lines.push("+" + l);
+  return lines.join("\n") + "\n";
+}
+function firstText(x) {
+  if (typeof x === "string") return x;
+  if (Array.isArray(x)) { const t = x.find((b) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string"); return t ? t.text : undefined; }
+  return undefined;
+}
+export function responseText(toolName, toolInput, resp) {
+  if (resp === null || resp === undefined) return undefined;
+  if (typeof resp === "string") return resp;
+  if (Array.isArray(resp)) return firstText(resp);
+  if (typeof resp !== "object") return String(resp);
+  if (resp.file && typeof resp.file.content === "string") return resp.file.content;
+  if (typeof resp.stdout === "string") return resp.stdout + (resp.stderr ? "\n[stderr]\n" + resp.stderr : "");
+  for (const k of ["content", "result", "output", "text"]) {
+    const v = resp[k];
+    if (typeof v === "string") return v;
+    const t = firstText(v); if (t !== undefined) return t;
+  }
+  try { return JSON.stringify(resp); } catch { return undefined; }
+}
+const TYPES = { Read: "file_read", Bash: "command", Edit: "diff", MultiEdit: "diff", Write: "diff", Grep: "tool_output", Glob: "tool_output", WebFetch: "tool_output" };
+function locatorFor(toolName, ti) {
+  switch (toolName) {
+    case "Read": case "Edit": case "MultiEdit": case "Write": return ti.file_path;
+    case "Bash": return ti.command;
+    case "Grep": case "Glob": return ti.pattern;
+    case "WebFetch": return ti.url;
+    default: return undefined;
+  }
+}
+export function artifactEvent({ toolName, toolInput, toolResponse, sessionId, scope, cwd, agent, nowMs = Date.now() }) {
+  const type = TYPES[toolName];
+  if (!type) return null;
+  const ti = toolInput && typeof toolInput === "object" ? toolInput : {};
+  let text;
+  if (toolName === "Edit") text = simpleDiff(ti.old_string, ti.new_string);
+  else if (toolName === "MultiEdit") text = (Array.isArray(ti.edits) ? ti.edits : []).map((e) => simpleDiff(e?.old_string, e?.new_string)).join("\n");
+  else if (toolName === "Write") text = typeof ti.content === "string" ? ti.content : undefined;
+  else text = responseText(toolName, ti, toolResponse);
+  if (typeof text !== "string") return null;
+  const locator = String(locatorFor(toolName, ti) ?? "");
+  const artifact = { type, locator, bytes: Buffer.byteLength(text, "utf8") };
+  if (artifact.bytes > SPOOL_HARD_CAP) artifact.hash = "sha256:" + createHash("sha256").update(text, "utf8").digest("hex");
+  else artifact.content = text;
+  const source = { harness: HARNESS, session: String(sessionId), scope: String(scope), tool: toolName };
+  if (cwd) source.cwd = String(cwd);
+  if (agent) source.agent = String(agent);
+  return { id: newUlid(nowMs), ts: nowMs, host: "", kind: "artifact", v: 1, source, artifact };
+}
+export function markerEvent({ type, sessionId, scope, nodeIds = [], nowMs = Date.now() }) {
+  const marker = { type, harness: HARNESS, session: String(sessionId), scope: String(scope) };
+  if (nodeIds.length) marker.node_ids = nodeIds.map(String);
+  return { id: newUlid(nowMs), ts: nowMs, host: "", kind: "marker", v: 1, marker };
+}
+
+export function tryMarker({ dataDir, env, projectDir, sessionId, type, nodeIds = [], sessionScopes }) {
+  try {
+    if (!dataDir || !sessionId || !projectDir || warehouseDisabled(env)) return;
+    const { scope } = sessionScopes({ projectDir });
+    appendSpool(dataDir, sessionId, markerEvent({ type, sessionId, scope, nodeIds }), env);
+  } catch { /* best-effort */ }
+}

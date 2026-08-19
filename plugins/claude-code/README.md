@@ -28,9 +28,21 @@ already run Pi extensions, you already satisfy it.
 
 ## What runs automatically
 
-Two hook-driven behaviors, both failing silently to "nothing happens"
+Three hook-driven behaviors, all failing silently to "nothing happens"
 rather than ever blocking a session:
 
+- **Context warehouse capture:** every `Read`/`Bash`/`Edit`/`Write`/`Grep`/
+  `Glob`/`WebFetch` result (main session and subagents) is appended, raw, to
+  a spool under `memory.warehouse/` next to the db, plus session start/end
+  and memory-write markers. The daemon's hygiene tick drains the spool into
+  content-addressed, redacted segments, mirrors the engine op log, and derives
+  `Artifact`/`Chunk` nodes with `evidence` links to the memories each session
+  wrote (search with `labels: ["Chunk"]`; `traverse` from a memory reaches its
+  evidence). Deterministic, no model calls. `TOPODB_WAREHOUSE=0` turns just
+  this off (`TOPODB_RECORDING=0` turns everything off); `TOPODB_WAREHOUSE_DIR`
+  relocates it. These env vars are the ONLY things the plugin's hooks read —
+  `[warehouse]` in `.topodb.toml` is not consulted by the hooks (see
+  "Configuration" below). See `topodb warehouse status`.
 - **Session-start recall:** each new session (fresh start or `/clear`)
   begins with up to 8 recent memories for this project injected as
   context — ranked by access within the recent window, capped well under
@@ -133,6 +145,7 @@ Two consequences are deliberate and worth knowing before you rely on this:
   Session-end episode capture writes nodes and edges to record which memories
   were retrieved — intended for consolidation, but adds disk growth even if
   no agent action is taken.
+- **The warehouse grows with every tool call** (raw file reads and command output, redacted for known secret shapes, tiered and expired per `[warehouse]` in `.topodb.toml`) unless `TOPODB_WAREHOUSE=0`.
 
 - **The scope is derived from the absolute project path, and that derivation
   is not portable.** The scope id is `ULID(sha256(canonical absolute project
@@ -144,6 +157,35 @@ Two consequences are deliberate and worth knowing before you rely on this:
   is wrong.) Because the database itself is local to the machine, this costs
   nothing in the common case — you only run into it if you expected the same
   memory to follow a repo across clones or machines, which it will not.
+
+## Configuration
+
+Set these environment variables to control plugin behavior:
+
+- `TOPODB_RECORDING=0|off` — disable all session recording (episode capture,
+  warehouse capture, and markers). This completely turns off the memory
+  recording infrastructure for the session.
+- `TOPODB_WAREHOUSE=0|off` — disable just warehouse capture and markers; keeps
+  session recording enabled. Useful if you want episode capture but not the
+  raw context warehouse.
+- `TOPODB_WAREHOUSE_DIR=<path>` — relocate the warehouse spool and sealed
+  segments to a different directory (by default colocated with `memory.redb`).
+
+  **Plugin hooks are governed ONLY by `TOPODB_WAREHOUSE` and
+  `TOPODB_WAREHOUSE_DIR` in the hook environment — they do not read
+  `.topodb.toml`.** `[warehouse].enabled`/`path` in `.topodb.toml` govern the
+  CLI/daemon side (`topodb warehouse …`, the hygiene tick) instead. If you
+  relocate or disable the warehouse in `.topodb.toml` for a db this plugin
+  uses, set the matching env var too (`TOPODB_WAREHOUSE_DIR` / `TOPODB_WAREHOUSE=0`)
+  — otherwise the hooks keep spooling raw artifacts into a directory nothing
+  drains.
+- `TOPODB_CAPTURE_NUDGE=0|off` — suppress the stop-capture nudge (the
+  suggestion to use `remember`/`create_memory` to ensure session artifacts
+  are saved when closing a session without any explicit memory writes).
+- `TOPODB_HOOK_DEBUG=1` — make the retrieval `PostToolUse` hook dump the
+  raw payload it received to `episodes/debug-last-payload.json` in the plugin
+  data dir, so the true `tool_output`/`tool_response` shape can be pinned
+  when debugging episode capture. Nothing else reads this variable.
 
 ## What this plugin does not do
 

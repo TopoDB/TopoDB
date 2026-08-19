@@ -162,6 +162,7 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
     };
 
     let embedder = build_embedder(config);
+    let tick_embedder = embedder.clone();
     let base = TopoServer::new(db.clone(), config, embedder);
     // Explicit socket path from --socket PATH takes precedence; otherwise derive from DB path.
     let endpoint = match &config.socket {
@@ -191,7 +192,7 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
         onboard_now_ms,
     );
 
-    spawn_hygiene_tick(&db, config);
+    spawn_hygiene_tick(&db, config, tick_embedder);
 
     run_accept_loop(base, db, endpoint, idle_ms, Duration::from_millis(hello_ms)).await
 }
@@ -208,10 +209,10 @@ pub async fn serve(config: &Config) -> Result<ServeOutcome, DaemonError> {
 /// "activity" that keeps a connectionless daemon alive, and it must never be
 /// able to crash the daemon (every catch-up error is swallowed inside
 /// [`crate::onboard_boot::tick_once`]).
-fn spawn_hygiene_tick(db: &Db, config: &Config) {
+fn spawn_hygiene_tick(db: &Db, config: &Config, embedder: Embedder) {
     let tick_db = db.clone();
     let tick_scope = config.default_scope;
-    let (tick_schedule, tick_sources) = crate::onboard_boot::resolve_config(&config.db_path);
+    let resolved = crate::onboard_boot::resolve_config(&config.db_path);
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(300));
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -221,11 +222,13 @@ fn spawn_hygiene_tick(db: &Db, config: &Config) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            let e = embedder.clone();
+            let embed_fn = move |t: &str| e.embed(t).map(|v| (e.model_name(), v));
             crate::onboard_boot::tick_once(
                 &tick_db,
                 tick_scope,
-                &tick_schedule,
-                &tick_sources,
+                &resolved,
+                Some(&embed_fn),
                 now_ms,
             );
         }

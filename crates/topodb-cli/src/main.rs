@@ -3,6 +3,7 @@ mod daemon_client;
 mod init;
 mod output;
 mod resolve;
+mod warehouse_cmd;
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
@@ -174,6 +175,11 @@ fn main() {
             lock_wait_ms,
             pretty: cli.pretty,
         });
+    }
+
+    // Warehouse status/verify/show never open the db (run before the direct open).
+    if let Command::Warehouse(w) = &cli.cmd {
+        warehouse_cmd::run_dbless(w, &db_path, cli.pretty);
     }
 
     // Socket-first dispatch: check if a daemon socket exists for this DB path,
@@ -471,6 +477,7 @@ fn main() {
             candidate,
         } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
         Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
+        Command::Warehouse(w) => warehouse_cmd::run(&w, &db, &db_path, cli.pretty),
         Command::Daemon(_) => unreachable!("daemon subcommands exit before the direct open"),
         Command::Conventions { .. } => unreachable!("conventions exits before the direct open"),
         Command::Init { .. } => unreachable!("init exits before the direct open"),

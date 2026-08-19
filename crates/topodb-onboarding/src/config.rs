@@ -10,6 +10,9 @@
 //! user comments in the existing file are not preserved across a merge. This
 //! is a known, accepted limitation (see task-4 brief).
 
+use std::path::{Path, PathBuf};
+use topodb_warehouse::WarehouseConfig;
+
 /// Which ingest layer a reingest source uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
@@ -37,6 +40,23 @@ pub struct ReingestSource {
     pub scope: Option<String>,
 }
 
+/// The `[warehouse]` table (spec §8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WarehouseSection {
+    pub enabled: bool,
+    pub path: Option<String>,
+    pub config: WarehouseConfig,
+}
+impl Default for WarehouseSection {
+    fn default() -> Self {
+        WarehouseSection {
+            enabled: true,
+            path: None,
+            config: WarehouseConfig::default(),
+        }
+    }
+}
+
 /// One scheduled maintenance task's config: whether it runs, and how often.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduleEntry {
@@ -51,6 +71,9 @@ pub struct Schedule {
     pub purge: ScheduleEntry,
     pub reingest: ScheduleEntry,
     pub lifecycle: ScheduleEntry,
+    pub warehouse_drain: ScheduleEntry,
+    pub warehouse_derive: ScheduleEntry,
+    pub warehouse_tier: ScheduleEntry,
 }
 
 const DAILY_SECS: u64 = 86_400;
@@ -59,7 +82,8 @@ const HOURLY_SECS: u64 = 3_600;
 impl Schedule {
     /// Default schedule: compact/purge/lifecycle run daily and are enabled
     /// out of the box; reingest defaults to hourly but disabled (it only
-    /// makes sense once a source is configured).
+    /// makes sense once a source is configured); warehouse_drain is immediate,
+    /// warehouse_derive hourly, and warehouse_tier daily.
     pub fn defaults() -> Self {
         Schedule {
             compact: ScheduleEntry {
@@ -78,6 +102,18 @@ impl Schedule {
                 enabled: true,
                 interval_secs: DAILY_SECS,
             },
+            warehouse_drain: ScheduleEntry {
+                enabled: true,
+                interval_secs: 0,
+            },
+            warehouse_derive: ScheduleEntry {
+                enabled: true,
+                interval_secs: HOURLY_SECS,
+            },
+            warehouse_tier: ScheduleEntry {
+                enabled: true,
+                interval_secs: DAILY_SECS,
+            },
         }
     }
 }
@@ -90,6 +126,7 @@ pub struct OnboardingConfig {
     pub onboarding_version: Option<u32>,
     pub schedule: Schedule,
     pub sources: Vec<ReingestSource>,
+    pub warehouse: WarehouseSection,
 }
 
 /// Updates to merge into an existing `.topodb.toml`.
@@ -150,6 +187,9 @@ pub fn parse(toml_text: &str) -> OnboardingConfig {
         purge: entry_from_table(sub("purge"), defaults.purge),
         reingest: entry_from_table(sub("reingest"), defaults.reingest),
         lifecycle: entry_from_table(sub("lifecycle"), defaults.lifecycle),
+        warehouse_drain: entry_from_table(sub("warehouse_drain"), defaults.warehouse_drain),
+        warehouse_derive: entry_from_table(sub("warehouse_derive"), defaults.warehouse_derive),
+        warehouse_tier: entry_from_table(sub("warehouse_tier"), defaults.warehouse_tier),
     };
 
     let sources = table
@@ -176,12 +216,15 @@ pub fn parse(toml_text: &str) -> OnboardingConfig {
         })
         .unwrap_or_default();
 
+    let warehouse = warehouse_from_table(table.get("warehouse").and_then(|v| v.as_table()));
+
     OnboardingConfig {
         db,
         scope,
         onboarding_version,
         schedule,
         sources,
+        warehouse,
     }
 }
 
@@ -199,6 +242,81 @@ fn subtable_mut<'a>(table: &'a mut toml::Table, key: &str) -> &'a mut toml::Tabl
         toml::Value::Table(t) => t,
         _ => unreachable!("coerced to a table immediately above"),
     }
+}
+
+fn warehouse_from_table(t: Option<&toml::Table>) -> WarehouseSection {
+    let d = WarehouseSection::default();
+    let Some(t) = t else { return d };
+    let b = |k: &str, dv: bool| t.get(k).and_then(|v| v.as_bool()).unwrap_or(dv);
+    let u = |k: &str, dv: u64| {
+        t.get(k)
+            .and_then(|v| v.as_integer())
+            .filter(|i| *i >= 0)
+            .map(|i| i as u64)
+            .unwrap_or(dv)
+    };
+    let c = &d.config;
+    WarehouseSection {
+        enabled: b("enabled", d.enabled),
+        path: t
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        config: WarehouseConfig {
+            hot_days: u("hot_days", c.hot_days),
+            warm_days: u("warm_days", c.warm_days),
+            retention_days: u("retention_days", c.retention_days),
+            purge_expired: b("purge_expired", c.purge_expired),
+            segment_mb: u("segment_mb", c.segment_mb),
+            max_inline_kb: u("max_inline_kb", c.max_inline_kb),
+            max_artifact_kb: u("max_artifact_kb", c.max_artifact_kb),
+            redact: b("redact", c.redact),
+            evidence_k: u("evidence_k", c.evidence_k as u64) as usize,
+            tier_batch: u("tier_batch", c.tier_batch as u64) as usize,
+            spool_min_age_ms: u("spool_min_age_ms", c.spool_min_age_ms),
+        },
+    }
+}
+
+/// Where the warehouse lives for `db_path`, or None when disabled (section or
+/// `TOPODB_WAREHOUSE=0|off`). `TOPODB_WAREHOUSE_DIR` wins over `[warehouse].path`,
+/// which wins over the `<db>.warehouse` sibling default.
+pub fn resolve_warehouse(
+    db_path: &Path,
+    section: &WarehouseSection,
+    base_dir: &Path,
+    env_dir: Option<&str>,
+    env_switch: Option<&str>,
+) -> Option<(PathBuf, WarehouseConfig)> {
+    if !section.enabled {
+        return None;
+    }
+    if matches!(
+        env_switch.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("off")
+    ) {
+        return None;
+    }
+    let dir = match (env_dir.filter(|s| !s.trim().is_empty()), &section.path) {
+        (Some(e), _) => PathBuf::from(e),
+        (None, Some(p)) => {
+            let expanded = if let Some(rest) = p.strip_prefix("~/") {
+                crate::reingest::env_home()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| PathBuf::from(p))
+            } else {
+                PathBuf::from(p)
+            };
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                base_dir.join(expanded)
+            }
+        }
+        (None, None) => topodb_warehouse::warehouse_dir_for_db(db_path, None),
+    };
+    Some((dir, section.config.clone()))
 }
 
 fn ensure_entry_defaults(schedule_table: &mut toml::Table, name: &str, default: ScheduleEntry) {
@@ -250,6 +368,13 @@ pub fn render_merged(existing_text: &str, updates: &OnboardingUpdates) -> String
         ensure_entry_defaults(schedule_table, "purge", defaults.purge);
         ensure_entry_defaults(schedule_table, "reingest", defaults.reingest);
         ensure_entry_defaults(schedule_table, "lifecycle", defaults.lifecycle);
+        ensure_entry_defaults(schedule_table, "warehouse_drain", defaults.warehouse_drain);
+        ensure_entry_defaults(
+            schedule_table,
+            "warehouse_derive",
+            defaults.warehouse_derive,
+        );
+        ensure_entry_defaults(schedule_table, "warehouse_tier", defaults.warehouse_tier);
     }
 
     toml::to_string_pretty(&table).unwrap_or_default()
@@ -338,5 +463,106 @@ kind = \"okf\"
         };
         let out = render_merged(existing, &updates);
         assert_eq!(out, existing);
+    }
+
+    #[test]
+    fn parses_warehouse_section_and_schedule_entries() {
+        let text = "\
+[warehouse]
+enabled = true
+path = \"./wh\"
+hot_days = 3
+warm_days = 30
+retention_days = 90
+purge_expired = true
+segment_mb = 8
+max_inline_kb = 4
+max_artifact_kb = 64
+redact = false
+evidence_k = 7
+
+[schedule.warehouse_derive]
+enabled = false
+interval_secs = 7200
+";
+        let c = parse(text);
+        assert!(c.warehouse.enabled);
+        assert_eq!(c.warehouse.path.as_deref(), Some("./wh"));
+        let w = &c.warehouse.config;
+        assert_eq!(
+            (w.hot_days, w.warm_days, w.retention_days, w.purge_expired),
+            (3, 30, 90, true)
+        );
+        assert_eq!(
+            (
+                w.segment_mb,
+                w.max_inline_kb,
+                w.max_artifact_kb,
+                w.redact,
+                w.evidence_k
+            ),
+            (8, 4, 64, false, 7)
+        );
+        assert_eq!(
+            c.schedule.warehouse_derive,
+            ScheduleEntry {
+                enabled: false,
+                interval_secs: 7200
+            }
+        );
+        assert_eq!(
+            c.schedule.warehouse_drain,
+            ScheduleEntry {
+                enabled: true,
+                interval_secs: 0
+            }
+        );
+        assert_eq!(
+            c.schedule.warehouse_tier,
+            ScheduleEntry {
+                enabled: true,
+                interval_secs: 86_400
+            }
+        );
+    }
+
+    #[test]
+    fn warehouse_defaults_when_absent_and_disable_switch() {
+        let c = parse("");
+        assert!(c.warehouse.enabled);
+        assert_eq!(
+            c.warehouse.config,
+            topodb_warehouse::WarehouseConfig::default()
+        );
+        let db = std::path::Path::new("/x/memory.redb");
+        let base = std::path::Path::new("/x");
+        let (dir, _) = resolve_warehouse(db, &c.warehouse, base, None, None).unwrap();
+        assert_eq!(dir, std::path::Path::new("/x/memory.warehouse"));
+        assert!(resolve_warehouse(db, &c.warehouse, base, None, Some("0")).is_none());
+        assert!(resolve_warehouse(db, &c.warehouse, base, None, Some("off")).is_none());
+        let (dir, _) = resolve_warehouse(db, &c.warehouse, base, Some("/env/wh"), None).unwrap();
+        assert_eq!(dir, std::path::Path::new("/env/wh"));
+        let mut sec = c.warehouse.clone();
+        sec.path = Some("rel/wh".into());
+        let (dir, _) = resolve_warehouse(db, &sec, base, None, None).unwrap();
+        assert_eq!(dir, std::path::Path::new("/x/rel/wh"));
+        sec.enabled = false;
+        assert!(resolve_warehouse(db, &sec, base, None, None).is_none());
+    }
+
+    #[test]
+    fn render_merged_ensures_warehouse_schedule_entries() {
+        let out = render_merged(
+            "",
+            &OnboardingUpdates {
+                db: None,
+                scope: None,
+                onboarding_version: 1,
+                ensure_schedule_defaults: true,
+            },
+        );
+        let c = parse(&out);
+        assert_eq!(c.schedule.warehouse_drain.interval_secs, 0);
+        assert!(out.contains("[schedule.warehouse_derive]"));
     }
 }
