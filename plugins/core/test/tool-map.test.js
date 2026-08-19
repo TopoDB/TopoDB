@@ -24,6 +24,13 @@ test("drops MCP and unknown tools; tolerates missing input", () => {
   assert.equal(fromCursorToolUse({ tool_name: "Shell", tool_input: undefined, tool_output: undefined }).toolInput.command, undefined);
 });
 
+test("drops Edit/MultiEdit with unrecovered keys (empty diffs are junk, not guesses)", () => {
+  assert.equal(fromCursorToolUse({ tool_name: "StrReplace", tool_input: { filePath: "/p/a.rs", code_edit: "x" }, tool_output: "{}" }), null);
+  assert.equal(fromCursorToolUse({ tool_name: "MultiEdit", tool_input: { filePath: "/p/a.rs", edits: [] }, tool_output: "{}" }), null);
+  const ed = fromCursorToolUse({ tool_name: "StrReplace", tool_input: { filePath: "/p/a.rs", oldString: "a", newString: "b" }, tool_output: "{}" });
+  assert.deepEqual(ed, { toolName: "Edit", toolInput: { file_path: "/p/a.rs", old_string: "a", new_string: "b" }, toolResponse: {} });
+});
+
 test("the mapped triple flows into artifactEvent", () => {
   const t = fromCursorToolUse({ tool_name: "Shell", tool_input: { command: "pwd" }, tool_output: "/p" });
   const ev = artifactEvent({ ...t, sessionId: "s", scope: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: "/p", harness: "cursor", nowMs: 1 });

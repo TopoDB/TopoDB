@@ -15,6 +15,7 @@ test("parseJson returns null on garbage", () => {
   assert.deepEqual(parseJson('{"a":1}'), { a: 1 });
   assert.equal(parseJson("nope"), null);
   assert.equal(parseJson(""), null);
+  assert.equal(parseJson("[1]"), null);
 });
 test("debugDump writes only when TOPODB_HOOK_DEBUG is set, sanitizes the name, never throws", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "hookio-"));

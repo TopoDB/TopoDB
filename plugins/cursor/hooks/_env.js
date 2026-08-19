@@ -1,7 +1,9 @@
 // _env.js — Cursor payload/env → the ids every hook needs. Cursor puts
-// conversation_id on every hook and session_id only on sessionStart/sessionEnd;
-// sessionStart returns TOPODB_SESSION_ID in its `env` output so later hooks in
-// the same session key their state identically (spec §4.3, dogfood D2).
+// conversation_id on every hook payload, while session_id is only on
+// sessionStart/sessionEnd; preferring conversation_id (and the env echo of
+// it, TOPODB_SESSION_ID, set by sessionStart's `env` output) keeps spool and
+// episode state on one key whether or not Cursor honors sessionStart's `env`
+// output (spec §4.3, dogfood D2).
 import { resolveDataDir } from "../core/data-dir.js";
 export const HARNESS = "cursor";
 export function hookContext(payload, env) {
@@ -9,6 +11,6 @@ export function hookContext(payload, env) {
   return {
     dataDir: resolveDataDir(env).dir,
     projectDir: env.CURSOR_PROJECT_DIR ?? (Array.isArray(p.workspace_roots) ? p.workspace_roots[0] : undefined) ?? p.cwd ?? null,
-    sessionId: p.session_id ?? env.TOPODB_SESSION_ID ?? p.conversation_id ?? null,
+    sessionId: env.TOPODB_SESSION_ID ?? p.conversation_id ?? p.session_id ?? null,
   };
 }

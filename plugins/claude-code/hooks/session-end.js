@@ -18,6 +18,5 @@ async function main() {
   const assistantText = text === null ? "" : assistantTextOrNull(parseClaude(text)) ?? "";
   const r = await flushEpisode({ dataDir, env: process.env, projectDir, sessionId: p.session_id, assistantText, reason: p.reason });
   if (r === "no-daemon") console.error("topodb hooks: daemon gone at session end; episode dropped");
-  if (r === "failed") console.error("topodb hooks: episode flush failed");
 }
 main().catch(() => {}).finally(() => process.exit(0));

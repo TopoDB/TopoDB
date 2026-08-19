@@ -13,8 +13,9 @@ const run = (payload, env) => execFileSync(process.execPath, [HOOK], { input: ty
 
 test("hookContext resolves ids and dirs from Cursor's payload and env", () => {
   const c = hookContext({ session_id: "S", conversation_id: "C", workspace_roots: ["/w"] }, { TOPODB_PLUGIN_DATA: "/d" });
-  assert.deepEqual(c, { dataDir: "/d", projectDir: "/w", sessionId: "S" });
+  assert.deepEqual(c, { dataDir: "/d", projectDir: "/w", sessionId: "C" });
   assert.equal(hookContext({ conversation_id: "C" }, { TOPODB_PLUGIN_DATA: "/d", TOPODB_SESSION_ID: "E", CURSOR_PROJECT_DIR: "/p" }).sessionId, "E");
+  assert.equal(hookContext({ session_id: "S" }, { TOPODB_PLUGIN_DATA: "/d" }).sessionId, "S");
   assert.equal(hookContext({ conversation_id: "C" }, { TOPODB_PLUGIN_DATA: "/d" }).sessionId, "C");
 });
 test("no daemon: emits only the env frame, writes a session_start marker, exits 0", () => {

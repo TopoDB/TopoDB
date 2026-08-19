@@ -17,7 +17,7 @@ export function offSwitch(v) {
 }
 export function recordingDisabled(env) { return offSwitch(env.TOPODB_RECORDING); }
 export function parseJson(raw) {
-  try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : null; } catch { return null; }
+  try { const v = JSON.parse(raw); return v && typeof v === "object" && !Array.isArray(v) ? v : null; } catch { return null; }
 }
 /** Debug escape (TOPODB_HOOK_DEBUG=1): dump the raw stdin payload so a real
  *  session can pin the true hook payload shape. Best-effort — never throws. */

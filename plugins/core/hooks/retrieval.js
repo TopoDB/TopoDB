@@ -9,6 +9,16 @@ export function bareToolName(name) {
   const s = String(name ?? "");
   return s.split(/__|\/|:/).pop();
 }
+/** True when a (possibly client-qualified) tool name is one of topodb's own
+ *  tools. An unqualified bare name (no `__`, `/`, or `:`) is accepted as-is;
+ *  a qualified name must mention "topodb" in its qualifier, so another MCP
+ *  server's same-named tool (e.g. `github/remember`) isn't mistaken for ours. */
+export function isTopodbTool(rawName) {
+  const s = String(rawName ?? "");
+  const bare = bareToolName(s);
+  if (/__|\/|:/.test(s)) return /topodb/i.test(s.slice(0, s.length - bare.length));
+  return true;
+}
 export function recordRetrieval({ dataDir, sessionId, toolName, toolInput, toolResult }) {
   if (!dataDir || !sessionId) return false;
   const tool = bareToolName(toolName);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { recordRetrieval, recordMemoryWrite, bareToolName, RETRIEVAL_TOOLS } from "../hooks/retrieval.js";
+import { recordRetrieval, recordMemoryWrite, bareToolName, isTopodbTool, RETRIEVAL_TOOLS } from "../hooks/retrieval.js";
 import { readState } from "../recorder.js";
 import { sessionScopes } from "../server-args.js";
 import { warehouseDir } from "../warehouse-spool.js";
@@ -14,6 +14,14 @@ test("bareToolName strips client prefixes", () => {
   assert.equal(bareToolName("topodb:recent_memories"), "recent_memories");
   assert.equal(bareToolName("remember"), "remember");
   assert.ok(RETRIEVAL_TOOLS.includes("search_memories"));
+});
+test("isTopodbTool accepts unqualified names and topodb-qualified names, rejects other clients' same-named tools", () => {
+  assert.equal(isTopodbTool("mcp__plugin_topodb_topodb__remember"), true);
+  assert.equal(isTopodbTool("topodb/search_memories"), true);
+  assert.equal(isTopodbTool("MCP:topodb/traverse"), true);
+  assert.equal(isTopodbTool("remember"), true);
+  assert.equal(isTopodbTool("github/remember"), false);
+  assert.equal(isTopodbTool("mcp__other__search_memories"), false);
 });
 test("recordRetrieval appends a record; non-retrieval tools are ignored", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "retr-"));

@@ -21,6 +21,5 @@ async function main() {
   const assistantText = text === null ? null : assistantTextOrNull(parseCursor(text));
   const r = await flushEpisode({ dataDir, env: process.env, projectDir, sessionId, assistantText, reason: p.reason });
   if (r === "no-daemon") console.error("topodb hooks: daemon gone at session end; episode kept for a later sweep");
-  if (r === "failed") console.error("topodb hooks: episode flush failed");
 }
 runHook(main, { deadlineMs: 8000 });

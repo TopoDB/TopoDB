@@ -23,6 +23,6 @@ export async function flushEpisode({ dataDir, env, projectDir, sessionId, assist
   const client = await connect({ projectDir, dataDir });
   if (!client) return "no-daemon"; // state file left for a later sweep
   try { await client.call("submit_batch", { commands: cmds }, 5000); deleteState(dataDir, sessionId); return "flushed"; }
-  catch { return "failed"; }
+  catch (e) { console.error(`topodb hooks: episode flush failed: ${e?.message ?? e}`); return "failed"; }
   finally { client.close(); }
 }

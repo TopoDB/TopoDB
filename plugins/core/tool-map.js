@@ -36,8 +36,15 @@ function parseOutput(o) {
 }
 export function fromCursorToolUse({ tool_name, tool_input, tool_output }) {
   const name = String(tool_name ?? "");
+  // Broad on purpose: a legitimately-named tool containing "MCP" is dropped
+  // too — dropping beats guessing for the warehouse.
   if (/MCP/i.test(name) || name.includes("__")) return null;
   const toolName = CURSOR_TOOL_NAMES[name];
   if (!toolName) return null;
-  return { toolName, toolInput: normalizeInput(tool_input), toolResponse: parseOutput(tool_output) };
+  const toolInput = normalizeInput(tool_input);
+  // An edit with no recovered old/new string (or empty edits array) is a
+  // junk empty diff — drop it rather than guess.
+  if (toolName === "Edit" && typeof toolInput.old_string !== "string" && typeof toolInput.new_string !== "string") return null;
+  if (toolName === "MultiEdit" && !(Array.isArray(toolInput.edits) && toolInput.edits.length > 0)) return null;
+  return { toolName, toolInput, toolResponse: parseOutput(tool_output) };
 }

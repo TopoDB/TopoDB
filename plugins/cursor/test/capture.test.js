@@ -45,3 +45,12 @@ test("afterMCPExecution: retrieval tools recorded into episode state; write tool
     assert.equal(run(MCP, { ...base, tool_name: "topodb/search_memories", tool_input: {}, result_json: "{}" }, { TOPODB_PLUGIN_DATA: dir, TOPODB_RECORDING: "0" }), "");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("afterMCPExecution: another client's same-named tool is not mistaken for topodb's", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cur-mcp-"));
+  try {
+    const base = { hook_event_name: "afterMCPExecution", conversation_id: "conv-3", workspace_roots: [dir] };
+    assert.equal(run(MCP, { ...base, tool_name: "github/remember", tool_input: {}, result_json: JSON.stringify({ structuredContent: { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" } }) }, { TOPODB_PLUGIN_DATA: dir }), "");
+    assert.ok(!readState(dir, "conv-3"));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

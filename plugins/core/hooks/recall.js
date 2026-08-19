@@ -59,6 +59,9 @@ export async function recallForSessionStart(client, { k = K, keep = KEEP, charCa
         try { const t = await client.call("get_node", { id: e.to }, 800); const name = t?.node?.props?.name; if (typeof name === "string") entities.push(name); } catch { /* skip */ }
       }
     } catch { /* decoration */ }
+    // ULID timestamp: first 10 chars are Crockford-base32 time — cheap decode
+    // not worth it; approximate age from access stats' last read is wrong
+    // too. Use 0 and render "today" rather than decode ULIDs.
     enriched.push({ id: n.id, content: n.props.content, entities, ageMs: 0, accessCount });
   }
   enriched.sort((a, b) => b.accessCount - a.accessCount);
