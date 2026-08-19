@@ -61,3 +61,22 @@ test("--check passes when in sync, names drifted, extra and missing files", () =
     assert.ok(d.some((s) => s.includes("stray.js") && s.includes("extra")), d.join("\n"));
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test("keeps a shebang on line 1 and puts the header on line 2; --check round-trips it", () => {
+  const f = fixture();
+  try {
+    // Create a source file with a shebang
+    writeFileSync(path.join(f.src, "bin.js"), "#!/usr/bin/env node\nexport const b = 1;\n");
+
+    // Sync without --check to vendor the file
+    syncCore({ source: f.src, targets: [f.target], check: false });
+
+    // Verify vendored file has shebang on line 1, header on line 2
+    const vendored = readFileSync(path.join(f.target, "bin.js"), "utf8");
+    assert.equal(vendored, "#!/usr/bin/env node\n" + GENERATED_HEADER + "export const b = 1;\n");
+
+    // Verify --check round-trips it (no drift)
+    const checkResult = syncCore({ source: f.src, targets: [f.target], check: true });
+    assert.deepEqual(checkResult.drift, []);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
