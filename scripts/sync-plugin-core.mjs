@@ -30,6 +30,12 @@ function walk(dir, rel = "") {
 }
 const sha = (buf) => createHash("sha256").update(buf).digest("hex");
 const isJs = (rel) => rel.endsWith(".js") || rel.endsWith(".mjs");
+// Everything under plugins/core is text. A Windows checkout with
+// core.autocrlf=true rewrites LF to CRLF on disk, which would (a) make the
+// header check below miss (the header ends in "\n") and (b) change every hash
+// against the LF manifest. Normalise on read so the comparison is about
+// content, never line endings; writes are always LF (what git stores).
+const readText = (p) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 // A shebang MUST stay on line 1: Node only strips a `#!` line for the entry
 // script it was told to run when that line is the file's very first bytes.
 // Prepending GENERATED_HEADER unconditionally used to push a source file's
@@ -49,7 +55,7 @@ function stripHeader(text) {
 export function syncCore({ source, targets, check }) {
   const files = walk(source);
   const hashes = {};
-  for (const rel of files) hashes[rel] = sha(readFileSync(path.join(source, rel)));
+  for (const rel of files) hashes[rel] = sha(readText(path.join(source, rel)));
   const drift = [];
   for (const target of targets) {
     const pluginDir = path.dirname(target);
@@ -59,8 +65,8 @@ export function syncCore({ source, targets, check }) {
       const present = new Set(walk(target));
       for (const rel of files) {
         if (!present.has(rel)) { drift.push(`${target}/${rel}: missing in vendored copy`); continue; }
-        const vend = readFileSync(path.join(target, rel));
-        const body = isJs(rel) ? Buffer.from(stripHeader(vend.toString("utf8")), "utf8") : vend;
+        const vend = readText(path.join(target, rel));
+        const body = isJs(rel) ? stripHeader(vend) : vend;
         if (sha(body) !== hashes[rel]) drift.push(`${target}/${rel}: drift (vendored copy differs from plugins/core)`);
       }
       for (const rel of present) if (!(rel in hashes)) drift.push(`${target}/${rel}: extra (not in plugins/core)`);
@@ -73,9 +79,9 @@ export function syncCore({ source, targets, check }) {
     for (const rel of files) {
       const dst = path.join(target, rel);
       mkdirSync(path.dirname(dst), { recursive: true });
-      const src = readFileSync(path.join(source, rel));
+      const src = readText(path.join(source, rel));
       if (isJs(rel)) {
-        const [shebang, rest] = splitShebang(src.toString("utf8"));
+        const [shebang, rest] = splitShebang(src);
         writeFileSync(dst, shebang + GENERATED_HEADER + rest);
       } else {
         writeFileSync(dst, src);

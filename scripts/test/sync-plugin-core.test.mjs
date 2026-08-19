@@ -80,3 +80,23 @@ test("keeps a shebang on line 1 and puts the header on line 2; --check round-tri
     assert.deepEqual(checkResult.drift, []);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test("CRLF checkouts (Windows autocrlf) on either side do not read as drift", () => {
+  const f = fixture();
+  try {
+    writeFileSync(path.join(f.src, "bin.js"), "#!/usr/bin/env node\nexport const b = 1;\n");
+    syncCore({ source: f.src, targets: [f.target], check: false });
+    // Simulate git rewriting BOTH trees to CRLF on checkout.
+    for (const rel of ["a.js", "hooks/b.js", "bin.js"]) {
+      for (const root of [f.src, f.target]) {
+        const p = path.join(root, rel);
+        writeFileSync(p, readFileSync(p, "utf8").replace(/\n/g, "\r\n"));
+      }
+    }
+    assert.deepEqual(syncCore({ source: f.src, targets: [f.target], check: true }).drift, []);
+    // A real content change is still caught under CRLF.
+    writeFileSync(path.join(f.src, "a.js"), "export const a = 2;\r\n");
+    const d = syncCore({ source: f.src, targets: [f.target], check: true }).drift;
+    assert.ok(d.some((s) => s.includes("a.js") && s.includes("drift")), d.join("\n"));
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
