@@ -40,7 +40,9 @@ rather than ever blocking a session:
   wrote (search with `labels: ["Chunk"]`; `traverse` from a memory reaches its
   evidence). Deterministic, no model calls. `TOPODB_WAREHOUSE=0` turns just
   this off (`TOPODB_RECORDING=0` turns everything off); `TOPODB_WAREHOUSE_DIR`
-  relocates it. See `topodb warehouse status`.
+  relocates it. These env vars are the ONLY things the plugin's hooks read —
+  `[warehouse]` in `.topodb.toml` is not consulted by the hooks (see
+  "Configuration" below). See `topodb warehouse status`.
 - **Session-start recall:** each new session (fresh start or `/clear`)
   begins with up to 8 recent memories for this project injected as
   context — ranked by access within the recent window, capped well under
@@ -168,6 +170,15 @@ Set these environment variables to control plugin behavior:
   raw context warehouse.
 - `TOPODB_WAREHOUSE_DIR=<path>` — relocate the warehouse spool and sealed
   segments to a different directory (by default colocated with `memory.redb`).
+
+  **Plugin hooks are governed ONLY by `TOPODB_WAREHOUSE` and
+  `TOPODB_WAREHOUSE_DIR` in the hook environment — they do not read
+  `.topodb.toml`.** `[warehouse].enabled`/`path` in `.topodb.toml` govern the
+  CLI/daemon side (`topodb warehouse …`, the hygiene tick) instead. If you
+  relocate or disable the warehouse in `.topodb.toml` for a db this plugin
+  uses, set the matching env var too (`TOPODB_WAREHOUSE_DIR` / `TOPODB_WAREHOUSE=0`)
+  — otherwise the hooks keep spooling raw artifacts into a directory nothing
+  drains.
 - `TOPODB_CAPTURE_NUDGE=0|off` — suppress the stop-capture nudge (the
   suggestion to use `remember`/`create_memory` to ensure session artifacts
   are saved when closing a session without any explicit memory writes).

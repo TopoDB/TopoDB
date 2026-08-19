@@ -40,3 +40,12 @@ spool_min_age_ms = 2000
 ```
 
 Precedence for the warehouse directory: `TOPODB_WAREHOUSE_DIR` > `[warehouse].path` > `<db>.warehouse` (sibling of the db file). Hygiene runs three scheduled tasks under `[schedule.warehouse_drain]`, `[schedule.warehouse_derive]`, and `[schedule.warehouse_tier]` (each an `{enabled, interval_secs}` pair, same shape as `[schedule.compact]` etc.) — drain defaults to immediate (interval 0), derive to hourly, tier to daily.
+
+**`[warehouse]` here governs the CLI/daemon side only** (`topodb warehouse …`,
+the hygiene tick that runs drain/derive/tier). The Claude Code plugin's hooks
+that spool raw artifacts in the first place do **not** read `.topodb.toml` at
+all — they are governed solely by `TOPODB_WAREHOUSE=0|off` and
+`TOPODB_WAREHOUSE_DIR` in the hook's environment (see the plugin README's
+Configuration section). If you relocate (`path`) or disable (`enabled =
+false`) the warehouse here for a db the plugin uses, set the matching env var
+too, or the hooks keep spooling into a directory nothing drains.
