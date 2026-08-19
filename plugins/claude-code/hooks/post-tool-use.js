@@ -4,7 +4,7 @@
 // no stdout, exit 0 always.
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { toRetrievalRecord, appendRetrieval, normalizeToolResult } from "../recorder.js";
+import { toRetrievalRecord, appendRetrieval, normalizeToolResult } from "../core/recorder.js";
 
 function recordingDisabled(env) {
   const v = (env.TOPODB_RECORDING ?? "").toLowerCase();

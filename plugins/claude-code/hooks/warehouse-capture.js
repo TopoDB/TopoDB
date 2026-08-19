@@ -2,8 +2,8 @@
 // PostToolUse (Read|Bash|Edit|Write|MultiEdit|Grep|Glob|WebFetch): land the
 // raw artifact into the warehouse spool. One appendFileSync, no broker, no
 // stdout, exit 0 always. Subagents ARE captured (attributed to the session).
-import { sessionScopes } from "../server-args.js";
-import { warehouseDisabled, artifactEvent, appendSpool } from "../warehouse-spool.js";
+import { sessionScopes } from "../core/server-args.js";
+import { warehouseDisabled, artifactEvent, appendSpool } from "../core/warehouse-spool.js";
 
 async function main() {
   const raw = await new Promise((r) => { let buf = ""; process.stdin.on("data", (d) => (buf += d)); process.stdin.on("end", () => r(buf)); });

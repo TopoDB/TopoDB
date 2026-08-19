@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // PostToolUse (memory write tools): flag that the agent already saved this
 // session, so the Stop capture-nudge does not fire. Main sessions only.
-import { markCaptured, normalizeToolResult } from "../recorder.js";
-import { sessionScopes } from "../server-args.js";
-import { tryMarker } from "../warehouse-spool.js";
+import { markCaptured, normalizeToolResult } from "../core/recorder.js";
+import { sessionScopes } from "../core/server-args.js";
+import { tryMarker } from "../core/warehouse-spool.js";
 
 function recordingDisabled(env) {
   const v = (env.TOPODB_RECORDING ?? "").toLowerCase();

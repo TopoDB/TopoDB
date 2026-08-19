@@ -1,0 +1,15 @@
+{
+  "source": "plugins/core",
+  "files": {
+    "broker-client.js": "73ea3665e0b40e56c39c16f4ba54ceb8588cb443a13240051f40403209500c2d",
+    "broker.js": "a2bc760f3d1d4d54c15292a31549d86cd23fb2dc7b0f0fceca0ab036368da0b9",
+    "degraded.js": "a41adb96f11a96ce9ecd80c403a33edd812a6bd7e0288fd9cf6ac9f147d1ba48",
+    "ipc.js": "b9f303a26582ea0dbf3af51a9be2a230ce9a2334f3d0850ab34e171042384cd8",
+    "launch.js": "d635972f3bb0964f0bc1d94351e29885aad02eab4cb1e972281cefb63db7e37f",
+    "recorder.js": "e9645d3fb8bc0c55cb6c8a2d263dbdaf85cdae3a1587387e4bc2d7d9a771bbba",
+    "render.js": "f722dd712c837440d551d6b5d1f5c01016380ba834553e086115ff371d59111a",
+    "scope-id.js": "abda1e8ccf4babf5cd12cd50b70862402d061b99dce00def3b9f4376a72bb39d",
+    "server-args.js": "7f2f797c0c523aa99f17d7761bc2c03e7e671682727a17fc9cee1cb3595999f8",
+    "warehouse-spool.js": "1721c4857739a2ffae5bd999aebc09c2ad489858ff84a25f46d98db9b809b35b"
+  }
+}

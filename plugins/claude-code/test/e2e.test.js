@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { projectScopeId } from "../scope-id.js";
+import { projectScopeId } from "../core/scope-id.js";
 import { rmWithGraceSync } from "./fsgrace.js";
 
 const require = createRequire(import.meta.url);

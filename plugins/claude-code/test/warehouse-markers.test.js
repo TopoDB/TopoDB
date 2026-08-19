@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { warehouseDir } from "../warehouse-spool.js";
+import { warehouseDir } from "../core/warehouse-spool.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOKS = path.join(HERE, "..", "hooks");

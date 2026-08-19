@@ -2,10 +2,10 @@
 // SubagentStart: prime a dispatched subagent with the memories relevant to its
 // task. HARD RULES: exit 0 no matter what; nothing on stdout except the
 // injection payload; self-deadline; never break or delay a dispatch.
-import { renderMemoryLines } from "./render.js";
+import { renderMemoryLines } from "../core/render.js";
 import { pathToFileURL } from "node:url";
 import { readFileSync } from "node:fs";
-import { connectForProject } from "../broker-client.js";
+import { connectForProject } from "../core/broker-client.js";
 
 const QUERY_CAP = 1000;
 const CHAR_CAP = 2000;

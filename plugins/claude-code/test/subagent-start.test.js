@@ -11,15 +11,15 @@ import path from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { extractTask, skipSet, renderSubagentContext } from "../hooks/subagent-start.js";
-import { connectForProject } from "../broker-client.js";
-import { serverArgs } from "../server-args.js";
-import { socketPathFor } from "../ipc.js";
+import { connectForProject } from "../core/broker-client.js";
+import { serverArgs } from "../core/server-args.js";
+import { socketPathFor } from "../core/ipc.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.join(HERE, "..");
 const REPO = path.join(PLUGIN_ROOT, "..", "..");
 const HOOK = path.join(PLUGIN_ROOT, "hooks", "subagent-start.js");
-const BROKER_JS = path.join(PLUGIN_ROOT, "broker.js");
+const BROKER_JS = path.join(PLUGIN_ROOT, "core", "broker.js");
 const LOCAL_SERVER = path.join(REPO, "target", "debug", process.platform === "win32" ? "topodb-mcp.exe" : "topodb-mcp");
 
 // --- Unit tests: extractTask ---

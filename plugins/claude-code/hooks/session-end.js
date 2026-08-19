@@ -3,10 +3,10 @@
 // then clean up. Sweeps stale state files from crashed sessions. No
 // stdout, exit 0 always.
 import { readFileSync } from "node:fs";
-import { connectForProject } from "../broker-client.js";
-import { readState, deleteState, sweepStale, extractText, isUsed, buildEpisodeBatch, normalizeToolResult } from "../recorder.js";
-import { sessionScopes } from "../server-args.js";
-import { tryMarker } from "../warehouse-spool.js";
+import { connectForProject } from "../core/broker-client.js";
+import { readState, deleteState, sweepStale, extractText, isUsed, buildEpisodeBatch, normalizeToolResult } from "../core/recorder.js";
+import { sessionScopes } from "../core/server-args.js";
+import { tryMarker } from "../core/warehouse-spool.js";
 
 function recordingDisabled(env) {
   const v = (env.TOPODB_RECORDING ?? "").toLowerCase();

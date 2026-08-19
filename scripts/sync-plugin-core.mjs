@@ -30,8 +30,19 @@ function walk(dir, rel = "") {
 }
 const sha = (buf) => createHash("sha256").update(buf).digest("hex");
 const isJs = (rel) => rel.endsWith(".js") || rel.endsWith(".mjs");
+// A shebang MUST stay on line 1: Node only strips a `#!` line for the entry
+// script it was told to run when that line is the file's very first bytes.
+// Prepending GENERATED_HEADER unconditionally used to push a source file's
+// shebang to line 2, which made every vendored copy of a directly-spawned
+// entry script (broker.js, launch.js) a SyntaxError at run time.
+function splitShebang(text) {
+  if (!text.startsWith("#!")) return ["", text];
+  const nl = text.indexOf("\n") + 1;
+  return [text.slice(0, nl), text.slice(nl)];
+}
 function stripHeader(text) {
-  return text.startsWith(GENERATED_HEADER) ? text.slice(GENERATED_HEADER.length) : text;
+  const [shebang, rest] = splitShebang(text);
+  return shebang + (rest.startsWith(GENERATED_HEADER) ? rest.slice(GENERATED_HEADER.length) : rest);
 }
 
 /** @returns {{ drift: string[] }} */
@@ -63,7 +74,12 @@ export function syncCore({ source, targets, check }) {
       const dst = path.join(target, rel);
       mkdirSync(path.dirname(dst), { recursive: true });
       const src = readFileSync(path.join(source, rel));
-      writeFileSync(dst, isJs(rel) ? GENERATED_HEADER + src.toString("utf8") : src);
+      if (isJs(rel)) {
+        const [shebang, rest] = splitShebang(src.toString("utf8"));
+        writeFileSync(dst, shebang + GENERATED_HEADER + rest);
+      } else {
+        writeFileSync(dst, src);
+      }
     }
     writeFileSync(path.join(target, "VENDORED.json"), JSON.stringify({ source: "plugins/core", files: hashes }, null, 2) + "\n");
   }

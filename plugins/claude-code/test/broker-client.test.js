@@ -9,10 +9,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { connectForProject } from "../broker-client.js";
+import { connectForProject } from "../core/broker-client.js";
 import { rmWithGrace } from "./fsgrace.js";
-import { socketPathFor } from "../ipc.js";
-import { serverArgs } from "../server-args.js";
+import { socketPathFor } from "../core/ipc.js";
+import { serverArgs } from "../core/server-args.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LAUNCH_JS = path.join(HERE, "..", "launch.js");

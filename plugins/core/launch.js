@@ -1,0 +1,447 @@
+#!/usr/bin/env node
+// The MCP entry point. `.mcp.json` is static and cannot compute a hash, so this
+// shim derives the project scope at spawn time, makes sure the database
+// directory and the server exist, then hands stdio to topodb-mcp.
+//
+// A shim, NOT a proxy: Claude Code speaks MCP natively, so there is no protocol
+// code here — unlike the Pi extension, which had to bridge MCP to Pi's tool API.
+//
+// Exports ONE function, run(), and never self-executes: each plugin's launch.js
+// is a two-line main that reads its client's env and calls run(). No
+// "am I the entry module?" guard anywhere (it misfires on Windows casing).
+import { spawn, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync } from "node:fs";
+import net from "node:net";
+import path from "node:path";
+import { serverArgs, sessionScopes, SERVER_VERSION } from "./server-args.js";
+import { socketPathFor, helloFrame } from "./ipc.js";
+import { serveDegraded } from "./degraded.js";
+
+const SERVER_PKG = "@topodb/topodb-mcp";
+
+const LOCK_STALE_MS = 5 * 60 * 1000; // a lock this old outlived any real npm install; treat it as abandoned by a killed process
+// 30s, not "a few": this install pulls a platform-specific native binary via
+// optionalDependencies, which can take longer than a couple seconds on a cold
+// npm cache or a slow link. Long enough to not false-positive a healthy
+// install, short enough that a genuinely wedged peer still fails fast-ish.
+const LOCK_WAIT_TIMEOUT_MS = 30_000;
+const LOCK_POLL_INTERVAL_MS = 200;
+
+/**
+ * Resolve the server's launcher, installing it into the plugin's persistent data
+ * directory on first run. CLAUDE_PLUGIN_DATA survives plugin updates, which is
+ * exactly what a node_modules cache (and the database) needs.
+ */
+function resolveServer(dataDir) {
+  const require = createRequire(import.meta.url);
+  const entry = `${SERVER_PKG}/bin/topodb-mcp.js`;
+  // Resolve ONLY from the data dir's node_modules. Do NOT add this file's own
+  // directory (`import.meta.url`'s dirname) to `paths`: in this repo,
+  // plugins/claude-code/node_modules/@topodb/topodb-mcp is a devDependency
+  // used by the e2e test, so resolving against `here` would silently succeed
+  // even when `dataDir` is completely empty, masking the first-run install
+  // path entirely. A distributed plugin ships without a node_modules of its
+  // own (gitignored, not published), so `here` was never load-bearing there —
+  // it only hid bugs in local dev/test.
+  const paths = [path.join(dataDir, "node_modules")];
+
+  const installedVersion = () => {
+    try {
+      const pkgJson = require.resolve(`${SERVER_PKG}/package.json`, { paths });
+      // readFileSync + JSON.parse, NOT require(pkgJson): require() caches by
+      // resolved path, so a second call after `install()` rewrites the file
+      // would return the pre-install value from the module cache and make a
+      // successful reinstall look like it silently failed.
+      return JSON.parse(readFileSync(pkgJson, "utf8")).version;
+    } catch {
+      return null;
+    }
+  };
+
+  // npm is not safe against two processes installing into the same --prefix
+  // at once. Two Claude Code sessions launched at the same moment both hit
+  // "nothing installed yet" and would otherwise both run `npm install
+  // --prefix dataDir` concurrently, which can leave a partial/corrupt
+  // node_modules for whichever one loses the race. mkdirSync is atomic
+  // (throws EEXIST if the directory already exists), which is enough to use
+  // as a cross-process lock without a new dependency.
+  const lockDir = path.join(dataDir, ".install.lock");
+
+  // Returns true if we now own the lock, false if someone else legitimately
+  // holds it (caller should wait, not install).
+  const acquireLock = () => {
+    for (;;) {
+      try {
+        mkdirSync(lockDir);
+        return true;
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+        let ageMs;
+        try {
+          ageMs = Date.now() - statSync(lockDir).mtimeMs;
+        } catch {
+          // The lock vanished between our mkdirSync and this stat (the
+          // holder just finished and cleaned up) — retry acquiring it.
+          continue;
+        }
+        if (ageMs > LOCK_STALE_MS) {
+          // A lock this old was almost certainly abandoned by a process that
+          // got killed mid-install, not one still legitimately installing.
+          // Without this, a single killed process would brick first-run for
+          // every future session forever.
+          try {
+            rmdirSync(lockDir);
+          } catch {
+            // Lost the cleanup race to another process doing the same thing;
+            // either way, retry.
+          }
+          continue;
+        }
+        return false;
+      }
+    }
+  };
+
+  // Block (this whole script is synchronous) until the lock holder's install
+  // finishes, one way or another.
+  const waitForInstall = () => {
+    const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      if (installedVersion() === SERVER_VERSION) return;
+      if (!existsSync(lockDir)) {
+        // The holder released the lock — its install finished — but the
+        // pinned version still isn't resolvable, so it failed. Don't sit out
+        // the rest of the timeout waiting on an install that already ended.
+        throw new Error(
+          `a concurrent install of ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir} finished without producing that version; it likely failed (check that session's stderr)`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `timed out after ${LOCK_WAIT_TIMEOUT_MS}ms waiting for a concurrent install of ${SERVER_PKG}@${SERVER_VERSION} into ${dataDir} to finish`,
+        );
+      }
+      // Atomics.wait blocks the calling thread without spinning; Node (unlike
+      // browsers) allows this on the main thread, and there is no async
+      // runtime here to yield to anyway (spawnSync below blocks it too).
+      Atomics.wait(sleeper, 0, 0, LOCK_POLL_INTERVAL_MS);
+    }
+  };
+
+  // EVERY spec this install should end up with must be passed in ONE call.
+  // `npm install --prefix <dir> <pkg>` does not just add <pkg>: it reconciles
+  // the whole tree against the package.json it maintains in <dir>, and PRUNES
+  // whatever isn't declared there. Installing only the platform package, into a
+  // dir whose package.json doesn't mention the server, made npm report
+  // "added 1 package, and removed 1 package" — the removed one being
+  // @topodb/topodb-mcp itself, the shim the broker resolves. The repair deleted
+  // the thing it was repairing. (Verified empirically; see the repair below.)
+  const install = (...specs) => {
+    const list = specs.length ? specs : [`${SERVER_PKG}@${SERVER_VERSION}`];
+    if (!acquireLock()) {
+      waitForInstall();
+      return;
+    }
+    try {
+      installLocked(list);
+    } finally {
+      // A crash between mkdirSync and here would skip this and wedge the
+      // lock — that's what the staleness check in acquireLock() is for.
+      rmdirSync(lockDir);
+    }
+  };
+
+  const installLocked = (specs) => {
+    // First run (or stale version): fetch the pinned server into the data
+    // dir. Fail loudly — silently falling back to some other version on the
+    // machine is worse than not starting, because the tool surface would be
+    // wrong in ways nobody sees.
+    //
+    // stdout MUST stay "ignore": this process's own stdout is the MCP
+    // JSON-RPC stream Claude Code reads. If a future edit "helpfully"
+    // changes this to "inherit" (to show install progress), npm's chatter
+    // would be interleaved into that stream and corrupt the protocol on
+    // every first run. stderr is safe to inherit for diagnostics.
+    const npmArgs = ["install", "--prefix", dataDir, "--no-audit", "--no-fund", ...specs];
+    const stdio = ["ignore", "ignore", "inherit"];
+    let res;
+    if (process.platform === "win32") {
+      // DO NOT spawn "npm.cmd" directly without shell:true. On Node
+      // 20.12+/22+/24 (the CVE-2024-27980 hardening) spawning a .cmd/.bat
+      // file with an argv array and no shell throws EINVAL — this is exactly
+      // the bug this comment exists to prevent from coming back. Every
+      // Windows user's first-run install broke on this before the fix below.
+      //
+      // The naive counter-fix — just add shell:true — trades EINVAL for a
+      // WORSE, silent bug: with shell:true, Node only *concatenates* argv
+      // into a command string, it does not quote it. CLAUDE_PLUGIN_DATA
+      // resolves under the user's home directory, which routinely contains
+      // spaces (e.g. "C:\Users\Andrew Smith\..."); unquoted, cmd.exe splits
+      // that path into separate words and npm installs into a truncated,
+      // WRONG directory with exit code 0 — no error, just data silently
+      // landing somewhere else. Verified empirically while fixing this: an
+      // unquoted `--prefix "C:\...\space test dir"` landed in
+      // "C:\...\space\node_modules" instead.
+      //
+      // Instead: run node itself against npm's own CLI entry point. This is
+      // NOT a hack — it's the same file npm.cmd itself execs (see npm.cmd's
+      // own `%~dp0\node_modules\npm\bin\npm-cli.js` resolution, where %~dp0
+      // is npm.cmd's own directory, i.e. the same directory as node.exe).
+      // Spawning it via [process.execPath, npmCliJs, ...args] needs no shell
+      // at all, so Node's normal (correct, no-shell) Windows argv escaping
+      // applies and spaced paths just work — verified empirically too.
+      //
+      // Fall back to shell:true with each arg manually double-quoted only if
+      // that bundled npm-cli.js isn't where every standard Windows Node
+      // install (official installer, nvm-windows, volta, scoop, ...) puts
+      // it — i.e. only for a genuinely unusual npm layout.
+      const npmCliJs = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+      if (existsSync(npmCliJs)) {
+        res = spawnSync(process.execPath, [npmCliJs, ...npmArgs], { stdio });
+      } else {
+        const quote = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
+        res = spawnSync("npm.cmd", npmArgs.map(quote), { shell: true, stdio });
+      }
+    } else {
+      // POSIX: "npm" is a plain shebang script, not a .cmd — no EINVAL, no
+      // shell needed, argv spaces are handled correctly by spawnSync as-is.
+      res = spawnSync("npm", npmArgs, { stdio });
+    }
+    if (res.status !== 0) {
+      // res.error (e.g. ENOENT when npm itself is missing/not on PATH) is the
+      // only signal a user gets when first-run install fails offline, behind
+      // a proxy, or on a machine without npm — surface it instead of a bare
+      // "it failed" with no cause.
+      throw new Error(
+        `failed to install ${specs.join(" ")} into ${dataDir}: ${res.error?.message ?? `npm exited ${res.status}`}`,
+      );
+    }
+  };
+
+  let version = installedVersion();
+  if (version !== SERVER_VERSION) {
+    // Either nothing is resolvable yet (first run) or a stale/foreign
+    // version is sitting in dataDir (e.g. after a SERVER_VERSION bump).
+    // "resolve succeeded" is not "the pinned version is installed" — verify
+    // it, don't assume it.
+    install();
+    version = installedVersion();
+    if (version !== SERVER_VERSION) {
+      throw new Error(
+        `expected ${SERVER_PKG}@${SERVER_VERSION} in ${dataDir}, found ${version ?? "nothing"} after install`,
+      );
+    }
+  }
+
+  const shimPath = require.resolve(entry, { paths });
+
+  // The pinned version of `@topodb/topodb-mcp` being present is NOT proof the
+  // server can start. That package is a JS shim; what actually executes is a
+  // platform binary from an OPTIONAL dependency — and on a real Windows install
+  // npm resolved that optional dependency for the WRONG platform
+  // (`topodb-mcp-linux-x64` on a win32 host). Every check above passed, because
+  // they all look at the shim. Nothing looked at the binary. The install
+  // reported itself healthy and the server could never start.
+  //
+  // So resolve the binary too, and do it through the SHIM'S OWN resolver: it is
+  // the single source of truth for the platform key, and (as of server 0.0.8) it
+  // refuses a platform package whose version isn't its own — which matters,
+  // because `require.resolve` walks UP the directory tree and on that same
+  // machine it found a stale `topodb-mcp-win32-x64@0.0.3` outside this data dir
+  // and ran it, silently, for a plugin that believed it was on 0.0.7.
+  // Where THIS install's platform binary must be — computed, never resolved.
+  //
+  // `require.resolve` is the wrong instrument for this question, twice over.
+  // It walks UP the directory tree, so when the data dir lacks the platform
+  // package it cheerfully returns one from somewhere else — on a real machine, a
+  // stale topodb-mcp-win32-x64@0.0.3 in an ancestor node_modules. Resolution
+  // SUCCEEDED, so the shim's "not installed" error never fired and the broker
+  // ran a server two format generations old while every version check here read
+  // 0.0.7. And it MEMOIZES that answer (Module._pathCache): after reinstalling
+  // the correct package, a second resolve in this process still hands back the
+  // ghost — measured, and it defeated the first version of this repair.
+  //
+  // An existence check at the exact path we own has neither problem. The shim's
+  // own pure helpers give us the platform key, so there is no second copy of
+  // that table to drift. Node's resolution at broker-spawn time (a fresh
+  // process, nearest-wins) then picks this package over any ancestor's.
+  const ownPlatformBinary = () => {
+    const { platformKey, subPackageName, binaryFileName } = require(shimPath);
+    const key = platformKey(process.platform, process.arch);
+    if (!key) {
+      throw new Error(
+        `unsupported platform ${process.platform}/${process.arch}; no prebuilt ${SERVER_PKG} binary exists for it`,
+      );
+    }
+    return {
+      key,
+      path: path.join(dataDir, "node_modules", ...subPackageName(key).split("/"), binaryFileName(process.platform)),
+    };
+  };
+
+  const { key, path: binPath } = ownPlatformBinary();
+  if (!existsSync(binPath)) {
+    // The platform package for THIS host is not in this install. On the machine
+    // that surfaced this, npm had installed a different platform's package
+    // entirely (topodb-mcp-linux-x64 on win32). Whatever the cause — a foreign
+    // lockfile, an .npmrc, npm resolving for another platform — the repair is
+    // the same: name this host's package explicitly. optionalDependencies pin it
+    // to the server's exact version, so there is exactly one right answer.
+    //
+    // BOTH specs, in ONE call, deliberately: npm prunes whatever the prefix's
+    // package.json doesn't declare, so repairing with the platform package alone
+    // DELETES the server shim (measured: "added 1 package, and removed 1
+    // package"). Naming both is what makes this a repair rather than a new way
+    // to break the install.
+    install(`${SERVER_PKG}@${SERVER_VERSION}`, `${SERVER_PKG}-${key}@${SERVER_VERSION}`);
+
+    if (!existsSync(binPath)) {
+      throw new Error(
+        `no ${SERVER_PKG} binary for ${key} in ${dataDir} even after installing ` +
+          `${SERVER_PKG}-${key}@${SERVER_VERSION}: expected it at ${binPath}. ` +
+          `Refusing to start — Node would otherwise resolve some other copy on this machine and run it silently.`,
+      );
+    }
+  }
+
+  return shimPath;
+}
+
+const tryConnect = (sock) =>
+  new Promise((res) => {
+    const c = net.connect(sock);
+    c.on("connect", () => res(c));
+    c.on("error", () => res(null));
+  });
+
+/** Once connected, this process is a dumb byte pipe: the daemon owns the DB and
+ *  stamps this connection's scope onto every request, so the client's JSON-RPC
+ *  passes through untouched. Each connection is its own session on the daemon,
+ *  so there is no id rewriting to do — the broker-era multiplexing machinery is
+ *  retired.
+ *
+ *  `hello` is written FIRST, before stdin is piped in. Not cosmetic: stdin is
+ *  already flowing by the time we get here (Claude Code sends `initialize`
+ *  immediately), so piping first would let a real request reach the daemon ahead
+ *  of the frame that says which scope this session is — and the daemon would have
+ *  to either guess or drop it. Writing hello before the pipe is what makes
+ *  "every request from this connection carries this session's scope" true for the
+ *  FIRST request too, not just the rest. */
+function relay(conn, hello) {
+  conn.write(hello);
+  process.stdin.pipe(conn);
+  conn.pipe(process.stdout);
+  conn.on("close", () => {
+    // NOT process.exit(0). If the daemon dies mid-session (killed, crashed,
+    // machine put it under memory pressure), the socket closes and this
+    // process is still the MCP server Claude Code is talking to. Exiting 0
+    // here reads to Claude Code as a clean, intentional shutdown -- no
+    // degraded server, no explanation -- while the skill keeps telling the
+    // agent to call search_memories against a server that no longer exists.
+    // Unpipe first: the streams are still wired to a now-dead socket, and
+    // serveDegraded needs stdin free to install its own listener.
+    process.stdin.unpipe(conn);
+    conn.unpipe(process.stdout);
+    // Empirically required, not optional: once a Readable has gone through a
+    // pipe()/unpipe() cycle, merely re-attaching a "data" listener (what
+    // serveDegraded does) is NOT sufficient to keep this process's event loop
+    // alive on this stack -- verified with a minimal net.Server repro. Without
+    // this explicit resume(), the process exits 0 within ~1ms of serveDegraded
+    // returning, silently, with no listener ever having failed and no error
+    // thrown -- an even more misleading variant of the exact bug this whole
+    // fix exists to close. `serveDegraded`'s OWN direct callers (never having
+    // connected to a daemon at all) don't need this: that stdin was never
+    // piped anywhere, so Node's normal on("data") auto-resume behavior holds.
+    process.stdin.resume();
+    serveDegraded("the topodb daemon exited mid-session; memory is unavailable for the rest of this session (see the daemon log in the plugin data dir)");
+  });
+}
+
+/**
+ * Bootstrap and serve. `dataDir` is where memory.redb, the npm-installed
+ * server, episodes/ and memory.warehouse/ live; `projectDir` decides the
+ * session's scope; `env` is consulted for TOPODB_MCP_SERVER_BIN only.
+ * Every failure path ends in serveDegraded — a failed MCP server is nearly
+ * invisible in an editor while the skill keeps telling the agent to call
+ * memory tools, so explaining beats dying.
+ */
+export async function run({ dataDir, projectDir, env = process.env }) {
+  let conn = null;
+  let degradedReason = null;
+  let hello = null;
+
+  // The ENTIRE bootstrap — reading dataDir, creating the data dir,
+  // resolving/installing the server, spawning the daemon — is one try/catch.
+  // Before this fix, the dataDir-unset check and mkdirSync sat OUTSIDE any
+  // try/catch: an uncaught throw there is exit 1 with a stack trace and no
+  // MCP server at all, while the skill still tells the agent to call
+  // search_memories. Same silent-failure class serveDegraded exists to
+  // prevent everywhere else — every bootstrap failure must land there too.
+  try {
+    if (!dataDir) {
+      throw new Error("no plugin data directory resolved; refusing to guess where to put the database");
+    }
+
+    // topodb-mcp creates the .redb file but treats a missing parent directory as an
+    // error. This is the exact bug that shipped in @topodb/pi 0.0.1. Do not remove.
+    mkdirSync(dataDir, { recursive: true });
+
+    // This process is no longer the server: it is a thin client of the daemon
+    // that owns memory.redb. See specs/2026-08-12-topodb-daemon-design.md.
+    const args = serverArgs({ projectDir, dataDir });
+    const dbPath = args[args.indexOf("--db") + 1];
+    const sock = socketPathFor(dbPath);
+
+    // The scopes of THIS session, which are not necessarily the ones in `args`:
+    // `args` only take effect if this shim is the one whose daemon wins the race,
+    // and one daemon serves every project. Sent on connect so the daemon can stamp
+    // them onto our requests — see sessionScopes()'s comment.
+    hello = helloFrame(sessionScopes({ projectDir }));
+
+    conn = await tryConnect(sock);
+    if (!conn) {
+      // No daemon on the socket yet — spawn one (or race another shim; redb's
+      // exclusive lock is the election, so the loser exits without binding and
+      // both shims connect to the winner). `topodb-mcp --socket` owns the DB and
+      // multiplexes connections itself (one rmcp session per client), serving a
+      // unix domain socket on unix and a NAMED PIPE on Windows (server >= 0.0.19,
+      // which is why the pin below is load-bearing). broker.js is no longer on the
+      // launch path on any platform.
+      //
+      // TOPODB_MCP_SERVER_BIN points at a NATIVE topodb-mcp binary (a local
+      // `cargo build` output) and bypasses npm resolution — the seam tests and
+      // dev builds use. Empty string means unset, so a test can opt a child back
+      // into real resolution.
+      const binOverride = env.TOPODB_MCP_SERVER_BIN;
+      if (binOverride) {
+        spawn(binOverride, ["--socket", sock, ...args], { detached: true, stdio: "ignore" }).unref();
+      } else {
+        const shimPath = resolveServer(dataDir); // installs the server if needed; returns the topodb-mcp launcher
+        spawn(process.execPath, [shimPath, "--socket", sock, ...args], { detached: true, stdio: "ignore" }).unref();
+      }
+      // 50 × 200ms = a 10s budget (the loop exits the moment the socket is
+      // up, so a fast boot pays nothing). The previous 5s budget was too
+      // tight for a Windows cold start — fresh exe copy + Defender scan +
+      // redb open routinely overran it, and the shim declared memory
+      // degraded while the daemon was still coming up.
+      for (let i = 0; i < 50 && !conn; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        conn = await tryConnect(sock);
+      }
+      if (!conn) degradedReason = "could not reach or start the topodb daemon; see the daemon log in the plugin data dir";
+    }
+  } catch (err) {
+    // Anything above — unset dataDir, a mkdirSync failure, resolveServer's
+    // install, or the daemon spawn itself — failed outright. This must NOT
+    // crash the process: a failed MCP server is nearly invisible in an
+    // editor while the skill keeps telling the agent to call memory tools.
+    // Explain the failure instead of dying — see design §5.
+    degradedReason = err.message;
+  }
+  // `hello` is null only if the bootstrap threw before deriving it, in which case
+  // `conn` is null too and we degrade — so a connected shim always has one.
+  if (conn) relay(conn, hello);
+  else serveDegraded(degradedReason ?? "could not reach or start the topodb daemon; see the daemon log in the plugin data dir");
+}

@@ -46,7 +46,7 @@ export function decideNudge({ payload, env, state, toolUses }) {
 
 import { pathToFileURL } from "node:url";
 import { readFileSync } from "node:fs";
-import { readState, markNudged } from "../recorder.js";
+import { readState, markNudged } from "../core/recorder.js";
 
 const DEADLINE_MS = 1500;
 const NUDGE_TEXT =

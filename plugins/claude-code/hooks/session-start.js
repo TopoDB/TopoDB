@@ -3,11 +3,11 @@
 // HARD RULES: exit 0 no matter what; nothing on stdout except the payload;
 // self-deadline (this hook BLOCKS session start); main sessions only.
 import { pathToFileURL } from "node:url";
-import { connectForProject } from "../broker-client.js";
-import { renderMemoryLines } from "./render.js";
+import { connectForProject } from "../core/broker-client.js";
+import { renderMemoryLines } from "../core/render.js";
 import { injectPointer } from "./onboard.js";
-import { sessionScopes } from "../server-args.js";
-import { tryMarker } from "../warehouse-spool.js";
+import { sessionScopes } from "../core/server-args.js";
+import { tryMarker } from "../core/warehouse-spool.js";
 
 const DEADLINE_MS = 2500;
 const K = 10;
