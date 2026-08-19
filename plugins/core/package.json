@@ -1,0 +1,10 @@
+{
+  "name": "@topodb/plugin-core",
+  "private": true,
+  "type": "module",
+  "description": "Client-agnostic source of truth for the TopoDB editor plugins. Vendored into plugins/*/core by scripts/sync-plugin-core.mjs — never imported across plugin boundaries.",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "test": "node --test --test-timeout=120000 \"test/*.test.js\""
+  }
+}

@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { rmWithGrace } from "./fsgrace.js";
 import { execFileSync, spawn } from "node:child_process";
-import { readState, stateFilePath } from "../recorder.js";
+import { readState, stateFilePath } from "../core/recorder.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOKS = path.join(HERE, "..", "hooks");
@@ -85,7 +85,7 @@ test("session-end flushes an episode through a real broker and deletes state", n
   });
   let client = null;
   try {
-    const { connectForProject } = await import("../broker-client.js");
+    const { connectForProject } = await import("../core/broker-client.js");
     for (let i = 0; i < 50 && !client; i++) {
       await new Promise((r) => setTimeout(r, 200));
       client = await connectForProject({ projectDir, dataDir });
@@ -95,7 +95,7 @@ test("session-end flushes an episode through a real broker and deletes state", n
     const mem = await client.call("create_memory", { content: "alpha beta gamma delta" });
 
     // Seed the state file as post-tool-use would have.
-    const { appendRetrieval } = await import("../recorder.js");
+    const { appendRetrieval } = await import("../core/recorder.js");
     appendRetrieval(dataDir, "sess-E", {
       query: "q", at: Date.now(), channel: "text",
       returned: [{ id: mem.id, rank: 0, score: 1 }],
@@ -116,7 +116,7 @@ test("session-end flushes an episode through a real broker and deletes state", n
     );
 
     // State file is gone…
-    const { readState: rs } = await import("../recorder.js");
+    const { readState: rs } = await import("../core/recorder.js");
     assert.equal(rs(dataDir, "sess-E"), null);
     // …and the episode is queryable: the memory has an incoming RETURNED
     // edge and an incoming USED edge from a RetrievalEvent. Incoming edges
@@ -230,7 +230,7 @@ test("concurrent appendRetrieval calls never tear the state file", async () => {
     // specifier parses as a URL with protocol "d:" and the loader throws
     // ERR_UNSUPPORTED_ESM_URL_SCHEME.
     const childScript = `
-      import { appendRetrieval } from ${JSON.stringify(pathToFileURL(path.join(HERE, "..", "recorder.js")).href)};
+      import { appendRetrieval } from ${JSON.stringify(pathToFileURL(path.join(HERE, "..", "core", "recorder.js")).href)};
       const dataDir = process.argv[1];
       const sessionId = process.argv[2];
       const n = Number(process.argv[3]);

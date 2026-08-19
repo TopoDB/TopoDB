@@ -69,7 +69,7 @@ function locatorFor(toolName, ti) {
     default: return undefined;
   }
 }
-export function artifactEvent({ toolName, toolInput, toolResponse, sessionId, scope, cwd, agent, nowMs = Date.now() }) {
+export function artifactEvent({ toolName, toolInput, toolResponse, sessionId, scope, cwd, agent, harness = HARNESS, nowMs = Date.now() }) {
   const type = TYPES[toolName];
   if (!type) return null;
   const ti = toolInput && typeof toolInput === "object" ? toolInput : {};
@@ -83,21 +83,21 @@ export function artifactEvent({ toolName, toolInput, toolResponse, sessionId, sc
   const artifact = { type, locator, bytes: Buffer.byteLength(text, "utf8") };
   if (artifact.bytes > SPOOL_HARD_CAP) artifact.hash = "sha256:" + createHash("sha256").update(text, "utf8").digest("hex");
   else artifact.content = text;
-  const source = { harness: HARNESS, session: String(sessionId), scope: String(scope), tool: toolName };
+  const source = { harness, session: String(sessionId), scope: String(scope), tool: toolName };
   if (cwd) source.cwd = String(cwd);
   if (agent) source.agent = String(agent);
   return { id: newUlid(nowMs), ts: nowMs, host: "", kind: "artifact", v: 1, source, artifact };
 }
-export function markerEvent({ type, sessionId, scope, nodeIds = [], nowMs = Date.now() }) {
-  const marker = { type, harness: HARNESS, session: String(sessionId), scope: String(scope) };
+export function markerEvent({ type, sessionId, scope, nodeIds = [], harness = HARNESS, nowMs = Date.now() }) {
+  const marker = { type, harness, session: String(sessionId), scope: String(scope) };
   if (nodeIds.length) marker.node_ids = nodeIds.map(String);
   return { id: newUlid(nowMs), ts: nowMs, host: "", kind: "marker", v: 1, marker };
 }
 
-export function tryMarker({ dataDir, env, projectDir, sessionId, type, nodeIds = [], sessionScopes }) {
+export function tryMarker({ dataDir, env, projectDir, sessionId, type, nodeIds = [], sessionScopes, harness = HARNESS }) {
   try {
     if (!dataDir || !sessionId || !projectDir || warehouseDisabled(env)) return;
     const { scope } = sessionScopes({ projectDir });
-    appendSpool(dataDir, sessionId, markerEvent({ type, sessionId, scope, nodeIds }), env);
+    appendSpool(dataDir, sessionId, markerEvent({ type, sessionId, scope, nodeIds, harness }), env);
   } catch { /* best-effort */ }
 }

@@ -41,10 +41,10 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
-import { lineReader, socketPathFor, helloFrame } from "../ipc.js";
-import { projectScopeId } from "../scope-id.js";
+import { lineReader, socketPathFor, helloFrame } from "../core/ipc.js";
+import { projectScopeId } from "../core/scope-id.js";
 import { rmWithGraceSync } from "./fsgrace.js";
-import { SERVER_VERSION } from "../server-args.js";
+import { SERVER_VERSION } from "../core/server-args.js";
 
 const require = createRequire(import.meta.url);
 // The real launcher's own platform-key logic, not a copy of it. A second copy of

@@ -3,59 +3,21 @@
 // HARD RULES: exit 0 no matter what; nothing on stdout except the payload;
 // self-deadline (this hook BLOCKS session start); main sessions only.
 import { pathToFileURL } from "node:url";
-import { connectForProject } from "../broker-client.js";
-import { renderMemoryLines } from "./render.js";
+import { connectForProject } from "../core/broker-client.js";
+import { recallForSessionStart } from "../core/hooks/recall.js";
 import { injectPointer } from "./onboard.js";
-import { sessionScopes } from "../server-args.js";
-import { tryMarker } from "../warehouse-spool.js";
+import { sessionScopes } from "../core/server-args.js";
+import { tryMarker } from "../core/warehouse-spool.js";
+import { readStdin, parseJson } from "../core/hook-io.js";
+
+export { renderHealth, renderInjection } from "../core/hooks/recall.js";
 
 const DEADLINE_MS = 2500;
-const K = 10;
-const KEEP = 8;
-const CHAR_CAP = 6000;
-// Session-start hygiene glance: run all three scans in one call. A 90-day
-// staleness window keeps the "stale" nudge meaningful (genuinely cold, not
-// routine 30-day-old memories that would nag every session). The health call
-// overlaps the enrichment loop (concurrent, own timeout), so it adds no serial
-// latency to the memory injection — and is never load-bearing.
-const HEALTH_STALE_DAYS = 90;
-const HEALTH_TIMEOUT_MS = 1200;
-
-// A one-line hygiene nudge for the categories that are non-zero, or null when
-// the store is tidy (or health is unavailable). Advisory — points at the tools,
-// never acts.
-export function renderHealth(health) {
-  if (!health || !health.needs_attention) return null;
-  const plur = (n, s) => `${n} ${s}${n === 1 ? "" : "s"}`;
-  const parts = [];
-  if (health.duplicate_pairs > 0) parts.push(plur(health.duplicate_pairs, "duplicate pair"));
-  if (health.supersession_pairs > 0) parts.push(plur(health.supersession_pairs, "supersession"));
-  if (health.orphan_count > 0) parts.push(plur(health.orphan_count, "orphan"));
-  if (health.stale_count > 0) parts.push(`${health.stale_count} stale`);
-  if (!parts.length) return null;
-  return `🧹 Memory hygiene: ${parts.join(", ")} — review with memory_health, then consolidate/link/supersede.`;
-}
-
-export function renderInjection(memories, healthLine = null) {
-  if (!memories.length) return null;
-  const lines = renderMemoryLines(memories, "## TopoDB memory (this project)", CHAR_CAP);
-  if (healthLine) lines.push(healthLine);
-  lines.push("Deeper recall: search_memories / traverse. Store: remember.");
-  return lines.join("\n");
-}
 
 async function main() {
-  const raw = await new Promise((r) => {
-    let buf = "";
-    process.stdin.on("data", (d) => (buf += d));
-    process.stdin.on("end", () => r(buf));
-  });
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return;
-  }
+  const raw = await readStdin();
+  const payload = parseJson(raw);
+  if (!payload) return;
   if (payload.agent_id || payload.agent_type) return; // main sessions only
   if (payload.source !== "startup" && payload.source !== "clear") return;
 
@@ -68,48 +30,11 @@ async function main() {
   const client = await connectForProject({ projectDir, dataDir });
   if (!client) return; // no broker yet — first-ever session; next one has it
   try {
-    const recent = await client.call("recent_memories", { k: K });
-    const nodes = Array.isArray(recent.memories) ? recent.memories : [];
-    if (!nodes.length) return;
-
-    // Fire the health scan concurrently so it overlaps the enrichment loop
-    // below (the broker multiplexes by request id). Own timeout + swallow: a
-    // hygiene nudge is a nicety, never worth risking the memory injection.
-    const healthPromise = client
-      .call("memory_health", { stale_older_than_days: HEALTH_STALE_DAYS }, HEALTH_TIMEOUT_MS)
-      .catch(() => null);
-
-    const enriched = [];
-    for (const n of nodes) {
-      if (typeof n?.id !== "string" || typeof n?.props?.content !== "string") continue;
-      let accessCount = 0;
-      try {
-        const stats = await client.call("access_stats", { id: n.id }, 800);
-        if (stats.found && typeof stats.access_count === "number") accessCount = stats.access_count;
-      } catch { /* stats are a ranking nicety, never load-bearing */ }
-      const entities = [];
-      try {
-        const edges = await client.call("get_edges", { from_id: n.id }, 800);
-        for (const e of (edges.edges ?? []).slice(0, 3)) {
-          try {
-            const t = await client.call("get_node", { id: e.to }, 800);
-            const name = t?.node?.props?.name;
-            if (typeof name === "string") entities.push(name);
-          } catch { /* skip */ }
-        }
-      } catch { /* entity names are decoration */ }
-      // ULID timestamp: first 10 chars are Crockford-base32 time — cheap
-      // decode not worth it; approximate age from access stats' last read
-      // is wrong too. Use 0 and render "today" rather than decode ULIDs.
-      enriched.push({ id: n.id, content: n.props.content, entities, ageMs: 0, accessCount });
-    }
-    enriched.sort((a, b) => b.accessCount - a.accessCount);
-    const healthLine = renderHealth(await healthPromise);
-    const out = renderInjection(enriched.slice(0, KEEP), healthLine);
+    const out = await recallForSessionStart(client);
     if (out) {
-      // CHAR_CAP (6000) keeps this comfortably under the ~64KB pipe buffer,
-      // so the process.exit(0) in finally() below can never truncate the
-      // write mid-flight. Revisit this assumption if CHAR_CAP grows a lot.
+      // CHAR_CAP (baked into recallForSessionStart) keeps this comfortably
+      // under the ~64KB pipe buffer, so the process.exit(0) in finally()
+      // below can never truncate the write mid-flight.
       process.stdout.write(
         JSON.stringify({
           hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: out },

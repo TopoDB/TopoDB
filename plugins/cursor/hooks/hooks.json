@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "node ${CURSOR_PLUGIN_ROOT}/hooks/session-start.js", "timeout": 5 }],
+    "postToolUse": [{ "command": "node ${CURSOR_PLUGIN_ROOT}/hooks/warehouse-capture.js", "timeout": 5 }],
+    "afterMCPExecution": [{ "command": "node ${CURSOR_PLUGIN_ROOT}/hooks/after-mcp.js", "timeout": 5 }],
+    "stop": [{ "command": "node ${CURSOR_PLUGIN_ROOT}/hooks/stop-nudge.js", "timeout": 5, "loop_limit": 1 }],
+    "sessionEnd": [{ "command": "node ${CURSOR_PLUGIN_ROOT}/hooks/session-end.js", "timeout": 10 }]
+  }
+}

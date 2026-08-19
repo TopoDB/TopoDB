@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { countToolUses, decideNudge } from "../hooks/stop-capture.js";
-import { readState } from "../recorder.js";
+import { readState } from "../core/recorder.js";
 
 const jsonl = (...objs) => objs.map((o) => JSON.stringify(o)).join("\n");
 const assistantWithTools = (n) => ({

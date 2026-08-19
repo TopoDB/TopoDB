@@ -13,14 +13,14 @@ import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { spawn, execFileSync } from "node:child_process";
 import { renderInjection, renderHealth } from "../hooks/session-start.js";
-import { connectForProject } from "../broker-client.js";
-import { serverArgs } from "../server-args.js";
-import { socketPathFor } from "../ipc.js";
+import { connectForProject } from "../core/broker-client.js";
+import { serverArgs } from "../core/server-args.js";
+import { socketPathFor } from "../core/ipc.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.join(HERE, "..", "..", "..");
 const PLUGIN_ROOT = path.join(HERE, "..");
-const BROKER_JS = path.join(PLUGIN_ROOT, "broker.js");
+const BROKER_JS = path.join(PLUGIN_ROOT, "core", "broker.js");
 const LOCAL_SERVER = path.join(REPO, "target", "debug", process.platform === "win32" ? "topodb-mcp.exe" : "topodb-mcp");
 
 test("renderInjection: caps, formats, and returns null when empty", () => {

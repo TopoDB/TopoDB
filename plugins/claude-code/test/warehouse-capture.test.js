@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { artifactEvent, newUlid, simpleDiff, warehouseDir, SPOOL_HARD_CAP } from "../warehouse-spool.js";
+import { artifactEvent, newUlid, simpleDiff, warehouseDir, SPOOL_HARD_CAP } from "../core/warehouse-spool.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(HERE, "..", "hooks", "warehouse-capture.js");

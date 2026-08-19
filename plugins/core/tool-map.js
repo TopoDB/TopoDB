@@ -1,0 +1,50 @@
+// tool-map.js — Cursor's postToolUse vocabulary → the Claude-shaped
+// { toolName, toolInput, toolResponse } that warehouse-spool.artifactEvent
+// already understands. Unknown tools map to null (dropped, never guessed);
+// the name table is pinned against real payloads in dogfood (spec D3).
+export const CURSOR_TOOL_NAMES = {
+  Shell: "Bash", Bash: "Bash", RunTerminalCmd: "Bash",
+  Read: "Read", ReadFile: "Read",
+  Write: "Write", WriteFile: "Write",
+  Edit: "Edit", StrReplace: "Edit", SearchReplace: "Edit", MultiEdit: "MultiEdit",
+  Grep: "Grep", Glob: "Glob", GlobFileSearch: "Glob",
+  WebFetch: "WebFetch", Fetch: "WebFetch",
+};
+const KEYS = {
+  file_path: ["file_path", "filePath", "path", "target_file", "targetFile"],
+  command: ["command", "cmd"],
+  pattern: ["pattern", "query", "glob_pattern", "globPattern", "regex"],
+  url: ["url", "uri"],
+  old_string: ["old_string", "oldString", "old"],
+  new_string: ["new_string", "newString", "new"],
+  content: ["content", "contents", "text", "code_edit", "codeEdit"],
+};
+function normalizeInput(ti) {
+  const src = ti && typeof ti === "object" ? ti : {};
+  const out = {};
+  for (const [canon, cands] of Object.entries(KEYS)) {
+    for (const k of cands) if (src[k] !== undefined) { out[canon] = src[k]; break; }
+  }
+  if (Array.isArray(src.edits)) out.edits = src.edits;
+  return out;
+}
+function parseOutput(o) {
+  if (typeof o !== "string") return o;
+  const s = o.trim();
+  if (!(s.startsWith("{") || s.startsWith("["))) return o;
+  try { const v = JSON.parse(s); return v && typeof v === "object" ? v : o; } catch { return o; }
+}
+export function fromCursorToolUse({ tool_name, tool_input, tool_output }) {
+  const name = String(tool_name ?? "");
+  // Broad on purpose: a legitimately-named tool containing "MCP" is dropped
+  // too — dropping beats guessing for the warehouse.
+  if (/MCP/i.test(name) || name.includes("__")) return null;
+  const toolName = CURSOR_TOOL_NAMES[name];
+  if (!toolName) return null;
+  const toolInput = normalizeInput(tool_input);
+  // An edit with no recovered old/new string (or empty edits array) is a
+  // junk empty diff — drop it rather than guess.
+  if (toolName === "Edit" && typeof toolInput.old_string !== "string" && typeof toolInput.new_string !== "string") return null;
+  if (toolName === "MultiEdit" && !(Array.isArray(toolInput.edits) && toolInput.edits.length > 0)) return null;
+  return { toolName, toolInput, toolResponse: parseOutput(tool_output) };
+}

@@ -25,9 +25,10 @@ The *tools* (`search_memories`, `remember`, `traverse`, …) work everywhere. Ho
 *automatic* memory feels depends on what lifecycle surface the client exposes:
 
 - **Seamless** — the client has lifecycle hooks, so memory is automatic: recall
-  is injected at session start and durable facts are captured at the end. Only
-  the **Claude Code** plugin does this today (see
-  [`plugins/claude-code/`](../plugins/claude-code/README.md)); **OpenCode** is
+  is injected at session start and durable facts are captured at the end. The
+  **Claude Code** and **Cursor** plugins do this today (see
+  [`plugins/claude-code/`](../plugins/claude-code/README.md) and
+  [`plugins/cursor/`](../plugins/cursor/README.md)); **OpenCode** is
   the natural next one (its plugin/hook system can host the same flow — a future
   effort, not shipped here).
 - **Rules-nudge** — no hooks, but the client reads a rules / `AGENTS.md` file, so
@@ -43,7 +44,7 @@ The *tools* (`search_memories`, `remember`, `traverse`, …) work everywhere. Ho
 | Claude Code | (use the plugin) | **Seamless** | [plugin README](../plugins/claude-code/README.md) |
 | OpenCode | `opencode.json` (project) or `~/.config/opencode/opencode.json` | Rules-nudge *(seamless-capable — future)* | Per vendor docs (2026-08) |
 | Codex CLI | `~/.codex/config.toml` | Rules-nudge (`AGENTS.md`) | Per vendor docs (2026-08) |
-| Cursor | `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` | Rules-nudge (`.cursor/rules`) | Per vendor docs (2026-08) |
+| Cursor | (use the plugin) | **Seamless** | [plugin README](../plugins/cursor/README.md) |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | Rules-nudge (`.windsurfrules`) | Per vendor docs (2026-08) |
 | Zed | `settings.json` → `context_servers` | Tool-only | Per vendor docs (2026-08) |
 | Cline | `cline_mcp_settings.json` | Rules-nudge (`.clinerules`) | Per vendor docs (2026-08) |
@@ -96,6 +97,10 @@ an untrusted project put the server in the global `~/.codex/config.toml`. Codex
 reads `AGENTS.md`, so the [rules-nudge snippet](#rules-nudge-snippet) applies.
 
 ### Cursor
+
+Install the [Cursor plugin](../plugins/cursor/README.md) for the seamless tier
+(auto-recall, episode + warehouse capture, shared db with Claude Code). Manual
+setup, if you prefer:
 
 `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
 

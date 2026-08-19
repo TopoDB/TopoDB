@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderMemoryLines } from "../hooks/render.js";
+import { renderMemoryLines } from "../render.js";
 
 test("renderMemoryLines: seeds header, truncates content, formats age/entities", () => {
   const lines = renderMemoryLines(

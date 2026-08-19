@@ -1,57 +1,16 @@
 #!/usr/bin/env node
-// PostToolUse (matched to topodb retrieval tools): append what the model
-// just retrieved to this session's episode state file. No broker contact,
-// no stdout, exit 0 always.
-import { mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";
-import { toRetrievalRecord, appendRetrieval, normalizeToolResult } from "../recorder.js";
-
-function recordingDisabled(env) {
-  const v = (env.TOPODB_RECORDING ?? "").toLowerCase();
-  return v === "0" || v === "off";
-}
-
-/** Debug escape (TOPODB_HOOK_DEBUG=1): dump the raw stdin payload so the
- * first real session can pin the true PostToolUse tool_output/tool_response
- * shape. Best-effort — never throws, never writes to stdout. */
-function dumpDebugPayload(dataDir, raw) {
-  try {
-    const dir = path.join(dataDir, "episodes");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, "debug-last-payload.json"), raw);
-  } catch { /* best-effort only */ }
-}
+// PostToolUse (matched to topodb retrieval tools): append what the model just
+// retrieved to this session's episode state file. No daemon contact, no stdout.
+import { readStdin, parseJson, debugDump, recordingDisabled } from "../core/hook-io.js";
+import { recordRetrieval } from "../core/hooks/retrieval.js";
 
 async function main() {
-  const raw = await new Promise((r) => {
-    let buf = "";
-    process.stdin.on("data", (d) => (buf += d));
-    process.stdin.on("end", () => r(buf));
-  });
-  // Debug escape, before anything else that could bail out early.
+  const raw = await readStdin();
   const dataDir = process.env.CLAUDE_PLUGIN_DATA;
-  if (process.env.TOPODB_HOOK_DEBUG && dataDir) {
-    dumpDebugPayload(dataDir, raw);
-  }
+  debugDump({ dataDir, env: process.env, eventName: "last-payload", raw }); // keeps the historical debug-last-payload.json name
   if (recordingDisabled(process.env)) return;
-  let p;
-  try {
-    p = JSON.parse(raw);
-  } catch {
-    return;
-  }
+  const p = parseJson(raw); if (!p) return;
   if (p.agent_id || p.agent_type) return; // main sessions only
-  if (!dataDir || !p.session_id) return;
-
-  // mcp__plugin_topodb_topodb__search_memories -> search_memories
-  const tool = String(p.tool_name ?? "").split("__").pop();
-  const rawResult = p.tool_output ?? p.tool_response; // docs carry both names
-  const result = normalizeToolResult(rawResult);
-  const rec = toRetrievalRecord(tool, p.tool_input ?? {}, result);
-  if (!rec) return;
-  appendRetrieval(dataDir, p.session_id, rec.record, rec.contents);
+  recordRetrieval({ dataDir, sessionId: p.session_id, toolName: p.tool_name, toolInput: p.tool_input, toolResult: p.tool_output ?? p.tool_response });
 }
-
-main()
-  .catch(() => {})
-  .finally(() => process.exit(0));
+main().catch(() => {}).finally(() => process.exit(0));

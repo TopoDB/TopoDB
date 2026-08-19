@@ -1,0 +1,20 @@
+---
+description: TopoDB memory — recall before re-deriving, remember what is durable
+alwaysApply: true
+---
+
+## Memory (TopoDB)
+
+You have a persistent memory via the `topodb` MCP tools. Recent memories for
+this project are injected when a chat starts — they are the headlines, not the
+whole store.
+
+- **At the start of a task**, call `search_memories` (and `traverse` from the
+  best hit) for anything relevant to what you're about to do — past decisions,
+  who owns what, prior gotchas. Prefer recalling over re-deriving. Retry with
+  different words before concluding nothing is stored.
+- **When you learn something durable** — a decision and its rationale, a
+  non-obvious constraint, a fix and its cause, a user preference — call
+  `remember` to store it. Pass `scope: "shared"` when the lesson would be just
+  as true in a different repo. Skip the ephemeral and anything obvious from the
+  code or git history. When a fact changes, `supersede` the old memory.

@@ -1,0 +1,24 @@
+{
+  "source": "plugins/core",
+  "files": {
+    "broker-client.js": "73ea3665e0b40e56c39c16f4ba54ceb8588cb443a13240051f40403209500c2d",
+    "broker.js": "a2bc760f3d1d4d54c15292a31549d86cd23fb2dc7b0f0fceca0ab036368da0b9",
+    "data-dir.js": "19e64942c85e4a6d4b4565392ddc8823c3f00c725f0c94f503493e07a0c779e2",
+    "degraded.js": "a41adb96f11a96ce9ecd80c403a33edd812a6bd7e0288fd9cf6ac9f147d1ba48",
+    "hook-io.js": "b83ba5b554425781b2ad43912725c1728583e6b8e34072d0372c95baa25a2ace",
+    "hooks/capture.js": "809035f35ad91d2ad524811eaa23102e3799999a65e084d84b4a8208fe7496ba",
+    "hooks/episode.js": "59e26bf3dd3bbfc63241653684aa0f7f86db15c807fc45214c3e51aa2abf9a39",
+    "hooks/recall.js": "36f7ed4382b636fbe554bd94b1930a730d81def27dab904c1ac8a841c0a2bbc4",
+    "hooks/retrieval.js": "686cdf2b1a54147b000e5247ade5ff4e7ffcb231e6f5332b4a4fe9ac69f30f48",
+    "hooks/stop.js": "407f2fcc12d3c380756e013e10ceb45c7537baf3907b8d29c6357d157bc6d89c",
+    "ipc.js": "b9f303a26582ea0dbf3af51a9be2a230ce9a2334f3d0850ab34e171042384cd8",
+    "launch.js": "d635972f3bb0964f0bc1d94351e29885aad02eab4cb1e972281cefb63db7e37f",
+    "recorder.js": "ad80fd82edf1ec2078098eb3da32b8dcdbd7590867780cb5f0b325ce6ca83045",
+    "render.js": "f722dd712c837440d551d6b5d1f5c01016380ba834553e086115ff371d59111a",
+    "scope-id.js": "abda1e8ccf4babf5cd12cd50b70862402d061b99dce00def3b9f4376a72bb39d",
+    "server-args.js": "7f2f797c0c523aa99f17d7761bc2c03e7e671682727a17fc9cee1cb3595999f8",
+    "tool-map.js": "eee63ffa99a12996082e3c7d9ccf4cd2de39d59d86e40a899f4fad376a241d31",
+    "transcript.js": "379768444f43f7d2daca5403fdd1e044fbc13b52d1e1a05e0a0f4f565b9430c8",
+    "warehouse-spool.js": "f13d92c82f17cbabf7a39a1099b14104e2a45659306a0c9d652452ef7ed7fee8"
+  }
+}

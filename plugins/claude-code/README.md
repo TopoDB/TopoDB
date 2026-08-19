@@ -125,7 +125,9 @@ directory itself comes from `CLAUDE_PLUGIN_DATA`, which Claude Code sets and
 which survives plugin updates.
 
 There is exactly one `.redb` file, shared by every project you use this
-plugin in — see the risk below.
+plugin in — see the risk below. The [Cursor plugin](../cursor/README.md) uses
+this same directory when it exists, so memory, scopes and the daemon are
+shared across both editors.
 
 ## The risks, stated plainly
 
