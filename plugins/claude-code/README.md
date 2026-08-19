@@ -184,10 +184,13 @@ Set these environment variables to control plugin behavior:
 - `TOPODB_CAPTURE_NUDGE=0|off` — suppress the stop-capture nudge (the
   suggestion to use `remember`/`create_memory` to ensure session artifacts
   are saved when closing a session without any explicit memory writes).
-- `TOPODB_HOOK_DEBUG=1` — make the retrieval `PostToolUse` hook dump the
-  raw payload it received to `episodes/debug-last-payload.json` in the plugin
-  data dir, so the true `tool_output`/`tool_response` shape can be pinned
-  when debugging episode capture. Nothing else reads this variable.
+- `TOPODB_HOOK_DEBUG=1` (or a `HOOK_DEBUG` marker file in the plugin data
+  dir: `touch ~/.claude/plugins/data/topodb-topodb/HOOK_DEBUG`) — make the
+  retrieval `PostToolUse` hook dump the raw payload it received to
+  `episodes/debug-last-payload.json` in the plugin data dir, so the true
+  `tool_output`/`tool_response` shape can be pinned when debugging episode
+  capture. The marker needs no restart; delete it when done. Dumps contain
+  raw tool output. Nothing else reads this switch.
 
 ## What this plugin does not do
 

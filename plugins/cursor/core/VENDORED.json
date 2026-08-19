@@ -5,7 +5,7 @@
     "broker.js": "a2bc760f3d1d4d54c15292a31549d86cd23fb2dc7b0f0fceca0ab036368da0b9",
     "data-dir.js": "19e64942c85e4a6d4b4565392ddc8823c3f00c725f0c94f503493e07a0c779e2",
     "degraded.js": "a41adb96f11a96ce9ecd80c403a33edd812a6bd7e0288fd9cf6ac9f147d1ba48",
-    "hook-io.js": "b83ba5b554425781b2ad43912725c1728583e6b8e34072d0372c95baa25a2ace",
+    "hook-io.js": "5e9181c4f656bb1d1e9a916c0be40e386845dfeca6cc9043e88bf0b0bf3eae7a",
     "hooks/capture.js": "809035f35ad91d2ad524811eaa23102e3799999a65e084d84b4a8208fe7496ba",
     "hooks/episode.js": "59e26bf3dd3bbfc63241653684aa0f7f86db15c807fc45214c3e51aa2abf9a39",
     "hooks/recall.js": "36f7ed4382b636fbe554bd94b1930a730d81def27dab904c1ac8a841c0a2bbc4",

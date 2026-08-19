@@ -80,10 +80,11 @@ project plus `shared`, writes default to the project.
   there — capture and the stop nudge still do.
 - Payload shapes (`tool_output`, transcript JSONL) are taken from Cursor's
   docs and are **not yet pinned against a real session** (the Cursor
-  transcript parser and tool-name table are marked SYNTHETIC in code); set
-  `TOPODB_HOOK_DEBUG=1` to dump raw payloads to
-  `<data dir>/episodes/debug-<event>.json` — note these dumps contain raw
-  tool output (file contents) — if something looks off.
+  transcript parser and tool-name table are marked SYNTHETIC in code). To
+  capture the real shapes: `touch <data dir>/HOOK_DEBUG` (or set
+  `TOPODB_HOOK_DEBUG=1` in Cursor's environment), use the agent, then read
+  `<data dir>/episodes/debug-<event>.json`; delete the marker when done —
+  the dumps contain raw tool output (file contents).
 - `hooks.json` references `${CURSOR_PLUGIN_ROOT}` unquoted in command strings
   (the form Cursor's own plugins use); a plugin-root path containing spaces
   is untested — verify at install if your home dir has one.
