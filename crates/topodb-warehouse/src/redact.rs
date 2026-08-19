@@ -227,7 +227,11 @@ mod tests {
 
     #[test]
     fn replacement_records_length_and_counts_per_class() {
-        let o = redact(concat!("a=AKIA", "IOSFODNN7EXAMPLE b=AKIA", "IOSFODNN7EXAMPLE"));
+        let o = redact(concat!(
+            "a=AKIA",
+            "IOSFODNN7EXAMPLE b=AKIA",
+            "IOSFODNN7EXAMPLE"
+        ));
         assert_eq!(classes(&o), vec![("aws".to_string(), 2)]);
         assert!(o.text.contains("«redacted:aws:20»"));
     }
