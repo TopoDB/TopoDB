@@ -19,6 +19,24 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - **Context warehouse** (`topodb-warehouse`, spec 2026-08-18): append-only, content-addressed log of raw session artifacts + mirrored engine ops under `<db>.warehouse/`; deterministic derive to `Artifact`/`Chunk` nodes with `evidence` lineage to memories; `rebuild` a redb from segments; hot/warm/cold/expired tiering; redaction. `topodb warehouse {status|drain|derive|tier|rebuild|verify|show}`; `[warehouse]` + `schedule.warehouse_*` in `.topodb.toml`; hygiene tasks drain (light), derive (heavy, daemon), tier (light); op-log compaction is clamped to the mirrored watermark; `db_info.warehouse`. Claude Code plugin: `warehouse-capture` PostToolUse hook + session/memory-write markers (`TOPODB_WAREHOUSE=0`, `TOPODB_WAREHOUSE_DIR`).
 - `topodb-json`: stock text index now includes `(Chunk, text)`; the previous stock default upgrades automatically.
 
+### Cursor plugin (`plugins/cursor`, 0.1.0)
+- New Cursor plugin with the seamless memory tier: daemon-backed `topodb` MCP
+  server (npm-bootstrapped, no Rust), chat-start recall injection, episode
+  capture, context-warehouse capture, once-per-session stop nudge, rules nudge,
+  `topodb-memory` skill, `/recall` and `/remember`. Installable from this repo's
+  root `.cursor-plugin/marketplace.json`.
+- Shares the database, scopes and daemon with the Claude Code plugin when both
+  are installed (data dir: `TOPODB_PLUGIN_DATA` → `CLAUDE_PLUGIN_DATA` →
+  `~/.claude/plugins/data/topodb-topodb/` if present → `~/.topodb/plugin-data/`).
+- Known gaps: no subagent recall injection in Cursor; multi-root workspaces use
+  the first root.
+
+### Plugin core (`plugins/core`)
+- Client-agnostic plugin code extracted into `plugins/core` and vendored into
+  each plugin by `scripts/sync-plugin-core.mjs` (drift-checked in CI). Claude
+  Code plugin 0.1.9: internal restructure only. Spool events now carry
+  `harness: "claude-code" | "cursor"`; episodes carry `usage_judged`.
+
 ---
 
 ## `topodb` (engine)
