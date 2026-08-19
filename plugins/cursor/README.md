@@ -30,11 +30,11 @@ All hook-driven, all failing silently to "nothing happens", never blocking:
   `Grep`/`Glob`/`WebFetch` results are spooled raw under `memory.warehouse/`
   next to the db; the daemon's hygiene tick drains, redacts, and derives
   `Artifact`/`Chunk` nodes (`topodb warehouse status`). `TOPODB_WAREHOUSE=0`
-  turns just this off.
+  turns just this off (`TOPODB_RECORDING=0` turns everything off).
 - **Episode capture** (`afterMCPExecution` + `sessionEnd`): what
   `search_memories`/`traverse`/`recent_memories` returned and which of it the
   session used, written as an `Episode` at session end. `TOPODB_RECORDING=0`
-  turns episode capture and the stop nudge off.
+  turns episode capture, the stop nudge, and warehouse capture off.
 - **Stop nudge** (`stop`): once per substantive session (≥5 tool calls, no
   memory written yet) a follow-up asks the agent to `remember` durable facts.
   `TOPODB_CAPTURE_NUDGE=0` turns only this off.
