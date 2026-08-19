@@ -1,0 +1,15 @@
+import { offSwitch } from "../hook-io.js";
+export const SUBSTANTIVE_MIN_TOOLS = 5;
+export const NUDGE_TEXT =
+  "This session may have produced durable facts, decisions, or lessons. Before finishing, save anything worth keeping across sessions with the `remember` tool (project scope by default; `shared` if it generalizes), and `supersede` any memory this session made outdated. If nothing durable came out of this session, just stop — do not save trivia or restate what is already in memory.";
+/** Client-agnostic half of "should we nudge?". Clients add their own checks
+ *  (subagent? plan mode? stop status?) before calling this. */
+export function nudgeGate({ dataDir, env, sessionId, state, toolUses }) {
+  if (!dataDir) return false;
+  if (offSwitch(env?.TOPODB_RECORDING) || offSwitch(env?.TOPODB_CAPTURE_NUDGE)) return false;
+  if (!sessionId) return false;
+  if (state?.nudged === true) return false;
+  if (state?.captured === true) return false;
+  if (!(toolUses >= SUBSTANTIVE_MIN_TOOLS)) return false;
+  return true;
+}

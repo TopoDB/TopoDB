@@ -213,7 +213,7 @@ export function toRetrievalRecord(tool, args, result) {
  * through as an additional Episode prop — additive, so pi's schema readers
  * tolerate it. */
 export function buildEpisodeBatch(args) {
-  const { state, outcome, failure, endedAt, used, reason = "" } = args;
+  const { state, outcome, failure, endedAt, used, reason = "", usageJudged = true } = args;
   const cmds = [
     {
       op: "create_node",
@@ -229,6 +229,7 @@ export function buildEpisodeBatch(args) {
         confidence: 0.5,
         failure,
         reason,
+        usage_judged: usageJudged,
       },
     },
   ];

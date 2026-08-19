@@ -96,7 +96,7 @@ test("buildEpisodeBatch emits pi's exact vocabulary", () => {
     label: "Episode",
     props: {
       goal: "", strategy: "", outcome: "success", started_at: 100, ended_at: 200,
-      turns: 1, tokens: 0, confidence: 0.5, failure: "", reason: "other",
+      turns: 1, tokens: 0, confidence: 0.5, failure: "", reason: "other", usage_judged: true,
     },
   });
   assert.deepEqual(cmds[1], { op: "create_node", label: "RetrievalEvent", props: { query: "q", at: 5 } });
