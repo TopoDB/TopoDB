@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "topodb": { "command": "node", "args": ["${CURSOR_PLUGIN_ROOT}/launch.js"] }
+  }
+}

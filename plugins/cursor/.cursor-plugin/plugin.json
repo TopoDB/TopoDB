@@ -1,0 +1,18 @@
+{
+  "name": "topodb",
+  "displayName": "topodb memory",
+  "version": "0.1.0",
+  "description": "Persistent agent memory: a temporal property graph, scoped per project with a shared layer for lessons that generalize. Recall injected at chat start; episodes and raw context captured automatically.",
+  "author": { "name": "TopoDB" },
+  "homepage": "https://github.com/TopoDB/TopoDB",
+  "repository": "https://github.com/TopoDB/TopoDB",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["memory", "mcp", "graph", "recall"],
+  "category": "developer-tools",
+  "tags": ["memory", "mcp", "graph"],
+  "mcpServers": "./mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "rules": "./rules/",
+  "skills": "./skills/",
+  "commands": "./commands/"
+}
