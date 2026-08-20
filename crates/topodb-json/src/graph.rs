@@ -117,6 +117,143 @@ pub fn to_canonical_json(s: &GraphSnapshot) -> Result<String, String> {
     serde_json::to_string(s).map_err(|e| format!("serializing snapshot: {e}"))
 }
 
+pub fn to_dot(s: &GraphSnapshot) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "digraph topodb {{");
+    let _ = writeln!(out, "rankdir=LR;");
+    let _ = writeln!(out, "node [shape=box];");
+
+    if let Some(t) = &s.truncated {
+        let _ = writeln!(
+            out,
+            "label=\"truncated: {} nodes, {} edges dropped\"; labelloc=t;",
+            t.nodes_dropped, t.edges_dropped
+        );
+    }
+
+    // Iterate over nodes (already sorted)
+    for node in &s.nodes {
+        let title_escaped = escape_dot_label(&node.title);
+        let label = if s.scopes.len() > 1 {
+            format!("{}\n{}\n{}", node.label, title_escaped, node.scope)
+        } else {
+            format!("{}\n{}", node.label, title_escaped)
+        };
+
+        let style = if node.superseded {
+            ", style=dashed"
+        } else {
+            ""
+        };
+
+        let _ = writeln!(out, "\"{}\" [label=\"{}\"]{}", node.id, label, style);
+    }
+
+    // Iterate over edges (already sorted)
+    for edge in &s.edges {
+        let _ = writeln!(
+            out,
+            "\"{}\" -> \"{}\" [label=\"{}\"]",
+            edge.from, edge.to, edge.ty
+        );
+    }
+
+    let _ = writeln!(out, "}}");
+    out
+}
+
+pub fn to_mermaid(s: &GraphSnapshot) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "graph TD");
+
+    // Create a mapping from node id to index
+    let mut id_to_index = std::collections::BTreeMap::new();
+    for (idx, node) in s.nodes.iter().enumerate() {
+        id_to_index.insert(node.id.clone(), idx);
+    }
+
+    if let Some(t) = &s.truncated {
+        let _ = writeln!(
+            out,
+            "  %% truncated: {} nodes, {} edges dropped",
+            t.nodes_dropped, t.edges_dropped
+        );
+    }
+
+    // Iterate over nodes (already sorted)
+    let mut has_superseded = false;
+    for (idx, node) in s.nodes.iter().enumerate() {
+        let title_sanitized = sanitize_mermaid_label(&node.title);
+        let superseded_class = if node.superseded {
+            has_superseded = true;
+            ":::superseded"
+        } else {
+            ""
+        };
+
+        let _ = writeln!(
+            out,
+            "  n{}[\"{}{}\"]{}\n",
+            idx, node.label, title_sanitized, superseded_class
+        );
+    }
+
+    // Emit truncation node if needed
+    if let Some(t) = &s.truncated {
+        let trunc_text = sanitize_mermaid_label(&format!(
+            "⚠ truncated: {} nodes, {} edges dropped",
+            t.nodes_dropped, t.edges_dropped
+        ));
+        let _ = writeln!(out, "  trunc[\"{}\"]", trunc_text);
+    }
+
+    // Iterate over edges (already sorted)
+    for edge in &s.edges {
+        if let (Some(&from_idx), Some(&to_idx)) =
+            (id_to_index.get(&edge.from), id_to_index.get(&edge.to))
+        {
+            let _ = writeln!(out, "  n{} -->|{}| n{}", from_idx, edge.ty, to_idx);
+        }
+    }
+
+    // Emit classDef superseded only if needed
+    if has_superseded {
+        let _ = writeln!(out, "classDef superseded opacity:0.45;");
+    }
+
+    out
+}
+
+fn escape_dot_label(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => result.push_str("\\\\"),
+            '"' => result.push_str("\\\""),
+            '\n' => result.push_str("\\n"),
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+fn sanitize_mermaid_label(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("#quot;"),
+            '[' => result.push('('),
+            ']' => result.push(')'),
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
 /// Parameters for ego snapshot building.
 #[derive(Clone, Debug)]
 pub struct EgoParams {
@@ -734,5 +871,81 @@ mod tests {
                 edge.to
             );
         }
+    }
+
+    fn tiny_snap(superseded: bool, truncated: bool) -> GraphSnapshot {
+        GraphSnapshot {
+            snapshot_version: GRAPH_SNAPSHOT_VERSION,
+            db_path: None,
+            op_seq: 1,
+            scopes: vec!["shared".into()],
+            view: GraphView {
+                kind: "scope".into(),
+                seeds: vec![],
+                query: None,
+                hops: 0,
+                as_of: None,
+                time_axis: "valid".into(),
+                direction: "out".into(),
+            },
+            truncated: truncated.then_some(GraphTruncation {
+                nodes_dropped: 2,
+                edges_dropped: 3,
+            }),
+            nodes: vec![
+                GraphNode {
+                    id: "01A".into(),
+                    label: "Memory".into(),
+                    title: "say \"hi\"".into(),
+                    scope: "shared".into(),
+                    superseded,
+                    hop: 0,
+                },
+                GraphNode {
+                    id: "01B".into(),
+                    label: "Entity".into(),
+                    title: "Bob".into(),
+                    scope: "shared".into(),
+                    superseded: false,
+                    hop: 0,
+                },
+            ],
+            edges: vec![GraphEdge {
+                from: "01A".into(),
+                to: "01B".into(),
+                ty: "ABOUT".into(),
+                scope: "shared".into(),
+                valid_from: 1,
+                valid_to: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn dot_escapes_and_marks_superseded_and_truncation() {
+        let d = to_dot(&tiny_snap(true, true));
+        assert!(d.starts_with("digraph topodb {"));
+        assert!(d.contains("say \\\"hi\\\""));
+        assert!(d.contains("style=dashed"));
+        assert!(d.contains("truncated: 2 nodes, 3 edges dropped"));
+        assert!(d.contains("\"01A\" -> \"01B\""));
+        assert!(!d.contains("\\nshared")); // single-scope snapshot elides scope lines (DOT uses the two-char \n escape)
+    }
+
+    #[test]
+    fn mermaid_sanitizes_ids_and_surfaces_truncation() {
+        let m = to_mermaid(&tiny_snap(false, true));
+        assert!(m.starts_with("graph TD"));
+        assert!(m.contains("n0[")); // sorted: 01A first
+        assert!(m.contains("n0 -->|ABOUT| n1"));
+        assert!(m.contains("#quot;"));
+        assert!(m.contains("truncated: 2 nodes, 3 edges dropped"));
+        assert!(!m.contains("01A[")); // raw ULIDs never used as mermaid ids
+    }
+
+    #[test]
+    fn mermaid_superseded_class_only_when_needed() {
+        assert!(to_mermaid(&tiny_snap(true, false)).contains("classDef superseded"));
+        assert!(!to_mermaid(&tiny_snap(false, false)).contains("classDef"));
     }
 }
