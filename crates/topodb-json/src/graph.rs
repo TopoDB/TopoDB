@@ -359,10 +359,6 @@ pub fn build_scope(
             .edges_to(scopes, *node_id, None, None, true, topodb::TimeAxis::Valid)
             .map_err(|e| format!("edges_to: {e}"))?;
         for edge in edges_in {
-            // Only count if the source (other endpoint from the destination perspective) is dropped
-            if dropped_ids.contains(&edge.from) {
-                edges_dropped += 1;
-            }
             all_edges.push(edge);
         }
     }
@@ -670,8 +666,10 @@ mod tests {
         assert_eq!(snap.nodes.len(), 2);
         let t = snap.truncated.expect("truncation must be recorded");
         assert_eq!(t.nodes_dropped, 1);
-        // the chain a->b->c loses at least one internal edge whichever node drops
-        assert!(t.edges_dropped >= 1);
+        assert_eq!(
+            t.edges_dropped, 1,
+            "a->b is the only dropped-adjacent edge and must be counted exactly once"
+        );
     }
 
     #[test]
