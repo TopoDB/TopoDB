@@ -371,24 +371,26 @@ pub fn build_scope(
     let mut seen_edges: HashSet<topodb::EdgeId> = HashSet::new();
     all_edges.retain(|e| seen_edges.insert(e.id));
 
-    // 5. Filter edges: keep only those whose `to` is also in kept_ids
+    // 5. Filter edges: keep only those with both endpoints in kept_ids
     let filtered_edges: Vec<topodb::EdgeRecord> = all_edges
         .into_iter()
         .filter(|e| {
-            if kept_ids.contains(&e.to) {
-                true
-            } else {
-                // Edge goes to a dropped node (from edges_from calls)
-                if dropped_ids.contains(&e.to) && kept_ids.contains(&e.from) {
-                    edges_dropped += 1;
-                }
+            if kept_ids.contains(&e.from) && kept_ids.contains(&e.to) {
+                true // both endpoints kept: render it
+            } else if kept_ids.contains(&e.from) && dropped_ids.contains(&e.to) {
+                edges_dropped += 1; // kept -> dropped
                 false
+            } else if kept_ids.contains(&e.to) && dropped_ids.contains(&e.from) {
+                edges_dropped += 1; // dropped -> kept
+                false
+            } else {
+                false // dropped <-> dropped: not counted (documented non-exhaustive)
             }
         })
         .collect();
 
     // 6. Sort edges: by raw edge id first, then stable (from, to, ty)
-    let mut edges_raw = filtered_edges.clone();
+    let mut edges_raw = filtered_edges;
     edges_raw.sort_by_key(|a| a.id);
     let mut edges: Vec<GraphEdge> = edges_raw.iter().map(graph_edge).collect();
     edges.sort_by(|a, b| {
@@ -693,5 +695,46 @@ mod tests {
         let e1 = to_canonical_json(&build_ego(&db, &scopes, &p).unwrap()).unwrap();
         let e2 = to_canonical_json(&build_ego(&db, &scopes, &p).unwrap()).unwrap();
         assert_eq!(e1, e2);
+    }
+
+    #[test]
+    fn scope_view_edges_are_closed_over_rendered_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = seed_chain(&dir);
+        let scopes = crate::scope_to_scope_set(Scope::Shared);
+
+        // Test with limit 2 (truncated)
+        let snap = build_scope(&db, &scopes, 2).unwrap();
+        let node_ids: std::collections::HashSet<_> =
+            snap.nodes.iter().map(|n| n.id.clone()).collect();
+        for edge in &snap.edges {
+            assert!(
+                node_ids.contains(&edge.from),
+                "edge from {} not in rendered nodes",
+                edge.from
+            );
+            assert!(
+                node_ids.contains(&edge.to),
+                "edge to {} not in rendered nodes",
+                edge.to
+            );
+        }
+
+        // Test with limit 500 (all nodes)
+        let snap = build_scope(&db, &scopes, 500).unwrap();
+        let node_ids: std::collections::HashSet<_> =
+            snap.nodes.iter().map(|n| n.id.clone()).collect();
+        for edge in &snap.edges {
+            assert!(
+                node_ids.contains(&edge.from),
+                "edge from {} not in rendered nodes",
+                edge.from
+            );
+            assert!(
+                node_ids.contains(&edge.to),
+                "edge to {} not in rendered nodes",
+                edge.to
+            );
+        }
     }
 }
