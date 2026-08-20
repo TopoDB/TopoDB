@@ -4680,3 +4680,76 @@ fn warehouse_status_drain_derive_rebuild_verify_roundtrip() {
     let sh = run(&["warehouse", "show", "b3:nope"]);
     assert_eq!(sh.status.code(), Some(2));
 }
+
+#[test]
+fn graph_exports_ego_scope_and_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("g.redb");
+    let run = |args: &[&str]| {
+        let out = bin().arg("--db").arg(&db).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let ent: serde_json::Value =
+        serde_json::from_str(&run(&["create-entity", "--name", "GraphTest"])).unwrap();
+    let mem: serde_json::Value =
+        serde_json::from_str(&run(&["create-memory", "--content", "graph export works"])).unwrap();
+    let (eid, mid) = (
+        ent["id"].as_str().unwrap().to_string(),
+        mem["id"].as_str().unwrap().to_string(),
+    );
+    run(&["link", "--from", &mid, "--to", &eid, "--type", "ABOUT"]);
+
+    // ego
+    let snap: serde_json::Value = serde_json::from_str(&run(&["graph", "--seed", &mid])).unwrap();
+    assert_eq!(snap["view"]["kind"], "ego");
+    assert_eq!(snap["nodes"].as_array().unwrap().len(), 2);
+    // scope (no seed)
+    let snap: serde_json::Value = serde_json::from_str(&run(&["graph"])).unwrap();
+    assert_eq!(snap["view"]["kind"], "scope");
+    // dot + mermaid to stdout
+    assert!(run(&["graph", "--graph-format", "dot"]).starts_with("digraph topodb"));
+    assert!(run(&["graph", "--graph-format", "mermaid"]).starts_with("graph TD"));
+    // html requires --out
+    let out = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["graph", "--graph-format", "html"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    // html with --out writes a self-contained file
+    let html_path = dir.path().join("g.html");
+    run(&[
+        "graph",
+        "--graph-format",
+        "html",
+        "--out",
+        html_path.to_str().unwrap(),
+    ]);
+    let html = std::fs::read_to_string(&html_path).unwrap();
+    assert!(html.contains("id=\"snapshot\""));
+    assert!(!html.contains("https://"));
+}
+
+#[test]
+fn graph_seed_and_query_both_absent_uses_scope_view_but_bad_seed_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("g2.redb");
+    let out = bin()
+        .arg("--db")
+        .arg(&db)
+        .args(["graph", "--seed", "not-a-ulid"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    // `output::fail` writes the error envelope to stderr, not stdout
+    // (confirmed by the other rejected-exit-2 tests in this file).
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "rejected");
+}
