@@ -47,6 +47,7 @@ pub use op::Op;
 pub use props::{PropValue, Props};
 pub use read::{Direction, Subgraph, TimeAxis, TraversalQuery, ValidInterval};
 pub use recall::RecallQuery;
+pub use smol_str::SmolStr;
 pub use state::{EdgeRecord, NodeRecord};
 pub use storage::AppliedBatch;
 #[doc(hidden)]
