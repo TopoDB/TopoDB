@@ -58,7 +58,7 @@ pub struct TopoServer {
     default_scopes: ScopeSet,
     /// The same default read set as `default_scopes`, kept as `ReadScopes`:
     /// `iter_scopes` is now public, but the `ReadScopes` list is still used for
-    /// rendering order and labels in `db_info` (Finding 2).
+    /// rendering order and labels in `db_info`.
     default_read_scopes: ReadScopes,
     /// Rendered db path, reported by `db_info`.
     db_path: String,

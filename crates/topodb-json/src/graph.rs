@@ -120,7 +120,7 @@ pub fn to_canonical_json(s: &GraphSnapshot) -> Result<String, String> {
 const GRAPH_HTML_TEMPLATE: &str = include_str!("../assets/graph.html");
 
 /// Self-contained interactive HTML: the canonical JSON is embedded verbatim
-/// (with `<` escaped as `<` to make a literal `</script>` breakout
+/// (with `<` escaped as `\u003c` to make a literal `</script>` breakout
 /// impossible) inside `assets/graph.html`, a vanilla-JS force-layout viewer.
 pub fn to_html(s: &GraphSnapshot) -> Result<String, String> {
     let json = to_canonical_json(s)?;
@@ -172,10 +172,11 @@ pub fn to_dot(s: &GraphSnapshot) -> String {
 
     // Iterate over edges (already sorted)
     for edge in &s.edges {
+        let ty_escaped = escape_dot_label(&edge.ty);
         let _ = writeln!(
             out,
             "\"{}\" -> \"{}\" [label=\"{}\"]",
-            edge.from, edge.to, edge.ty
+            edge.from, edge.to, ty_escaped
         );
     }
 
@@ -206,6 +207,7 @@ pub fn to_mermaid(s: &GraphSnapshot) -> String {
     // Iterate over nodes (already sorted)
     let mut has_superseded = false;
     for (idx, node) in s.nodes.iter().enumerate() {
+        let label_sanitized = sanitize_mermaid_label(&node.label);
         let title_sanitized = sanitize_mermaid_label(&node.title);
         let superseded_class = if node.superseded {
             has_superseded = true;
@@ -217,7 +219,7 @@ pub fn to_mermaid(s: &GraphSnapshot) -> String {
         let _ = writeln!(
             out,
             "  n{}[\"{}: {}\"]{}",
-            idx, node.label, title_sanitized, superseded_class
+            idx, label_sanitized, title_sanitized, superseded_class
         );
     }
 
@@ -235,7 +237,7 @@ pub fn to_mermaid(s: &GraphSnapshot) -> String {
         if let (Some(&from_idx), Some(&to_idx)) =
             (id_to_index.get(&edge.from), id_to_index.get(&edge.to))
         {
-            let ty = edge.ty.replace('|', "");
+            let ty = edge.ty.replace(['|', '"'], "");
             let _ = writeln!(out, "  n{} -->|{}| n{}", from_idx, ty, to_idx);
         }
     }
@@ -289,11 +291,7 @@ pub struct EgoParams {
 
 /// Compute hop distances from seeds via undirected BFS over edges.
 /// Returns a map of node id → hop distance.
-fn hops_from(
-    seeds: &[String],
-    edges: &[GraphEdge],
-    _node_ids: &[String],
-) -> std::collections::BTreeMap<String, u32> {
+fn hops_from(seeds: &[String], edges: &[GraphEdge]) -> std::collections::BTreeMap<String, u32> {
     use std::collections::{BTreeMap, HashSet, VecDeque};
 
     let mut hops: BTreeMap<String, u32> = BTreeMap::new();
@@ -389,8 +387,7 @@ pub fn build_ego(
     // Compute hops
     let edges_for_bfs: Vec<GraphEdge> = subgraph.edges.iter().map(graph_edge).collect();
 
-    let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
-    let hops_map = hops_from(&seeds_str_vec, &edges_for_bfs, &node_ids);
+    let hops_map = hops_from(&seeds_str_vec, &edges_for_bfs);
 
     for node in &mut nodes {
         node.hop = *hops_map.get(&node.id).unwrap_or(&(p.max_hops as u32));
@@ -992,6 +989,50 @@ mod tests {
         assert!(m.contains("truncated: 2 nodes, 3 edges dropped"));
         assert!(!m.contains("01A[")); // raw ULIDs never used as mermaid ids
         assert!(m.contains("n0[\"Memory: ")); // Label: title separator
+
+        // Test node label sanitization: label with `"` and `[` must be sanitized
+        let mut snap = tiny_snap(false, false);
+        snap.nodes[0].label = "Memory[bad]\"label".into();
+        let m = to_mermaid(&snap);
+        // Sanitized form should appear: [ → (, ] → ), " → #quot;
+        assert!(
+            m.contains("Memory(bad)#quot;label"),
+            "sanitized label should appear in output"
+        );
+        // Raw form should NOT appear
+        assert!(
+            !m.contains("[\"bad\"label"),
+            "raw label with quotes and brackets should not appear"
+        );
+        assert!(
+            !m.contains("Memory[bad]\"label"),
+            "unsanitized label should not appear"
+        );
+    }
+
+    #[test]
+    fn dot_and_mermaid_escape_edge_types() {
+        let mut snap = tiny_snap(false, false);
+        snap.edges[0].ty = "he\"llo|x".into();
+
+        // Test dot escaping: `"` should be escaped as `\"`
+        let d = to_dot(&snap);
+        assert!(
+            d.contains("he\\\"llo|x"),
+            "dot should escape quotes in edge types"
+        );
+
+        // Test mermaid stripping: both `"` and `|` should be removed
+        let m = to_mermaid(&snap);
+        assert!(
+            m.contains("-->|hellox|"),
+            "mermaid should strip pipes and quotes from edge types"
+        );
+        // Verify raw form is not present
+        assert!(
+            !m.contains("-->|he\"llo|x|"),
+            "mermaid should not contain raw quotes or pipes in edge label"
+        );
     }
 
     #[test]
