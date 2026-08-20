@@ -35,7 +35,7 @@
   }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   #app { position: relative; width: 100%; height: 100vh; overflow: hidden; }
-  #canvas { position: absolute; inset: 0; background: var(--canvas-bg); cursor: grab; touch-action: none; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: var(--canvas-bg); cursor: grab; touch-action: none; }
   #canvas.dragging { cursor: grabbing; }
 
   header {
@@ -142,14 +142,18 @@
   var pos = {};
   data.nodes.forEach(function (n, i) {
     var a = (i / Math.max(N, 1)) * Math.PI * 2;
-    var r = 200 + rand() * 40;
+    var r = 40 * Math.sqrt(Math.max(N, 1)) + rand() * 40;
     pos[n.id] = { x: Math.cos(a) * r + (rand() - 0.5) * 20, y: Math.sin(a) * r + (rand() - 0.5) * 20 };
   });
   var idIndex = {};
   data.nodes.forEach(function (n, i) { idIndex[n.id] = i; });
   var edgeList = data.edges.filter(function (e) { return idIndex[e.from] !== undefined && idIndex[e.to] !== undefined; });
 
-  var REPEL_K = 6000, SPRING_LEN = 120, SPRING_K = 0.02, CENTER_K = 0.002;
+  // Fruchterman-Reingold-style cooling: cap per-tick displacement by a
+  // decaying temperature, so the sim settles instead of oscillating, and
+  // isolated nodes can't rocket to the huge repulsion/centering equilibrium.
+  var REPEL_K = 20000, SPRING_LEN = 140, SPRING_K = 0.03, CENTER_K = 0.01;
+  var temp = 40;
   for (var tick = 0; tick < 300; tick++) {
     var force = {};
     data.nodes.forEach(function (n) { force[n.id] = { x: 0, y: 0 }; });
@@ -177,9 +181,13 @@
     data.nodes.forEach(function (n) {
       force[n.id].x -= pos[n.id].x * CENTER_K;
       force[n.id].y -= pos[n.id].y * CENTER_K;
-      pos[n.id].x += force[n.id].x;
-      pos[n.id].y += force[n.id].y;
+      var fx = force[n.id].x, fy = force[n.id].y;
+      var mag = Math.sqrt(fx * fx + fy * fy) || 1;
+      var step = Math.min(mag, temp);
+      pos[n.id].x += (fx / mag) * step;
+      pos[n.id].y += (fy / mag) * step;
     });
+    temp = Math.max(temp * 0.985, 1);
   }
 
   // --- hop reveal (ego views only) ---
@@ -329,6 +337,21 @@
     panel.classList.add('open');
   }
 
+  // Fit the whole layout into the viewport on load (canvas is a replaced
+  // element, so it must be sized by CSS width/height:100%, not inset alone).
+  (function fitView() {
+    var xs = [], ys = [];
+    data.nodes.forEach(function (n) { var p = pos[n.id]; if (p) { xs.push(p.x); ys.push(p.y); } });
+    if (!xs.length) return;
+    var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+    var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+    var w = Math.max(maxX - minX, 1), h = Math.max(maxY - minY, 1);
+    var vw = canvas.clientWidth || window.innerWidth, vh = canvas.clientHeight || window.innerHeight;
+    view.scale = Math.min((vw - 120) / w, (vh - 140) / h, 1.5);
+    if (!(view.scale > 0)) { view.scale = 1; }
+    view.x = -(minX + maxX) / 2;
+    view.y = -(minY + maxY) / 2;
+  })();
   resize();
 })();
 </script>
