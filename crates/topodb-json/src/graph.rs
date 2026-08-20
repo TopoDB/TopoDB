@@ -288,6 +288,150 @@ pub fn build_ego(
     })
 }
 
+/// Build a scope-view snapshot: all entities and memories in the scope,
+/// truncated to `limit` (keeping newest-first by ULID, recording honest
+/// dropout counts). All nodes have hop: 0. View is marked "scope" with
+/// empty seeds and query.
+pub fn build_scope(
+    db: &topodb::Db,
+    scopes: &topodb::ScopeSet,
+    limit: usize,
+) -> Result<GraphSnapshot, String> {
+    use std::collections::{BTreeSet, HashSet};
+
+    // 1. Collect nodes from both ENTITY_LABEL and MEMORY_LABEL (unbumped)
+    let mut all_nodes = db
+        .nodes_by_label_unbumped(scopes, crate::ENTITY_LABEL)
+        .into_iter()
+        .chain(db.nodes_by_label_unbumped(scopes, crate::MEMORY_LABEL))
+        .collect::<Vec<_>>();
+
+    // 2. Track which nodes are kept/dropped
+    let nodes_dropped = if all_nodes.len() > limit {
+        all_nodes.len() - limit
+    } else {
+        0
+    };
+
+    let mut kept_ids: BTreeSet<topodb::NodeId> = BTreeSet::new();
+    let mut dropped_ids: HashSet<topodb::NodeId> = HashSet::new();
+
+    if all_nodes.len() > limit {
+        // Sort descending (newest first, ULIDs are time-ordered)
+        all_nodes.sort_by_key(|n| std::cmp::Reverse(n.id));
+        // Keep the limit
+        let kept = all_nodes.drain(..limit).collect::<Vec<_>>();
+        // Remaining are dropped
+        for n in all_nodes.iter() {
+            dropped_ids.insert(n.id);
+        }
+        for n in kept.iter() {
+            kept_ids.insert(n.id);
+        }
+        all_nodes = kept;
+    } else {
+        for n in all_nodes.iter() {
+            kept_ids.insert(n.id);
+        }
+    }
+
+    // Re-sort kept nodes ascending for output (like build_ego does)
+    all_nodes.sort_by_key(|n| n.id);
+
+    // 3. Convert nodes and set hop to 0
+    let mut nodes: Vec<GraphNode> = all_nodes.iter().map(|n| graph_node(n, 0)).collect();
+    nodes.sort_by_key(|a| a.id.clone());
+
+    // 4. Collect edges: outgoing from kept nodes
+    let mut edges_dropped = 0;
+    let mut all_edges: Vec<topodb::EdgeRecord> = Vec::new();
+
+    for node_id in kept_ids.iter() {
+        let edges_out = db
+            .edges_from(scopes, *node_id, None, None, true, topodb::TimeAxis::Valid)
+            .map_err(|e| format!("edges_from: {e}"))?;
+        all_edges.extend(edges_out);
+    }
+
+    // Also check for edges pointing TO kept nodes from dropped nodes
+    for node_id in kept_ids.iter() {
+        let edges_in = db
+            .edges_to(scopes, *node_id, None, None, true, topodb::TimeAxis::Valid)
+            .map_err(|e| format!("edges_to: {e}"))?;
+        for edge in edges_in {
+            // Only count if the source (other endpoint from the destination perspective) is dropped
+            if dropped_ids.contains(&edge.from) {
+                edges_dropped += 1;
+            }
+            all_edges.push(edge);
+        }
+    }
+
+    // Deduplicate edges by id to handle edges that appear in both from and to queries
+    let mut seen_edges: HashSet<topodb::EdgeId> = HashSet::new();
+    all_edges.retain(|e| seen_edges.insert(e.id));
+
+    // 5. Filter edges: keep only those whose `to` is also in kept_ids
+    let filtered_edges: Vec<topodb::EdgeRecord> = all_edges
+        .into_iter()
+        .filter(|e| {
+            if kept_ids.contains(&e.to) {
+                true
+            } else {
+                // Edge goes to a dropped node (from edges_from calls)
+                if dropped_ids.contains(&e.to) && kept_ids.contains(&e.from) {
+                    edges_dropped += 1;
+                }
+                false
+            }
+        })
+        .collect();
+
+    // 6. Sort edges: by raw edge id first, then stable (from, to, ty)
+    let mut edges_raw = filtered_edges.clone();
+    edges_raw.sort_by_key(|a| a.id);
+    let mut edges: Vec<GraphEdge> = edges_raw.iter().map(graph_edge).collect();
+    edges.sort_by(|a, b| {
+        a.from
+            .cmp(&b.from)
+            .then_with(|| a.to.cmp(&b.to))
+            .then_with(|| a.ty.cmp(&b.ty))
+    });
+
+    // 7. Get op_seq and scopes
+    let op_seq = db.current_seq().map_err(|e| format!("current_seq: {e}"))?;
+    let scope_labels: Vec<String> = scopes.iter_scopes().map(|s| scope_label(&s)).collect();
+
+    // 8. Build truncation info (only if something was dropped)
+    let truncated = if nodes_dropped > 0 || edges_dropped > 0 {
+        Some(GraphTruncation {
+            nodes_dropped,
+            edges_dropped,
+        })
+    } else {
+        None
+    };
+
+    Ok(GraphSnapshot {
+        snapshot_version: GRAPH_SNAPSHOT_VERSION,
+        db_path: None,
+        op_seq,
+        scopes: scope_labels,
+        view: GraphView {
+            kind: "scope".to_string(),
+            seeds: vec![],
+            query: None,
+            hops: 0,
+            as_of: None,
+            time_axis: "valid".to_string(),
+            direction: "out".to_string(),
+        },
+        truncated,
+        nodes,
+        edges,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +645,53 @@ mod tests {
         assert_eq!(a, b);
         let back: GraphSnapshot = serde_json::from_str(&a).unwrap();
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn scope_view_includes_all_nodes_and_internal_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = seed_chain(&dir);
+        let scopes = crate::scope_to_scope_set(Scope::Shared);
+        let snap = build_scope(&db, &scopes, GRAPH_DEFAULT_LIMIT).unwrap();
+        assert_eq!(snap.nodes.len(), 3);
+        assert_eq!(snap.edges.len(), 2);
+        assert_eq!(snap.view.kind, "scope");
+        assert!(snap.truncated.is_none());
+    }
+
+    #[test]
+    fn scope_view_truncates_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = seed_chain(&dir);
+        let scopes = crate::scope_to_scope_set(Scope::Shared);
+        let snap = build_scope(&db, &scopes, 2).unwrap();
+        assert_eq!(snap.nodes.len(), 2);
+        let t = snap.truncated.expect("truncation must be recorded");
+        assert_eq!(t.nodes_dropped, 1);
+        // the chain a->b->c loses at least one internal edge whichever node drops
+        assert!(t.edges_dropped >= 1);
+    }
+
+    #[test]
+    fn exports_are_byte_identical_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, [a, ..]) = seed_chain(&dir);
+        let scopes = crate::scope_to_scope_set(Scope::Shared);
+        let s1 = to_canonical_json(&build_scope(&db, &scopes, 500).unwrap()).unwrap();
+        let s2 = to_canonical_json(&build_scope(&db, &scopes, 500).unwrap()).unwrap();
+        assert_eq!(s1, s2);
+        let p = EgoParams {
+            seeds: vec![a],
+            query: None,
+            query_k: 3,
+            max_hops: 2,
+            direction: topodb::Direction::Both,
+            edge_types: None,
+            as_of: None,
+            time_axis: topodb::TimeAxis::Valid,
+        };
+        let e1 = to_canonical_json(&build_ego(&db, &scopes, &p).unwrap()).unwrap();
+        let e2 = to_canonical_json(&build_ego(&db, &scopes, &p).unwrap()).unwrap();
+        assert_eq!(e1, e2);
     }
 }
