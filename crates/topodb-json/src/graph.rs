@@ -135,7 +135,7 @@ pub struct EgoParams {
 fn hops_from(
     seeds: &[String],
     edges: &[GraphEdge],
-    node_ids: &[String],
+    _node_ids: &[String],
 ) -> std::collections::BTreeMap<String, u32> {
     use std::collections::{BTreeMap, HashSet, VecDeque};
 
@@ -155,11 +155,11 @@ fn hops_from(
     for edge in edges {
         adjacency
             .entry(edge.from.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(edge.to.clone());
         adjacency
             .entry(edge.to.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(edge.from.clone());
     }
 
@@ -175,11 +175,6 @@ fn hops_from(
                 }
             }
         }
-    }
-
-    // Set unreachable nodes (defensive) to max_hops
-    for node_id in node_ids {
-        hops.entry(node_id.clone()).or_insert(u32::MAX);
     }
 
     hops
@@ -232,22 +227,22 @@ pub fn build_ego(
         .iter()
         .map(|n| graph_node(n, 0)) // placeholder hop, will update
         .collect();
-    nodes.sort_by(|a, b| a.id.cmp(&b.id)); // Sort by id
+    nodes.sort_by_key(|a| a.id.clone()); // Sort by id
 
     // Compute hops
-    let edges_for_bfs: Vec<GraphEdge> = subgraph.edges.iter().map(|e| graph_edge(e)).collect();
+    let edges_for_bfs: Vec<GraphEdge> = subgraph.edges.iter().map(graph_edge).collect();
 
     let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let hops_map = hops_from(&seeds_str_vec, &edges_for_bfs, &node_ids);
 
     for node in &mut nodes {
-        node.hop = *hops_map.get(&node.id).unwrap_or(&u32::MAX);
+        node.hop = *hops_map.get(&node.id).unwrap_or(&(p.max_hops as u32));
     }
 
     // 4. Sort edges
     let mut edges_raw = subgraph.edges.clone();
-    edges_raw.sort_by(|a, b| a.id.cmp(&b.id)); // Sort EdgeRecords by id first
-    let mut edges: Vec<GraphEdge> = edges_raw.iter().map(|e| graph_edge(e)).collect();
+    edges_raw.sort_by_key(|a| a.id); // Sort EdgeRecords by id first
+    let mut edges: Vec<GraphEdge> = edges_raw.iter().map(graph_edge).collect();
     // Stable sort by (from, to, ty)
     edges.sort_by(|a, b| {
         a.from
