@@ -11,7 +11,7 @@ test("plugin.json is a valid Cursor manifest pointing at files that exist", () =
   const m = read(".cursor-plugin/plugin.json");
   assert.equal(m.name, "topodb");
   assert.match(m.version, /^\d+\.\d+\.\d+$/);
-  for (const k of ["mcpServers", "hooks", "rules", "skills", "commands"]) assert.ok(existsSync(path.join(ROOT, m[k])), `${k} → ${m[k]} missing`);
+  for (const k of ["mcpServers", "hooks", "rules", "skills", "commands", "logo"]) assert.ok(existsSync(path.join(ROOT, m[k])), `${k} → ${m[k]} missing`);
 });
 test("mcp.json launches node on the plugin's launch.js via ${CURSOR_PLUGIN_ROOT}", () => {
   const s = read("mcp.json").mcpServers.topodb;

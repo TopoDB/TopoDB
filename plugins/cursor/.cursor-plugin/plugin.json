@@ -10,6 +10,7 @@
   "keywords": ["memory", "mcp", "graph", "recall"],
   "category": "developer-tools",
   "tags": ["memory", "mcp", "graph"],
+  "logo": "assets/logo.png",
   "mcpServers": "./mcp.json",
   "hooks": "./hooks/hooks.json",
   "rules": "./rules/",

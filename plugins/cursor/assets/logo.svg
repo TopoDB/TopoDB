@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+     fill="none" role="img" aria-labelledby="topodb-mark-title">
+  <title id="topodb-mark-title">TopoDB</title>
+  <!-- Ridge-T. Three nodes trace a ridgeline; a stem drops from the summit to a root node,
+       closing the graph and forming the letter T. The summit carries the accent.
+       Peak = crossbar rise / half-span = 1.44 / 8.0 = 18%. Chosen by rasterising the mark
+       at true 16px across a peak sweep: above ~28% the arms droop and the glyph reads as an
+       anchor, not a letter. 18% keeps a visible summit at hero size and an unambiguous T in a tab.
+       Nodes and edges use #191C1F so mono and inverted cuts need no separate file.
+       Accent is overridable via the topodb-accent custom property when inlining. -->
+  <g stroke="#191C1F" stroke-width="1.9" stroke-linecap="round">
+    <path d="M4 6.54 12 5.1l8 1.44"/>
+    <path d="M12 5.1v14.2"/>
+  </g>
+  <circle cx="4"  cy="6.54" r="2.7" fill="#191C1F"/>
+  <circle cx="20" cy="6.54" r="2.7" fill="#191C1F"/>
+  <circle cx="12" cy="19.3" r="2.7" fill="#191C1F"/>
+  <circle cx="12" cy="5.1"  r="3.1" fill="#2E6F8E"/>
+</svg>

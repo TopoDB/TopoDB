@@ -1,6 +1,6 @@
 // hook-io.js — the boring, shared half of every hook script: stdin, JSON,
 // kill switches, the debug dump, and the "exit 0 no matter what" runner.
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export function readStdin() {
@@ -18,11 +18,19 @@ export function recordingDisabled(env) { return offSwitch(env.TOPODB_RECORDING);
 export function parseJson(raw) {
   try { const v = JSON.parse(raw); return v && typeof v === "object" && !Array.isArray(v) ? v : null; } catch { return null; }
 }
-/** Debug escape (TOPODB_HOOK_DEBUG=1): dump the raw stdin payload so a real
- *  session can pin the true hook payload shape. Best-effort — never throws. */
+/** The marker file that turns the debug dump on without touching the editor's
+ *  environment: `touch <dataDir>/HOOK_DEBUG`, reproduce, read episodes/debug-*.json,
+ *  then delete it. Editors spawn hooks with their own env, so the env switch
+ *  alone would force a relaunch-from-terminal to use. */
+export const HOOK_DEBUG_MARKER = "HOOK_DEBUG";
+/** Debug escape (TOPODB_HOOK_DEBUG=1 or the HOOK_DEBUG marker file): dump the
+ *  raw stdin payload so a real session can pin the true hook payload shape.
+ *  Dumps contain raw tool output (file contents) — opt-in only. Best-effort,
+ *  never throws. */
 export function debugDump({ dataDir, env, eventName, raw }) {
   try {
-    if (!env?.TOPODB_HOOK_DEBUG || !dataDir) return;
+    if (!dataDir) return;
+    if (!env?.TOPODB_HOOK_DEBUG && !existsSync(path.join(dataDir, HOOK_DEBUG_MARKER))) return;
     const dir = path.join(dataDir, "episodes");
     mkdirSync(dir, { recursive: true });
     const safe = String(eventName ?? "unknown").replace(/[^A-Za-z0-9_-]/g, "_");
