@@ -191,6 +191,14 @@ fn routed_reads_match_direct_output() {
         ("stats", vec!["stats", &mem]),
         ("lifecycle-candidates", vec!["lifecycle-candidates"]),
         ("traverse", vec!["traverse", &ent, "--max-hops", "2"]),
+        // `graph`'s daemon-routed path always requests `format: "json"` from
+        // `graph_snapshot` and deserializes straight into `GraphSnapshot`
+        // (see `Command::Graph` in `topodb-cli/src/main.rs`), so this proves
+        // the routed json format is byte-identical to the direct builder —
+        // `build_ego`/`to_canonical_json` already sort nodes/edges
+        // deterministically, so no special sorting is needed here (unlike
+        // `traverse`'s raw subgraph).
+        ("graph", vec!["graph", "--seed", &ent, "--max-hops", "1"]),
     ];
 
     // Direct outputs first (no daemon holds the lock yet).

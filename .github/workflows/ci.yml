@@ -13,8 +13,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Fail fast instead of burning the 6h default if a test wedges (e.g. a
     # client blocking on an unresponsive daemon over a pipe with no read
-    # deadline). A cold Windows build + full test run is comfortably under this.
-    timeout-minutes: 30
+    # deadline). Warm-cache Windows runs take ~22m as of 2026-08-20, so 30m no
+    # longer survives a cold cache (graph-export's first run was cancelled at
+    # the cap mid "sgh all features" with every test already green). 45m keeps
+    # the wedge protection with headroom for cold-cache branches.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

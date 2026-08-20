@@ -1,0 +1,357 @@
+<meta charset="utf-8">
+<title>__PAGE_TITLE__</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --panel-bg: #ffffff;
+    --ink: #1b1f24;
+    --ink-dim: #5b6470;
+    --rule: #d7dce2;
+    --accent: #2563eb;
+    --accent-dim: #93b4f5;
+    --warn-bg: #fff4e5;
+    --warn-ink: #8a4b00;
+    --canvas-bg: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c;
+      --panel-bg: #1b1f26;
+      --ink: #e6e9ee;
+      --ink-dim: #9aa4b2;
+      --rule: #2b313a;
+      --accent: #5b8ff5;
+      --accent-dim: #2f4a86;
+      --warn-bg: #3a2a10;
+      --warn-ink: #f0b96a;
+      --canvas-bg: #101317;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #app { position: relative; width: 100%; height: 100vh; overflow: hidden; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: var(--canvas-bg); cursor: grab; touch-action: none; }
+  #canvas.dragging { cursor: grabbing; }
+
+  header {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 3;
+    display: flex; align-items: center; gap: 0.75rem;
+    padding: 0.6rem 0.9rem;
+    background: var(--panel-bg);
+    border-bottom: 1px solid var(--rule);
+    font-size: 0.8rem; color: var(--ink-dim);
+  }
+  header .title { color: var(--ink); font-weight: 600; }
+  header .stat { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  #banner {
+    position: absolute; top: 2.6rem; left: 0.9rem; right: 0.9rem; z-index: 3;
+    background: var(--warn-bg); color: var(--warn-ink);
+    border: 1px solid var(--warn-ink);
+    border-radius: 4px;
+    padding: 0.4rem 0.7rem;
+    font-size: 0.8rem;
+    display: none;
+  }
+  #banner.show { display: block; }
+
+  #hopbar {
+    position: absolute; bottom: 0.9rem; left: 0.9rem; z-index: 3;
+    background: var(--panel-bg);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 0.5rem 0.8rem;
+    font-size: 0.75rem; color: var(--ink-dim);
+    display: none;
+    align-items: center; gap: 0.5rem;
+  }
+  #hopbar.show { display: flex; }
+  #hopbar input[type="range"] { width: 160px; }
+  #hopbar .hopval { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+
+  #panel {
+    position: absolute; top: 0; right: -320px; width: 300px; height: 100%;
+    background: var(--panel-bg); border-left: 1px solid var(--rule);
+    padding: 3rem 1rem 1rem 1rem;
+    font-size: 0.8rem; overflow-y: auto;
+    transition: right 0.15s ease-out;
+    z-index: 4;
+  }
+  #panel.open { right: 0; }
+  #panel h2 { font-size: 0.95rem; margin: 0 0 0.6rem 0; }
+  #panel .row { margin: 0.5rem 0; }
+  #panel .k { color: var(--ink-dim); text-transform: uppercase; font-size: 0.65rem; letter-spacing: 0.04em; }
+  #panel .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-word; }
+  #panel .close {
+    position: absolute; top: 0.6rem; right: 0.7rem;
+    background: none; border: none; color: var(--ink-dim);
+    font-size: 1rem; cursor: pointer; line-height: 1;
+  }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 0.6rem 0; }
+</style>
+<div id="app">
+  <header>
+    <span class="title">topodb graph</span>
+    <span class="stat" id="hdr-stat"></span>
+  </header>
+  <div id="banner"></div>
+  <canvas id="canvas"></canvas>
+  <div id="hopbar">
+    <span>hop ≤</span>
+    <input id="hop-range" type="range" min="0" max="0" value="0">
+    <span class="hopval mono" id="hop-val">0</span>
+  </div>
+  <div id="panel">
+    <button class="close" id="panel-close">✕</button>
+    <h2 id="p-title">—</h2>
+    <div class="row"><div class="k">id</div><div class="v mono" id="p-id"></div></div>
+    <div class="row"><div class="k">label</div><div class="v" id="p-label"></div></div>
+    <div class="row"><div class="k">scope</div><div class="v" id="p-scope"></div></div>
+    <hr>
+    <div class="row"><div class="k">superseded</div><div class="v" id="p-sup"></div></div>
+  </div>
+</div>
+<script id="snapshot" type="application/json">__SNAPSHOT_JSON__</script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById('snapshot').textContent);
+
+  // --- deterministic PRNG: FNV-1a seed over sorted node ids, mulberry32 ---
+  function fnv1a(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h; }
+  function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  var sortedIds = data.nodes.map(function (n) { return n.id; }).slice().sort();
+  var rand = mulberry32(fnv1a(sortedIds.join('')));
+
+  // --- truncation banner ---
+  var banner = document.getElementById('banner');
+  if (data.truncated) {
+    banner.textContent = '⚠ truncated: ' + data.truncated.nodes_dropped + ' nodes, ' +
+      data.truncated.edges_dropped + ' edges dropped — re-export with a higher --limit';
+    banner.classList.add('show');
+  }
+  document.getElementById('hdr-stat').textContent =
+    data.nodes.length + ' nodes / ' + data.edges.length + ' edges · ' + data.view.kind;
+
+  // --- force layout: circle init + jitter, 300 synchronous ticks ---
+  var N = data.nodes.length;
+  var pos = {};
+  data.nodes.forEach(function (n, i) {
+    var a = (i / Math.max(N, 1)) * Math.PI * 2;
+    var r = 40 * Math.sqrt(Math.max(N, 1)) + rand() * 40;
+    pos[n.id] = { x: Math.cos(a) * r + (rand() - 0.5) * 20, y: Math.sin(a) * r + (rand() - 0.5) * 20 };
+  });
+  var idIndex = {};
+  data.nodes.forEach(function (n, i) { idIndex[n.id] = i; });
+  var edgeList = data.edges.filter(function (e) { return idIndex[e.from] !== undefined && idIndex[e.to] !== undefined; });
+
+  // Fruchterman-Reingold-style cooling: cap per-tick displacement by a
+  // decaying temperature, so the sim settles instead of oscillating, and
+  // isolated nodes can't rocket to the huge repulsion/centering equilibrium.
+  var REPEL_K = 20000, SPRING_LEN = 140, SPRING_K = 0.03, CENTER_K = 0.01;
+  var temp = 40;
+  for (var tick = 0; tick < 300; tick++) {
+    var force = {};
+    data.nodes.forEach(function (n) { force[n.id] = { x: 0, y: 0 }; });
+    for (var i = 0; i < N; i++) {
+      for (var j = i + 1; j < N; j++) {
+        var a = data.nodes[i], b = data.nodes[j];
+        var dx = pos[a.id].x - pos[b.id].x, dy = pos[a.id].y - pos[b.id].y;
+        var d2 = dx * dx + dy * dy + 0.01;
+        var d = Math.sqrt(d2);
+        var f = REPEL_K / d2;
+        var fx = (dx / d) * f, fy = (dy / d) * f;
+        force[a.id].x += fx; force[a.id].y += fy;
+        force[b.id].x -= fx; force[b.id].y -= fy;
+      }
+    }
+    edgeList.forEach(function (e) {
+      var pa = pos[e.from], pb = pos[e.to];
+      var dx = pb.x - pa.x, dy = pb.y - pa.y;
+      var d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      var f = (d - SPRING_LEN) * SPRING_K;
+      var fx = (dx / d) * f, fy = (dy / d) * f;
+      force[e.from].x += fx; force[e.from].y += fy;
+      force[e.to].x -= fx; force[e.to].y -= fy;
+    });
+    data.nodes.forEach(function (n) {
+      force[n.id].x -= pos[n.id].x * CENTER_K;
+      force[n.id].y -= pos[n.id].y * CENTER_K;
+      var fx = force[n.id].x, fy = force[n.id].y;
+      var mag = Math.sqrt(fx * fx + fy * fy) || 1;
+      var step = Math.min(mag, temp);
+      pos[n.id].x += (fx / mag) * step;
+      pos[n.id].y += (fy / mag) * step;
+    });
+    temp = Math.max(temp * 0.985, 1);
+  }
+
+  // --- hop reveal (ego views only) ---
+  var maxHop = 0;
+  data.nodes.forEach(function (n) { if (n.hop > maxHop) maxHop = n.hop; });
+  var hopLimit = maxHop;
+  var isEgo = data.view.kind === 'ego';
+  var hopbar = document.getElementById('hopbar');
+  var hopRange = document.getElementById('hop-range');
+  var hopVal = document.getElementById('hop-val');
+  if (isEgo) {
+    hopbar.classList.add('show');
+    hopRange.max = String(maxHop);
+    hopRange.value = String(maxHop);
+    hopVal.textContent = String(maxHop);
+    hopRange.addEventListener('input', function () {
+      hopLimit = parseInt(hopRange.value, 10);
+      hopVal.textContent = String(hopLimit);
+      draw();
+    });
+  }
+  function nodeVisible(n) { return !isEgo || n.hop <= hopLimit; }
+
+  // --- canvas render: pan + zoom, node/edge draw, hit-test, side panel ---
+  var canvas = document.getElementById('canvas');
+  var ctx = canvas.getContext('2d');
+  var view = { x: 0, y: 0, scale: 1 };
+  var dragging = false, lastX = 0, lastY = 0, dragMoved = false;
+
+  function resize() {
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = canvas.clientHeight * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  function worldToScreen(p) {
+    var cx = canvas.clientWidth / 2, cy = canvas.clientHeight / 2;
+    return { x: cx + (p.x + view.x) * view.scale, y: cy + (p.y + view.y) * view.scale };
+  }
+
+  var styleRoot = getComputedStyle(document.documentElement);
+  function cssVar(name) { return styleRoot.getPropertyValue(name).trim(); }
+
+  function draw() {
+    var w = canvas.clientWidth, h = canvas.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+    var accent = cssVar('--accent') || '#2563eb';
+    var ink = cssVar('--ink') || '#1b1f24';
+    var inkDim = cssVar('--ink-dim') || '#5b6470';
+    var visible = {};
+    data.nodes.forEach(function (n) { visible[n.id] = nodeVisible(n); });
+
+    ctx.lineWidth = 1;
+    edgeList.forEach(function (e) {
+      if (!visible[e.from] || !visible[e.to]) return;
+      var a = worldToScreen(pos[e.from]), b = worldToScreen(pos[e.to]);
+      ctx.strokeStyle = inkDim;
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      // arrowhead at target end
+      var dx = b.x - a.x, dy = b.y - a.y;
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      var ux = dx / len, uy = dy / len;
+      var ah = 8;
+      var tx = b.x - ux * 9, ty = b.y - uy * 9;
+      var left = { x: tx - uy * ah * 0.4 - ux * ah, y: ty + ux * ah * 0.4 - uy * ah };
+      var right = { x: tx + uy * ah * 0.4 - ux * ah, y: ty - ux * ah * 0.4 - uy * ah };
+      ctx.beginPath(); ctx.moveTo(b.x - ux * 9, b.y - uy * 9); ctx.lineTo(left.x, left.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(b.x - ux * 9, b.y - uy * 9); ctx.lineTo(right.x, right.y); ctx.stroke();
+      ctx.globalAlpha = 1;
+    });
+
+    data.nodes.forEach(function (n) {
+      if (!visible[n.id]) return;
+      var p = worldToScreen(pos[n.id]);
+      var r = 6 * Math.min(Math.max(view.scale, 0.4), 2.5);
+      ctx.globalAlpha = n.superseded ? 0.4 : 1;
+      ctx.fillStyle = n.label === 'Entity' ? accent : ink;
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+      if (view.scale > 0.8) {
+        ctx.globalAlpha = n.superseded ? 0.4 : 1;
+        ctx.fillStyle = ink;
+        ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+        var label = n.title.length > 24 ? n.title.slice(0, 24) + '…' : n.title;
+        ctx.fillText(label, p.x + r + 3, p.y + 4);
+      }
+      ctx.globalAlpha = 1;
+    });
+  }
+
+  canvas.addEventListener('mousedown', function (e) {
+    dragging = true; dragMoved = false; lastX = e.clientX; lastY = e.clientY;
+    canvas.classList.add('dragging');
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (!dragging) return;
+    var dx = e.clientX - lastX, dy = e.clientY - lastY;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragMoved = true;
+    view.x += dx / view.scale; view.y += dy / view.scale;
+    lastX = e.clientX; lastY = e.clientY;
+    draw();
+  });
+  window.addEventListener('mouseup', function (e) {
+    if (dragging && !dragMoved) handleClick(e);
+    dragging = false;
+    canvas.classList.remove('dragging');
+  });
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var before = { x: (mx - canvas.clientWidth / 2) / view.scale - view.x, y: (my - canvas.clientHeight / 2) / view.scale - view.y };
+    var factor = Math.exp(-e.deltaY * 0.001);
+    view.scale = Math.min(Math.max(view.scale * factor, 0.1), 8);
+    var after = { x: (mx - canvas.clientWidth / 2) / view.scale - view.x, y: (my - canvas.clientHeight / 2) / view.scale - view.y };
+    view.x += after.x - before.x; view.y += after.y - before.y;
+    draw();
+  }, { passive: false });
+
+  var panel = document.getElementById('panel');
+  document.getElementById('panel-close').addEventListener('click', function () {
+    panel.classList.remove('open');
+  });
+
+  function handleClick(e) {
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var best = null, bestD = 12;
+    data.nodes.forEach(function (n) {
+      if (!nodeVisible(n)) return;
+      var p = worldToScreen(pos[n.id]);
+      var d = Math.sqrt((p.x - mx) * (p.x - mx) + (p.y - my) * (p.y - my));
+      if (d < bestD) { bestD = d; best = n; }
+    });
+    if (best) showPanel(best);
+  }
+
+  function showPanel(n) {
+    document.getElementById('p-title').textContent = n.title || n.label;
+    document.getElementById('p-id').textContent = n.id;
+    document.getElementById('p-label').textContent = n.label;
+    document.getElementById('p-scope').textContent = n.scope;
+    document.getElementById('p-sup').textContent = n.superseded ? 'yes' : 'no';
+    panel.classList.add('open');
+  }
+
+  // Fit the whole layout into the viewport on load (canvas is a replaced
+  // element, so it must be sized by CSS width/height:100%, not inset alone).
+  (function fitView() {
+    var xs = [], ys = [];
+    data.nodes.forEach(function (n) { var p = pos[n.id]; if (p) { xs.push(p.x); ys.push(p.y); } });
+    if (!xs.length) return;
+    var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+    var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+    var w = Math.max(maxX - minX, 1), h = Math.max(maxY - minY, 1);
+    var vw = canvas.clientWidth || window.innerWidth, vh = canvas.clientHeight || window.innerHeight;
+    view.scale = Math.min((vw - 120) / w, (vh - 140) / h, 1.5);
+    if (!(view.scale > 0)) { view.scale = 1; }
+    view.x = -(minX + maxX) / 2;
+    view.y = -(minY + maxY) / 2;
+  })();
+  resize();
+})();
+</script>

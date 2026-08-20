@@ -57,9 +57,8 @@ pub struct TopoServer {
     /// (see [`TopoServer::resolve_scopes`]).
     default_scopes: ScopeSet,
     /// The same default read set as `default_scopes`, kept as `ReadScopes`:
-    /// `ScopeSet::iter_scopes` is `pub(crate)` to `topodb`,
-    /// so `db_info` (Finding 2) renders its reported read set from this list
-    /// via `scope_label` rather than from `default_scopes` directly.
+    /// `iter_scopes` is now public, but the `ReadScopes` list is still used for
+    /// rendering order and labels in `db_info`.
     default_read_scopes: ReadScopes,
     /// Rendered db path, reported by `db_info`.
     db_path: String,
@@ -1542,6 +1541,119 @@ struct TraverseParams {
 struct TraverseResult {
     /// `{"nodes": [...], "edges": [...]}` reached from the seed(s).
     subgraph: Value,
+}
+
+/// The MCP spec requires every tool's output schema to have literal root
+/// `"type": "object"` (`validate_and_strip` in rmcp panics otherwise) — a
+/// bare `Json<serde_json::Value>` fails that check because `Value`'s own
+/// schema is typeless. `graph_snapshot`'s four formats return genuinely
+/// different shapes (the full snapshot object verbatim for `"json"`, vs.
+/// `{mermaid, nodes, edges, truncated}` / `{path, nodes, edges, truncated}`
+/// for the others), so this thin wrapper — a real struct, satisfying the
+/// root-object check — flattens whichever `Value` object was built for the
+/// call, keeping every field at the top level the way callers (including the
+/// CLI's `serde_json::from_value::<GraphSnapshot>`) expect.
+#[derive(Debug, Serialize, JsonSchema)]
+struct GraphSnapshotResult {
+    #[serde(flatten)]
+    payload: Value,
+}
+
+fn default_graph_query_k() -> usize {
+    3
+}
+
+fn default_graph_limit() -> usize {
+    topodb_json::GRAPH_DEFAULT_LIMIT
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GraphSnapshotParams {
+    /// Seed node ids (ULIDs) to center an ego view on. Combined with `query`
+    /// hits (union). Any seed or query switches the view from "scope" to
+    /// "ego"; omit both for a scope view (every entity + memory in scope).
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    seeds: Option<Vec<String>>,
+    /// Full-text query whose top-`query_k` hits are added as seeds.
+    #[serde(default)]
+    query: Option<String>,
+    /// How many top query hits to add as seeds. Default 3.
+    #[serde(default = "default_graph_query_k")]
+    query_k: usize,
+    /// Hop budget for the ego view (1-4). Default 2. Ignored for the scope
+    /// view.
+    #[serde(default = "default_max_hops")]
+    #[schemars(range(min = 1, max = 4))]
+    max_hops: u8,
+    /// Which adjacency to follow from each frontier node (ego view only).
+    #[serde(default)]
+    direction: DirectionParam,
+    /// Restrict the ego walk to these edge types; omit to follow every type.
+    #[serde(default)]
+    edge_types: Option<Vec<String>>,
+    /// View the graph as it was at this Unix-millisecond instant (ego view
+    /// only). Omitted = now.
+    #[serde(default)]
+    as_of: Option<i64>,
+    /// Which time axis `as_of` gates on: `"valid"` (default) is world time;
+    /// `"recorded"` is belief time.
+    #[serde(default)]
+    time_axis: Option<String>,
+    /// Node cap for the scope view (newest-first by id; excess nodes are
+    /// dropped with an honest count in `truncated`). Ignored for the ego
+    /// view. Default 500.
+    #[serde(default = "default_graph_limit")]
+    limit: usize,
+    /// Output rendering: `"auto"` (default) inlines mermaid for small graphs,
+    /// else requires `out`; `"json"` returns the full snapshot; `"mermaid"`
+    /// returns `{mermaid, nodes, edges, truncated}`; `"html"` requires `out`
+    /// and writes a self-contained interactive file there.
+    #[serde(default)]
+    format: Option<String>,
+    /// File path to write to. Required for `"html"`; used by `"auto"` when
+    /// the graph is too large to inline as mermaid.
+    #[serde(default)]
+    out: Option<String>,
+    /// Read across SEVERAL scopes at once. Omit for the server's default
+    /// read scopes. Must not be empty when present.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    scopes: Option<Vec<String>>,
+}
+
+/// `{mermaid, nodes, edges, truncated}` shared by the `"mermaid"` format and
+/// the small-graph arm of `"auto"`.
+fn mermaid_snapshot_result(snapshot: &topodb_json::GraphSnapshot) -> GraphSnapshotResult {
+    GraphSnapshotResult {
+        payload: serde_json::json!({
+            "mermaid": convert::to_mermaid(snapshot),
+            "nodes": snapshot.nodes.len(),
+            "edges": snapshot.edges.len(),
+            "truncated": snapshot.truncated,
+        }),
+    }
+}
+
+/// Writes `to_html(snapshot)` to `out` and returns `{path, nodes, edges,
+/// truncated}` — shared by the `"html"` format and the large-graph arm of
+/// `"auto"`.
+fn write_html_snapshot_result(
+    snapshot: &topodb_json::GraphSnapshot,
+    out: &str,
+) -> Result<Json<GraphSnapshotResult>, ErrorData> {
+    let html = convert::to_html(snapshot).map_err(|e| ErrorData::internal_error(e, None))?;
+    std::fs::write(out, html)
+        .map_err(|e| ErrorData::internal_error(format!("writing {out}: {e}"), None))?;
+    Ok(Json(GraphSnapshotResult {
+        payload: serde_json::json!({
+            "path": out,
+            "nodes": snapshot.nodes.len(),
+            "edges": snapshot.edges.len(),
+            "truncated": snapshot.truncated,
+        }),
+    }))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3404,6 +3516,99 @@ impl TopoServer {
         let subgraph =
             convert::subgraph_to_json(&sg).map_err(|e| ErrorData::internal_error(e, None))?;
         Ok(Json(TraverseResult { subgraph }))
+    }
+
+    #[tool(
+        description = "Export a renderable snapshot of the graph: ego view from seed ids and/or a query (traverse-based, hop-labeled), or a whole-scope view when neither is given. format auto returns inline mermaid for small graphs; html writes a self-contained interactive file to out. Deterministic; truncation is always reported."
+    )]
+    fn graph_snapshot(
+        &self,
+        Parameters(p): Parameters<GraphSnapshotParams>,
+    ) -> Result<Json<GraphSnapshotResult>, ErrorData> {
+        validate_as_of(p.as_of)?;
+        let time_axis = parse_time_axis(p.time_axis.as_deref())?;
+
+        let mut seeds = Vec::new();
+        if let Some(ids) = &p.seeds {
+            for s in ids {
+                seeds.push(parse_node_id(s)?);
+            }
+        }
+        let scope_set = self.resolve_scopes(None, p.scopes.as_deref())?;
+        let edge_types = p
+            .edge_types
+            .map(|v| v.into_iter().map(Into::into).collect());
+
+        // Ego view (seed and/or query given) mirrors `traverse`'s builder;
+        // otherwise a whole-scope view. Both `build_ego`/`build_scope`
+        // return a `String` error — same convention as the CLI's `graph`
+        // command (`output::fail("rejected", &e, 2)`): every failure here is
+        // caller-input shaped (no seeds/hits, or the traverse's own
+        // `Rejected` collapsed to a string), so it maps to `invalid_params`,
+        // not `internal_error`.
+        let mut snapshot = if !seeds.is_empty() || p.query.is_some() {
+            let params = convert::EgoParams {
+                seeds,
+                query: p.query.clone(),
+                query_k: p.query_k,
+                max_hops: p.max_hops,
+                direction: p.direction.into(),
+                edge_types,
+                as_of: p.as_of,
+                time_axis,
+            };
+            convert::build_ego(&self.db, &scope_set, &params)
+        } else {
+            convert::build_scope(&self.db, &scope_set, p.limit)
+        }
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+
+        snapshot.db_path = Some(self.db_path.clone());
+
+        let format = p.format.as_deref().unwrap_or("auto");
+        match format {
+            "json" => {
+                let payload = serde_json::to_value(&snapshot)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                Ok(Json(GraphSnapshotResult { payload }))
+            }
+            "mermaid" => Ok(Json(mermaid_snapshot_result(&snapshot))),
+            "html" => {
+                let out = p.out.as_deref().ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        "format \"html\" requires `out` (a file path) — a JSON reply is not a \
+                         place for an HTML blob"
+                            .to_string(),
+                        None,
+                    )
+                })?;
+                write_html_snapshot_result(&snapshot, out)
+            }
+            "auto" => {
+                if snapshot.nodes.len() <= topodb_json::GRAPH_MERMAID_INLINE_MAX_NODES {
+                    Ok(Json(mermaid_snapshot_result(&snapshot)))
+                } else if let Some(out) = p.out.as_deref() {
+                    write_html_snapshot_result(&snapshot, out)
+                } else {
+                    Err(ErrorData::invalid_params(
+                        format!(
+                            "graph has {} nodes, over the {}-node inline-mermaid cap — pass \
+                             `out` (a file path) for an HTML export, or format: \"json\" for the \
+                             raw snapshot",
+                            snapshot.nodes.len(),
+                            topodb_json::GRAPH_MERMAID_INLINE_MAX_NODES
+                        ),
+                        None,
+                    ))
+                }
+            }
+            other => Err(ErrorData::invalid_params(
+                format!(
+                    "format must be one of \"auto\", \"json\", \"mermaid\", \"html\" (got {other:?})"
+                ),
+                None,
+            )),
+        }
     }
 
     #[tool(

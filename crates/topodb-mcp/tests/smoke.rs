@@ -28,11 +28,11 @@ fn handshake_and_tools_list_exposes_all_tools() {
 
     let tools = server.tools_list(DEFAULT_TIMEOUT);
 
-    // db_info + onboarding_pointer + 15 read tools + 15 write tools = 32 total.
+    // db_info + onboarding_pointer + 16 read tools + 15 write tools = 33 total.
     assert_eq!(
         tools.len(),
-        32,
-        "expected exactly 32 tools, got: {tools:#?}"
+        33,
+        "expected exactly 33 tools, got: {tools:#?}"
     );
     for name in [
         "db_info",
@@ -48,6 +48,7 @@ fn handshake_and_tools_list_exposes_all_tools() {
         "lifecycle_candidates",
         "get_changes",
         "get_edges",
+        "graph_snapshot",
         "create_memory",
         "create_entity",
         "remember",

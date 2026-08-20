@@ -194,9 +194,38 @@ exit-code contract, scoping rules, and v1 limitations (no `--spec` flag; no mult
 this CLI reads under one scope at a time, while `topodb-mcp` can read across a set; direct-embedded
 single-process access only).
 
+#### Seeing the graph
+
+The `graph` subcommand exports a deterministic snapshot of your database as an interactive graph:
+
+**Views:**
+- **Ego** — traverse from a starting point (`--seed` entity IDs or `--query` search results) for a limited hop-labeled subgraph
+- **Scope** — the full scoped graph when neither `--seed` nor `--query` is given (default)
+
+**Formats** (pick one via `--graph-format`):
+- `json` — canonical JSON snapshot (default); round-trippable for downstream analysis
+- `dot` — Graphviz DOT format, render with `dot -Tpng` / `dot -Tsvg`
+- `mermaid` — Mermaid diagram syntax, renders inline in markdown and many docs
+- `html` — self-contained interactive HTML file with zero external requests; opens in any browser, click a node for details
+
+**Examples:**
+
+```bash
+# Ego graph, mermaid format
+topodb graph --query "deploy" --graph-format mermaid
+
+# Scope graph to an HTML file
+topodb graph --graph-format html --out graph.html
+```
+
+**Determinism & reliability:**
+- Snapshots are stamped with the database's op-log sequence number, not wall-clock time: the same database state produces byte-identical output every run.
+- Truncation is always reported in the snapshot metadata, never silent — if the graph exceeds `--limit` (e.g., 500 nodes), the output tells you.
+- Like other read commands, `graph` routes through a resident daemon for concurrency safety — no server setup required.
+
 ### topodb-mcp
 
-A standalone binary: point it at a `.redb` file and it serves **31 MCP tools** over stdio
+A standalone binary: point it at a `.redb` file and it serves **33 MCP tools** over stdio
 JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
 
 - **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`

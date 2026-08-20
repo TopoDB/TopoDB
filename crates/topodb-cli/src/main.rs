@@ -201,7 +201,7 @@ fn main() {
             };
             match daemon_client::DaemonClient::connect(&endpoint, &scopes) {
                 Ok(mut client) => {
-                    match try_daemon_route(&mut client, &cli.cmd, &db_path) {
+                    match try_daemon_route(&mut client, &cli.cmd, &db_path, cli.pretty) {
                         Ok(result) => {
                             output::ok(&result, cli.pretty);
                         }
@@ -415,6 +415,35 @@ fn main() {
             as_of,
             time_axis.into(),
             allen_interval(&valid_interval),
+            cli.pretty,
+        ),
+        Command::Graph {
+            seed,
+            query,
+            query_k,
+            max_hops,
+            direction,
+            edge_type,
+            as_of,
+            time_axis,
+            limit,
+            graph_format,
+            out,
+        } => graph(
+            &db,
+            &db_path,
+            default_scope,
+            seed,
+            query,
+            query_k,
+            max_hops,
+            direction.into(),
+            edge_type,
+            as_of,
+            time_axis.into(),
+            limit,
+            graph_format,
+            out.as_deref(),
             cli.pretty,
         ),
         Command::GetEdges {
@@ -860,6 +889,136 @@ fn traverse(
         Err(e) => output::fail("internal", &e, 1),
     };
     output::ok(&serde_json::json!({ "subgraph": subgraph }), pretty);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph(
+    db: &Db,
+    db_path: &Path,
+    scope: Scope,
+    seed: Vec<String>,
+    query: Option<String>,
+    query_k: usize,
+    max_hops: u8,
+    direction: Direction,
+    edge_type: Vec<String>,
+    as_of: Option<i64>,
+    time_axis: TimeAxis,
+    limit: usize,
+    graph_format: cli::GraphFormatArg,
+    out: Option<&Path>,
+    pretty: bool,
+) -> ! {
+    // Validate as_of: must be positive if provided (mirrors `traverse`).
+    if let Some(ts) = as_of {
+        if ts <= 0 {
+            output::fail(
+                "rejected",
+                "as-of must be a positive Unix-millisecond timestamp",
+                2,
+            );
+        }
+    }
+    let seeds: Vec<NodeId> = seed
+        .iter()
+        .map(|s| {
+            NodeId::from_str(s).unwrap_or_else(|e| {
+                output::fail("rejected", &format!("invalid seed id {s:?}: {e}"), 2)
+            })
+        })
+        .collect();
+    // Empty --edge-type (none given) -> None, follow every edge type; see
+    // `traverse`'s identical comment for why `Some(vec![])` is wrong here.
+    let edge_types = if edge_type.is_empty() {
+        None
+    } else {
+        Some(edge_type.into_iter().map(Into::into).collect())
+    };
+    let scopes = topodb_json::scope_to_scope_set(scope);
+    let mut snapshot = if !seeds.is_empty() || query.is_some() {
+        let params = topodb_json::EgoParams {
+            seeds,
+            query,
+            query_k,
+            max_hops,
+            direction,
+            edge_types,
+            as_of,
+            time_axis,
+        };
+        topodb_json::build_ego(db, &scopes, &params)
+    } else {
+        topodb_json::build_scope(db, &scopes, limit)
+    }
+    .unwrap_or_else(|e| output::fail("rejected", &e, 2));
+    snapshot.db_path = Some(db_path.display().to_string());
+    emit_graph(snapshot, graph_format, out, pretty);
+}
+
+/// Serialize a graph snapshot per `--graph-format` and either print it (no
+/// `--out`) or write it to a file plus a summary envelope (`--out`). Shared
+/// tail for both the direct `graph` path and the daemon-routed path, so
+/// routed and direct output are byte-identical for every format.
+fn emit_graph(
+    snapshot: topodb_json::GraphSnapshot,
+    graph_format: cli::GraphFormatArg,
+    out: Option<&Path>,
+    pretty: bool,
+) -> ! {
+    use cli::GraphFormatArg;
+
+    let render = |format: GraphFormatArg| -> String {
+        match format {
+            GraphFormatArg::Json => topodb_json::to_canonical_json(&snapshot)
+                .unwrap_or_else(|e| output::fail("internal", &e, 1)),
+            GraphFormatArg::Dot => topodb_json::to_dot(&snapshot),
+            GraphFormatArg::Mermaid => topodb_json::to_mermaid(&snapshot),
+            GraphFormatArg::Html => {
+                topodb_json::to_html(&snapshot).unwrap_or_else(|e| output::fail("internal", &e, 1))
+            }
+        }
+    };
+
+    match out {
+        Some(path) => {
+            let content = render(graph_format);
+            if let Err(e) = std::fs::write(path, content) {
+                output::fail("internal", &format!("writing {}: {e}", path.display()), 1);
+            }
+            let truncated = snapshot.truncated.as_ref().map(|t| {
+                serde_json::json!({
+                    "nodes_dropped": t.nodes_dropped,
+                    "edges_dropped": t.edges_dropped,
+                })
+            });
+            output::ok(
+                &serde_json::json!({
+                    "path": path.display().to_string(),
+                    "nodes": snapshot.nodes.len(),
+                    "edges": snapshot.edges.len(),
+                    "truncated": truncated,
+                }),
+                pretty,
+            );
+        }
+        None => match graph_format {
+            GraphFormatArg::Json => {
+                let v = serde_json::to_value(&snapshot).unwrap_or_else(|e| {
+                    output::fail("internal", &format!("serializing snapshot: {e}"), 1)
+                });
+                output::ok(&v, pretty);
+            }
+            GraphFormatArg::Dot | GraphFormatArg::Mermaid => {
+                println!("{}", render(graph_format));
+                std::process::exit(0);
+            }
+            GraphFormatArg::Html => output::fail(
+                "rejected",
+                "--graph-format html needs --out — a terminal is not a place for an HTML blob",
+                2,
+            ),
+        },
+    }
 }
 
 /// Run `fetch` with the normalized form of `edge_type`, then — when the raw
@@ -1763,6 +1922,7 @@ fn is_daemon_routable(cmd: &Command) -> bool {
         | Command::Get { .. }
         | Command::Find { .. }
         | Command::Traverse { .. }
+        | Command::Graph { .. }
         | Command::GetEdges { .. }
         | Command::Stats { .. }
         | Command::LifecycleCandidates { .. }
@@ -1794,6 +1954,7 @@ fn try_daemon_route(
     client: &mut DaemonClient,
     cmd: &Command,
     _db_path: &Path,
+    pretty: bool,
 ) -> Result<serde_json::Value, daemon_client::DaemonError> {
     use daemon_client::DaemonError;
 
@@ -1885,6 +2046,50 @@ fn try_daemon_route(
             params["time_axis"] = serde_json::json!(time_axis.as_str());
             insert_valid_interval(&mut params, &allen_interval(valid_interval));
             client.call_tool("traverse", params)
+        }
+        Command::Graph {
+            seed,
+            query,
+            query_k,
+            max_hops,
+            direction,
+            edge_type,
+            as_of,
+            time_axis,
+            limit,
+            graph_format,
+            out,
+        } => {
+            let mut params = serde_json::json!({
+                "format": "json",
+                "query_k": query_k,
+                "max_hops": max_hops,
+                "direction": direction.as_str(),
+                "time_axis": time_axis.as_str(),
+                "limit": limit,
+            });
+            if !seed.is_empty() {
+                params["seeds"] = serde_json::to_value(seed).unwrap();
+            }
+            if let Some(q) = query {
+                params["query"] = serde_json::json!(q);
+            }
+            if !edge_type.is_empty() {
+                params["edge_types"] = serde_json::to_value(edge_type).unwrap();
+            }
+            if let Some(ts) = as_of {
+                params["as_of"] = serde_json::json!(ts);
+            }
+            let result = client.call_tool("graph_snapshot", params)?;
+            let mut snapshot: topodb_json::GraphSnapshot =
+                serde_json::from_value(result).map_err(|e| {
+                    DaemonError::Protocol(format!("decoding graph_snapshot result: {e}"))
+                })?;
+            // Direct `graph` always stamps db_path from the local CLI's
+            // resolved path; do the same here so routed and direct output
+            // agree on this field regardless of what the daemon fills in.
+            snapshot.db_path = Some(_db_path.display().to_string());
+            emit_graph(snapshot, *graph_format, out.as_deref(), pretty)
         }
         Command::GetEdges {
             from,

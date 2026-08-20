@@ -101,7 +101,7 @@ impl ScopeSet {
     /// stat + postings row per scope and merges. The `ScopeSet` representation
     /// (a `bool` + `BTreeSet<ScopeId>`) is directly enumerable, so this is an
     /// exact enumeration, not an approximation.
-    pub(crate) fn iter_scopes(&self) -> impl Iterator<Item = Scope> + '_ {
+    pub fn iter_scopes(&self) -> impl Iterator<Item = Scope> + '_ {
         self.include_shared
             .then_some(Scope::Shared)
             .into_iter()

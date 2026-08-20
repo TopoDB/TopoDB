@@ -38,6 +38,14 @@ pub use lifecycle::{
 mod retry;
 pub use retry::open_with_busy_retry;
 
+mod graph;
+pub use graph::{
+    build_ego, build_scope, graph_edge, graph_node, node_superseded, node_title, to_canonical_json,
+    to_dot, to_html, to_mermaid, EgoParams, GraphEdge, GraphNode, GraphSnapshot, GraphTruncation,
+    GraphView, GRAPH_DEFAULT_LIMIT, GRAPH_MERMAID_INLINE_MAX_NODES, GRAPH_SNAPSHOT_VERSION,
+    GRAPH_TITLE_MAX_CHARS,
+};
+
 mod temporal;
 pub use temporal::{parse_iso_instant, parse_temporal_query, TemporalRewrite};
 

@@ -261,6 +261,60 @@ pub enum Command {
         #[command(flatten)]
         valid_interval: ValidIntervalArgs,
     },
+    /// Export a graph snapshot: an ego view (BFS out from `--seed`/`--query`
+    /// hits, like `traverse`) when any seed or query is given, else a scope
+    /// view (every entity + memory in scope, newest-first, truncated to
+    /// `--limit`). Renders to `--graph-format` — `json` (default, the one
+    /// machine-parseable form), `dot`/`mermaid` (printed raw for piping into
+    /// Graphviz/Mermaid tooling), or `html` (a self-contained interactive
+    /// viewer, which needs `--out` — a terminal is not a place for an HTML
+    /// blob). `--out <path>` writes the rendered form to a file instead of
+    /// stdout, for any format, printing a `{path, nodes, edges, truncated}`
+    /// summary. Daemon-routed via `graph_snapshot`.
+    Graph {
+        /// Seed node id (ULID) to center the ego view on; repeatable.
+        /// Combined with `--query` hits (union). Any seed or query switches
+        /// the view from "scope" to "ego".
+        #[arg(long)]
+        seed: Vec<String>,
+        /// Full-text query whose top-`--query-k` hits are added as seeds.
+        #[arg(long)]
+        query: Option<String>,
+        /// How many top query hits to add as seeds.
+        #[arg(long = "query-k", default_value_t = 3)]
+        query_k: usize,
+        /// Hop budget for the ego view (1-4).
+        #[arg(long = "max-hops", default_value_t = 2)]
+        max_hops: u8,
+        /// Which adjacency to follow from each frontier node (ego view only).
+        #[arg(long, value_enum, default_value_t = DirectionArg::Both)]
+        direction: DirectionArg,
+        /// Restrict the ego walk to these edge types; repeatable. Omit to
+        /// follow every type.
+        #[arg(long = "edge-type")]
+        edge_type: Vec<String>,
+        /// View the graph as it was at this Unix-millisecond instant (ego
+        /// view only). Omitted = now.
+        #[arg(long)]
+        as_of: Option<i64>,
+        /// Which time axis `--as-of` gates on: `valid` (default) is world
+        /// time; `recorded` is belief time. See `traverse`'s doc for the
+        /// full explanation.
+        #[arg(long = "time-axis", value_enum, default_value_t = TimeAxisArg::Valid)]
+        time_axis: TimeAxisArg,
+        /// Node cap for the scope view (newest-first by ULID; excess nodes
+        /// are dropped with an honest count in `truncated`). Ignored for the
+        /// ego view.
+        #[arg(long, default_value_t = topodb_json::GRAPH_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Output rendering. Named `--graph-format` (not `--format`) because
+        /// the global `--format json|text` flag already exists.
+        #[arg(long = "graph-format", value_enum, default_value_t = GraphFormatArg::Json)]
+        graph_format: GraphFormatArg,
+        /// Write the rendered output to this path instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// List edges from a source node, with optional time-travel (as_of) and
     /// history access (open_only). Defaults to currently-open edges when neither
     /// flag is set; pass `--open-only false` to see closed edges (history).
@@ -634,6 +688,18 @@ impl From<DirectionArg> for topodb::Direction {
 pub enum FormatArg {
     Json,
     Text,
+}
+
+/// `topodb graph`'s rendering: `json` (default, machine-parseable snapshot),
+/// `dot`/`mermaid` (raw text for piping into graph tooling), or `html` (a
+/// self-contained interactive viewer, requires `--out`).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GraphFormatArg {
+    #[default]
+    Json,
+    Dot,
+    Mermaid,
+    Html,
 }
 
 impl From<FormatArg> for crate::resolve::Format {
