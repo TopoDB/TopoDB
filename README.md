@@ -206,7 +206,7 @@ The `graph` subcommand exports a deterministic snapshot of your database as an i
 - `json` — canonical JSON snapshot (default); round-trippable for downstream analysis
 - `dot` — Graphviz DOT format, render with `dot -Tpng` / `dot -Tsvg`
 - `mermaid` — Mermaid diagram syntax, renders inline in markdown and many docs
-- `html` — self-contained interactive HTML file with zero external requests; opens in any browser, details on hover/click
+- `html` — self-contained interactive HTML file with zero external requests; opens in any browser, click a node for details
 
 **Examples:**
 
@@ -225,7 +225,7 @@ topodb graph --graph-format html --out graph.html
 
 ### topodb-mcp
 
-A standalone binary: point it at a `.redb` file and it serves **31 MCP tools** over stdio
+A standalone binary: point it at a `.redb` file and it serves **33 MCP tools** over stdio
 JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
 
 - **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`
