@@ -136,10 +136,12 @@ pub fn to_dot(s: &GraphSnapshot) -> String {
     // Iterate over nodes (already sorted)
     for node in &s.nodes {
         let title_escaped = escape_dot_label(&node.title);
+        let label_escaped = escape_dot_label(&node.label);
+        let scope_escaped = escape_dot_label(&node.scope);
         let label = if s.scopes.len() > 1 {
-            format!("{}\n{}\n{}", node.label, title_escaped, node.scope)
+            format!("{}\\n{}\\n{}", label_escaped, title_escaped, scope_escaped)
         } else {
-            format!("{}\n{}", node.label, title_escaped)
+            format!("{}\\n{}", label_escaped, title_escaped)
         };
 
         let style = if node.superseded {
@@ -197,7 +199,7 @@ pub fn to_mermaid(s: &GraphSnapshot) -> String {
 
         let _ = writeln!(
             out,
-            "  n{}[\"{}{}\"]{}\n",
+            "  n{}[\"{}: {}\"]{}",
             idx, node.label, title_sanitized, superseded_class
         );
     }
@@ -216,7 +218,8 @@ pub fn to_mermaid(s: &GraphSnapshot) -> String {
         if let (Some(&from_idx), Some(&to_idx)) =
             (id_to_index.get(&edge.from), id_to_index.get(&edge.to))
         {
-            let _ = writeln!(out, "  n{} -->|{}| n{}", from_idx, edge.ty, to_idx);
+            let ty = edge.ty.replace('|', "");
+            let _ = writeln!(out, "  n{} -->|{}| n{}", from_idx, ty, to_idx);
         }
     }
 
@@ -797,15 +800,30 @@ mod tests {
     #[test]
     fn scope_view_truncates_honestly() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, _) = seed_chain(&dir);
+        let (db, [a, b, c]) = seed_chain(&dir);
         let scopes = crate::scope_to_scope_set(Scope::Shared);
         let snap = build_scope(&db, &scopes, 2).unwrap();
         assert_eq!(snap.nodes.len(), 2);
         let t = snap.truncated.expect("truncation must be recorded");
         assert_eq!(t.nodes_dropped, 1);
+        let kept: std::collections::BTreeSet<String> =
+            snap.nodes.iter().map(|n| n.id.clone()).collect();
+        let dropped = [a, b, c]
+            .iter()
+            .find(|id| !kept.contains(&id.to_string()))
+            .unwrap()
+            .to_string();
+        // chain edges: a->b, b->c. Count edges adjacent to the dropped node.
+        let expected = [
+            (a.to_string(), b.to_string()),
+            (b.to_string(), c.to_string()),
+        ]
+        .iter()
+        .filter(|(f, t2)| *f == dropped || *t2 == dropped)
+        .count();
         assert_eq!(
-            t.edges_dropped, 1,
-            "a->b is the only dropped-adjacent edge and must be counted exactly once"
+            t.edges_dropped, expected,
+            "each dropped-adjacent edge counted exactly once"
         );
     }
 
@@ -930,6 +948,21 @@ mod tests {
         assert!(d.contains("truncated: 2 nodes, 3 edges dropped"));
         assert!(d.contains("\"01A\" -> \"01B\""));
         assert!(!d.contains("\\nshared")); // single-scope snapshot elides scope lines (DOT uses the two-char \n escape)
+
+        // Multi-scope test: verify two-char escape sequence and single physical line
+        let mut snap = tiny_snap(false, false);
+        snap.scopes = vec!["shared".into(), "other".into()];
+        let d = to_dot(&snap);
+        assert!(d.contains("\\nshared")); // two-char escape in Rust source becomes \n in output
+                                          // Verify it stays on one line (no raw newline inside label quotes)
+        for line in d.lines() {
+            if line.contains("01A") && line.contains("[label=") {
+                assert!(
+                    !line.contains("\n"),
+                    "node label must stay on one physical line"
+                );
+            }
+        }
     }
 
     #[test]
@@ -941,6 +974,7 @@ mod tests {
         assert!(m.contains("#quot;"));
         assert!(m.contains("truncated: 2 nodes, 3 edges dropped"));
         assert!(!m.contains("01A[")); // raw ULIDs never used as mermaid ids
+        assert!(m.contains("n0[\"Memory: ")); // Label: title separator
     }
 
     #[test]
