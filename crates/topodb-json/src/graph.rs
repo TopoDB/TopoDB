@@ -117,6 +117,23 @@ pub fn to_canonical_json(s: &GraphSnapshot) -> Result<String, String> {
     serde_json::to_string(s).map_err(|e| format!("serializing snapshot: {e}"))
 }
 
+const GRAPH_HTML_TEMPLATE: &str = include_str!("../assets/graph.html");
+
+/// Self-contained interactive HTML: the canonical JSON is embedded verbatim
+/// (with `<` escaped as `<` to make a literal `</script>` breakout
+/// impossible) inside `assets/graph.html`, a vanilla-JS force-layout viewer.
+pub fn to_html(s: &GraphSnapshot) -> Result<String, String> {
+    let json = to_canonical_json(s)?;
+    // `<` only ever appears inside JSON strings, so escaping it is always
+    // legal JSON and guarantees no literal "</script>" can appear in the
+    // embedded payload.
+    let json_escaped = json.replace('<', "\\u003c");
+    let title = format!("topodb graph — {} view", s.view.kind);
+    Ok(GRAPH_HTML_TEMPLATE
+        .replace("__PAGE_TITLE__", &title)
+        .replace("__SNAPSHOT_JSON__", &json_escaped))
+}
+
 pub fn to_dot(s: &GraphSnapshot) -> String {
     use std::fmt::Write;
 
@@ -981,5 +998,64 @@ mod tests {
     fn mermaid_superseded_class_only_when_needed() {
         assert!(to_mermaid(&tiny_snap(true, false)).contains("classDef superseded"));
         assert!(!to_mermaid(&tiny_snap(false, false)).contains("classDef"));
+    }
+
+    #[test]
+    fn html_round_trips_the_snapshot_and_is_self_contained() {
+        let snap = tiny_snap(false, true);
+        let html = to_html(&snap).unwrap();
+        // extract the embedded JSON
+        let start = html.find("<script id=\"snapshot\"").unwrap();
+        let json_start = html[start..].find('>').unwrap() + start + 1;
+        let json_end = html[json_start..].find("</script>").unwrap() + json_start;
+        let back: GraphSnapshot = serde_json::from_str(&html[json_start..json_end]).unwrap();
+        assert_eq!(back, snap);
+        // zero network requests
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+        // markers fully substituted
+        assert!(!html.contains("__SNAPSHOT_JSON__"));
+        assert!(!html.contains("__PAGE_TITLE__"));
+        // truncation banner text present
+        assert!(html.contains("truncated"));
+    }
+
+    #[test]
+    fn html_escapes_script_breakout() {
+        let mut snap = tiny_snap(false, false);
+        snap.nodes[0].title = "</script><script>alert(1)".into();
+        let html = to_html(&snap).unwrap();
+        let body_after_snapshot = &html[html.find("id=\"snapshot\"").unwrap()..];
+        // the payload's literal </script> must not appear un-escaped
+        assert!(!body_after_snapshot.contains("</script><script>alert"));
+    }
+
+    #[test]
+    #[ignore]
+    fn html_smoke_writes_to_target_for_eyeballing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, [a, ..]) = seed_chain(&dir);
+        let scopes = crate::scope_to_scope_set(Scope::Shared);
+        let p = EgoParams {
+            seeds: vec![a],
+            query: None,
+            query_k: 3,
+            max_hops: 2,
+            direction: topodb::Direction::Both,
+            edge_types: None,
+            as_of: None,
+            time_axis: topodb::TimeAxis::Valid,
+        };
+        let snap = build_ego(&db, &scopes, &p).unwrap();
+        let html = to_html(&snap).unwrap();
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let target = manifest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target");
+        let _ = std::fs::create_dir_all(&target);
+        std::fs::write(target.join("graph-smoke.html"), html).unwrap();
     }
 }
