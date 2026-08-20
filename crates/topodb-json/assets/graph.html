@@ -113,8 +113,6 @@
     <div class="row"><div class="k">label</div><div class="v" id="p-label"></div></div>
     <div class="row"><div class="k">scope</div><div class="v" id="p-scope"></div></div>
     <hr>
-    <div class="row"><div class="k">valid from</div><div class="v mono" id="p-vf"></div></div>
-    <div class="row"><div class="k">valid to</div><div class="v mono" id="p-vt"></div></div>
     <div class="row"><div class="k">superseded</div><div class="v" id="p-sup"></div></div>
   </div>
 </div>
@@ -327,9 +325,6 @@
     document.getElementById('p-id').textContent = n.id;
     document.getElementById('p-label').textContent = n.label;
     document.getElementById('p-scope').textContent = n.scope;
-    var inEdge = data.edges.find(function (e) { return e.from === n.id || e.to === n.id; });
-    document.getElementById('p-vf').textContent = inEdge ? String(inEdge.valid_from) : '—';
-    document.getElementById('p-vt').textContent = inEdge && inEdge.valid_to != null ? String(inEdge.valid_to) : '—';
     document.getElementById('p-sup').textContent = n.superseded ? 'yes' : 'no';
     panel.classList.add('open');
   }
