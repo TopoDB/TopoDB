@@ -1,8 +1,11 @@
 [package]
 name = "topodb-node"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 publish = false
+description = "Node.js (napi) binding for TopoDB"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TopoDB/TopoDB"
 
 [lib]
 crate-type = ["cdylib"]

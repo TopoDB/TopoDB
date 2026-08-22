@@ -59,6 +59,11 @@ test('edges', async () => {
   const edges = await db.edgesFrom(S, ids[1])
   assert.equal(edges.length, 1)
   assert.equal(edges[0].type, 'about')
+  // Bi-temporal belief axis (engine 0.0.15+): every edge carries when it was
+  // recorded and whether it has been superseded. Pins the wire shape the
+  // index.d.ts EdgeRecord declares.
+  assert.equal(edges[0].recorded_at, NOW)
+  assert.equal(edges[0].superseded_at, null)
   const allEdges = await db.allEdgesBetween(ids[1], ids[0])
   assert.equal(allEdges.length, 1)
   const openEdges = await db.openEdgesBetween(ids[1], ids[0])

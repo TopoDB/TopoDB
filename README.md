@@ -44,6 +44,8 @@ will fail.
 | Pi | `pi install npm:@topodb/pi` |
 | Any MCP client | `cargo install topodb-mcp` — [`docs/agent-clients.md`](docs/agent-clients.md) |
 | Rust | [`crates/topodb`](crates/topodb/README.md) |
+| Node.js (embedded) | `npm i topodb` — [`crates/topodb-node`](crates/topodb-node/README.md) |
+| Python (embedded) | `pip install topodb` — [`crates/topodb-py`](crates/topodb-py/README.md) |
 
 Scope ids are keyed to the absolute project path.
 They do not follow a repo across clones or machines.

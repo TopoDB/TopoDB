@@ -16,6 +16,10 @@ export interface EdgeRecord {
   props: unknown
   valid_from: number
   valid_to: number | null
+  /** Belief time: when this edge was recorded (ms). Engine-stamped, never caller-settable. */
+  recorded_at: number
+  /** Belief time: when this edge stopped being believed (ms), or null while current. */
+  superseded_at: number | null
 }
 
 export interface Subgraph {
