@@ -4,9 +4,16 @@ build-backend = "maturin"
 
 [project]
 name = "topodb"
-version = "0.0.1"
+version = "0.1.0"
 requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+keywords = ["memory", "graph", "temporal", "database", "embedded", "agent"]
 description = "TopoDB — embedded, temporal, graph-native memory for AI agents"
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/TopoDB/TopoDB"
+Repository = "https://github.com/TopoDB/TopoDB"
 
 [tool.maturin]
 module-name = "topodb._native"

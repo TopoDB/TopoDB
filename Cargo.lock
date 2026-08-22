@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-node"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "napi",
@@ -3458,7 +3458,7 @@ dependencies = [
 
 [[package]]
 name = "topodb-py"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "pyo3",

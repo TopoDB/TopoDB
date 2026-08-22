@@ -1896,3 +1896,46 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 - Corrected a materially stale README: it claimed the CLI had no vector search, no
   `set-props`/`remove-node`, and no batch `submit` (all four exist), and counted 11 commands when
   there are 17.
+
+---
+
+## `topodb-node` (`topodb` on npm)
+
+### 0.1.0 — 2026-08-22
+
+First published release of the package. Earlier crate versions were never
+published anywhere; per the policy at the top of this file, its changelog
+starts here.
+
+#### Added
+
+- **`topodb-node`** — embedded Node.js bindings (napi) for the 0.1 engine:
+  open a `.redb` file in-process, build batches with the `ops` builders,
+  `submit`, and read back via `recall`/`traverse` and the other engine reads.
+  Multi-scope reads (`scopes: string[]` on every read) with single-scope
+  writes; errors decorated with `err.code` (`STORAGE` / `ENCODING` /
+  `REJECTED` / `COMPACTED` / `CLOSED` / `UNSUPPORTED_FORMAT`); bi-temporal
+  edge fields (`valid_*` world time, `recorded_at`/`superseded_at` belief
+  time). Ships as the unscoped `topodb` package with prebuilt platform
+  packages (linux x64/arm64, darwin x64/arm64, windows x64) as
+  `optionalDependencies` — `npm i topodb`, no Rust toolchain.
+
+---
+
+## `topodb-py` (`topodb` on PyPI)
+
+### 0.1.0 — 2026-08-22
+
+First published release of the package. Earlier crate versions were never
+published anywhere; per the policy at the top of this file, its changelog
+starts here.
+
+#### Added
+
+- **`topodb-py`** — embedded Python bindings (pyo3) for the 0.1 engine: the
+  same surface as the Node bindings in Python idioms — context-manager `Db`,
+  `ops.create_entity`-style builders, snake_case, dict wire shapes.
+  Multi-scope reads with single-scope writes; typed exceptions mirroring the
+  engine's error kinds; bi-temporal edge fields. Ships as `topodb` on PyPI
+  with prebuilt wheels (linux x64/arm64, macOS x64/arm64, windows x64) plus
+  an sdist — `pip install topodb`, no Rust toolchain.
