@@ -113,8 +113,8 @@ we believe then" (e.g. `traverse` with `asOf`).
 
 ## Platform support
 
-Prebuilt `.node` binaries ship as platform packages
-(`topodb-<platform>`, e.g. `topodb-linux-x64-gnu`) listed as
+Prebuilt `.node` binaries ship as scoped platform packages
+(`@topodb/topodb-<platform>`, e.g. `@topodb/topodb-linux-x64-gnu`) listed as
 `optionalDependencies` — npm installs
 only the one matching your machine. The main `topodb` package contains no
 binaries.
