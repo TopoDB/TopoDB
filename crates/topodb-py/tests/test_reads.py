@@ -50,6 +50,10 @@ def test_edges(db):
     edges = db.edges_from(S, ids[1])
     assert len(edges) == 1
     assert edges[0]["type"] == "about"
+    # Bi-temporal belief axis (engine 0.0.15+): every edge carries when it was
+    # recorded and whether it has been superseded.
+    assert edges[0]["recorded_at"] == NOW
+    assert edges[0]["superseded_at"] is None
     assert len(db.all_edges_between(ids[1], ids[0])) == 1
     assert db.open_edges_between(ids[1], ids[0]) == [ids[2]]
     assert db.edges_from(S, ids[1], type="OTHER") == []
