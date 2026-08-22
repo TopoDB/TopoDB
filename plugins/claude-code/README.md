@@ -14,7 +14,11 @@ project with a shared layer for lessons that generalize. This plugin wires a
 
 That's it. The next session in any project gets a `topodb` MCP server, a
 `topodb-memory` skill that tells the agent when to recall and when to store,
-and two slash commands: `/recall <query>` and `/remember <fact>`.
+and two slash commands: `/recall <query>` and `/remember <fact>`. Cursor
+auto-imports this plugin; `launch.js` then uses the same data-dir rules as
+the Cursor plugin (`CLAUDE_PLUGIN_DATA` when Claude Code set it, otherwise
+the shared `~/.claude/plugins/data/topodb-topodb/` store) so import does not
+advertise a 0-tool server.
 
 ### Requires `node` at runtime
 
@@ -22,8 +26,9 @@ The plugin is a Node launcher (`launch.js`) that connects to a shared
 **broker** process, which spawns the real server, `@topodb/topodb-mcp`, as a
 subprocess (see "How it works" below). `launch.js` downloads that server via
 `npm` into the plugin's data directory on first run and reuses it after that
-— no `cargo install`, no Rust toolchain — but it does need a working `node`
-(and `npm`) on `PATH`. This is the same constraint `@topodb/pi` has; if you
+— no `cargo install`, no Rust toolchain. `npm` is resolved next to the `node`
+that launched `launch.js` (editor MCP spawns often have `node` but not `npm`
+on `PATH`). Node ≥ 22.19. This is the same constraint `@topodb/pi` has; if you
 already run Pi extensions, you already satisfy it.
 
 ## What runs automatically

@@ -18,6 +18,7 @@ import path from "node:path";
 import { serverArgs, sessionScopes, SERVER_VERSION } from "./server-args.js";
 import { socketPathFor, helloFrame } from "./ipc.js";
 import { serveDegraded } from "./degraded.js";
+import { resolveNpmSpawn } from "./npm-cli.js";
 
 const SERVER_PKG = "@topodb/topodb-mcp";
 
@@ -167,49 +168,23 @@ function resolveServer(dataDir) {
     // every first run. stderr is safe to inherit for diagnostics.
     const npmArgs = ["install", "--prefix", dataDir, "--no-audit", "--no-fund", ...specs];
     const stdio = ["ignore", "ignore", "inherit"];
-    let res;
-    if (process.platform === "win32") {
-      // DO NOT spawn "npm.cmd" directly without shell:true. On Node
-      // 20.12+/22+/24 (the CVE-2024-27980 hardening) spawning a .cmd/.bat
-      // file with an argv array and no shell throws EINVAL — this is exactly
-      // the bug this comment exists to prevent from coming back. Every
-      // Windows user's first-run install broke on this before the fix below.
-      //
-      // The naive counter-fix — just add shell:true — trades EINVAL for a
-      // WORSE, silent bug: with shell:true, Node only *concatenates* argv
-      // into a command string, it does not quote it. CLAUDE_PLUGIN_DATA
-      // resolves under the user's home directory, which routinely contains
-      // spaces (e.g. "C:\Users\Andrew Smith\..."); unquoted, cmd.exe splits
-      // that path into separate words and npm installs into a truncated,
-      // WRONG directory with exit code 0 — no error, just data silently
-      // landing somewhere else. Verified empirically while fixing this: an
-      // unquoted `--prefix "C:\...\space test dir"` landed in
-      // "C:\...\space\node_modules" instead.
-      //
-      // Instead: run node itself against npm's own CLI entry point. This is
-      // NOT a hack — it's the same file npm.cmd itself execs (see npm.cmd's
-      // own `%~dp0\node_modules\npm\bin\npm-cli.js` resolution, where %~dp0
-      // is npm.cmd's own directory, i.e. the same directory as node.exe).
-      // Spawning it via [process.execPath, npmCliJs, ...args] needs no shell
-      // at all, so Node's normal (correct, no-shell) Windows argv escaping
-      // applies and spaced paths just work — verified empirically too.
-      //
-      // Fall back to shell:true with each arg manually double-quoted only if
-      // that bundled npm-cli.js isn't where every standard Windows Node
-      // install (official installer, nvm-windows, volta, scoop, ...) puts
-      // it — i.e. only for a genuinely unusual npm layout.
-      const npmCliJs = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-      if (existsSync(npmCliJs)) {
-        res = spawnSync(process.execPath, [npmCliJs, ...npmArgs], { stdio });
-      } else {
-        const quote = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
-        res = spawnSync("npm.cmd", npmArgs.map(quote), { shell: true, stdio });
-      }
-    } else {
-      // POSIX: "npm" is a plain shebang script, not a .cmd — no EINVAL, no
-      // shell needed, argv spaces are handled correctly by spawnSync as-is.
-      res = spawnSync("npm", npmArgs, { stdio });
-    }
+    // Cursor's MCP spawn PATH often has `node` (how it launched us) but not
+    // `npm`. Resolve npm next to process.execPath — see npm-cli.js.
+    //
+    // Windows quoteArgs: do NOT spawn npm.cmd without shell:true (Node
+    // 20.12+ EINVAL on .cmd), and do NOT shell:true without quoting —
+    // unquoted --prefix under a home path with spaces installs to the wrong
+    // dir with exit 0. quoteArgs is only set on that fallback.
+    const inv = resolveNpmSpawn({ execPath: process.execPath });
+    const spawnArgs = inv.quoteArgs
+      ? [...inv.args, ...npmArgs].map((s) => `"${String(s).replace(/"/g, '\\"')}"`)
+      : [...inv.args, ...npmArgs];
+    const nodeDir = path.dirname(process.execPath);
+    const env = {
+      ...process.env,
+      PATH: `${nodeDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    };
+    const res = spawnSync(inv.command, spawnArgs, { stdio, shell: inv.shell, env });
     if (res.status !== 0) {
       // res.error (e.g. ENOENT when npm itself is missing/not on PATH) is the
       // only signal a user gets when first-run install fails offline, behind
@@ -317,6 +292,33 @@ const tryConnect = (sock) =>
     c.on("error", () => res(null));
   });
 
+function daemonConnectWaitMs(env) {
+  const n = Number(env.TOPODB_DAEMON_CONNECT_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 10_000;
+}
+
+/** Cursor (and any editor that is itself one stdio MCP client) must not sit
+ *  on a degraded 0-tool stub when the daemon socket never comes up. Spawn
+ *  topodb-mcp on this process's stdin/stdout with no hello frame — the
+ *  `--scope`/`--read-scopes` in argv already name this session. */
+function serveForeground(command, argv) {
+  process.stderr.write("topodb: daemon socket never bound; serving topodb-mcp on stdio\n");
+  const child = spawn(command, argv, { stdio: ["pipe", "pipe", "inherit"] });
+  process.stdin.pipe(child.stdin);
+  child.stdout.pipe(process.stdout);
+  const fail = (why) => {
+    process.stdin.unpipe(child.stdin);
+    child.stdout.unpipe(process.stdout);
+    process.stdin.resume();
+    serveDegraded(why);
+  };
+  child.on("error", (err) => fail(`stdio topodb-mcp failed to spawn: ${err.message}`));
+  child.on("exit", (code, sig) => {
+    if (code === 0) process.exit(0);
+    fail(`stdio topodb-mcp exited code=${code} signal=${sig}`);
+  });
+}
+
 /** Once connected, this process is a dumb byte pipe: the daemon owns the DB and
  *  stamps this connection's scope onto every request, so the client's JSON-RPC
  *  passes through untouched. Each connection is its own session on the daemon,
@@ -363,10 +365,10 @@ function relay(conn, hello) {
 /**
  * Bootstrap and serve. `dataDir` is where memory.redb, the npm-installed
  * server, episodes/ and memory.warehouse/ live; `projectDir` decides the
- * session's scope; `env` is consulted for TOPODB_MCP_SERVER_BIN only.
- * Every failure path ends in serveDegraded — a failed MCP server is nearly
- * invisible in an editor while the skill keeps telling the agent to call
- * memory tools, so explaining beats dying.
+ * session's scope; `env` is consulted for TOPODB_MCP_SERVER_BIN and
+ * TOPODB_DAEMON_CONNECT_MS. Bootstrap failures and a dead daemon still
+ * land in serveDegraded. A daemon socket that never binds falls through
+ * to a foreground stdio server instead of a 0-tool stub.
  */
 export async function run({ dataDir, projectDir, env = process.env }) {
   let conn = null;
@@ -416,22 +418,44 @@ export async function run({ dataDir, projectDir, env = process.env }) {
       // dev builds use. Empty string means unset, so a test can opt a child back
       // into real resolution.
       const binOverride = env.TOPODB_MCP_SERVER_BIN;
+      let daemon;
+      let fgCommand;
+      let fgArgs;
       if (binOverride) {
-        spawn(binOverride, ["--socket", sock, ...args], { detached: true, stdio: "ignore" }).unref();
+        fgCommand = binOverride;
+        fgArgs = [...args];
+        daemon = spawn(binOverride, ["--socket", sock, ...args], { detached: true, stdio: "ignore" });
       } else {
         const shimPath = resolveServer(dataDir); // installs the server if needed; returns the topodb-mcp launcher
-        spawn(process.execPath, [shimPath, "--socket", sock, ...args], { detached: true, stdio: "ignore" }).unref();
+        fgCommand = process.execPath;
+        fgArgs = [shimPath, ...args];
+        daemon = spawn(process.execPath, [shimPath, "--socket", sock, ...args], { detached: true, stdio: "ignore" });
       }
-      // 50 × 200ms = a 10s budget (the loop exits the moment the socket is
-      // up, so a fast boot pays nothing). The previous 5s budget was too
+      daemon.unref();
+      // Default 10s (50 × 200ms); the loop exits the moment the socket is
+      // up, so a fast boot pays nothing. The previous 5s budget was too
       // tight for a Windows cold start — fresh exe copy + Defender scan +
       // redb open routinely overran it, and the shim declared memory
       // degraded while the daemon was still coming up.
-      for (let i = 0; i < 50 && !conn; i++) {
+      // TOPODB_DAEMON_CONNECT_MS shortens this for tests.
+      const waitMs = daemonConnectWaitMs(env);
+      const polls = waitMs <= 0 ? 0 : Math.max(1, Math.ceil(waitMs / 200));
+      for (let i = 0; i < polls && !conn; i++) {
         await new Promise((r) => setTimeout(r, 200));
         conn = await tryConnect(sock);
       }
-      if (!conn) degradedReason = "could not reach or start the topodb daemon; see the daemon log in the plugin data dir";
+      if (!conn) {
+        try {
+          daemon.kill();
+        } catch {
+          /* already gone */
+        }
+        // One stdio client (Cursor) is better served by a foreground
+        // topodb-mcp than by a 0-tool degraded stub. Kill the socket
+        // spawn first so it cannot keep the redb lock.
+        serveForeground(fgCommand, fgArgs);
+        return;
+      }
     }
   } catch (err) {
     // Anything above — unset dataDir, a mkdirSync failure, resolveServer's
