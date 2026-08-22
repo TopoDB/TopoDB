@@ -18,17 +18,18 @@ This installs a binary named **`topodb`** (not `topodb-cli`) to your Cargo bin d
 ## Global flags
 
 ```
-topodb [--db <path>] [--scope <ulid|shared>] [--pretty] [--lock-wait-ms <ms>] <command> [args...]
+topodb [--db <path>] [--scope <ulid|shared>] [--read-scopes <ulid|shared>[,...]] [--pretty] [--lock-wait-ms <ms>] <command> [args...]
 ```
 
 `--pretty` and `--lock-wait-ms` are valid **before or after** the subcommand
-name; `--db` and `--scope` must come before it (or use the `TOPODB_DB` env
+name; `--db`, `--scope`, and `--read-scopes` must come before it (or use the `TOPODB_DB` env
 var for the former).
 
 | Flag | Required | Default | Meaning |
 |---|---|---|---|
 | `--db <path>` (env `TOPODB_DB`) | yes | — | Path to the redb database file. A missing file is created fresh (with the canonical default index spec — equality on `Entity/name`, text on `Memory/content`); an existing file is opened with **its own persisted index spec** via `Db::open_stored` — no `--spec` flag exists on this CLI, and none is ever needed. A missing *parent directory* is a db-open failure. |
 | `--scope <ulid\|shared>` | no | `shared` | The default scope every scoped command uses. `"shared"` (case-insensitive) resolves to the shared scope; any other value is parsed as a `ScopeId` ULID. An invalid value is rejected before the db is even opened. |
+| `--read-scopes <list>` (env `TOPODB_READ_SCOPES`) | no | `--scope`'s value | The default **read** scope set: comma-separated `"shared"` or scope ULIDs (whitespace around entries ignored). Reads filter by this set; writes still stamp exactly one scope via `--scope`. An empty list is rejected before the db is opened. |
 | `--lock-wait-ms <ms>` (env `TOPODB_LOCK_WAIT_MS`) | no | `3000` | How long to retry on lock contention (`TopoError::Busy`) during database open. `0` disables retries and fails immediately. After 500ms of waiting, an audible note is printed to stderr: `topodb: database held by another process; retrying (budget <N>ms)`. See **Exit-code contract** below for the exit code on lock exhaustion. |
 | `--pretty` | no | off | Pretty-print the JSON output instead of compact one-line JSON. |
 
@@ -38,7 +39,7 @@ All 26 subcommands, in scaffold + write + read + warehouse order:
 
 | Command | Key flags | Output |
 |---|---|---|
-| `info` | — | `{"path","format_version","current_seq","index_spec","default_scope"}` |
+| `info` | — | `{"path","format_version","current_seq","index_spec","default_scope","default_read_scopes"}` |
 | `create-memory` | `--content <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>` | `{"id": "<ulid>", "deduplicated": bool}` |
 | `create-entity` | `--name <text>` (required), `--props <json-object>`, `--scope <ulid\|shared>`, `--always-create` | `{"id": "<ulid>", "created": bool}` |
 | `remember` | `--content <text>` (required), `--entity <name>` (required, repeatable), `--edge-type <ty>` (default `"about"`), `--supersedes <id>` (repeatable), `--kind <episodic\|semantic\|procedural\|decision>`, `--props <json-object>`, `--scope <ulid\|shared>` | `{"memory_id": "<ulid>", "deduplicated": bool, "entities": [{"name": "<name>", "id": "<ulid>", "created": bool}], "edge_ids": ["<ulid>", ...], "superseded": ["<ulid>", ...]}` |
@@ -217,9 +218,6 @@ that decision needs revisiting.
 - **No `--spec` flag.** An existing db is always opened with its own persisted index spec; a fresh
   one is created with the canonical default (equality on `Entity/name`, text on `Memory/content`).
   There's no way to declare a different spec from this CLI.
-- **No multi-scope reads.** Every read filters by the single scope named in the global `--scope`.
-  `topodb-mcp` can read across a *set* of scopes (`--read-scopes`, and a `scopes` param on its read
-  tools); this CLI cannot. To read another scope, run again with a different `--scope`.
 - **Direct-embedded only, single-process access.** There's no `--connect`/HTTP mode — the CLI opens
   the `.redb` file directly in-process, the same way `topodb-mcp` does. You can't run `topodb`
   against a database file another process (another `topodb` invocation, or a running `topodb-mcp`

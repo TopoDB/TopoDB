@@ -651,6 +651,50 @@ pub fn scope_to_scope_set(scope: Scope) -> ScopeSet {
     }
 }
 
+/// A **non-empty** set of scopes a read filters by. The non-empty invariant is
+/// structural: an empty [`ScopeSet`] admits nothing, so an empty read set would
+/// make every default read silently return empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadScopes(Vec<Scope>);
+
+impl ReadScopes {
+    /// Rejects an empty list. This is the only constructor.
+    pub fn new(scopes: Vec<Scope>) -> Result<Self, String> {
+        if scopes.is_empty() {
+            return Err(
+                "read scope set is empty; expected at least one of \"shared\" or a scope ULID"
+                    .to_string(),
+            );
+        }
+        Ok(Self(scopes))
+    }
+
+    /// The scopes, in the order given.
+    pub fn as_slice(&self) -> &[Scope] {
+        &self.0
+    }
+}
+
+/// Parses a comma-separated list of `shared` (case-insensitive) or scope ULIDs.
+/// Whitespace around each entry is ignored. Order and duplicates are preserved.
+/// Rejects an empty list (`""`, `" , "`). Each token is parsed via
+/// [`resolve_scope`] — the `default` passed there is never used because every
+/// token is required.
+pub fn parse_read_scopes(s: &str) -> Result<ReadScopes, String> {
+    let scopes: Vec<Scope> = s
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|token| resolve_scope(Some(token), Scope::Shared))
+        .collect::<Result<_, _>>()?;
+    if scopes.is_empty() {
+        return Err(format!(
+            "read scope list {s:?} is empty; expected a comma-separated list of \"shared\" or scope ULIDs"
+        ));
+    }
+    ReadScopes::new(scopes)
+}
+
 /// Several resolved `Scope`s → the `ScopeSet` a multi-scope read runs against.
 /// `Scope::Shared` sets the set's `include_shared` flag; each `Scope::Id`
 /// becomes a member id. This is the only constructor that can produce a
@@ -1202,6 +1246,46 @@ mod tests {
         let set = scopes_to_scope_set(&[]);
         assert!(!set.contains(Scope::Shared));
         assert!(!set.contains(Scope::Id(a)));
+    }
+
+    // --- ReadScopes / parse_read_scopes ---
+
+    #[test]
+    fn read_scopes_new_rejects_empty_and_accepts_nonempty() {
+        assert!(ReadScopes::new(vec![]).is_err());
+        assert!(ReadScopes::new(vec![Scope::Shared]).is_ok());
+        assert!(ReadScopes::new(vec![Scope::Id(ScopeId::new()), Scope::Shared]).is_ok());
+    }
+
+    #[test]
+    fn parse_read_scopes_comma_separated_shared_and_ulid() {
+        let a = ScopeId::new();
+        let rs = parse_read_scopes(&format!("{a},shared")).unwrap();
+        assert_eq!(rs.as_slice(), &[Scope::Id(a), Scope::Shared]);
+    }
+
+    #[test]
+    fn parse_read_scopes_trims_whitespace_around_entries() {
+        let a = ScopeId::new();
+        let rs = parse_read_scopes(&format!(" {a} , shared ")).unwrap();
+        assert_eq!(rs.as_slice(), &[Scope::Id(a), Scope::Shared]);
+    }
+
+    #[test]
+    fn parse_read_scopes_preserves_order_and_duplicates() {
+        let rs = parse_read_scopes("shared,shared").unwrap();
+        assert_eq!(rs.as_slice(), &[Scope::Shared, Scope::Shared]);
+    }
+
+    #[test]
+    fn parse_read_scopes_rejects_empty_list() {
+        assert!(parse_read_scopes("").is_err());
+        assert!(parse_read_scopes(" , ").is_err());
+    }
+
+    #[test]
+    fn parse_read_scopes_rejects_bad_ulid() {
+        assert!(parse_read_scopes("shared,not-a-ulid").is_err());
     }
 
     // --- json_to_prop_changes: null removes, scalar sets ---

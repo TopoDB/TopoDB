@@ -45,9 +45,8 @@
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::str::FromStr;
 
-use topodb::{IndexSpec, Scope, ScopeId};
+use topodb::{IndexSpec, Scope};
 
 /// The one canonical usage line, shared by `--help` and the unknown-argument
 /// error so the two can never drift. `<off|auto|model>` matches the README
@@ -63,35 +62,8 @@ pub use topodb_json::{
     MEMORY_CONTENT_PROP, MEMORY_LABEL, SYNONYM_EXPANSION_PROP, SYNONYM_LABEL, SYNONYM_TERM_PROP,
 };
 
-/// A **non-empty** set of scopes a read filters by. The non-empty invariant is
-/// structural rather than conventional: an empty [`ScopeSet`] admits nothing, so
-/// an empty read set would make every default read silently return empty. There
-/// is no unscoped read, and "read nothing" is never what a caller means.
-///
-/// Distinct from [`Config::default_scope`], the single [`Scope`] a *write* is
-/// stamped with. A read filters by a set; a write picks one.
-///
-/// [`ScopeSet`]: topodb::ScopeSet
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadScopes(Vec<Scope>);
-
-impl ReadScopes {
-    /// Rejects an empty list. This is the only constructor.
-    pub fn new(scopes: Vec<Scope>) -> Result<Self, Box<dyn Error>> {
-        if scopes.is_empty() {
-            return Err(
-                "read scope set is empty; expected at least one of \"shared\" or a scope ULID"
-                    .into(),
-            );
-        }
-        Ok(Self(scopes))
-    }
-
-    /// The scopes, in the order given.
-    pub fn as_slice(&self) -> &[Scope] {
-        &self.0
-    }
-}
+/// Non-empty read scope set — single-sourced in `topodb-json`.
+pub use topodb_json::ReadScopes;
 
 /// Resolved server configuration (see the module docs for the CLI contract).
 #[derive(Debug, Clone)]
@@ -149,39 +121,6 @@ pub use topodb_json::default_spec;
 /// Single-sourced in `topodb-json`; re-exported here so existing
 /// `topodb-mcp` call sites keep working unchanged.
 pub use topodb_json::scope_label;
-
-/// Parses a `--scope` value: `"shared"` (any case) => [`Scope::Shared`],
-/// otherwise a ULID string => [`Scope::Id`].
-fn parse_scope(s: &str) -> Result<Scope, Box<dyn Error>> {
-    if s.eq_ignore_ascii_case("shared") {
-        Ok(Scope::Shared)
-    } else {
-        let id = ScopeId::from_str(s).map_err(|e| {
-            format!("invalid --scope value {s:?} (expected \"shared\" or a ULID): {e}")
-        })?;
-        Ok(Scope::Id(id))
-    }
-}
-
-/// Parses a `--read-scopes` value: a comma-separated list of `shared` / ULID
-/// entries, whitespace around each entry ignored. Rejects an empty list — an
-/// empty `ScopeSet` admits nothing, and "read nothing" is never what a caller
-/// means (there is no unscoped read).
-fn parse_read_scopes(s: &str) -> Result<ReadScopes, Box<dyn Error>> {
-    let scopes = s
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(parse_scope)
-        .collect::<Result<Vec<_>, _>>()?;
-    if scopes.is_empty() {
-        return Err(format!(
-            "--read-scopes value {s:?} is empty; expected a comma-separated list of \"shared\" or scope ULIDs"
-        )
-        .into());
-    }
-    ReadScopes::new(scopes)
-}
 
 impl Config {
     /// Parses config from an argument iterator (excluding argv[0]). Returns a
@@ -298,12 +237,9 @@ impl Config {
         }
 
         let db_path = db_path.ok_or("missing required --db <path>")?;
-        let default_scope = match scope {
-            Some(s) => parse_scope(&s)?,
-            None => Scope::Shared,
-        };
+        let default_scope = topodb_json::resolve_scope(scope.as_deref(), Scope::Shared)?;
         let default_read_scopes = match read_scopes {
-            Some(s) => parse_read_scopes(&s)?,
+            Some(s) => topodb_json::parse_read_scopes(&s)?,
             None => ReadScopes::new(vec![default_scope])?,
         };
         let spec = match spec_path {
@@ -334,6 +270,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use topodb::ScopeId;
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

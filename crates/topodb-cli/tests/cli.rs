@@ -5,6 +5,7 @@ fn bin() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_topodb"));
     c.env_remove("TOPODB_DB");
     c.env_remove("TOPODB_SCOPE");
+    c.env_remove("TOPODB_READ_SCOPES");
     c.env_remove("TOPODB_FORMAT");
     c
 }
@@ -52,6 +53,7 @@ fn info_reports_fields_on_fresh_db() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["current_seq"], 0);
     assert_eq!(v["default_scope"], "shared");
+    assert_eq!(v["default_read_scopes"], serde_json::json!(["shared"]));
     assert!(v["format_version"].is_number());
 }
 
@@ -2928,11 +2930,12 @@ fn obsidian_seed_resolves_shared_entity_from_a_project_scope_and_round_trips() {
 
     let vault = dir.path().join("wm");
 
-    // Before the fix, this failed with "unknown entity redis" because seed
-    // read only the project scope, never shared.
+    // Multi-scope read: project memory linked to a shared entity.
     let seed = run(&[
         "--scope",
         &project,
+        "--read-scopes",
+        &format!("{project},shared"),
         "obsidian-seed",
         vault.to_str().unwrap(),
         "--entity",
@@ -4735,6 +4738,295 @@ fn graph_exports_ego_scope_and_formats() {
     let html = std::fs::read_to_string(&html_path).unwrap();
     assert!(html.contains("id=\"snapshot\""));
     assert!(!html.contains("https://"));
+}
+
+// --- CLI --read-scopes (multi-scope reads) ---
+
+fn run_db(db: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut v = vec!["--db", db.to_str().unwrap()];
+    v.extend_from_slice(args);
+    bin().args(&v).output().unwrap()
+}
+
+#[test]
+fn scoped_search_does_not_see_shared_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rs1.redb");
+    let project = topodb::ScopeId::new().to_string();
+    run_db(
+        &db,
+        &[
+            "--scope",
+            "shared",
+            "remember",
+            "--content",
+            "rs1 shared visible fact",
+            "--entity",
+            "S",
+        ],
+    );
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "remember",
+            "--content",
+            "rs1 scoped only fact",
+            "--entity",
+            "P",
+        ],
+    );
+    let out = run_db(&db, &["--scope", &project, "search", "rs1"]);
+    assert!(out.status.success());
+    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let body = hits.to_string();
+    assert!(
+        body.contains("scoped only fact"),
+        "expected scoped hit: {body}"
+    );
+    assert!(
+        !body.contains("shared visible fact"),
+        "scoped search must not leak shared: {body}"
+    );
+}
+
+#[test]
+fn read_scopes_spans_project_and_shared() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rs2.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let read_list = format!("{project},shared");
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "--read-scopes",
+            &read_list,
+            "remember",
+            "--content",
+            "rs2 project fact",
+            "--entity",
+            "P",
+        ],
+    );
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "--read-scopes",
+            &read_list,
+            "remember",
+            "--content",
+            "rs2 shared lesson",
+            "--entity",
+            "S",
+            "--scope",
+            "shared",
+        ],
+    );
+    let out = run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "--read-scopes",
+            &read_list,
+            "search",
+            "rs2",
+        ],
+    );
+    assert!(out.status.success());
+    let hits = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        hits, 2,
+        "read-scopes {project},shared must see both memories"
+    );
+}
+
+#[test]
+fn unscoped_write_lands_in_write_scope_not_read_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rs3.redb");
+    let project = topodb::ScopeId::new().to_string();
+    let read_list = format!("{project},shared");
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "--read-scopes",
+            &read_list,
+            "remember",
+            "--content",
+            "rs3 leakcheck unscoped write",
+            "--entity",
+            "P",
+        ],
+    );
+    let in_project = run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "--read-scopes",
+            &project,
+            "search",
+            "rs3 leakcheck",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&in_project.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let in_shared = run_db(
+        &db,
+        &[
+            "--scope",
+            "shared",
+            "--read-scopes",
+            "shared",
+            "search",
+            "rs3 leakcheck",
+        ],
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&in_shared.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn empty_read_scopes_is_rejected_before_db_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("never_created_rs.redb");
+    assert!(!db.exists());
+    for list in ["", " , "] {
+        let out = run_db(&db, &["--read-scopes", list, "info"]);
+        assert_eq!(out.status.code(), Some(2), "list={list:?}");
+        assert!(!db.exists(), "empty read-scopes must not create db");
+    }
+}
+
+#[test]
+fn bad_ulid_in_read_scopes_is_rejected_before_db_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("never_created_bad_rs.redb");
+    assert!(!db.exists());
+    let out = run_db(&db, &["--read-scopes", "shared,not-a-ulid", "info"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!db.exists());
+}
+
+#[test]
+fn read_scopes_precedence_flag_over_env_over_config() {
+    let home = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let db = proj.path().join("rs6.redb");
+    let a = topodb::ScopeId::new().to_string();
+    let b = topodb::ScopeId::new().to_string();
+    let c = topodb::ScopeId::new().to_string();
+    std::fs::write(
+        proj.path().join(".topodb.toml"),
+        format!("db = '{}'\nread_scopes = \"{c}\"\n", db.display()),
+    )
+    .unwrap();
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &a,
+            "remember",
+            "--content",
+            "rs6 flag fact",
+            "--entity",
+            "F",
+        ],
+    );
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &b,
+            "remember",
+            "--content",
+            "rs6 env fact",
+            "--entity",
+            "E",
+        ],
+    );
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &c,
+            "remember",
+            "--content",
+            "rs6 config fact",
+            "--entity",
+            "C",
+        ],
+    );
+    let mut cmd = bin_home(home.path());
+    cmd.current_dir(proj.path())
+        .env("TOPODB_READ_SCOPES", &b)
+        .args(["--read-scopes", &a, "search", "rs6"]);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success());
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(body.contains("flag fact"), "flag wins: {body}");
+    assert!(!body.contains("env fact"));
+    assert!(!body.contains("config fact"));
+}
+
+#[test]
+fn omitted_read_scopes_equals_scope_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rs7.redb");
+    let project = topodb::ScopeId::new().to_string();
+    run_db(
+        &db,
+        &[
+            "--scope",
+            "shared",
+            "remember",
+            "--content",
+            "rs7 shared fact",
+            "--entity",
+            "S",
+        ],
+    );
+    run_db(
+        &db,
+        &[
+            "--scope",
+            &project,
+            "remember",
+            "--content",
+            "rs7 project fact",
+            "--entity",
+            "P",
+        ],
+    );
+    let out = run_db(&db, &["--scope", &project, "search", "rs7"]);
+    assert!(out.status.success());
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(body.contains("project fact"));
+    assert!(!body.contains("shared fact"));
 }
 
 #[test]

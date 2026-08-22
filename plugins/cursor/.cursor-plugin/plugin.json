@@ -1,7 +1,7 @@
 {
   "name": "topodb",
   "displayName": "topodb memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Persistent agent memory: a temporal property graph, scoped per project with a shared layer for lessons that generalize. Recall injected at chat start; episodes and raw context captured automatically.",
   "author": { "name": "TopoDB" },
   "homepage": "https://github.com/TopoDB/TopoDB",

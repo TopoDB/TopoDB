@@ -18,6 +18,11 @@ pub struct Cli {
     /// flag, then TOPODB_SCOPE, then `.topodb.toml`, then "shared".
     #[arg(long)]
     pub scope: Option<String>,
+    /// Default read scope set: comma-separated `"shared"` or scope ULIDs.
+    /// Resolution order: this flag, then TOPODB_READ_SCOPES, then
+    /// `.topodb.toml` key `read_scopes`, then the global `--scope` alone.
+    #[arg(long)]
+    pub read_scopes: Option<String>,
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pub pretty: bool,
