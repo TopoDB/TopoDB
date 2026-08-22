@@ -110,7 +110,10 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, platform: linux-x64-gnu }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, platform: linux-arm64-gnu, zig: true }
+          # Native arm64 runner (free for public repos) — the zig cross-link
+          # failed on rustc's aarch64 erratum flag (--fix-cortex-a53-843419,
+          # rejected by zig's lld wrapper on the bindings-v0.1.0 run).
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux-arm64-gnu }
           - { os: macos-latest, target: x86_64-apple-darwin, platform: darwin-x64 }
           - { os: macos-latest, target: aarch64-apple-darwin, platform: darwin-arm64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, platform: win32-x64-msvc }
@@ -121,14 +124,9 @@ jobs:
         with: { targets: '${{ matrix.target }}' }
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      # linux-arm64 cross-links through zig (napi's --zig flag); everything
-      # else builds on a native or same-OS runner.
-      - uses: goto-bus-stop/setup-zig@v2
-        if: matrix.zig
-        with: { version: 0.11.0 }
       - run: npm install
         working-directory: crates/topodb-node
-      - run: npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.zig && '--zig' || '' }} --js native.js --dts native.d.ts
+      - run: npx napi build --platform --release --target ${{ matrix.target }} --js native.js --dts native.d.ts
         working-directory: crates/topodb-node
       - uses: actions/upload-artifact@v4
         with: { name: 'napi-${{ matrix.platform }}', path: 'crates/topodb-node/*.node' }
