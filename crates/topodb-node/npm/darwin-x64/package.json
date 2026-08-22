@@ -1,6 +1,6 @@
 {
   "name": "@topodb/topodb-darwin-x64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TopoDB native binding for macOS x64",
   "main": "topodb.darwin-x64.node",
   "files": [

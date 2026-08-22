@@ -64,8 +64,20 @@ jobs:
           for d in crates/topodb-node/npm/*/; do
             (cd "$d" && npm pack --dry-run)
           done
-      - name: Pack main package (dry run)
-        run: npm pack --dry-run
+      # The 0.1.0 main tarball shipped WITHOUT native.js (it was gitignored
+      # and the publish job packs a fresh checkout — npm silently skips
+      # missing `files` entries). native.js/native.d.ts are committed now;
+      # this asserts they actually land in the tarball.
+      - name: Pack main package (dry run) and assert loader ships
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e '
+            const files = JSON.parse(require("fs").readFileSync("/tmp/pack.json","utf8"))[0].files.map(f => f.path);
+            for (const need of ["native.js", "native.d.ts", "index.js", "index.d.ts", "ops.js", "README.md"]) {
+              if (!files.includes(need)) { console.error("missing from tarball:", need, "— got:", files); process.exit(1); }
+            }
+            console.log("tarball complete:", files.join(", "));
+          '
         working-directory: crates/topodb-node
 
   # Built on every run (not just tags) so sdist breakage surfaces on PRs.
@@ -151,9 +163,12 @@ jobs:
           name: sdist
           path: dist
       # Trusted publishing (OIDC pending publisher on pypi.org) — no API token.
+      # skip-existing: a re-tag after a partial release must not fail on the
+      # files that already made it up.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
 
   publish-npm-bindings:
     if: startsWith(github.ref, 'refs/tags/bindings-v')
@@ -177,16 +192,30 @@ jobs:
             cp "prebuilds/topodb.${platform}.node" "$d"
           done
       # Platform packages go first so a partial failure leaves the unscoped
-      # `topodb` name unpublished rather than published-but-broken.
+      # `topodb` name unpublished rather than published-but-broken. Skip
+      # versions that already exist so a re-tag after a partial release is
+      # idempotent instead of dying on the packages that made it up.
       - name: Publish platform packages
         run: |
           for d in crates/topodb-node/npm/*/; do
-            (cd "$d" && npm publish --access public)
+            name=$(node -p 'require("./'"$d"'/package.json").name')
+            ver=$(node -p 'require("./'"$d"'/package.json").version')
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "skip $name@$ver — already published"
+            else
+              (cd "$d" && npm publish --access public)
+            fi
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish main package
-        run: npm publish --access public
+        run: |
+          ver=$(node -p 'require("./package.json").version')
+          if npm view "topodb@$ver" version >/dev/null 2>&1; then
+            echo "skip topodb@$ver — already published"
+          else
+            npm publish --access public
+          fi
         working-directory: crates/topodb-node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

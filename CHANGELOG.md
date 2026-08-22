@@ -1913,6 +1913,19 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## `topodb-node` (`topodb` on npm)
 
+### 0.1.1 — 2026-08-22
+
+#### Fixed
+
+- **The published package actually loads.** The 0.1.0 tarball shipped without
+  `native.js`/`native.d.ts` — generated loader files that were gitignored, so
+  the tag-run publish (a fresh checkout) silently packed without them and
+  `require('topodb')` failed with `Cannot find module './native.js'`. The
+  loader files are committed now, the pack dry-run asserts they land in the
+  tarball, and the publish jobs skip already-published versions so a re-tag
+  is idempotent. Platform packages were unaffected but move to 0.1.1 in
+  lockstep.
+
 ### 0.1.0 — 2026-08-22
 
 First published release of the package. Earlier crate versions were never
