@@ -1,0 +1,16 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "codex-sess-0001",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "tool_name": "mcp__topodb__search_memories",
+  "tool_input": { "query": "hnsw" },
+  "tool_response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"hits\":[{\"node\":{\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"props\":{\"content\":\"hello from memory\"}},\"score\":0.9}]}"
+      }
+    ]
+  }
+}

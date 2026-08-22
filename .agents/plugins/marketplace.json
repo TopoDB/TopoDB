@@ -1,0 +1,8 @@
+{
+  "name": "topodb",
+  "owner": { "name": "TopoDB" },
+  "metadata": { "description": "Persistent agent memory for Codex: a temporal property graph, scoped per project with a shared layer." },
+  "plugins": [
+    { "name": "topodb", "source": "plugins/codex", "description": "Persistent agent memory: a temporal property graph, scoped per project with a shared layer." }
+  ]
+}

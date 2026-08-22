@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "topodb": { "command": "node", "args": ["${PLUGIN_ROOT}/launch.js"] }
+  }
+}

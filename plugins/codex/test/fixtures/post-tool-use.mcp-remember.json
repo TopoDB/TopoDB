@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "codex-sess-0001",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "tool_name": "mcp__topodb__remember",
+  "tool_input": { "content": "a durable fact" },
+  "tool_response": { "structuredContent": { "memory_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" } }
+}

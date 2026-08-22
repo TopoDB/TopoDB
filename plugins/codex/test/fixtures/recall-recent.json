@@ -1,0 +1,6 @@
+{
+  "memories": [
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "props": { "content": "Decided to use HNSW behind a flag" } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G5FB0", "props": { "content": "Windows CI is the testbench; iterate via PRs" } }
+  ]
+}
