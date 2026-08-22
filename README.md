@@ -16,8 +16,8 @@ pure Rust: a property graph with temporal facts (facts supersede, never
 overwrite), scope-aware recall, graph-scoped vector search, and a change feed
 for external consolidation — running in-process, no server.
 
-Status: **early development (0.0.x), API not yet stable — pin exact
-versions.** Shipping today: the engine (temporal property graph, scoped
+Status: **0.1 — breaking changes are 0.2.0.** On-disk format still migrates
+in place. Shipping today: the engine (temporal property graph, scoped
 k-hop traversal, BM25 + graph-scoped vector search, change feed, a
 replay-deterministic op log), hybrid recall, and — over `topodb-mcp` — a
 full memory-hygiene layer (write-time dedup and supersession,
@@ -93,7 +93,7 @@ and scoped recall as a library call.
 
 ## What's built
 
-Everything in the three groups below ships today (0.0.x — pin exact versions).
+Everything in the three groups below ships today.
 
 **Engine — `topodb`**
 
@@ -127,8 +127,6 @@ Everything in the three groups below ships today (0.0.x — pin exact versions).
 - Frozen-DAG execution with a pre-computed worst-case model-call bound; approval gate; durable, crash-resumable runs (event sidecar, `sgh show --follow` mid-run)
 - Providers: `claude`-CLI, Anthropic API, any OpenAI-compatible endpoint; agent nodes opt into TopoDB memory via `tools: [topodb]` (node-scoped MCP bridge — the memory db unlocks between tool nodes)
 - Claude Code plugin: `/sgh:plan`, `/sgh:run`, `/sgh:lifecycle`, `/sgh:show`
-
-**Planned:** multi-scope reads over the CLI · API stabilization (0.1)
 
 **Never — by principle:** LLM calls inside the engine (principle 4) · a server process as a prerequisite (principle 5)
 

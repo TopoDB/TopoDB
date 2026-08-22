@@ -7,13 +7,13 @@ pure Rust: a scoped temporal property graph on [redb], with an op-log write
 path, disk-resident MVCC reads, and k-hop temporal traversal — running
 in-process, no server.
 
-Status: **early development (0.0.x)** — the engine core **and the recall
-layer** are implemented: op log, single-applier concurrency, scoped temporal
-traversal (point-in-time `as_of` and Allen-style valid-time interval
-predicates), BM25 full-text search, graph-scoped vector search, hybrid RRF
-recall (recency-, access-, and corroboration-weighted), access stats,
-change feed, and replay-determinism property tests. The API is not yet
-stable; pin exact versions.
+Status: **0.1 — breaking changes are 0.2.0.** On-disk format still migrates
+in place. The engine core **and the recall layer** are implemented: op log,
+single-applier concurrency, scoped temporal traversal (point-in-time `as_of`
+and Allen-style valid-time interval predicates), BM25 full-text search,
+graph-scoped vector search, hybrid RRF recall (recency-, access-, and
+corroboration-weighted), access stats, change feed, and replay-determinism
+property tests.
 
 ```rust,no_run
 use topodb::{

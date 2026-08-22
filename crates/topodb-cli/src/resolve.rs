@@ -27,6 +27,7 @@ impl Source {
 pub struct ProjectConfig {
     pub db: Option<String>,
     pub scope: Option<String>,
+    pub read_scopes: Option<String>,
     pub format: Option<String>,
     pub path: Option<PathBuf>,
     pub unknown_keys: Vec<String>,
@@ -59,6 +60,7 @@ pub fn load_project_config(start_dir: &Path) -> Result<Option<ProjectConfig>, St
                 match k.as_str() {
                     "db" => cfg.db = Some(as_string("db", v)?),
                     "scope" => cfg.scope = Some(as_string("scope", v)?),
+                    "read_scopes" => cfg.read_scopes = Some(as_string("read_scopes", v)?),
                     "format" => cfg.format = Some(as_string("format", v)?),
                     other => cfg.unknown_keys.push(other.to_string()),
                 }
@@ -120,6 +122,35 @@ pub fn resolve_db(
     }
     Resolved {
         value: expand_home("~/.topodb/memory.redb", home),
+        source: Source::Default,
+    }
+}
+
+pub fn resolve_read_scopes_str(
+    flag: Option<String>,
+    env: Option<String>,
+    config: Option<(&str, &Path)>,
+) -> Resolved<Option<String>> {
+    if let Some(f) = flag {
+        return Resolved {
+            value: Some(f),
+            source: Source::Flag,
+        };
+    }
+    if let Some(e) = env {
+        return Resolved {
+            value: Some(e),
+            source: Source::Env,
+        };
+    }
+    if let Some((c, p)) = config {
+        return Resolved {
+            value: Some(c.to_string()),
+            source: Source::Config(p.to_path_buf()),
+        };
+    }
+    Resolved {
+        value: None,
         source: Source::Default,
     }
 }
@@ -324,6 +355,41 @@ mod tests {
         let r = resolve_db(None, None, None, Some("/home"));
         assert_eq!(r.value, PathBuf::from("/home/.topodb/memory.redb"));
         assert_eq!(r.source, Source::Default);
+    }
+
+    #[test]
+    fn read_scopes_toml_string_parses_and_array_rejects() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "read_scopes = \"shared,01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        );
+        let cfg = load_project_config(d.path()).unwrap().unwrap();
+        assert_eq!(
+            cfg.read_scopes.as_deref(),
+            Some("shared,01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        write(d.path(), "read_scopes = [\"shared\"]\n");
+        let err = load_project_config(d.path()).unwrap_err();
+        assert!(err.contains("read_scopes"), "err was: {err}");
+    }
+
+    #[test]
+    fn read_scopes_precedence_flag_over_env_over_config() {
+        let p = PathBuf::from("/cfg/.topodb.toml");
+        assert_eq!(
+            resolve_read_scopes_str(Some("A".into()), Some("B".into()), Some(("C", &p))).value,
+            Some("A".into())
+        );
+        assert_eq!(
+            resolve_read_scopes_str(None, Some("B".into()), Some(("C", &p))).value,
+            Some("B".into())
+        );
+        assert_eq!(
+            resolve_read_scopes_str(None, None, Some(("C", &p))).value,
+            Some("C".into())
+        );
+        assert_eq!(resolve_read_scopes_str(None, None, None).value, None);
     }
 
     #[test]

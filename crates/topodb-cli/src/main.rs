@@ -17,7 +17,7 @@ use daemon_client::BusyDiagnosis;
 #[cfg(any(unix, windows))]
 use daemon_client::{DaemonClient, Discovery};
 use topodb::{
-    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, TimeAxis, TopoError,
+    Db, Direction, EdgeId, EdgeRecord, NodeId, Op, PropValue, Scope, ScopeSet, TimeAxis, TopoError,
     TraversalQuery, ValidInterval, VectorQuery,
 };
 
@@ -87,6 +87,37 @@ fn main() {
         ),
     };
 
+    let read_scopes_r = resolve::resolve_read_scopes_str(
+        cli.read_scopes.clone(),
+        std::env::var("TOPODB_READ_SCOPES").ok(),
+        cfg.read_scopes.as_deref().zip(cfg_path.as_deref()),
+    );
+    let read_scopes = match &read_scopes_r.value {
+        Some(s) => match topodb_json::parse_read_scopes(s) {
+            Ok(rs) => rs,
+            Err(e) => output::fail(
+                "rejected",
+                &format!("read scopes from {}: {e}", read_scopes_r.source.label()),
+                2,
+            ),
+        },
+        None => topodb_json::ReadScopes::new(vec![default_scope]).unwrap_or_else(|e| {
+            output::fail("internal", &e, 1);
+        }),
+    };
+    let read_scope_set = topodb_json::scopes_to_scope_set(read_scopes.as_slice());
+    let read_scopes_display = read_scopes
+        .as_slice()
+        .iter()
+        .map(topodb_json::scope_label)
+        .collect::<Vec<_>>()
+        .join(",");
+    let read_scopes_source = if read_scopes_r.value.is_some() {
+        read_scopes_r.source.label()
+    } else {
+        scope_r.source.label()
+    };
+
     let fmt = match resolve::resolve_format(
         cli.format.map(Into::into),
         std::env::var("TOPODB_FORMAT").ok(),
@@ -106,8 +137,6 @@ fn main() {
     }
 
     let text_mode = matches!(fmt, resolve::Format::Text);
-    let scope_display = scope_r.value.clone();
-    let scope_source = scope_r.source.label();
 
     // Open using the file's own persisted index spec — no --spec flag on
     // this CLI. An EXISTING file always inherits its persisted spec exactly
@@ -188,16 +217,14 @@ fn main() {
     if is_daemon_routable(&cli.cmd) {
         if let Discovery::SocketPresent(endpoint) = daemon_client::discover(&db_path) {
             let scope_str = topodb_json::scope_label(&default_scope);
-            // The routed read set MUST equal the direct path's, which is
-            // `scope_to_scope_set(default_scope)` — i.e. exactly the one scope
-            // (a ULID reads only itself; `Scope::Shared` reads only shared).
-            // Adding "shared" here would make a `--scope <ULID>` search return
-            // shared-scope memories the direct path never sees — a silent
-            // daemon-vs-no-daemon divergence on the dogfood workflow.
-            let read_scopes = vec![scope_str.clone()];
+            let read_scope_labels: Vec<String> = read_scopes
+                .as_slice()
+                .iter()
+                .map(topodb_json::scope_label)
+                .collect();
             let scopes = daemon_client::HelloScopes {
                 scope: scope_str,
-                read_scopes,
+                read_scopes: read_scope_labels,
             };
             match daemon_client::DaemonClient::connect(&endpoint, &scopes) {
                 Ok(mut client) => {
@@ -265,7 +292,13 @@ fn main() {
     };
 
     match cli.cmd {
-        Command::Info => info(&db, &db_path, default_scope, cli.pretty),
+        Command::Info => info(
+            &db,
+            &db_path,
+            default_scope,
+            read_scopes.as_slice(),
+            cli.pretty,
+        ),
         Command::CreateMemory { content, props, .. } => {
             create_memory(&db, write_scope, content, props.as_deref(), cli.pretty)
         }
@@ -349,10 +382,10 @@ fn main() {
             entity,
             hops,
             overwrite,
-            default_scope,
+            &read_scope_set,
             cli.pretty,
         ),
-        Command::Get { id } => get(&db, default_scope, &id, text_mode, cli.pretty),
+        Command::Get { id } => get(&db, &read_scope_set, &id, text_mode, cli.pretty),
         Command::Find {
             label,
             prop,
@@ -360,14 +393,14 @@ fn main() {
             normalized,
         } => find(
             &db,
-            default_scope,
+            &read_scope_set,
             &label,
             &prop,
             &value,
             normalized,
             text_mode,
-            &scope_display,
-            &scope_source,
+            &read_scopes_display,
+            &read_scopes_source,
             cli.pretty,
         ),
         Command::Search {
@@ -382,7 +415,7 @@ fn main() {
             no_temporal_rewrite,
         } => search(
             &db,
-            default_scope,
+            &read_scope_set,
             &query,
             k,
             include_superseded,
@@ -393,8 +426,8 @@ fn main() {
             created_before,
             no_temporal_rewrite,
             text_mode,
-            &scope_display,
-            &scope_source,
+            &read_scopes_display,
+            &read_scopes_source,
             cli.pretty,
         ),
         Command::Traverse {
@@ -407,7 +440,7 @@ fn main() {
             valid_interval,
         } => traverse(
             &db,
-            default_scope,
+            &read_scope_set,
             &seed,
             max_hops,
             direction.into(),
@@ -432,7 +465,7 @@ fn main() {
         } => graph(
             &db,
             &db_path,
-            default_scope,
+            &read_scope_set,
             seed,
             query,
             query_k,
@@ -457,7 +490,7 @@ fn main() {
             valid_interval,
         } => get_edges(
             &db,
-            default_scope,
+            &read_scope_set,
             &from,
             to.as_deref(),
             edge_type.as_deref(),
@@ -468,7 +501,7 @@ fn main() {
             allen_interval(&valid_interval),
             cli.pretty,
         ),
-        Command::Stats { id } => stats(&db, default_scope, &id, cli.pretty),
+        Command::Stats { id } => stats(&db, &read_scope_set, &id, cli.pretty),
         Command::LifecycleCandidates {
             limit,
             half_life_episodic_days,
@@ -478,7 +511,7 @@ fn main() {
             now_ms,
         } => lifecycle_candidates(
             &db,
-            default_scope,
+            &read_scope_set,
             limit,
             half_life_episodic_days,
             half_life_semantic_days,
@@ -504,7 +537,15 @@ fn main() {
             vector,
             k,
             candidate,
-        } => search_vector(&db, default_scope, model, &vector, k, candidate, cli.pretty),
+        } => search_vector(
+            &db,
+            &read_scope_set,
+            model,
+            &vector,
+            k,
+            candidate,
+            cli.pretty,
+        ),
         Command::Submit { input } => submit(&db, default_scope, &input, cli.pretty),
         Command::Warehouse(w) => warehouse_cmd::run(&w, &db, &db_path, cli.pretty),
         Command::Daemon(_) => unreachable!("daemon subcommands exit before the direct open"),
@@ -581,13 +622,12 @@ fn parse_value_arg(value: &str) -> PropValue {
     }
 }
 
-fn get(db: &Db, scope: Scope, id: &str, text_mode: bool, pretty: bool) -> ! {
+fn get(db: &Db, scopes: &ScopeSet, id: &str, text_mode: bool, pretty: bool) -> ! {
     let id = match NodeId::from_str(id) {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid id {id:?}: {e}"), 2),
     };
-    let scopes = topodb_json::scope_to_scope_set(scope);
-    let value = match db.node(&scopes, id) {
+    let value = match db.node(scopes, id) {
         Some(n) => {
             let node = match topodb_json::node_to_json(&n) {
                 Ok(v) => v,
@@ -611,7 +651,7 @@ fn get(db: &Db, scope: Scope, id: &str, text_mode: bool, pretty: bool) -> ! {
 #[allow(clippy::too_many_arguments)]
 fn find(
     db: &Db,
-    scope: Scope,
+    scopes: &ScopeSet,
     label: &str,
     prop: &str,
     value: &str,
@@ -622,11 +662,10 @@ fn find(
     pretty: bool,
 ) -> ! {
     let pv = parse_value_arg(value);
-    let scopes = topodb_json::scope_to_scope_set(scope);
     let hits = if normalized {
-        db.nodes_by_prop_normalized(&scopes, label, prop, &pv)
+        db.nodes_by_prop_normalized(scopes, label, prop, &pv)
     } else {
-        db.nodes_by_prop(&scopes, label, prop, &pv)
+        db.nodes_by_prop(scopes, label, prop, &pv)
     };
     let hits = match hits {
         Ok(hits) => hits,
@@ -657,7 +696,7 @@ fn find(
 #[allow(clippy::too_many_arguments)]
 fn search(
     db: &Db,
-    scope: Scope,
+    scopes: &ScopeSet,
     query: &str,
     k: usize,
     include_superseded: bool,
@@ -672,7 +711,6 @@ fn search(
     scope_source: &str,
     pretty: bool,
 ) -> ! {
-    let scopes = topodb_json::scope_to_scope_set(scope);
     // The kinds filter is policy over the engine's generic prop_retain:
     // this layer names the prop and maps "absent" to the default kind.
     let prop_retain = if kinds.is_empty() {
@@ -761,10 +799,10 @@ fn search(
     // 0` is what restores raw BM25. Forgotten memories are also dropped from
     // default search (same liveness model as superseded).
     let hits = if include_superseded {
-        db.search_text_with(&scopes, &query, k, &options)
+        db.search_text_with(scopes, &query, k, &options)
     } else {
         db.search_text_live(
-            &scopes,
+            scopes,
             &query,
             k,
             &options,
@@ -814,7 +852,7 @@ fn search(
 #[allow(clippy::too_many_arguments)]
 fn traverse(
     db: &Db,
-    scope: Scope,
+    scopes: &ScopeSet,
     seed: &str,
     max_hops: u8,
     direction: Direction,
@@ -857,7 +895,6 @@ fn traverse(
             );
         }
     }
-    let scopes = topodb_json::scope_to_scope_set(scope);
     // Empty --edge-type (none given) -> None, follow every edge type; the
     // engine treats `Some(vec![])` as "match nothing", which would silently
     // strand the traversal at the seed — so an empty CLI list must map to
@@ -868,7 +905,7 @@ fn traverse(
         Some(edge_type.into_iter().map(Into::into).collect())
     };
     let query = TraversalQuery {
-        scopes,
+        scopes: scopes.clone(),
         seeds: vec![seed],
         max_hops,
         edge_types,
@@ -895,7 +932,7 @@ fn traverse(
 fn graph(
     db: &Db,
     db_path: &Path,
-    scope: Scope,
+    scopes: &ScopeSet,
     seed: Vec<String>,
     query: Option<String>,
     query_k: usize,
@@ -934,7 +971,6 @@ fn graph(
     } else {
         Some(edge_type.into_iter().map(Into::into).collect())
     };
-    let scopes = topodb_json::scope_to_scope_set(scope);
     let mut snapshot = if !seeds.is_empty() || query.is_some() {
         let params = topodb_json::EgoParams {
             seeds,
@@ -946,9 +982,9 @@ fn graph(
             as_of,
             time_axis,
         };
-        topodb_json::build_ego(db, &scopes, &params)
+        topodb_json::build_ego(db, scopes, &params)
     } else {
-        topodb_json::build_scope(db, &scopes, limit)
+        topodb_json::build_scope(db, scopes, limit)
     }
     .unwrap_or_else(|e| output::fail("rejected", &e, 2));
     snapshot.db_path = Some(db_path.display().to_string());
@@ -1049,7 +1085,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn get_edges(
     db: &Db,
-    scope: Scope,
+    scopes: &ScopeSet,
     from: &str,
     to: Option<&str>,
     edge_type: Option<&str>,
@@ -1095,8 +1131,6 @@ fn get_edges(
         );
     }
 
-    let scopes = topodb_json::scope_to_scope_set(scope);
-
     // An interval predicate REPLACES the open-only/as-of gating: an explicit
     // temporal flag alongside it is a conflict, and only the valid axis is
     // in scope. Passing predicates then routes to the `*_interval` reads,
@@ -1139,12 +1173,12 @@ fn get_edges(
     // Fold the interval conditional INSIDE the fetch closures so there is one
     // shared tail (mirrors the MCP server's shape at server.rs ~4153-4172).
     let fetch_from = |t: Option<&str>| match valid_interval {
-        Some(iv) => db.edges_from_interval(&scopes, from_id, to_id, t, iv),
-        None => db.edges_from(&scopes, from_id, to_id, t, open_only_to_use, time_axis),
+        Some(iv) => db.edges_from_interval(scopes, from_id, to_id, t, iv),
+        None => db.edges_from(scopes, from_id, to_id, t, open_only_to_use, time_axis),
     };
     let fetch_to = |t: Option<&str>| match valid_interval {
-        Some(iv) => db.edges_to_interval(&scopes, from_id, to_id, t, iv),
-        None => db.edges_to(&scopes, from_id, to_id, t, open_only_to_use, time_axis),
+        Some(iv) => db.edges_to_interval(scopes, from_id, to_id, t, iv),
+        None => db.edges_to(scopes, from_id, to_id, t, open_only_to_use, time_axis),
     };
 
     let mut edges = match direction {
@@ -1183,13 +1217,12 @@ fn get_edges(
     output::ok(&serde_json::json!({ "edges": edges }), pretty);
 }
 
-fn stats(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
+fn stats(db: &Db, scopes: &ScopeSet, id: &str, pretty: bool) -> ! {
     let id = match NodeId::from_str(id) {
         Ok(id) => id,
         Err(e) => output::fail("rejected", &format!("invalid id {id:?}: {e}"), 2),
     };
-    let scopes = topodb_json::scope_to_scope_set(scope);
-    let value = match db.access_stats(&scopes, id) {
+    let value = match db.access_stats(scopes, id) {
         Ok(Some(s)) => serde_json::json!({
             "found": true,
             "access_stats": {
@@ -1210,7 +1243,7 @@ fn stats(db: &Db, scope: Scope, id: &str, pretty: bool) -> ! {
 #[allow(clippy::too_many_arguments)]
 fn lifecycle_candidates(
     db: &Db,
-    scope: Scope,
+    scopes: &ScopeSet,
     limit: usize,
     half_life_episodic_days: f64,
     half_life_semantic_days: f64,
@@ -1219,7 +1252,6 @@ fn lifecycle_candidates(
     now_ms: Option<i64>,
     pretty: bool,
 ) -> ! {
-    let scopes = topodb_json::scope_to_scope_set(scope);
     let params = topodb_json::LifecycleParams {
         limit,
         half_life_episodic_ms: (half_life_episodic_days * 86_400_000.0) as i64,
@@ -1233,7 +1265,7 @@ fn lifecycle_candidates(
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
     });
-    let candidates = match topodb_json::lifecycle_candidates(db, &scopes, &params, now) {
+    let candidates = match topodb_json::lifecycle_candidates(db, scopes, &params, now) {
         Ok(c) => c,
         Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
         Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
@@ -1302,17 +1334,28 @@ fn compact(db: &Db, keep_from: u64, pretty: bool) -> ! {
     output::ok(&serde_json::json!({ "oldest": keep_from }), pretty);
 }
 
-fn info(db: &Db, path: &std::path::Path, default_scope: Scope, pretty: bool) -> ! {
+fn info(
+    db: &Db,
+    path: &std::path::Path,
+    default_scope: Scope,
+    read_scopes: &[Scope],
+    pretty: bool,
+) -> ! {
     let current_seq = match db.current_seq() {
         Ok(seq) => seq,
         Err(e) => output::fail_engine(&e),
     };
+    let default_read_scopes: Vec<serde_json::Value> = read_scopes
+        .iter()
+        .map(|s| topodb_json::scope_to_json(*s))
+        .collect();
     let value = serde_json::json!({
         "path": path.to_string_lossy(),
         "format_version": db.format_version(),
         "current_seq": current_seq,
         "index_spec": db.index_spec(),
         "default_scope": topodb_json::scope_to_json(default_scope),
+        "default_read_scopes": default_read_scopes,
     });
     output::ok(&value, pretty);
 }
@@ -1703,14 +1746,13 @@ fn obsidian_seed(
     entity: Option<String>,
     hops: u8,
     overwrite: bool,
-    scope: Scope,
+    scopes: &ScopeSet,
     pretty: bool,
 ) -> ! {
-    let scopes = topodb_json::scopes_to_scope_set(&[scope, Scope::Shared]);
     let memories = match (&query, &entity) {
-        (Some(q), None) => topodb_obsidian::select_by_query(db, &scopes, q, k, None)
+        (Some(q), None) => topodb_obsidian::select_by_query(db, scopes, q, k, None)
             .unwrap_or_else(|e| output::fail_engine(&e)),
-        (None, Some(name)) => match topodb_obsidian::select_by_entity(db, &scopes, name, hops) {
+        (None, Some(name)) => match topodb_obsidian::select_by_entity(db, scopes, name, hops) {
             Ok(m) => m,
             Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
             Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
@@ -1721,7 +1763,7 @@ fn obsidian_seed(
             2,
         ),
     };
-    match topodb_obsidian::seed_vault(db, &scopes, vault, &memories, overwrite) {
+    match topodb_obsidian::seed_vault(db, scopes, vault, &memories, overwrite) {
         Ok(report) => output::ok(
             &serde_json::to_value(&report).expect("report serializes"),
             pretty,
@@ -1801,7 +1843,7 @@ fn set_embedding(db: &Db, id: &str, model: String, vector: &str, pretty: bool) -
 #[allow(clippy::too_many_arguments)]
 fn search_vector(
     db: &Db,
-    scope: Scope,
+    scopes: &ScopeSet,
     model: String,
     vector: &str,
     k: usize,
@@ -1832,9 +1874,8 @@ fn search_vector(
         }
         Some(ids)
     };
-    let scopes = topodb_json::scope_to_scope_set(scope);
     let query = VectorQuery {
-        scopes,
+        scopes: scopes.clone(),
         model,
         vector,
         k,

@@ -14,38 +14,16 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## Unreleased
 
-### Added
-
-- **Context warehouse** (`topodb-warehouse`, spec 2026-08-18): append-only, content-addressed log of raw session artifacts + mirrored engine ops under `<db>.warehouse/`; deterministic derive to `Artifact`/`Chunk` nodes with `evidence` lineage to memories; `rebuild` a redb from segments; hot/warm/cold/expired tiering; redaction. `topodb warehouse {status|drain|derive|tier|rebuild|verify|show}`; `[warehouse]` + `schedule.warehouse_*` in `.topodb.toml`; hygiene tasks drain (light), derive (heavy, daemon), tier (light); op-log compaction is clamped to the mirrored watermark; `db_info.warehouse`. Claude Code plugin: `warehouse-capture` PostToolUse hook + session/memory-write markers (`TOPODB_WAREHOUSE=0`, `TOPODB_WAREHOUSE_DIR`).
-- `topodb-json`: stock text index now includes `(Chunk, text)`; the previous stock default upgrades automatically.
-- `topodb graph` (CLI) and `graph_snapshot` (MCP): deterministic graph export —
-  ego view (traverse from seeds and/or a search query, hop-labeled) or whole-scope
-  view — as canonical JSON, DOT, Mermaid, or a self-contained interactive HTML
-  file (zero network requests). Truncation is always reported, never silent.
-  Snapshots are stamped with the op-log seq, not wall-clock time: same DB state,
-  same bytes.
-
-### Cursor plugin (`plugins/cursor`, 0.1.0)
-- New Cursor plugin with the seamless memory tier: daemon-backed `topodb` MCP
-  server (npm-bootstrapped, no Rust), chat-start recall injection, episode
-  capture, context-warehouse capture, once-per-session stop nudge, rules nudge,
-  `topodb-memory` skill, `/recall` and `/remember`. Installable from this repo's
-  root `.cursor-plugin/marketplace.json`.
-- Shares the database, scopes and daemon with the Claude Code plugin when both
-  are installed (data dir: `TOPODB_PLUGIN_DATA` → `CLAUDE_PLUGIN_DATA` →
-  `~/.claude/plugins/data/topodb-topodb/` if present → `~/.topodb/plugin-data/`).
-- Known gaps: no subagent recall injection in Cursor; multi-root workspaces use
-  the first root.
-
-### Plugin core (`plugins/core`)
-- Client-agnostic plugin code extracted into `plugins/core` and vendored into
-  each plugin by `scripts/sync-plugin-core.mjs` (drift-checked in CI). Claude
-  Code plugin 0.1.9: internal restructure only. Spool events now carry
-  `harness: "claude-code" | "cursor"`; episodes carry `usage_judged`.
-
 ---
 
 ## `topodb` (engine)
+
+### 0.1.0 — 2026-08-21
+
+#### Changed
+
+- **0.1 stability line** — breaking changes are reserved for 0.2.0; on-disk
+  format still migrates in place on open.
 
 ### 0.0.18 — 2026-08-16
 
@@ -509,6 +487,17 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-json`
 
+### 0.1.0 — 2026-08-21
+
+#### Added
+
+- **Stock text index `(Chunk, text)`** — the default `IndexSpec` now indexes
+  warehouse chunks; the previous stock default upgrades automatically via
+  `upgraded_spec`.
+- **`ReadScopes` / `parse_read_scopes`** — shared comma-separated read-scope
+  parser (`shared` / scope-ULID list, order-preserving, empty rejected);
+  single-sourced for CLI, MCP, and daemon config so they cannot drift.
+
 ### 0.0.15 — 2026-08-16
 
 #### Changed
@@ -716,6 +705,12 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## `topodb-obsidian`
 
+### 0.1.0 — 2026-08-21
+
+#### Changed
+
+- Dependency-only bump (engine 0.1.0 / json 0.1.0); no functional change.
+
 ### 0.0.7 — 2026-08-16
 
 #### Changed
@@ -766,6 +761,22 @@ First published release of the crate.
 
 ---
 
+## `topodb-warehouse`
+
+### 0.1.0 — 2026-08-21
+
+First published release of the crate.
+
+#### Added
+
+- **Context warehouse** (spec 2026-08-18) — append-only, content-addressed log
+  of raw session artifacts + mirrored engine ops under `<db>.warehouse/`;
+  deterministic derive to `Artifact`/`Chunk` nodes with `evidence` lineage to
+  memories; `rebuild` a redb from segments; hot/warm/cold/expired tiering;
+  redaction.
+
+---
+
 ## `topodb-mcp`
 
 ### Unreleased
@@ -781,6 +792,21 @@ First published release of the crate.
   never fatal, and `reingest`'s `last_run` advances after attempting all, so a
   misconfigured path retries next interval rather than every tick. `topodb init`
   resolves the same sources but leaves the heavy work deferred.
+
+### 0.1.0 — 2026-08-21
+
+#### Added
+
+- **`graph_snapshot` tool** — deterministic graph export (ego view from seeds
+  and/or a search query, hop-labeled, or whole-scope view) as canonical JSON,
+  DOT, Mermaid, or self-contained interactive HTML (zero network requests).
+  Truncation is always reported, never silent. Snapshots are stamped with the
+  op-log seq, not wall-clock time: same DB state, same bytes.
+- **`parse_read_scopes` shared with `topodb-json`** — CLI/MCP/daemon read-scope
+  defaults use the same parser.
+- **Warehouse hygiene** — drain (light), derive (heavy, daemon), tier (light)
+  tasks; op-log compaction clamped to the mirrored watermark;
+  `db_info.warehouse`.
 
 ### 0.0.20 — 2026-08-16
 
@@ -1498,6 +1524,24 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ## Claude Code plugin
 
+### 0.2.0 — 2026-08-21
+
+#### Added
+
+- **`warehouse-capture` PostToolUse hook** — captures raw session context into
+  the warehouse; session/memory-write markers (`TOPODB_WAREHOUSE=0`,
+  `TOPODB_WAREHOUSE_DIR`).
+
+#### Changed
+
+- **Still pins `@topodb/topodb-mcp` 0.0.20** until 0.1.0 is on npm (CI
+  `npm install` 404s on an unpublished pin). Bump `SERVER_VERSION` in a
+  follow-up after the `topodb-mcp-v0.1.0` tag publishes.
+- **Plugin core extracted to `plugins/core`** — client-agnostic code vendored
+  into each plugin by `scripts/sync-plugin-core.mjs` (drift-checked in CI).
+  Spool events carry `harness: "claude-code" | "cursor"`; episodes carry
+  `usage_judged`.
+
 ### 0.1.8 — 2026-08-16
 
 #### Added
@@ -1584,7 +1628,50 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 ---
 
+## Cursor plugin
+
+### 0.2.0 — 2026-08-21
+
+#### Added
+
+- **New Cursor plugin** — daemon-backed `topodb` MCP server (npm-bootstrapped,
+  no Rust), chat-start recall injection, episode capture, context-warehouse
+  capture, once-per-session stop nudge, rules nudge, `topodb-memory` skill,
+  `/recall` and `/remember`. Installable from this repo's root
+  `.cursor-plugin/marketplace.json`.
+- Shares the database, scopes, and daemon with the Claude Code plugin when both
+  are installed (data dir: `TOPODB_PLUGIN_DATA` → `CLAUDE_PLUGIN_DATA` →
+  `~/.claude/plugins/data/topodb-topodb/` if present →
+  `~/.topodb/plugin-data/`).
+- Known gaps: no subagent recall injection in Cursor; multi-root workspaces use
+  the first root.
+
+#### Changed
+
+- **Still pins `@topodb/topodb-mcp` 0.0.20** until 0.1.0 is on npm (same
+  follow-up as the Claude Code plugin).
+- Vendors shared plugin core from `plugins/core` (same sync as Claude Code
+  plugin).
+
+---
+
 ## `topodb-cli`
+
+### 0.1.0 — 2026-08-21
+
+#### Added
+
+- **`--read-scopes <list>`** — comma-separated default **read** `ScopeSet`
+  (`shared` / scope-ULID); defaults to `--scope` alone; writes still stamp
+  exactly one scope via `--scope`. Config/env precedence matches other globals.
+- **`topodb graph`** — deterministic graph export (ego view from seeds and/or a
+  search query, hop-labeled, or whole-scope view) as JSON, DOT, Mermaid, or
+  self-contained HTML; daemon-routed via `graph_snapshot`. Truncation always
+  reported; snapshot stamped with op-log seq.
+- **`topodb warehouse {status|drain|derive|tier|rebuild|verify|show}`** —
+  context-warehouse control surface.
+- **`[warehouse]` + `schedule.warehouse_*` in `.topodb.toml`** — warehouse
+  scheduling config.
 
 ### 0.0.15 — 2026-08-16
 

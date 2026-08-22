@@ -343,6 +343,66 @@ fn routed_reads_honor_a_non_shared_scope_like_the_direct_path() {
 }
 
 #[test]
+fn routed_reads_honor_read_scopes_like_the_direct_path() {
+    let Some(bin) = daemon_bin() else {
+        eprintln!("skipping: target topodb-mcp not built");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("read_scopes.redb");
+    let ulid = "0000000000ABCDEFGHJKMNPQRT";
+    let read_list = format!("{ulid},shared");
+    run(
+        &db,
+        &[
+            "--scope",
+            "shared",
+            "remember",
+            "--content",
+            "multi shared visible fact",
+            "--entity",
+            "S",
+        ],
+    );
+    run(
+        &db,
+        &[
+            "--scope",
+            ulid,
+            "remember",
+            "--content",
+            "multi scoped only fact",
+            "--entity",
+            "P",
+        ],
+    );
+
+    let args = &[
+        "--scope",
+        ulid,
+        "--read-scopes",
+        read_list.as_str(),
+        "search",
+        "fact",
+    ];
+    let direct = run(&db, args);
+    let _daemon = start_daemon(&bin, &db);
+    let routed = run(&db, args);
+    run(&db, &["daemon", "stop"]);
+
+    for (label, out) in [("direct", &direct), ("routed", &routed)] {
+        assert!(
+            out.contains("scoped only fact"),
+            "{label} multi-scope search should see the scoped memory: {out}"
+        );
+        assert!(
+            out.contains("shared visible fact"),
+            "{label} multi-scope search should see the shared memory: {out}"
+        );
+    }
+}
+
+#[test]
 fn info_is_not_routed() {
     // `info` deliberately does not route (db_info is a lighter summary than
     // the direct full index_spec dump). A lone direct call prints the full
