@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "codex-sess-0001",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/tmp/topodb-codex-fixture/project/src/lib.rs",
+    "old_string": "let x = 1;",
+    "new_string": "let x = 2;"
+  },
+  "tool_response": { "success": true }
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "codex-sess-0001",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "tool_name": "Read",
+  "tool_input": { "file_path": "/tmp/topodb-codex-fixture/project/src/lib.rs" },
+  "tool_response": "fn main() {}\n"
+}

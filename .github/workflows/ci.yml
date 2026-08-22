@@ -37,7 +37,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
   node-test:
     # Guards the npm distribution layer (npm/ launcher, scripts/ generator) and
-    # the Claude Code and Cursor plugins and their shared core. Runs on Windows too because the generator
+    # the Claude Code, Cursor and Codex plugins and their shared core. Runs on Windows too because the generator
     # shells out to `npm pack` and the Windows npm.cmd/execSync path is exactly
     # what broke during development. The plugin tests ALSO need ubuntu-latest:
     # the broker's loser-exits-without-unlinking behavior (C1) only exists on
@@ -68,6 +68,10 @@ jobs:
         working-directory: plugins/cursor
       - run: npm test
         working-directory: plugins/cursor
+      - run: npm install --no-audit --no-fund
+        working-directory: plugins/codex
+      - run: npm test
+        working-directory: plugins/codex
       # The pi extension's suite (idle-release, failure-path hardening) ran
       # nowhere in CI before publish — the npm install pulls the published
       # topodb-mcp with its prebuilt binary, so the real-server tests run on

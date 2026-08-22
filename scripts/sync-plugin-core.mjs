@@ -94,7 +94,8 @@ export function syncCore({ source, targets, check }) {
 
 function parseArgs(argv) {
   const o = { check: false, source: path.join(REPO_ROOT, "plugins", "core"),
-    targets: [path.join(REPO_ROOT, "plugins", "claude-code", "core"), path.join(REPO_ROOT, "plugins", "cursor", "core")] };
+    targets: [path.join(REPO_ROOT, "plugins", "claude-code", "core"), path.join(REPO_ROOT, "plugins", "cursor", "core"),
+      path.join(REPO_ROOT, "plugins", "codex", "core")] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--check") o.check = true;
     else if (argv[i] === "--source") o.source = path.resolve(argv[++i]);

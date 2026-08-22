@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "codex-sess-0001",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "stop_hook_active": true,
+  "last_assistant_message": "Saved what was worth keeping."
+}

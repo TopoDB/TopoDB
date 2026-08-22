@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "codex-sess-0002",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "tool_name": "mcp__github__remember",
+  "tool_input": {},
+  "tool_response": { "structuredContent": { "memory_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" } }
+}

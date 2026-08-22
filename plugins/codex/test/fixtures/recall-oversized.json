@@ -1,0 +1,15 @@
+{
+  "note": "Doc-derived oversized-recall base set: the session-start test tiles these memories until the rendered injection block exceeds Codex's additionalContextLimit (~2,500-token spill threshold), then asserts buildOutput clamps it. Promoted live payloads replace this file (Cursor pre-D4 pattern).",
+  "memories": [
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G500A", "props": { "content": "Oversized recall memory 00: the warehouse spool captures every PostToolUse artifact asynchronously so the episode flush at Stop can reconstruct the turn without a daemon round-trip on the hot path of the session." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G501A", "props": { "content": "Oversized recall memory 01: compact re-injection is a Codex-only capability — the same session-start script re-fires on the compact matcher so recall survives context compaction without any extra hook definition." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G502A", "props": { "content": "Oversized recall memory 02: hook command strings are static forever because Codex trust-hashes each definition and any change re-prompts in /hooks; all behavior changes live inside the scripts themselves." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G503A", "props": { "content": "Oversized recall memory 03: flush-at-Stop is the load-bearing episode path with a 600 second budget and last_assistant_message in the payload, so at most one turn is lost when a session dies unexpectedly." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G504A", "props": { "content": "Oversized recall memory 04: SessionEnd is advisory only — a marker plus a detached flusher — because it also fires after thirty minutes of idle and runs under a hard three second cap enforced by Codex." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G505A", "props": { "content": "Oversized recall memory 05: apply_patch arrives normalized as Edit or Write in the documented PostToolUse payload, so the warehouse capture path treats patches exactly like ordinary file edits and writes." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G506A", "props": { "content": "Oversized recall memory 06: mcp__ prefixed tool names match the capture hook, so topodb's own search and remember calls are recorded into episode state while foreign servers' same-named tools are ignored." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G507A", "props": { "content": "Oversized recall memory 07: the TOPODB_RECORDING and TOPODB_WAREHOUSE kill switches suppress spooling entirely, and every hook fails open — exit zero always, nothing on stdout except the documented payload." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G508A", "props": { "content": "Oversized recall memory 08: the data dir resolves through the shared chain — TOPODB_PLUGIN_DATA test override, then the CLAUDE_PLUGIN_DATA and PLUGIN_DATA compat pair, then the shared Claude Code dir." } },
+    { "id": "01ARZ3NDEKTSV4RRFFQ69G509A", "props": { "content": "Oversized recall memory 09: the once-per-session capture nudge is hard-gated by a nudged marker in recorder state plus a loop guard so the auto-submitted follow-up turn can never re-trigger the nudge." } }
+  ]
+}

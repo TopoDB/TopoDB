@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "SessionStart",
+  "session_id": "codex-sess-0001",
+  "transcript_path": "/tmp/topodb-codex-fixture/transcript.jsonl",
+  "cwd": "/tmp/topodb-codex-fixture/project",
+  "source": "resume",
+  "is_background_agent": false
+}
