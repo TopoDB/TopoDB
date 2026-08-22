@@ -1,5 +1,5 @@
 {
-  "name": "topodb-linux-x64-gnu",
+  "name": "@topodb/topodb-linux-x64-gnu",
   "version": "0.1.0",
   "description": "TopoDB native binding for Linux x64 (glibc)",
   "main": "topodb.linux-x64-gnu.node",
