@@ -14,6 +14,18 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## Unreleased
 
+### Claude Code plugin
+
+- `launch.js` uses the same data-dir resolution as the Cursor plugin, so a
+  Cursor auto-import (no `CLAUDE_PLUGIN_DATA`) still finds the store instead
+  of advertising a 0-tool degraded server.
+- When the daemon socket never binds, `launch.js` serves `topodb-mcp` on
+  stdio rather than a 0-tool stub.
+
+### Cursor plugin
+
+- Same stdio fallback when the daemon socket never binds.
+
 ---
 
 ## `topodb` (engine)

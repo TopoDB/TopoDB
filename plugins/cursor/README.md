@@ -10,14 +10,10 @@ installed they share one database and one daemon.
 - **From this repo (team marketplace / "Import from Repo"):** add
   `https://github.com/TopoDB/TopoDB` — the root `.cursor-plugin/marketplace.json`
   lists the `topodb` plugin at `plugins/cursor`.
-- **Local development:** `ln -s /path/to/TopoDB/plugins/cursor ~/.cursor/plugins/local/topodb`,
-  then enable it under Customize → Plugins.
+- **Local development:** copy `plugins/cursor` to `~/.cursor/plugins/local/topodb` (a real directory). Cursor **rejects** a symlink whose target is outside `~/.cursor/plugins/local`. Then enable it under Customize → Plugins.
 - Official Cursor Marketplace listing: pending submission.
 
-### Requires `node` (and `npm`) on PATH
-
-`launch.js` downloads `@topodb/topodb-mcp` into the plugin data directory on
-first run and reuses it — no Rust toolchain. Node ≥ 22.19.
+`launch.js` downloads `@topodb/topodb-mcp` into the plugin data directory on first run. It finds `npm` next to the `node` that launched it (Cursor's MCP PATH often omits `/usr/local/bin`). Node ≥ 22.19.
 
 ## What runs automatically
 
@@ -66,7 +62,9 @@ you installed the Claude Code plugin under another marketplace name or use
 redb allows one process per database file, and Cursor starts one MCP server per
 window, so `launch.js` is a thin stdio client of a shared daemon
 (`topodb-mcp --socket`) that owns `memory.redb`; the first window spawns it, it
-exits shortly after the last one disconnects. The daemon log is
+exits shortly after the last one disconnects. If that socket never binds,
+`launch.js` runs `topodb-mcp` on this window's stdio instead of advertising
+zero tools. The daemon log is
 `<data dir>/daemon.log` (or `broker.log` on older servers). Scope = hash of the
 workspace's first root path, identical to the Claude Code plugin; reads span the
 project plus `shared`, writes default to the project.
