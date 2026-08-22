@@ -799,10 +799,10 @@ fn search(
     // 0` is what restores raw BM25. Forgotten memories are also dropped from
     // default search (same liveness model as superseded).
     let hits = if include_superseded {
-        db.search_text_with(&scopes, &query, k, &options)
+        db.search_text_with(scopes, &query, k, &options)
     } else {
         db.search_text_live(
-            &scopes,
+            scopes,
             &query,
             k,
             &options,
@@ -1173,12 +1173,12 @@ fn get_edges(
     // Fold the interval conditional INSIDE the fetch closures so there is one
     // shared tail (mirrors the MCP server's shape at server.rs ~4153-4172).
     let fetch_from = |t: Option<&str>| match valid_interval {
-        Some(iv) => db.edges_from_interval(&scopes, from_id, to_id, t, iv),
-        None => db.edges_from(&scopes, from_id, to_id, t, open_only_to_use, time_axis),
+        Some(iv) => db.edges_from_interval(scopes, from_id, to_id, t, iv),
+        None => db.edges_from(scopes, from_id, to_id, t, open_only_to_use, time_axis),
     };
     let fetch_to = |t: Option<&str>| match valid_interval {
-        Some(iv) => db.edges_to_interval(&scopes, from_id, to_id, t, iv),
-        None => db.edges_to(&scopes, from_id, to_id, t, open_only_to_use, time_axis),
+        Some(iv) => db.edges_to_interval(scopes, from_id, to_id, t, iv),
+        None => db.edges_to(scopes, from_id, to_id, t, open_only_to_use, time_axis),
     };
 
     let mut edges = match direction {
@@ -1750,9 +1750,9 @@ fn obsidian_seed(
     pretty: bool,
 ) -> ! {
     let memories = match (&query, &entity) {
-        (Some(q), None) => topodb_obsidian::select_by_query(db, &scopes, q, k, None)
+        (Some(q), None) => topodb_obsidian::select_by_query(db, scopes, q, k, None)
             .unwrap_or_else(|e| output::fail_engine(&e)),
-        (None, Some(name)) => match topodb_obsidian::select_by_entity(db, &scopes, name, hops) {
+        (None, Some(name)) => match topodb_obsidian::select_by_entity(db, scopes, name, hops) {
             Ok(m) => m,
             Err(topodb_json::ComposeError::Invalid(m)) => output::fail("rejected", &m, 2),
             Err(topodb_json::ComposeError::Engine(e)) => output::fail_engine(&e),
@@ -1763,7 +1763,7 @@ fn obsidian_seed(
             2,
         ),
     };
-    match topodb_obsidian::seed_vault(db, &scopes, vault, &memories, overwrite) {
+    match topodb_obsidian::seed_vault(db, scopes, vault, &memories, overwrite) {
         Ok(report) => output::ok(
             &serde_json::to_value(&report).expect("report serializes"),
             pretty,

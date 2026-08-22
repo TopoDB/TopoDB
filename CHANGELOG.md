@@ -1534,7 +1534,9 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 #### Changed
 
-- **Pins `@topodb/topodb-mcp` 0.1.0** (engine 0.1.0).
+- **Still pins `@topodb/topodb-mcp` 0.0.20** until 0.1.0 is on npm (CI
+  `npm install` 404s on an unpublished pin). Bump `SERVER_VERSION` in a
+  follow-up after the `topodb-mcp-v0.1.0` tag publishes.
 - **Plugin core extracted to `plugins/core`** — client-agnostic code vendored
   into each plugin by `scripts/sync-plugin-core.mjs` (drift-checked in CI).
   Spool events carry `harness: "claude-code" | "cursor"`; episodes carry
@@ -1646,7 +1648,8 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 
 #### Changed
 
-- **Pins `@topodb/topodb-mcp` 0.1.0** (engine 0.1.0).
+- **Still pins `@topodb/topodb-mcp` 0.0.20** until 0.1.0 is on npm (same
+  follow-up as the Claude Code plugin).
 - Vendors shared plugin core from `plugins/core` (same sync as Claude Code
   plugin).
 
