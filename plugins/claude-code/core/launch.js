@@ -297,6 +297,17 @@ function daemonConnectWaitMs(env) {
   return Number.isFinite(n) && n >= 0 ? n : 10_000;
 }
 
+/** How to spawn a TOPODB_MCP_SERVER_BIN override. A native binary spawns
+ *  directly; a .js/.mjs/.cjs override runs via the current node, because
+ *  Windows cannot exec a script file (spawn EFTYPE — a shebang only works on
+ *  POSIX). Same shape the resolveServer path already uses for the npm shim.
+ *  Exported for the unit test. */
+export function serverInvocation(binOverride) {
+  return /\.[cm]?js$/i.test(binOverride)
+    ? { command: process.execPath, preArgs: [binOverride] }
+    : { command: binOverride, preArgs: [] };
+}
+
 /** Cursor (and any editor that is itself one stdio MCP client) must not sit
  *  on a degraded 0-tool stub when the daemon socket never comes up. Spawn
  *  topodb-mcp on this process's stdin/stdout with no hello frame — the
@@ -414,17 +425,19 @@ export async function run({ dataDir, projectDir, env = process.env }) {
       // launch path on any platform.
       //
       // TOPODB_MCP_SERVER_BIN points at a NATIVE topodb-mcp binary (a local
-      // `cargo build` output) and bypasses npm resolution — the seam tests and
-      // dev builds use. Empty string means unset, so a test can opt a child back
-      // into real resolution.
+      // `cargo build` output) — or a .js/.mjs/.cjs stand-in, which the launch
+      // seam tests use — and bypasses npm resolution. Script overrides run via
+      // the current node (see serverInvocation). Empty string means unset, so
+      // a test can opt a child back into real resolution.
       const binOverride = env.TOPODB_MCP_SERVER_BIN;
       let daemon;
       let fgCommand;
       let fgArgs;
       if (binOverride) {
-        fgCommand = binOverride;
-        fgArgs = [...args];
-        daemon = spawn(binOverride, ["--socket", sock, ...args], { detached: true, stdio: "ignore" });
+        const { command, preArgs } = serverInvocation(binOverride);
+        fgCommand = command;
+        fgArgs = [...preArgs, ...args];
+        daemon = spawn(command, [...preArgs, "--socket", sock, ...args], { detached: true, stdio: "ignore" });
       } else {
         const shimPath = resolveServer(dataDir); // installs the server if needed; returns the topodb-mcp launcher
         fgCommand = process.execPath;
