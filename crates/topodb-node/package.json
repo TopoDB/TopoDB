@@ -1,14 +1,52 @@
 {
   "name": "topodb",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "main": "index.js",
   "types": "index.d.ts",
-  "napi": { "name": "topodb" },
-  "engines": { "node": ">= 18" },
-  "devDependencies": { "@napi-rs/cli": "^2.18.0" },
+  "files": [
+    "README.md",
+    "index.js",
+    "index.d.ts",
+    "ops.js",
+    "native.js",
+    "native.d.ts"
+  ],
+  "napi": {
+    "name": "topodb"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "optionalDependencies": {
+    "topodb-linux-x64-gnu": "0.1.0",
+    "topodb-linux-arm64-gnu": "0.1.0",
+    "topodb-darwin-x64": "0.1.0",
+    "topodb-darwin-arm64": "0.1.0",
+    "topodb-win32-x64-msvc": "0.1.0"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
     "test": "node --test"
-  }
+  },
+  "description": "TopoDB \u2014 embedded, temporal, graph-native memory for AI agents (native Node.js binding)",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TopoDB/TopoDB.git",
+    "directory": "crates/topodb-node"
+  },
+  "homepage": "https://github.com/TopoDB/TopoDB",
+  "keywords": [
+    "memory",
+    "graph",
+    "temporal",
+    "database",
+    "embedded",
+    "agent",
+    "napi"
+  ]
 }

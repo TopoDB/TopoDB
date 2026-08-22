@@ -91,6 +91,26 @@ To embed the engine directly in a Rust process, see the
 [`topodb` crate example](crates/topodb/README.md) — the same graph, ops,
 and scoped recall as a library call.
 
+### Embedded bindings (JS / Python)
+
+The same embedded engine is available as native bindings for Node.js (napi)
+and Python (pyo3) — the graph, ops, and scoped recall in-process, no server
+and no Rust toolchain:
+
+```bash
+npm i topodb        # Node.js (prebuilt platform binaries)
+pip install topodb  # Python (prebuilt wheels)
+```
+
+**0.1.0 is the first published release of both packages** — they wrap the
+frozen 0.1 engine API, but the packages themselves are new; expect
+early-release rough edges. Reads filter by a scope *set*, writes stamp one
+scope — the same model as the MCP server. See
+[`crates/topodb-node/README.md`](crates/topodb-node/README.md) and
+[`crates/topodb-py/README.md`](crates/topodb-py/README.md) for quickstarts
+and platform tables, and [`docs/agent-clients.md`](docs/agent-clients.md)
+for when to embed versus talk to `topodb-mcp`.
+
 ## What's built
 
 Everything in the three groups below ships today.
