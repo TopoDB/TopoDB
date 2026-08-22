@@ -13,9 +13,10 @@ README = pathlib.Path(__file__).parents[1] / "README.md"
 
 def test_readme_quickstart_runs_and_search_hits(tmp_path, capsys):
     text = README.read_text(encoding="utf-8")
-    m = re.search(r"## Quickstart\s+```python\n(.*?)```", text, re.S)
+    # \r?\n + normalize: Windows CI checks out with autocrlf (CRLF fences).
+    m = re.search(r"## Quickstart\s+```python\r?\n(.*?)```", text, re.S)
     assert m, "README has a ## Quickstart ```python block"
-    code = m.group(1)
+    code = m.group(1).replace("\r\n", "\n")
     # Redirect the db file into tmp_path; everything else runs as written.
     code = code.replace('"memory.redb"', repr(str(tmp_path / "memory.redb")))
     exec(compile(code, str(README), "exec"), {})  # noqa: S102 - the README is ours

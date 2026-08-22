@@ -15,9 +15,11 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const readme = readFileSync(join(HERE, '..', 'README.md'), 'utf8')
 
 test('README quickstart runs verbatim and its search finds the memory', async () => {
-  const m = /## Quickstart\s+```js\n([\s\S]*?)```/.exec(readme)
+  // \r?\n + a normalize below: Windows CI checks out with autocrlf, so the
+  // fence is ```js\r\n there — the exact mismatch that broke this test once.
+  const m = /## Quickstart\s+```js\r?\n([\s\S]*?)```/.exec(readme)
   assert.ok(m, 'README has a ## Quickstart ```js block')
-  let code = m[1]
+  let code = m[1].replaceAll('\r\n', '\n')
   assert.ok(code.includes("require('topodb')"), 'quickstart requires topodb')
   // Redirect the db file into a temp dir; everything else runs as written.
   const dbPath = join(mkdtempSync(join(tmpdir(), 'readme-qs-')), 'memory.redb')
