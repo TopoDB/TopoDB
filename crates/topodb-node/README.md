@@ -19,27 +19,33 @@ Prebuilt binaries are pulled in automatically via platform packages (see
 ```js
 const { TopoDB, ops } = require('topodb')
 
-const db = await TopoDB.open('memory.redb')
+// Indexing is opt-in per (label, prop): declare what you'll look up by
+// equality and what full-text search should cover. Plain TopoDB.open()
+// indexes nothing (fine for pure graph workloads); TopoDB.openStored()
+// reopens a file with the spec it was created with.
+const db = await TopoDB.openWith('memory.redb', {
+  equality: [{ label: 'Entity', prop: 'name' }],
+  text: [{ label: 'Memory', prop: 'content' }],
+})
 
 // Write: build a batch with the ops builders, then submit it.
 // '#N' back-references the id created by the Nth command in the same batch.
-const { ids } = await db.submit(
-  [
-    ops.createEntity('ada'),
-    ops.createMemory('ada wrote the first program'),
-    ops.link('#1', '#0', 'ABOUT'),
-  ],
-  'my-scope', // default scope for commands that don't set their own
-)
+// A scope is "shared" or a ULID; with no default scope passed here,
+// everything lands in "shared".
+const { ids } = await db.submit([
+  ops.createEntity('ada'),
+  ops.createMemory('ada wrote the first program'),
+  ops.link('#1', '#0', 'ABOUT'),
+])
 
 // Read: every read takes an array of scopes to search across.
-const hits = await db.recall(['my-scope'], 'first program', 5)
+const hits = await db.recall(['shared'], 'first program', 5)
 for (const { node, score } of hits) {
   console.log(score, node.label, node.props)
 }
 
 // Walk the graph outward from a seed node.
-const subgraph = await db.traverse(['my-scope'], [ids[0]], 2)
+const subgraph = await db.traverse(['shared'], [ids[0]], 2)
 console.log(subgraph.nodes.length, subgraph.edges.length)
 
 db.close() // TopoDB also implements Symbol.dispose (`using db = ...`)

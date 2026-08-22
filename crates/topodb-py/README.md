@@ -30,7 +30,16 @@ Other platforms build from the sdist (requires a Rust toolchain via maturin).
 import topodb
 from topodb import ops
 
-with topodb.TopoDB.open("memory.redb") as db:
+# Indexing is opt-in per (label, prop): declare equality lookups and what
+# full-text search should cover. Plain TopoDB.open() indexes nothing (fine
+# for pure graph workloads); TopoDB.open_stored() reopens a file with the
+# spec it was created with.
+spec = {
+    "equality": [{"label": "Entity", "prop": "name"}],
+    "text": [{"label": "Memory", "prop": "content"}],
+}
+
+with topodb.TopoDB.open_with("memory.redb", spec) as db:
     r = db.submit([
         ops.create_entity("ada"),
         ops.create_memory("ada wrote the first program"),
