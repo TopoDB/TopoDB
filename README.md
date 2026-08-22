@@ -2,28 +2,21 @@
 
 [![crates.io](https://img.shields.io/crates/v/topodb.svg)](https://crates.io/crates/topodb)
 [![docs.rs](https://img.shields.io/docsrs/topodb)](https://docs.rs/topodb)
-[![topodb-json on crates.io](https://img.shields.io/crates/v/topodb-json.svg?label=topodb-json)](https://crates.io/crates/topodb-json)
-[![topodb-json on docs.rs](https://img.shields.io/docsrs/topodb-json?label=docs.rs%3A%20topodb-json)](https://docs.rs/topodb-json)
-[![topodb-mcp on crates.io](https://img.shields.io/crates/v/topodb-mcp.svg?label=topodb-mcp)](https://crates.io/crates/topodb-mcp)
-[![topodb-mcp on docs.rs](https://img.shields.io/docsrs/topodb-mcp?label=docs.rs%3A%20topodb-mcp)](https://docs.rs/topodb-mcp)
-[![topodb-cli on crates.io](https://img.shields.io/crates/v/topodb-cli.svg?label=topodb-cli)](https://crates.io/crates/topodb-cli)
-[![topodb-cli on docs.rs](https://img.shields.io/docsrs/topodb-cli?label=docs.rs%3A%20topodb-cli)](https://docs.rs/topodb-cli)
 
-**The memory terrain for AI agents — embedded, temporal, graph-native.**
+TopoDB is an embedded memory engine for AI agents, written in Rust.
+It runs in-process, and there is no server.
+Facts are stored on a temporal property graph and supersede rather than
+overwrite.
+Recall is scoped, and search uses BM25 and graph-scoped vectors.
+A change feed supports work outside the engine.
 
-TopoDB is an embedded, local-first memory engine for AI agents, written in
-pure Rust: a property graph with temporal facts (facts supersede, never
-overwrite), scope-aware recall, graph-scoped vector search, and a change feed
-for external consolidation — running in-process, no server.
+Status is 0.1, with breaking changes reserved for 0.2.0; however, the
+on-disk format migrates in place.
 
-Status: **0.1 — breaking changes are 0.2.0.** On-disk format still migrates
-in place. Shipping today: the engine (temporal property graph, scoped
-k-hop traversal, BM25 + graph-scoped vector search, change feed, a
-replay-deterministic op log), hybrid recall, and — over `topodb-mcp` — a
-full memory-hygiene layer (write-time dedup and supersession,
-contradiction-aware near-duplicate detection, and orphan / stale / health
-maintenance scans), plus a Claude Code plugin that injects recall and a
-hygiene nudge at session start. See [what's built](#whats-built).
+![Scope view of a small TopoDB graph](assets/graph.png)
+
+`topodb graph --graph-format html --out graph.html` writes a self-contained
+viewer.
 
 ## Principles
 
@@ -33,110 +26,38 @@ hygiene nudge at session start. See [what's built](#whats-built).
 4. Engine, not policy — no LLM calls inside the database, ever
 5. Embedded-first — servers and sync are future layers, never prerequisites
 
-Principle 4 is a hard boundary, not a preference: anything LLM-driven —
-summarization, reflection, consolidation — is a **layer built on the
-engine**, never a feature inside it. The engine's job is to hand those
-layers the primitives they need: the change feed, temporal history, and
-scoped recall.
-
-## Five-minute quick start
-
-The fastest path is the CLI (installs a binary named `topodb`):
+## Install
 
 ```bash
-cargo install topodb-cli
-
-# Store and link a fact in one call.
+cargo install topodb-cli          # binary name: topodb
 topodb --db agent.redb remember --content "ada wrote the first program" --entity ada
-# → {"memory_id":"01…","deduplicated":false,"entities":[{"name":"ada","id":"01…","created":true}],…}
 topodb --db agent.redb search "first program"
-topodb --db agent.redb traverse 01… --max-hops 2
 ```
 
-(The low-level `create-memory`, `create-entity`, and `link` commands are still available for
-fine-grained control.)
+The CLI opens the file in-process. A second process holding the same file
+will fail.
 
-To give a coding agent the same database as MCP tools:
+| Client | Install |
+|---|---|
+| Claude Code | `/plugin marketplace add TopoDB/TopoDB` then `/plugin install topodb` |
+| Cursor | Import `https://github.com/TopoDB/TopoDB` (`plugins/cursor`) |
+| Pi | `pi install npm:@topodb/pi` |
+| Any MCP client | `cargo install topodb-mcp` — [`docs/agent-clients.md`](docs/agent-clients.md) |
+| Rust | [`crates/topodb`](crates/topodb/README.md) |
 
-```bash
-cargo install topodb-mcp
-claude mcp add topodb --transport stdio -- topodb-mcp --db /path/to/agent.redb
-```
-
-On [Pi](https://pi.dev) it is one command: `pi install npm:@topodb/pi`.
-
-Using another agent client — Codex CLI, OpenCode, Cursor, Windsurf, Zed, or
-Cline? `topodb-mcp` works with any MCP client; see
-[`docs/agent-clients.md`](docs/agent-clients.md) for a copy-paste config per
-client (and how memory scoping works without the Claude Code plugin).
-
-Inside Claude Code specifically, skip `cargo` and `claude mcp add` entirely —
-install the plugin, which manages the server (including fetching it) for you:
-
-```
-/plugin marketplace add TopoDB/TopoDB
-/plugin install topodb
-```
-
-See [`plugins/claude-code/README.md`](plugins/claude-code/README.md) for the
-memory model and the risks it accepts (one database shared across every
-project; the scope id is keyed to the absolute project path, so it does not
-follow a repo across clones or machines).
-
-**Cursor:** `plugins/cursor/` — same behavior, installable from this repo via
-Cursor's marketplace import; shares the database with the Claude Code plugin
-when both are installed.
-
-To embed the engine directly in a Rust process, see the
-[`topodb` crate example](crates/topodb/README.md) — the same graph, ops,
-and scoped recall as a library call.
-
-## What's built
-
-Everything in the three groups below ships today.
-
-**Engine — `topodb`**
-
-- Op-log write path — atomic batches, deterministic replay (property-tested)
-- Single-applier concurrency; MVCC reads that never block each other or redb's storage commits (a long read can briefly delay the applier's next batch via registry guards)
-- Scoped k-hop temporal traversal with `as_of` history reads and Allen-style interval predicates (`during` / `overlaps` / `before` / `after` over edge valid time)
-- Temporal edges — facts supersede, never overwrite
-- Equality property index; BM25 full-text search (per-scope corpus)
-- Graph-scoped vector search (cosine; embeddings host-computed, stored via `SetEmbedding`)
-- Hybrid recall (`Db::recall`) — RRF fusion of the text/vector/graph legs with recency, access, and optional cross-leg corroboration weighting (corroborated hits win near-ties)
-- Access stats (recall-driven counters); change feed (`subscribe` / `ops_since`) + op-log compaction
-- Versioned on-disk format ([FORMAT.md](FORMAT.md))
-
-**Memory & recall over MCP — `topodb-mcp`** (31 tools; [full table](crates/topodb-mcp/README.md))
-
-- Hybrid recall — BM25 + vector + graph, RRF-fused, recency-weighted
-- Memory kinds — `episodic | semantic | procedural | decision`, with kind-aware lifecycle decay (filter recall to `decision` for precedent retrieval)
-- Memory hygiene — write-time dedup + supersession, banded/contradiction-aware near-duplicate detection, `consolidate_memories`, orphan + stale scans, `memory_health`, `suggest_links`
-- Aliases and synonyms (`add_alias`, `add_synonym`) resolved into lookup and search
-- Local embeddings (fastembed, on by default; ONNX Runtime auto-downloaded and sha256-pinned — Intel Macs still need a system runtime)
-- Multi-scope reads — read across a scope *set*
-- Obsidian vault bridge (`ingest_vault` / `seed_vault`) — vault as working memory, graph as LTM
-
-**CLI & distribution — `topodb-cli`, `@topodb/pi`, plugin**
-
-- All 17 engine operations plus `remember`, `forget`, `obsidian-ingest`, `obsidian-seed`; JSON in/out, exit-code contract (incl. `set-props` / `remove-node` / bulk submit)
-- One-command Pi install (`@topodb/pi`); Claude Code plugin (managed server + session-start recall/hygiene injection); Obsidian vault bridge (`obsidian-ingest` / `obsidian-seed`) — vault as working memory, graph as LTM
-
-**Agent harness — `topodb-sgh`, sgh plugin**
-
-- Frozen-DAG execution with a pre-computed worst-case model-call bound; approval gate; durable, crash-resumable runs (event sidecar, `sgh show --follow` mid-run)
-- Providers: `claude`-CLI, Anthropic API, any OpenAI-compatible endpoint; agent nodes opt into TopoDB memory via `tools: [topodb]` (node-scoped MCP bridge — the memory db unlocks between tool nodes)
-- Claude Code plugin: `/sgh:plan`, `/sgh:run`, `/sgh:lifecycle`, `/sgh:show`
-
-**Never — by principle:** LLM calls inside the engine (principle 4) · a server process as a prerequisite (principle 5)
+Scope ids are keyed to the absolute project path.
+They do not follow a repo across clones or machines.
+[`plugins/claude-code/README.md`](plugins/claude-code/README.md) ·
+[`crates/topodb-cli`](crates/topodb-cli/README.md) ·
+[`crates/topodb-mcp`](crates/topodb-mcp/README.md) ·
+[FORMAT.md](FORMAT.md) ·
+[topodb.dev](https://topodb.dev)
 
 ## Benchmarks
 
-Principle 3, made concrete. On [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
-(a long-term-memory benchmark, 500 questions), TopoDB's retrieval surfaces the
-gold evidence session in the **top-5 ~99% of the time** — hybrid Recall@5 of
-**0.987** — with a held-constant embedder so the number reflects *ranking*, not
-embedder choice. Full set, turn granularity (the harness default):
+[LongMemEval-S](https://github.com/xiaowu0162/LongMemEval), 500 questions.
+The embedder is held constant, so the figure is ranking.
+Hybrid Recall@5 is **0.987** at turn granularity.
 
 | Leg | R@1 | R@3 | R@5 | R@10 |
 |-----|-----|-----|-----|------|
@@ -144,102 +65,20 @@ embedder choice. Full set, turn granularity (the harness default):
 | vector          | 0.864 | 0.953 | 0.977 | 0.989 |
 | hybrid (RRF)    | 0.894 | 0.966 | 0.987 | 0.996 |
 
-**Granularity is the lever.** Storing each *turn* as its own memory rather than
-the whole session — a focused per-turn embedding instead of a whole-session
-average — is what puts R@1 here: on the full set it lifts hybrid R@1 from 0.832
-to **0.894** and vector R@1 from 0.760 to **0.864** over session-granularity
-ingestion.
-
-Honest benchmarks means reporting the duds too: a deterministic co_mention
-**graph leg is neutral** here (retrieval is already near-ceiling, so a
-corroboration graph has no headroom to add), and the best text/vector **fusion
-weight flips with granularity** — turn granularity subsumes that lead rather
-than stacking with it. Both are written up in full.
-
-The harness, methodology, per-type breakdown, the turn-vs-session and
-fusion-weight studies, and a preliminary end-to-end QA-accuracy pass live in
-[`benchmarks/longmemeval/`](benchmarks/longmemeval/RESULTS.md) — reproducible
-with one command, no competitor figures claimed.
+Per-turn memories lift hybrid R@1 from 0.832 to **0.894**.
+The co_mention graph leg is neutral here.
+[`benchmarks/longmemeval/RESULTS.md`](benchmarks/longmemeval/RESULTS.md)
 
 ## Crates
 
 | Crate | crates.io | What it is |
 |---|---|---|
-| [`topodb`](crates/topodb) | [![crates.io](https://img.shields.io/crates/v/topodb.svg)](https://crates.io/crates/topodb) | The embedded engine itself — link it into your process as a library. |
-| [`topodb-json`](crates/topodb-json) | [![crates.io](https://img.shields.io/crates/v/topodb-json.svg)](https://crates.io/crates/topodb-json) | The shared JSON↔engine conversion layer used by `topodb-mcp` and `topodb-cli`. Not a library you typically depend on directly. |
-| [`topodb-mcp`](crates/topodb-mcp) | [![crates.io](https://img.shields.io/crates/v/topodb-mcp.svg)](https://crates.io/crates/topodb-mcp) | An MCP (Model Context Protocol) server exposing a `topodb` database over stdio, for coding agents and other MCP clients that want scoped recall/write tools without embedding Rust. |
-| [`topodb-cli`](crates/topodb-cli) | [![crates.io](https://img.shields.io/crates/v/topodb-cli.svg)](https://crates.io/crates/topodb-cli) | A direct-embedded `topodb` command-line binary — JSON in, JSON out, predictable exit codes — for scripting and ad hoc inspection of a database file without a server or an MCP client. |
-| [`topodb-obsidian`](crates/topodb-obsidian) | [![crates.io](https://img.shields.io/crates/v/topodb-obsidian.svg)](https://crates.io/crates/topodb-obsidian) | Deterministic Obsidian-vault ⇄ graph transforms (ingest/seed) shared by the CLI and MCP server. |
-| [`topodb-warehouse`](crates/topodb-warehouse) | — | The bronze tier: an append-only, content-addressed log of raw session artifacts + mirrored engine ops under `<db>.warehouse/`, from which `Artifact`/`Chunk` nodes and `evidence` lineage are deterministically re-derivable, and a whole redb can be rebuilt from segments. |
-| [`topodb-sgh`](crates/topodb-sgh) | [![crates.io](https://img.shields.io/crates/v/topodb-sgh.svg)](https://crates.io/crates/topodb-sgh) | The Structured Graph Harness — frozen-DAG agent execution over a `topodb` database: validated graphs with a worst-case bound, durable resumable runs, an approval gate, and agent nodes that opt into the TopoDB MCP tool surface. Installs a binary named `sgh` (also via `npm i -g @topodb/topodb-sgh` from the first `topodb-sgh-v*` release tag). |
+| [`topodb`](crates/topodb) | [![crates.io](https://img.shields.io/crates/v/topodb.svg)](https://crates.io/crates/topodb) | The engine |
+| [`topodb-cli`](crates/topodb-cli) | [![crates.io](https://img.shields.io/crates/v/topodb-cli.svg)](https://crates.io/crates/topodb-cli) | `topodb` binary |
+| [`topodb-mcp`](crates/topodb-mcp) | [![crates.io](https://img.shields.io/crates/v/topodb-mcp.svg)](https://crates.io/crates/topodb-mcp) | MCP server |
+| [`topodb-json`](crates/topodb-json) | [![crates.io](https://img.shields.io/crates/v/topodb-json.svg)](https://crates.io/crates/topodb-json) | JSON↔engine layer |
+| [`topodb-obsidian`](crates/topodb-obsidian) | [![crates.io](https://img.shields.io/crates/v/topodb-obsidian.svg)](https://crates.io/crates/topodb-obsidian) | Vault ingest/seed |
+| [`topodb-warehouse`](crates/topodb-warehouse) | — | Session-artifact log |
+| [`topodb-sgh`](crates/topodb-sgh) | [![crates.io](https://img.shields.io/crates/v/topodb-sgh.svg)](https://crates.io/crates/topodb-sgh) | Optional agent harness |
 
-### topodb-cli
-
-`topodb-cli` installs a binary named **`topodb`**: point it at a `.redb` file and it gives you
-all 17 engine operations (`info`, `create-memory`, `create-entity`, `link`, `get`, `find`,
-`search`, `traverse`, `stats`, `changes`, `compact`, `set-props`, `remove-node`, `close-edge`,
-`set-embedding`, `search-vector`, `submit`), plus `remember` / `forget` (memory write), and `obsidian-ingest` / `obsidian-seed` (vault bridge) as one-shot, script-friendly subcommands — compact
-JSON on stdout, a `{"error":{"kind","message"}}` shape on stderr, and exit codes you can branch
-on in a shell script (`0` success, `2` rejected/bad input, `1` internal/db-open failure).
-`create-memory`, `create-entity`, and `link` each also take their own per-command `--scope`,
-overriding the global `--scope` for that one invocation — the same override the batch DSL's
-same-named ops and the equivalent `topodb-mcp` tools support. It opens the database file
-directly and in-process, the same way `topodb-mcp` does — no server, no network hop, and
-(because of that) no running concurrently with something else that already has the same file
-open. Install with `cargo install topodb-cli`. See
-[`crates/topodb-cli/README.md`](crates/topodb-cli/README.md) for the full command table,
-exit-code contract, scoping rules, and v1 limitations (no `--spec` flag; no multi-scope reads —
-this CLI reads under one scope at a time, while `topodb-mcp` can read across a set; direct-embedded
-single-process access only).
-
-#### Seeing the graph
-
-The `graph` subcommand exports a deterministic snapshot of your database as an interactive graph:
-
-**Views:**
-- **Ego** — traverse from a starting point (`--seed` entity IDs or `--query` search results) for a limited hop-labeled subgraph
-- **Scope** — the full scoped graph when neither `--seed` nor `--query` is given (default)
-
-**Formats** (pick one via `--graph-format`):
-- `json` — canonical JSON snapshot (default); round-trippable for downstream analysis
-- `dot` — Graphviz DOT format, render with `dot -Tpng` / `dot -Tsvg`
-- `mermaid` — Mermaid diagram syntax, renders inline in markdown and many docs
-- `html` — self-contained interactive HTML file with zero external requests; opens in any browser, click a node for details
-
-**Examples:**
-
-```bash
-# Ego graph, mermaid format
-topodb graph --query "deploy" --graph-format mermaid
-
-# Scope graph to an HTML file
-topodb graph --graph-format html --out graph.html
-```
-
-**Determinism & reliability:**
-- Snapshots are stamped with the database's op-log sequence number, not wall-clock time: the same database state produces byte-identical output every run.
-- Truncation is always reported in the snapshot metadata, never silent — if the graph exceeds `--limit` (e.g., 500 nodes), the output tells you.
-- Like other read commands, `graph` routes through a resident daemon for concurrency safety — no server setup required.
-
-### topodb-mcp
-
-A standalone binary: point it at a `.redb` file and it serves **33 MCP tools** over stdio
-JSON-RPC. In brief (the [full tool table](crates/topodb-mcp/README.md) lives in the crate README):
-
-- **Recall & read** — `search_memories` (hybrid BM25 + vector + graph, RRF-fused), `recent_memories`, `traverse`, `suggest_links`, `get_node`, `find_by_prop`, `get_edges`, `access_stats`, `search_vectors`
-- **Memory hygiene** — `find_duplicate_memories` (vector-mode: banded + contradiction-aware; text-mode fallback when embedder unavailable), `find_orphan_memories`, `find_stale_memories`, `memory_health`
-- **Write** — `remember`, `create_memory`, `consolidate_memories`, `create_entity`, `add_alias`, `add_synonym`, `link`, `set_node_props`, `remove_node`, `close_edge`, `set_embedding`, `submit_batch`
-- **Admin** — `db_info`; `get_changes` (the one unscoped read — replays the op log across every scope, so it's off unless you pass `--allow-unscoped-changes`)
-- **Obsidian vault bridge** — `ingest_vault`, `seed_vault`
-
-**Scoping.** Reads filter by a *set* of scopes (`--read-scopes`, or a per-call `scopes` array);
-a write is stamped with exactly *one* scope (`--scope`, or a per-call `scope`) — `link` included,
-so an edge can join nodes in different scopes.
-
-**Embeddings.** `--embeddings` is on by default and auto-fetches an ONNX Runtime on first run
-(system runtimes and `ORT_DYLIB_PATH` win; `--no-ort-download` disables it). Intel Macs have no
-official 1.24.2 artifact and use the manual path; with no runtime the server runs text+graph-only.
-
-Install with `cargo install topodb-mcp` (or on **Pi**: `pi install npm:@topodb/pi`). See
-[`crates/topodb-mcp/README.md`](crates/topodb-mcp/README.md) for the full CLI reference, tool
-table, and client config.
+License: MIT OR Apache-2.0.
