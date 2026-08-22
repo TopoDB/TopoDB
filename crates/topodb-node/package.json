@@ -1,6 +1,6 @@
 {
   "name": "topodb",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "index.js",
   "types": "index.d.ts",
   "files": [
@@ -21,11 +21,11 @@
     "node": ">= 18"
   },
   "optionalDependencies": {
-    "@topodb/topodb-linux-x64-gnu": "0.1.0",
-    "@topodb/topodb-linux-arm64-gnu": "0.1.0",
-    "@topodb/topodb-darwin-x64": "0.1.0",
-    "@topodb/topodb-darwin-arm64": "0.1.0",
-    "@topodb/topodb-win32-x64-msvc": "0.1.0"
+    "@topodb/topodb-linux-x64-gnu": "0.1.1",
+    "@topodb/topodb-linux-arm64-gnu": "0.1.1",
+    "@topodb/topodb-darwin-x64": "0.1.1",
+    "@topodb/topodb-darwin-arm64": "0.1.1",
+    "@topodb/topodb-win32-x64-msvc": "0.1.1"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"

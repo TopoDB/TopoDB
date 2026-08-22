@@ -1,4 +1,2 @@
 *.node
-native.js
-native.d.ts
 node_modules/

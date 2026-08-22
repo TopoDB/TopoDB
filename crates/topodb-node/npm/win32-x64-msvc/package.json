@@ -1,6 +1,6 @@
 {
   "name": "@topodb/topodb-win32-x64-msvc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TopoDB native binding for Windows x64",
   "main": "topodb.win32-x64-msvc.node",
   "files": [

@@ -1,6 +1,6 @@
 {
   "name": "@topodb/topodb-linux-arm64-gnu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TopoDB native binding for Linux arm64 (glibc)",
   "main": "topodb.linux-arm64-gnu.node",
   "files": [
