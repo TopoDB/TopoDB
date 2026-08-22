@@ -49,9 +49,11 @@ jobs:
   # Skipped for `topodb-pi-v*` tags: `@topodb/pi` is an npm-only package that
   # cargo-dist doesn't know, so the whole cargo-dist chain (which all cascades
   # off `plan`) skips cleanly, leaving only the independent `publish-npm-pi`
-  # job to run for those tags.
+  # job to run for those tags. Same for `bindings-v*`: those releases live in
+  # bindings.yml, and cargo-dist's plan dies parsing the prefix ("unexpected
+  # character 'b' while parsing major version number", Release run #210).
   plan:
-    if: ${{ !startsWith(github.ref_name, 'topodb-pi-v') }}
+    if: ${{ !startsWith(github.ref_name, 'topodb-pi-v') && !startsWith(github.ref_name, 'bindings-v') }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
