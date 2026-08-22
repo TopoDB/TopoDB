@@ -1,0 +1,68 @@
+name: install-smoke
+# Installs the PUBLISHED bindings from the live registries and runs a runtime
+# probe — the check that caught topodb@0.1.0 shipping without its loader
+# (local packs and green publish jobs both looked fine; only a fresh install
+# from the registry failed). Dispatch after every bindings release, with the
+# versions the release just published.
+on:
+  workflow_dispatch:
+    inputs:
+      npm_version:
+        description: 'topodb version on npm'
+        required: true
+        default: '0.1.1'
+      pypi_version:
+        description: 'topodb version on PyPI'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  npm:
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Install from the live registry and probe
+        shell: bash
+        run: |
+          mkdir smoke && cd smoke
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund "topodb@${{ inputs.npm_version }}"
+          node -e '
+            const { TopoDB, ops } = require("topodb");
+            (async () => {
+              const path = require("path").join(require("os").tmpdir(), "smoke-" + process.pid + ".redb");
+              const db = await TopoDB.openWith(path, { equality: [], text: [{ label: "Memory", prop: "content" }] });
+              await db.submit([ops.createMemory("installed from the public npm registry")]);
+              const hits = await db.searchText(["shared"], "public npm registry", 3);
+              if (!hits.length) throw new Error("search returned nothing");
+              console.log("NPM INSTALL SMOKE OK:", process.platform, process.arch, "-", hits[0].node.props.content);
+              db.close();
+            })().catch((e) => { console.error("SMOKE FAIL", e); process.exit(1); });
+          '
+
+  pypi:
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install from the live registry and probe
+        shell: bash
+        run: |
+          pip install "topodb==${{ inputs.pypi_version }}"
+          python -c '
+          import os, sys, tempfile, topodb
+          from topodb import ops
+          spec = {"equality": [], "text": [{"label": "Memory", "prop": "content"}]}
+          with topodb.TopoDB.open_with(os.path.join(tempfile.mkdtemp(), "m.redb"), spec) as db:
+              db.submit([ops.create_memory("installed from the public PyPI registry")])
+              hits = db.search_text(["shared"], "public PyPI registry", 3)
+              assert hits, "search returned nothing"
+              print("PYPI INSTALL SMOKE OK:", sys.platform, "-", hits[0]["node"]["props"]["content"])
+          '
