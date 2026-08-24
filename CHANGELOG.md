@@ -50,24 +50,6 @@ workspace are versioned and released independently (tags are per-package, e.g.
   plugin data dir, with the daemon's precedence (env dir > toml path; toml
   `enabled = false` wins), so the spool always lands where the drain looks.
 
-### `@topodb/pi` (Pi extension)
-
-#### Added
-
-- **Context warehouse capture** — the extension now spools successful
-  `bash`/`read`/`edit`/`write`/`grep`/`find` results and session-start /
-  session-end / memory-write markers to `<db>.warehouse/spool/` next to the db
-  (`.topodb/memory.warehouse/` by default; `TOPODB_WAREHOUSE_DIR` relocates) in
-  the same event format as the Claude Code and Cursor plugins (pinned by an
-  in-repo parity test against `plugins/core`). The `topodb-mcp` child drains
-  and derives it at boot; no new daemon plumbing. Off with
-  `TOPODB_WAREHOUSE=0` (warehouse only) or `TOPODB_RECORD=0` (all recording).
-  The extension resolves `.topodb.toml` `[warehouse] path`/`enabled` exactly as
-  the server does; `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) bounds the
-  spool backlog; a `remember`/`create_memory` with an explicit `scope` now
-  produces a `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
-  Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse spec.
-
 ---
 
 ## `topodb` (engine)
@@ -1535,6 +1517,36 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 ---
 
 ## `@topodb/pi` (Pi extension)
+
+### 0.1.1 — 2026-08-24
+
+#### Added
+
+- **Context warehouse capture** — the extension now spools successful
+  `bash`/`read`/`edit`/`write`/`grep`/`find` results and session-start /
+  session-end / memory-write markers to `<db>.warehouse/spool/` next to the db
+  (`.topodb/memory.warehouse/` by default; `TOPODB_WAREHOUSE_DIR` relocates) in
+  the same event format as the Claude Code and Cursor plugins (pinned by an
+  in-repo parity test against `plugins/core`). The `topodb-mcp` child drains
+  and derives it at boot; no new daemon plumbing. Off with
+  `TOPODB_WAREHOUSE=0` (warehouse only) or `TOPODB_RECORD=0` (all recording).
+  The extension resolves `.topodb.toml` `[warehouse] path`/`enabled` exactly as
+  the server does; `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) bounds the
+  spool backlog; a `remember`/`create_memory` with an explicit `scope` now
+  produces a `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+  Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse spec.
+
+#### Changed
+
+- **Bundles `@topodb/topodb-mcp` 0.1.1** (was 0.0.20) — the server with the
+  claim-by-rename drain the warehouse capture above relies on, plus the 0.1.0
+  tool surface (`graph_snapshot`): the pinned tool count (`test/tool-count.ts`)
+  moves 32 → 33.
+
+### 0.1.0 — 2026-08-21
+
+- Version bump alongside the 0.1 stability line; no functional change from
+  0.0.7 (still bundled `@topodb/topodb-mcp` 0.0.20).
 
 ### 0.0.7 — 2026-08-16
 
