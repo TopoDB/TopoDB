@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { TopodbServer, recordingEnabled, dbPath, scopeLabel } from "./server-handle.ts";
 import {
-  warehouseDisabled, warehouseDirForDb, appendSpool, artifactEvent, markerEvent, fromPiToolResult, memoryWriteIds,
+  warehouseDisabled, resolveWarehouse, appendSpool, artifactEvent, markerEvent, fromPiToolResult, memoryWriteIds,
   HARNESS as WAREHOUSE_HARNESS,
 } from "./warehouse.ts";
 import { EpisodeBuffer, extractText, isUsed, buildEpisodeBatch, toRetrievalRecord } from "./recorder.ts";
@@ -40,8 +40,9 @@ export default function (pi: ExtensionAPI): void {
   // ---- context warehouse (spec 2026-08-24-pi-warehouse-capture) ----------
   // Resolved once at registration from the same env the server child gets, so
   // the spool lands exactly where the child's boot hygiene drains from.
-  const warehouseOn = !warehouseDisabled(process.env);
-  const warehouseDir = warehouseDirForDb(dbPath(process.env), process.env);
+  const resolved = resolveWarehouse(dbPath(process.env), process.env);
+  const warehouseOn = resolved.enabled && !warehouseDisabled(process.env);
+  const warehouseDir = resolved.dir;
   const warehouseScope = scopeLabel(process.env);
   const sessionOf = (ctx: unknown): string | undefined => {
     try {

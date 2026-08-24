@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   HARNESS, SPOOL_HARD_CAP, warehouseDisabled, warehouseDirForDb, spoolPath, appendSpool, newUlid,
-  simpleDiff, fromPiToolResult, artifactEvent, markerEvent, memoryWriteIds,
+  simpleDiff, fromPiToolResult, artifactEvent, markerEvent, memoryWriteIds, nearestTopodbToml, parseWarehouseToml, resolveWarehouse,
 } from "../src/warehouse.ts";
 
 test("harness label is pi", () => {
@@ -129,4 +129,50 @@ test("memoryWriteIds finds 26-char ids in object, text-block, and string results
   assert.deepEqual(memoryWriteIds({ id: "short" }), []);
   assert.deepEqual(memoryWriteIds("not json"), []);
   assert.deepEqual(memoryWriteIds(undefined), []);
+});
+
+const fakeIo = (files: Record<string, string>) => ({
+  existsFile: (p: string) => Object.prototype.hasOwnProperty.call(files, p),
+  readFile: (p: string) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]; },
+});
+
+test("nearestTopodbToml walks up from the db's directory without resolving relative paths", () => {
+  const io = fakeIo({ "/r/.topodb.toml": "", "/r/a/b/.topodb.toml": "" });
+  assert.equal(nearestTopodbToml("/r/a/b/c/memory.redb", io), "/r/a/b/.topodb.toml");
+  assert.equal(nearestTopodbToml("/r/a/memory.redb", io), "/r/.topodb.toml");
+  assert.equal(nearestTopodbToml("/elsewhere/memory.redb", io), undefined);
+  // Relative db: Rust checks `<parent>/.topodb.toml` then `.topodb.toml` (cwd) and stops.
+  const rel = fakeIo({ ".topodb.toml": "" });
+  assert.equal(nearestTopodbToml(".topodb/memory.redb", rel), ".topodb.toml");
+  assert.equal(nearestTopodbToml("memory.redb", rel), ".topodb.toml");
+});
+
+test("parseWarehouseToml reads only [warehouse] enabled/path and tolerates the rest", () => {
+  assert.deepEqual(parseWarehouseToml(""), { enabled: true });
+  assert.deepEqual(parseWarehouseToml("[schedule.warehouse_drain]\nenabled = false\n"), { enabled: true });
+  assert.deepEqual(parseWarehouseToml("# c\n[warehouse]\nenabled = false # trailing\npath = \"wh\"\nsegment_mb = 64\n[[reingest.source]]\npath = \"nope\"\n"), { enabled: false, path: "wh" });
+  assert.deepEqual(parseWarehouseToml("[warehouse]\npath = ''\n"), { enabled: true });
+  assert.deepEqual(parseWarehouseToml("[warehouse]\npath = '~/w'\nenabled = maybe\n"), { enabled: true, path: "~/w" });
+  assert.deepEqual(parseWarehouseToml("[ warehouse ]\r\nenabled=true\r\n"), { enabled: true });
+});
+
+test("resolveWarehouse mirrors the Rust precedence: toml enabled=false > env switch; env dir > toml path > <db>.warehouse", () => {
+  const db = "/p/sub/memory.redb";
+  const none = fakeIo({});
+  assert.deepEqual(resolveWarehouse(db, {}, none), { enabled: true, dir: "/p/sub/memory.warehouse", source: "default" });
+  assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE_DIR: "/w " }, none), { enabled: true, dir: "/w ", source: "env" });
+  assert.equal(resolveWarehouse(db, { TOPODB_WAREHOUSE: " OFF " }, none).enabled, false);
+  const rel = fakeIo({ "/p/.topodb.toml": "[warehouse]\npath = \"wh\"\n" });
+  assert.deepEqual(resolveWarehouse(db, {}, rel), { enabled: true, dir: "/p/wh", source: "toml" });
+  assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE_DIR: "/env" }, rel), { enabled: true, dir: "/env", source: "env" });
+  const abs = fakeIo({ "/p/.topodb.toml": "[warehouse]\npath = \"/abs/wh\"\n" });
+  assert.equal(resolveWarehouse(db, {}, abs).dir, "/abs/wh");
+  const home = fakeIo({ "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" });
+  const homeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+  assert.equal(resolveWarehouse(db, { [homeKey]: "/home/u" }, home).dir, path.join("/home/u", "wh"));
+  assert.equal(resolveWarehouse(db, { [homeKey]: "" }, home).dir, path.join("/p", "~/wh")); // no HOME: literal, relative to toml dir (as Rust)
+  const off = fakeIo({ "/p/.topodb.toml": "[warehouse]\nenabled = false\n" });
+  assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE: "1", TOPODB_WAREHOUSE_DIR: "/env" }, off), { enabled: false, dir: "/env", source: "env" });
+  const broken = { existsFile: () => true, readFile: () => { throw new Error("EACCES"); } };
+  assert.deepEqual(resolveWarehouse(db, {}, broken), { enabled: true, dir: "/p/sub/memory.warehouse", source: "default" });
 });

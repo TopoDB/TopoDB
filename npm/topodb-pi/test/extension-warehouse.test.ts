@@ -4,7 +4,7 @@
 // TopodbServer.prototype.call is monkey-patched so no topodb-mcp is spawned.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { TopodbServer } from "../src/server-handle.ts";
@@ -145,6 +145,31 @@ test("a spool write failure is logged, never thrown, and the tool result is stil
   } finally {
     console.error = origErr;
     h.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a .topodb.toml [warehouse] next to the db redirects the spool, and enabled=false stops it", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "piwh-toml-"));
+  const sub = path.join(root, "sub");
+  mkdirSync(sub, { recursive: true });
+  const db = path.join(sub, "memory.redb");
+  try {
+    writeFileSync(path.join(root, ".topodb.toml"), "[warehouse]\npath = \"wh\"\n");
+    const h = harness({ TOPODB_WAREHOUSE_DIR: undefined, TOPODB_DB: db, TOPODB_SCOPE: undefined, TOPODB_RECORD: undefined, TOPODB_WAREHOUSE: undefined, TOPODB_RECORDING: undefined }, () => ({}));
+    try {
+      await h.fire("session_start", { type: "session_start", reason: "startup" }, ctxFor("t1"));
+      assert.equal(spooled(path.join(root, "wh")).length, 1);
+      assert.equal(existsSync(path.join(sub, "memory.warehouse")), false);
+    } finally { h.restore(); }
+    writeFileSync(path.join(root, ".topodb.toml"), "[warehouse]\nenabled = false\n");
+    const g = harness({ TOPODB_WAREHOUSE_DIR: undefined, TOPODB_DB: db, TOPODB_SCOPE: undefined, TOPODB_RECORD: undefined, TOPODB_WAREHOUSE: undefined, TOPODB_RECORDING: undefined }, () => ({}));
+    try {
+      await g.fire("session_start", { type: "session_start", reason: "startup" }, ctxFor("t2"));
+      assert.equal(existsSync(path.join(sub, "memory.warehouse")), false);
+      assert.equal(existsSync(path.join(root, "wh")) && spooled(path.join(root, "wh")).length > 1, false);
+    } finally { g.restore(); }
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

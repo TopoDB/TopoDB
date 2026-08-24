@@ -6,7 +6,7 @@
 // is pinned byte-for-byte to plugins/core by test/warehouse-parity.test.ts —
 // change core first, then this file. Redaction/size policy is the Rust
 // drain's job. Spec: docs/superpowers/specs/2026-08-24-pi-warehouse-capture-design.md
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -34,6 +34,116 @@ export function warehouseDirForDb(db: string, env: NodeJS.ProcessEnv): string {
   if (o && o.trim()) return o;
   const ext = path.extname(db);
   return (ext ? db.slice(0, -ext.length) : db) + ".warehouse";
+}
+
+// ---- .topodb.toml [warehouse] (spec 2026-08-24-pi-warehouse-followups §2) ----
+
+/** Filesystem seam for the toml lookup; tests inject a map. */
+export interface WarehouseIo {
+  existsFile(p: string): boolean;
+  readFile(p: string): string;
+}
+export const nodeIo: WarehouseIo = {
+  existsFile: (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  },
+  readFile: (p) => readFileSync(p, "utf8"),
+};
+
+/** Mirrors topodb-mcp's `nearest_topodb_toml`: from the db's parent directory
+ * upward, the first regular file named `.topodb.toml`. Deliberately does not
+ * resolve a relative db — Rust walks `Path::parent()` on the literal path, so a
+ * relative db checks `<parent>/.topodb.toml` and then `.topodb.toml` (cwd). */
+export function nearestTopodbToml(db: string, io: WarehouseIo = nodeIo): string | undefined {
+  let dir = path.dirname(db);
+  for (;;) {
+    const cand = path.join(dir, ".topodb.toml");
+    if (io.existsFile(cand)) return cand;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+export interface WarehouseSection {
+  enabled: boolean;
+  path?: string;
+}
+
+/** The two `[warehouse]` keys the extension needs, from a tolerant line-level
+ * parse: comments, blank lines, `[table]` / `[[array]]` headers, `key = value`
+ * with a bare boolean or a quoted string. Everything else is ignored. (Rust
+ * rejects a malformed file entirely and falls back to defaults; this parser
+ * may still read a well-formed `[warehouse]` table out of such a file —
+ * documented divergence, spec §2.) */
+export function parseWarehouseToml(text: string): WarehouseSection {
+  const out: WarehouseSection = { enabled: true };
+  let section = "";
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const hdr = /^\[\[?\s*([^\]]+?)\s*\]\]?$/.exec(line);
+    if (hdr) {
+      section = hdr[1];
+      continue;
+    }
+    if (section !== "warehouse") continue;
+    const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/.exec(line);
+    if (!kv) continue;
+    const key = kv[1];
+    const val = kv[2].replace(/\s+#.*$/, "").trim();
+    if (key === "enabled") {
+      if (val === "true" || val === "false") out.enabled = val === "true";
+    } else if (key === "path") {
+      const q = /^"(.*)"$|^'(.*)'$/.exec(val);
+      const p = q ? (q[1] ?? q[2]) : undefined;
+      if (p) out.path = p;
+    }
+  }
+  return out;
+}
+
+export interface ResolvedWarehouse {
+  enabled: boolean;
+  dir: string;
+  source: "env" | "toml" | "default";
+}
+
+/** Mirrors `topodb_onboarding::resolve_warehouse`: toml `enabled = false`
+ * disables regardless of env (Rust returns None before reading env); then
+ * `TOPODB_WAREHOUSE=0|off`; dir = non-blank `TOPODB_WAREHOUSE_DIR` → toml
+ * `path` (`~/` → HOME / USERPROFILE on win32; relative → the toml's directory)
+ * → `<db>.warehouse`. An unreadable toml counts as absent, as in Rust. */
+export function resolveWarehouse(db: string, env: NodeJS.ProcessEnv, io: WarehouseIo = nodeIo): ResolvedWarehouse {
+  const tomlPath = nearestTopodbToml(db, io);
+  let section: WarehouseSection = { enabled: true };
+  if (tomlPath) {
+    try {
+      section = parseWarehouseToml(io.readFile(tomlPath));
+    } catch {
+      /* unreadable → defaults, as Rust */
+    }
+  }
+  const envDir = env.TOPODB_WAREHOUSE_DIR;
+  let dir: string;
+  let source: ResolvedWarehouse["source"];
+  if (envDir && envDir.trim()) {
+    dir = envDir;
+    source = "env";
+  } else if (tomlPath && section.path) {
+    const home = env[process.platform === "win32" ? "USERPROFILE" : "HOME"];
+    const p = section.path.startsWith("~/") && home ? path.join(home, section.path.slice(2)) : section.path;
+    dir = path.isAbsolute(p) ? p : path.join(path.dirname(tomlPath), p);
+    source = "toml";
+  } else {
+    dir = warehouseDirForDb(db, {});
+    source = "default";
+  }
+  return { enabled: section.enabled && !off(env.TOPODB_WAREHOUSE), dir, source };
 }
 
 function encodeUlid(bytes: Uint8Array): string {
