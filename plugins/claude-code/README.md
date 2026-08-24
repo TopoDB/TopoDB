@@ -185,8 +185,8 @@ Set these environment variables to control plugin behavior:
 
   **Plugin hooks read `TOPODB_WAREHOUSE`, `TOPODB_WAREHOUSE_DIR`, and the nearest
   `.topodb.toml` above the plugin data dir** — `[warehouse].enabled`/`path` there
-  govern the hooks and the daemon alike (env dir wins over toml path; toml
-  `enabled = false` wins over everything). A *project* `.topodb.toml` does not
+  govern the hooks and the daemon alike for a well-formed file (env dir wins
+  over toml path; toml `enabled = false` wins over everything). A *project* `.topodb.toml` does not
   apply to the plugin's db, which lives in the data dir.
 - `TOPODB_CAPTURE_NUDGE=0|off` — suppress the stop-capture nudge (the
   suggestion to use `remember`/`create_memory` to ensure session artifacts
