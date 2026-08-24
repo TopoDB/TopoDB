@@ -36,6 +36,18 @@ export function idleMs(env: NodeJS.ProcessEnv): number {
   return Number.isInteger(n) && n >= 0 ? Math.min(n, MAX_TIMEOUT_MS) : 30_000;
 }
 
+/** The db the server is launched against — also what the warehouse dir is
+ * derived from (warehouse.ts), so the two can never disagree. */
+export function dbPath(env: NodeJS.ProcessEnv): string {
+  return env.TOPODB_DB || ".topodb/memory.redb";
+}
+
+/** The scope label write tools stamp when they omit `scope` — and therefore
+ * the label warehouse events carry (spec §7). */
+export function scopeLabel(env: NodeJS.ProcessEnv): string {
+  return env.TOPODB_SCOPE || "shared";
+}
+
 export type TopodbServerOptions = {
   /** Full node-args override for the spawned child. Tests inject stub servers
    * here; production always uses the bundled launcher. */
@@ -111,8 +123,8 @@ export class TopodbServer {
 
   private async spawnClient(): Promise<McpStdioClient> {
     await this.reaping; // let the previous child release the lock first
-    const db = this.env.TOPODB_DB || ".topodb/memory.redb";
-    const scope = this.env.TOPODB_SCOPE || "shared";
+    const db = dbPath(this.env);
+    const scope = scopeLabel(this.env);
     // topodb-mcp creates the db file on open but treats a missing parent
     // directory as a startup error — and the default `.topodb/` won't exist in
     // a fresh project. Create it so the server comes up on first use.

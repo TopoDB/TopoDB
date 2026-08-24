@@ -1,7 +1,11 @@
 // src/extension.ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { TopodbServer, recordingEnabled } from "./server-handle.ts";
+import { TopodbServer, recordingEnabled, dbPath, scopeLabel } from "./server-handle.ts";
+import {
+  warehouseDisabled, warehouseDirForDb, appendSpool, artifactEvent, markerEvent, fromPiToolResult, memoryWriteIds,
+  HARNESS as WAREHOUSE_HARNESS,
+} from "./warehouse.ts";
 import { EpisodeBuffer, extractText, isUsed, buildEpisodeBatch, toRetrievalRecord } from "./recorder.ts";
 import { ensurePolicyVersion } from "./policy.ts";
 import { injectPointer } from "./onboard.ts";
@@ -33,6 +37,45 @@ export default function (pi: ExtensionAPI): void {
   let policyResolved = false;
   let onboarded = false;
 
+  // ---- context warehouse (spec 2026-08-24-pi-warehouse-capture) ----------
+  // Resolved once at registration from the same env the server child gets, so
+  // the spool lands exactly where the child's boot hygiene drains from.
+  const warehouseOn = !warehouseDisabled(process.env);
+  const warehouseDir = warehouseDirForDb(dbPath(process.env), process.env);
+  const warehouseScope = scopeLabel(process.env);
+  const sessionOf = (ctx: unknown): string | undefined => {
+    try {
+      const id = (ctx as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager?.getSessionId?.();
+      return typeof id === "string" && id ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  /** Land one spool event. Never throws into the agent: a failure is one
+   * console.error line and the event is lost (spec §8). */
+  const land = (ctx: unknown, what: string, build: (session: string) => object | null): void => {
+    if (!warehouseOn) return;
+    try {
+      const session = sessionOf(ctx);
+      if (!session) return;
+      const ev = build(session);
+      if (ev) appendSpool(warehouseDir, session, ev);
+    } catch (e) {
+      console.error(`topodb warehouse: ${what} failed: ${(e as Error).message}`);
+    }
+  };
+  const marker = (ctx: unknown, type: string, nodeIds: string[] = []) =>
+    land(ctx, `${type} marker`, (session) => markerEvent({ type, sessionId: session, scope: warehouseScope, nodeIds, harness: WAREHOUSE_HARNESS }));
+
+  pi.on("session_start", async (_ev, ctx) => marker(ctx, "session_start"));
+  pi.on("tool_result", async (ev, ctx) => {
+    land(ctx, "tool_result capture", (session) => {
+      const mapped = fromPiToolResult(ev);
+      return mapped && artifactEvent({ ...mapped, sessionId: session, scope: warehouseScope, cwd: ctx?.cwd, harness: WAREHOUSE_HARNESS });
+    });
+  });
+  pi.on("session_shutdown", async (_ev, ctx) => marker(ctx, "session_end"));
+
   pi.on("session_start", async (_ev, ctx) => {
     if (onboarded) return;
     onboarded = true;
@@ -61,7 +104,7 @@ export default function (pi: ExtensionAPI): void {
       tool: Type.Optional(Type.String()),
       args: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
         if (params.action === "list" && params.tool) {
           return {
@@ -82,6 +125,10 @@ export default function (pi: ExtensionAPI): void {
           };
         }
         const result = await server.call(params.tool, params.args ?? {});
+        if (params.tool === "remember" || params.tool === "create_memory") {
+          const ids = memoryWriteIds(result);
+          if (ids.length) marker(ctx, "memory_write", ids);
+        }
         if (recording && buffer.open && (params.tool === "search_memories" || params.tool === "traverse")) {
           try {
             const cap = toRetrievalRecord(params.tool, params.args ?? {}, result);
