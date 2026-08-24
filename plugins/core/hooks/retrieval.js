@@ -28,11 +28,13 @@ export function recordRetrieval({ dataDir, sessionId, toolName, toolInput, toolR
   appendRetrieval(dataDir, sessionId, rec.record, rec.contents);
   return true;
 }
-export function recordMemoryWrite({ dataDir, env, projectDir, sessionId, toolResult, harness = HARNESS }) {
+export function recordMemoryWrite({ dataDir, env, projectDir, sessionId, toolResult, toolInput, harness = HARNESS }) {
   if (!dataDir || !sessionId) return [];
   markCaptured(dataDir, sessionId);
   const r = normalizeToolResult(toolResult) ?? {};
   const ids = [...new Set([r.memory_id, r.id, r.node?.id, r.memory?.id].filter((s) => typeof s === "string" && s.length === 26))];
-  if (ids.length) tryMarker({ dataDir, env, projectDir, sessionId, type: "memory_write", nodeIds: ids, sessionScopes, harness });
+  const s = toolInput && typeof toolInput === "object" ? toolInput.scope : undefined;
+  const scope = typeof s === "string" && s.trim() ? s.trim() : undefined;
+  if (ids.length) tryMarker({ dataDir, env, projectDir, sessionId, type: "memory_write", nodeIds: ids, sessionScopes, harness, scope });
   return ids;
 }

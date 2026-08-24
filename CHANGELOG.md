@@ -21,10 +21,55 @@ workspace are versioned and released independently (tags are per-package, e.g.
   of advertising a 0-tool degraded server.
 - When the daemon socket never binds, `launch.js` serves `topodb-mcp` on
   stdio rather than a 0-tool stub.
+- Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
+  64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
+  a `remember`/`create_memory` with an explicit `scope` now produces a
+  `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
 
 ### Cursor plugin
 
 - Same stdio fallback when the daemon socket never binds.
+- Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
+  64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
+  a `remember`/`create_memory` with an explicit `scope` now produces a
+  `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+
+### Codex plugin
+
+- Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
+  64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
+  a `remember`/`create_memory` with an explicit `scope` now produces a
+  `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+
+### `@topodb/pi` (Pi extension)
+
+#### Added
+
+- **Context warehouse capture** — the extension now spools successful
+  `bash`/`read`/`edit`/`write`/`grep`/`find` results and session-start /
+  session-end / memory-write markers to `<db>.warehouse/spool/` next to the db
+  (`.topodb/memory.warehouse/` by default; `TOPODB_WAREHOUSE_DIR` relocates) in
+  the same event format as the Claude Code and Cursor plugins (pinned by an
+  in-repo parity test against `plugins/core`). The `topodb-mcp` child drains
+  and derives it at boot; no new daemon plumbing. Off with
+  `TOPODB_WAREHOUSE=0` (warehouse only) or `TOPODB_RECORD=0` (all recording).
+  The extension resolves `.topodb.toml` `[warehouse] path`/`enabled` exactly as
+  the server does; `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) bounds the
+  spool backlog; a `remember`/`create_memory` with an explicit `scope` now
+  produces a `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+  Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse spec.
+
+### `topodb-warehouse`
+
+#### Fixed
+
+- **Drain claims spool files by rename** (`<name>.jsonl` → a collision-free
+  `<name>[.N].jsonl.draining`) before reading them, so a long-lived writer that keeps appending to one file
+  (the pi extension) cannot have an append deleted unread once its file has
+  been claimed (the residual window is a single append whose open precedes
+  the rename); leftover `.draining` files from a crashed drain are recovered first and deduped by
+  event id. A failed rename (Windows sharing violation) is reported as a
+  deferred file.
 
 ---
 

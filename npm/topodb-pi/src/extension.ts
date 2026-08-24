@@ -1,7 +1,11 @@
 // src/extension.ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { TopodbServer, recordingEnabled } from "./server-handle.ts";
+import { TopodbServer, recordingEnabled, dbPath, scopeLabel } from "./server-handle.ts";
+import {
+  warehouseDisabled, resolveWarehouse, appendSpool, artifactEvent, markerEvent, fromPiToolResult, memoryWriteIds,
+  HARNESS as WAREHOUSE_HARNESS, spoolCapBytes, spoolBytes,
+} from "./warehouse.ts";
 import { EpisodeBuffer, extractText, isUsed, buildEpisodeBatch, toRetrievalRecord } from "./recorder.ts";
 import { ensurePolicyVersion } from "./policy.ts";
 import { injectPointer } from "./onboard.ts";
@@ -33,6 +37,64 @@ export default function (pi: ExtensionAPI): void {
   let policyResolved = false;
   let onboarded = false;
 
+  // ---- context warehouse (spec 2026-08-24-pi-warehouse-capture) ----------
+  // Resolved once at registration from the same env the server child gets, so
+  // the spool lands exactly where the child's boot hygiene drains from.
+  const resolved = resolveWarehouse(dbPath(process.env), process.env);
+  const warehouseOn = resolved.enabled && !warehouseDisabled(process.env);
+  const warehouseDir = resolved.dir;
+  const warehouseScope = scopeLabel(process.env);
+  const sessionOf = (ctx: unknown): string | undefined => {
+    try {
+      const id = (ctx as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager?.getSessionId?.();
+      return typeof id === "string" && id ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const spoolCap = spoolCapBytes(process.env);
+  let capLogged = false;
+  /** Land one spool event. Never throws into the agent: a failure is one
+   * console.error line and the event is lost (spec §8). Artifacts are subject
+   * to the spool cap (markers are tiny and lineage-critical, so they always
+   * land); capture resumes once a drain has emptied the file. */
+  const land = (ctx: unknown, what: string, build: (session: string) => object | null, opts: { artifact?: boolean } = {}): void => {
+    if (!warehouseOn) return;
+    try {
+      const session = sessionOf(ctx);
+      if (!session) return;
+      if (opts.artifact && spoolCap > 0) {
+        if (spoolBytes(warehouseDir, spoolCap) >= spoolCap) {
+          if (!capLogged) {
+            capLogged = true;
+            console.error(`topodb warehouse: spool cap (${spoolCap / (1024 * 1024)} MB) reached; artifacts dropped until the server drains it`);
+          }
+          return;
+        }
+        capLogged = false;
+      }
+      const ev = build(session);
+      if (ev) appendSpool(warehouseDir, session, ev);
+    } catch (e) {
+      console.error(`topodb warehouse: ${what} failed: ${(e as Error).message}`);
+    }
+  };
+  const marker = (ctx: unknown, type: string) =>
+    land(ctx, `${type} marker`, (session) => markerEvent({ type, sessionId: session, scope: warehouseScope, harness: WAREHOUSE_HARNESS }));
+
+  // Fires on startup/new/resume/fork AND reload. A reload keeps the session
+  // id, so it emits session_end then session_start for the same session —
+  // which is load-bearing: the derive lineage rule treats session_start as an
+  // evidence-window reset, mirroring the context reset a reload performs.
+  pi.on("session_start", async (_ev, ctx) => marker(ctx, "session_start"));
+  pi.on("tool_result", async (ev, ctx) => {
+    land(ctx, "tool_result capture", (session) => {
+      const mapped = fromPiToolResult(ev);
+      return mapped && artifactEvent({ ...mapped, sessionId: session, scope: warehouseScope, cwd: ctx?.cwd, harness: WAREHOUSE_HARNESS });
+    }, { artifact: true });
+  });
+  pi.on("session_shutdown", async (_ev, ctx) => marker(ctx, "session_end"));
+
   pi.on("session_start", async (_ev, ctx) => {
     if (onboarded) return;
     onboarded = true;
@@ -61,7 +123,7 @@ export default function (pi: ExtensionAPI): void {
       tool: Type.Optional(Type.String()),
       args: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
         if (params.action === "list" && params.tool) {
           return {
@@ -82,6 +144,16 @@ export default function (pi: ExtensionAPI): void {
           };
         }
         const result = await server.call(params.tool, params.args ?? {});
+        if (params.tool === "remember" || params.tool === "create_memory") {
+          // A write with an explicit scope lands there; the marker must say so
+          // or derive looks the memory up in the wrong scope set (spec §5).
+          const argScope = (params.args ?? {}).scope;
+          const scope = typeof argScope === "string" && argScope.trim() ? argScope.trim() : warehouseScope;
+          land(ctx, "memory_write marker", (session) => {
+            const ids = memoryWriteIds(result);
+            return ids.length ? markerEvent({ type: "memory_write", sessionId: session, scope, nodeIds: ids, harness: WAREHOUSE_HARNESS }) : null;
+          });
+        }
         if (recording && buffer.open && (params.tool === "search_memories" || params.tool === "traverse")) {
           try {
             const cap = toRetrievalRecord(params.tool, params.args ?? {}, result);

@@ -175,6 +175,10 @@ Set these environment variables to control plugin behavior:
 - `TOPODB_WAREHOUSE=0|off` — disable just warehouse capture and markers; keeps
   session recording enabled. Useful if you want episode capture but not the
   raw context warehouse.
+- `TOPODB_WAREHOUSE_SPOOL_MAX_MB=<n>` — cap on the spool backlog (total bytes
+  under `memory.warehouse/spool/`; default 64, `0` = unlimited). Over the cap,
+  artifacts are dropped until the daemon drains the spool — markers still
+  land — and one stderr line notes the first drop.
 - `TOPODB_WAREHOUSE_DIR=<path>` — relocate the warehouse spool and sealed
   segments to a different directory (by default colocated with `memory.redb`).
 

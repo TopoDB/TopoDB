@@ -32,6 +32,7 @@ pub struct DeriveReport {
     pub pointer_only: usize,
     pub removed: usize,
     pub markers_skipped: usize,
+    pub cross_scope_skipped: usize,
     pub embed_model: Option<String>,
 }
 
@@ -272,7 +273,10 @@ pub fn derive(
                 };
                 let art_scope = parse_scope(ascope);
                 let edge_scope = match (mem.scope, art_scope) {
-                    (Scope::Id(a), Scope::Id(b)) if a != b => continue, // cross-project: not representable
+                    (Scope::Id(a), Scope::Id(b)) if a != b => {
+                        rep.cross_scope_skipped += 1;
+                        continue; // cross-project: not representable
+                    }
                     (Scope::Id(a), _) => Scope::Id(a),
                     (Scope::Shared, other) => other,
                 };

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { TopodbServer } from "../src/server-handle.ts";
+import { TopodbServer, dbPath, scopeLabel } from "../src/server-handle.ts";
 import { EXPECTED_TOOL_COUNT } from "./tool-count.ts";
 
 const env = () => ({
@@ -59,4 +59,11 @@ test("creates the db's parent directory if it does not exist", async () => {
   } finally {
     s.shutdown();
   }
+});
+
+test("dbPath and scopeLabel are the single source of truth for the spawn args", () => {
+  assert.equal(dbPath({}), ".topodb/memory.redb");
+  assert.equal(dbPath({ TOPODB_DB: "/x/team.redb" }), "/x/team.redb");
+  assert.equal(scopeLabel({}), "shared");
+  assert.equal(scopeLabel({ TOPODB_SCOPE: "01SCOPEAAAAAAAAAAAAAAAAAAA" }), "01SCOPEAAAAAAAAAAAAAAAAAAA");
 });
