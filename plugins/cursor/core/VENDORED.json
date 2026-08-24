@@ -6,7 +6,7 @@
     "data-dir.js": "19e64942c85e4a6d4b4565392ddc8823c3f00c725f0c94f503493e07a0c779e2",
     "degraded.js": "a41adb96f11a96ce9ecd80c403a33edd812a6bd7e0288fd9cf6ac9f147d1ba48",
     "hook-io.js": "5e9181c4f656bb1d1e9a916c0be40e386845dfeca6cc9043e88bf0b0bf3eae7a",
-    "hooks/capture.js": "4a9548485439026d152272819de240111ceb902a03b718f34f5a86a6c87dab7b",
+    "hooks/capture.js": "ecd091114b69794133b7655872a4f4f9beea7b77ce1b0deeaa9d2d18beccd352",
     "hooks/episode.js": "59e26bf3dd3bbfc63241653684aa0f7f86db15c807fc45214c3e51aa2abf9a39",
     "hooks/recall.js": "36f7ed4382b636fbe554bd94b1930a730d81def27dab904c1ac8a841c0a2bbc4",
     "hooks/retrieval.js": "017cdcf442fb13ba1eb5459eb19ef2b8f47fb9137ba5a78bfb4f696716fe108c",
@@ -20,6 +20,6 @@
     "server-args.js": "0de21e7a44b90d848d3e2cd4e1d9fce0b652504a3a6561a9caa0a47560d917c8",
     "tool-map.js": "eee63ffa99a12996082e3c7d9ccf4cd2de39d59d86e40a899f4fad376a241d31",
     "transcript.js": "379768444f43f7d2daca5403fdd1e044fbc13b52d1e1a05e0a0f4f565b9430c8",
-    "warehouse-spool.js": "cd32fe99098807e4221b562a0b5b8fa269d802f80199f46fd3ca1ffbd48c9b22"
+    "warehouse-spool.js": "bcb8f04db3164be64164e9c2cc6998b1754bec95d5ada74763cbcc10a7b92f09"
   }
 }

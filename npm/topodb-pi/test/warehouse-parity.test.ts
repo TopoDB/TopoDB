@@ -4,6 +4,7 @@
 // published package never imports plugins/core.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import * as core from "../../../plugins/core/warehouse-spool.js";
 import * as pi from "../src/warehouse.ts";
 
@@ -50,4 +51,33 @@ test("spool file naming parity with plugins/core", () => {
 test("ULID alphabet parity with plugins/core", () => {
   const ts = 1_700_000_000_000;
   assert.equal(pi.newUlid(ts).slice(0, 10), core.newUlid(ts).slice(0, 10));
+});
+
+const tomlIo = (files: Record<string, string>) => {
+  const norm = (p: string) => path.normalize(p);
+  const map = new Map(Object.entries(files).map(([k, v]) => [norm(k), v]));
+  return { existsFile: (p: string) => map.has(norm(p)), readFile: (p: string) => { if (!map.has(norm(p))) throw new Error("ENOENT"); return map.get(norm(p))!; } };
+};
+
+test("parseWarehouseToml parity with plugins/core", () => {
+  for (const t of ["", "[warehouse]\nenabled = false # x\npath = \"wh\"\n", "[warehouse]\npath = \"a # b\"\n", "[ warehouse ]\r\nenabled=true\r\n", "[warehouse.sub]\npath = \"no\"\n", "[[warehouse]]\npath = \"arr\"\n", "[warehouse]\npath = ''\n", "[warehouse]\npath = 'x' # c\n"]) {
+    assert.deepEqual(pi.parseWarehouseToml(t), core.parseWarehouseToml(t), JSON.stringify(t));
+  }
+});
+
+test("resolveWarehouse parity with plugins/core", () => {
+  const homeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+  const cases: Array<[string, Record<string, string>, Record<string, string>]> = [
+    ["/p/sub/memory.redb", {}, {}],
+    ["/p/sub/memory.redb", { TOPODB_WAREHOUSE_DIR: "/w " }, {}],
+    ["/p/sub/memory.redb", {}, { "/p/.topodb.toml": "[warehouse]\npath = \"wh\"\n" }],
+    ["/p/sub/memory.redb", { [homeKey]: "" }, { "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" }],
+    ["/p/sub/memory.redb", { [homeKey]: "/home/u" }, { "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" }],
+    ["/p/sub/memory.redb", { TOPODB_WAREHOUSE: "1", TOPODB_WAREHOUSE_DIR: "/env" }, { "/p/.topodb.toml": "[warehouse]\nenabled = false\n" }],
+    [".topodb/memory.redb", {}, { ".topodb.toml": "[warehouse]\npath = \"wh\"\n" }],
+    ["db", { TOPODB_WAREHOUSE: " off " }, {}],
+  ];
+  for (const [db, env, files] of cases) {
+    assert.deepEqual(pi.resolveWarehouse(db, env, tomlIo(files)), core.resolveWarehouse(db, env, tomlIo(files)), `${db} ${JSON.stringify(env)}`);
+  }
 });

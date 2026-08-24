@@ -1,17 +1,99 @@
 // warehouse-spool.js — pure helpers for landing raw context into the
 // warehouse spool (spec §6.1). Redaction/size policy is the Rust drain's job.
-import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { encodeUlid } from "./scope-id.js";
 
 export const SPOOL_HARD_CAP = 4 * 1024 * 1024;
 export const HARNESS = "claude-code";
-const off = (v) => { const s = String(v ?? "").toLowerCase(); return s === "0" || s === "off"; };
+const off = (v) => { const s = String(v ?? "").trim().toLowerCase(); return s === "0" || s === "off"; };
 export function warehouseDisabled(env) { return off(env.TOPODB_RECORDING) || off(env.TOPODB_WAREHOUSE); }
+/** Where the plugin's db lives (server-args.js launches the server on it). */
+export const DB_FILE = "memory.redb";
+/** `TOPODB_WAREHOUSE_DIR` → nearest `.topodb.toml` `[warehouse] path` (walking
+ *  up from the data dir, where memory.redb lives) → `<dataDir>/memory.warehouse`.
+ *  Same rule as the daemon (`resolve_warehouse`), so one setting steers both. */
 export function warehouseDir(dataDir, env) {
-  const o = env?.TOPODB_WAREHOUSE_DIR;
-  return o && String(o).trim() ? String(o) : path.join(dataDir, "memory.warehouse");
+  return resolveWarehouse(path.join(dataDir, DB_FILE), env ?? {}).dir;
+}
+/** Off when an env switch says so OR the nearest `.topodb.toml` has
+ *  `[warehouse] enabled = false` (which env cannot re-enable, as in Rust). */
+export function warehouseOff(dataDir, env) {
+  return warehouseDisabled(env ?? {}) || !resolveWarehouse(path.join(dataDir, DB_FILE), env ?? {}).enabled;
+}
+// ---- .topodb.toml [warehouse] (spec 2026-08-24-plugins-toml-parity) --------
+/** Filesystem seam for the toml lookup; tests inject a map. */
+export const nodeIo = {
+  existsFile: (p) => { try { return statSync(p).isFile(); } catch { return false; } },
+  readFile: (p) => readFileSync(p, "utf8"),
+};
+/** Mirrors topodb-mcp's `nearest_topodb_toml`: from the db's parent directory
+ *  upward, the first regular file named `.topodb.toml`. Never resolves a
+ *  relative db — Rust walks `Path::parent()` on the literal path. */
+export function nearestTopodbToml(db, io = nodeIo) {
+  let dir = path.dirname(db);
+  for (;;) {
+    const cand = path.join(dir, ".topodb.toml");
+    if (io.existsFile(cand)) return cand;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+/** The two `[warehouse]` keys the hooks need, from a tolerant line-level parse
+ *  (comments, blank lines, `[table]`/`[[array]]` headers, `key = value` with a
+ *  bare boolean or a quoted string). Rust rejects a malformed file entirely;
+ *  this may still read a well-formed `[warehouse]` table out of one. */
+export function parseWarehouseToml(text) {
+  const out = { enabled: true };
+  let section = "";
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const hdr = /^\[\[?\s*([^\]]+?)\s*\]\]?$/.exec(line);
+    if (hdr) { section = hdr[1]; continue; }
+    if (section !== "warehouse") continue;
+    const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/.exec(line);
+    if (!kv) continue;
+    const key = kv[1];
+    const rawVal = kv[2].trim();
+    if (key === "enabled") {
+      const val = rawVal.replace(/\s+#.*$/, "").trim();
+      if (val === "true" || val === "false") out.enabled = val === "true";
+    } else if (key === "path") {
+      // A quoted string keeps everything inside its quotes (a `#` there is
+      // not a comment); only what follows the closing quote may be one.
+      const q = /^"([^"]*)"|^'([^']*)'/.exec(rawVal);
+      const p = q ? (q[1] ?? q[2]) : undefined;
+      if (p) out.path = p;
+    }
+  }
+  return out;
+}
+/** Mirrors `topodb_onboarding::resolve_warehouse`: toml `enabled = false`
+ *  disables regardless of env; then `TOPODB_WAREHOUSE=0|off`; dir = non-blank
+ *  `TOPODB_WAREHOUSE_DIR` → toml `path` (`~/` → HOME / USERPROFILE on win32,
+ *  expanding even when set-but-empty like Rust's `var_os`; relative → the
+ *  toml's directory) → `<db>.warehouse`. An unreadable toml counts as absent. */
+export function resolveWarehouse(db, env, io = nodeIo) {
+  const tomlPath = nearestTopodbToml(db, io);
+  let section = { enabled: true };
+  if (tomlPath) { try { section = parseWarehouseToml(io.readFile(tomlPath)); } catch { /* unreadable → defaults, as Rust */ } }
+  const envDir = env?.TOPODB_WAREHOUSE_DIR;
+  let dir, source;
+  if (envDir && String(envDir).trim()) { dir = String(envDir); source = "env"; }
+  else if (tomlPath && section.path) {
+    const home = env?.[process.platform === "win32" ? "USERPROFILE" : "HOME"];
+    const p = section.path.startsWith("~/") && home !== undefined ? path.join(home, section.path.slice(2)) : section.path;
+    dir = path.isAbsolute(p) ? p : path.join(path.dirname(tomlPath), p);
+    source = "toml";
+  } else {
+    const ext = path.extname(db);
+    dir = (ext ? db.slice(0, -ext.length) : db) + ".warehouse";
+    source = "default";
+  }
+  return { enabled: section.enabled && !off(env?.TOPODB_WAREHOUSE), dir, source };
 }
 export function newUlid(nowMs = Date.now()) {
   const b = new Uint8Array(16);
@@ -142,7 +224,7 @@ export function markerEvent({ type, sessionId, scope, nodeIds = [], harness = HA
 
 export function tryMarker({ dataDir, env, projectDir, sessionId, type, nodeIds = [], sessionScopes, harness = HARNESS, scope: scopeOverride }) {
   try {
-    if (!dataDir || !sessionId || !projectDir || warehouseDisabled(env)) return;
+    if (!dataDir || !sessionId || !projectDir || warehouseOff(dataDir, env)) return;
     // A write with an explicit scope lands there; the marker must say so or
     // derive looks the memory up in the wrong scope set.
     const scope = scopeOverride ?? sessionScopes({ projectDir }).scope;
