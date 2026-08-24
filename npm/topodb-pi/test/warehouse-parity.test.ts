@@ -73,6 +73,7 @@ test("resolveWarehouse parity with plugins/core", () => {
     ["/p/sub/memory.redb", {}, { "/p/.topodb.toml": "[warehouse]\npath = \"wh\"\n" }],
     ["/p/sub/memory.redb", { [homeKey]: "" }, { "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" }],
     ["/p/sub/memory.redb", { [homeKey]: "/home/u" }, { "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" }],
+    ["/p/sub/memory.redb", {}, { "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" }], // unset HOME: literal ~/ kept
     ["/p/sub/memory.redb", { TOPODB_WAREHOUSE: "1", TOPODB_WAREHOUSE_DIR: "/env" }, { "/p/.topodb.toml": "[warehouse]\nenabled = false\n" }],
     [".topodb/memory.redb", {}, { ".topodb.toml": "[warehouse]\npath = \"wh\"\n" }],
     ["db", { TOPODB_WAREHOUSE: " off " }, {}],
