@@ -173,3 +173,65 @@ test("a .topodb.toml [warehouse] next to the db redirects the spool, and enabled
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("spool cap: artifacts are dropped with one log line while over cap, markers still land, capture resumes after a drain", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "piwh-cap-ext-"));
+  const errors: string[] = [];
+  const origErr = console.error;
+  console.error = (m: unknown) => { errors.push(String(m)); };
+  // 0.0001 MB = 104 bytes: the session_start marker alone (~150 bytes) puts the spool total over cap.
+  const h = harness({ TOPODB_WAREHOUSE_DIR: dir, TOPODB_WAREHOUSE_SPOOL_MAX_MB: "0.0001", TOPODB_RECORD: undefined, TOPODB_WAREHOUSE: undefined, TOPODB_RECORDING: undefined }, () => ({}));
+  try {
+    const ctx = ctxFor("cap-1");
+    const read = { type: "tool_result", toolCallId: "c", toolName: "read", input: { path: "/p" }, content: text("t"), details: undefined, isError: false };
+    await h.fire("session_start", { type: "session_start", reason: "startup" }, ctx);
+    await h.fire("tool_result", read, ctx);
+    await h.fire("tool_result", read, ctx);
+    await h.fire("session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+    let evs = spooled(dir);
+    assert.deepEqual(evs.map((e) => e.kind), ["marker", "marker"], "artifacts dropped, markers kept");
+    assert.equal(errors.filter((e) => e.startsWith("topodb warehouse: spool cap")).length, 1, "logged once");
+    // A drain empties the spool: capture resumes and the next over-cap episode logs again.
+    rmSync(path.join(dir, "spool"), { recursive: true, force: true });
+    await h.fire("tool_result", read, ctx);
+    evs = spooled(dir);
+    assert.deepEqual(evs.map((e) => e.kind), ["artifact"]);
+    await h.fire("tool_result", read, ctx); // file now over cap again (artifact ~170 bytes)
+    assert.equal(spooled(dir).length, 1);
+    assert.equal(errors.filter((e) => e.startsWith("topodb warehouse: spool cap")).length, 2);
+  } finally {
+    console.error = origErr;
+    h.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("spool cap 0 is unlimited", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "piwh-cap0-"));
+  const h = harness({ TOPODB_WAREHOUSE_DIR: dir, TOPODB_WAREHOUSE_SPOOL_MAX_MB: "0", TOPODB_RECORD: undefined, TOPODB_WAREHOUSE: undefined, TOPODB_RECORDING: undefined }, () => ({}));
+  try {
+    const ctx = ctxFor("cap-2");
+    await h.fire("session_start", { type: "session_start", reason: "startup" }, ctx);
+    await h.fire("tool_result", { type: "tool_result", toolCallId: "c", toolName: "read", input: { path: "/p" }, content: text("t"), details: undefined, isError: false }, ctx);
+    assert.deepEqual(spooled(dir).map((e) => e.kind), ["marker", "artifact"]);
+  } finally {
+    h.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("memory_write marker carries an explicit args.scope, else the session scope", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "piwh-scope-"));
+  const h = harness({ TOPODB_WAREHOUSE_DIR: dir, TOPODB_SCOPE: undefined, TOPODB_RECORD: undefined, TOPODB_WAREHOUSE: undefined, TOPODB_RECORDING: undefined }, () => ({ memory_id: MEM }));
+  try {
+    const ctx = ctxFor("scope-1");
+    await h.tool.execute("c1", { tool: "remember", args: { content: "x", scope: " 01SCOPEAAAAAAAAAAAAAAAAAAA " } }, undefined, undefined, ctx);
+    await h.tool.execute("c2", { tool: "create_memory", args: { content: "y", scope: "" } }, undefined, undefined, ctx);
+    await h.tool.execute("c3", { tool: "remember", args: { content: "z" } }, undefined, undefined, ctx);
+    const scopes = spooled(dir).map((e) => e.marker.scope);
+    assert.deepEqual(scopes, ["01SCOPEAAAAAAAAAAAAAAAAAAA", "shared", "shared"]);
+  } finally {
+    h.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

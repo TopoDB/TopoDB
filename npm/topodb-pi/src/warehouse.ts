@@ -6,7 +6,7 @@
 // is pinned byte-for-byte to plugins/core by test/warehouse-parity.test.ts —
 // change core first, then this file. Redaction/size policy is the Rust
 // drain's job. Spec: docs/superpowers/specs/2026-08-24-pi-warehouse-capture-design.md
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync, readdirSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -177,6 +177,41 @@ export function appendSpool(dir: string, sessionId: string, event: object): void
   const p = spoolPath(dir, sessionId);
   mkdirSync(path.dirname(p), { recursive: true });
   appendFileSync(p, JSON.stringify(event) + "\n");
+}
+
+// ---- spool growth cap (spec 2026-08-24-pi-warehouse-followups §4) -----------
+
+export const DEFAULT_SPOOL_MAX_MB = 64;
+
+/** `TOPODB_WAREHOUSE_SPOOL_MAX_MB` in bytes: `0` = unlimited; unset, blank,
+ * non-numeric or negative → 64 MB. Fractions are allowed (tests). */
+export function spoolCapBytes(env: NodeJS.ProcessEnv): number {
+  const dflt = DEFAULT_SPOOL_MAX_MB * 1024 * 1024;
+  const raw = env.TOPODB_WAREHOUSE_SPOOL_MAX_MB;
+  if (raw === undefined || raw.trim() === "") return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n * 1024 * 1024) : dflt;
+}
+
+/** Total bytes of every file under `<dir>/spool` (any extension — `.draining`
+ * leftovers are backlog too); 0 when the directory does not exist (yet, or
+ * because a drain emptied it). Directory total, not per file, so the semantics
+ * match plugins/core where every hook process writes its own file. */
+export function spoolBytes(dir: string): number {
+  const spool = path.join(dir, "spool");
+  let total = 0;
+  try {
+    for (const f of readdirSync(spool)) {
+      try {
+        total += statSync(path.join(spool, f)).size;
+      } catch {
+        /* vanished between readdir and stat (a drain) */
+      }
+    }
+  } catch {
+    return 0;
+  }
+  return total;
 }
 
 export function simpleDiff(oldStr: unknown, newStr: unknown): string {

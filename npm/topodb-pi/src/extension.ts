@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { TopodbServer, recordingEnabled, dbPath, scopeLabel } from "./server-handle.ts";
 import {
   warehouseDisabled, resolveWarehouse, appendSpool, artifactEvent, markerEvent, fromPiToolResult, memoryWriteIds,
-  HARNESS as WAREHOUSE_HARNESS,
+  HARNESS as WAREHOUSE_HARNESS, spoolCapBytes, spoolBytes,
 } from "./warehouse.ts";
 import { EpisodeBuffer, extractText, isUsed, buildEpisodeBatch, toRetrievalRecord } from "./recorder.ts";
 import { ensurePolicyVersion } from "./policy.ts";
@@ -52,13 +52,27 @@ export default function (pi: ExtensionAPI): void {
       return undefined;
     }
   };
+  const spoolCap = spoolCapBytes(process.env);
+  let capLogged = false;
   /** Land one spool event. Never throws into the agent: a failure is one
-   * console.error line and the event is lost (spec §8). */
-  const land = (ctx: unknown, what: string, build: (session: string) => object | null): void => {
+   * console.error line and the event is lost (spec §8). Artifacts are subject
+   * to the spool cap (markers are tiny and lineage-critical, so they always
+   * land); capture resumes once a drain has emptied the file. */
+  const land = (ctx: unknown, what: string, build: (session: string) => object | null, opts: { artifact?: boolean } = {}): void => {
     if (!warehouseOn) return;
     try {
       const session = sessionOf(ctx);
       if (!session) return;
+      if (opts.artifact && spoolCap > 0) {
+        if (spoolBytes(warehouseDir) >= spoolCap) {
+          if (!capLogged) {
+            capLogged = true;
+            console.error(`topodb warehouse: spool cap (${spoolCap / (1024 * 1024)} MB) reached; artifacts dropped until the server drains it`);
+          }
+          return;
+        }
+        capLogged = false;
+      }
       const ev = build(session);
       if (ev) appendSpool(warehouseDir, session, ev);
     } catch (e) {
@@ -77,7 +91,7 @@ export default function (pi: ExtensionAPI): void {
     land(ctx, "tool_result capture", (session) => {
       const mapped = fromPiToolResult(ev);
       return mapped && artifactEvent({ ...mapped, sessionId: session, scope: warehouseScope, cwd: ctx?.cwd, harness: WAREHOUSE_HARNESS });
-    });
+    }, { artifact: true });
   });
   pi.on("session_shutdown", async (_ev, ctx) => marker(ctx, "session_end"));
 
@@ -131,9 +145,13 @@ export default function (pi: ExtensionAPI): void {
         }
         const result = await server.call(params.tool, params.args ?? {});
         if (params.tool === "remember" || params.tool === "create_memory") {
+          // A write with an explicit scope lands there; the marker must say so
+          // or derive looks the memory up in the wrong scope set (spec §5).
+          const argScope = (params.args ?? {}).scope;
+          const scope = typeof argScope === "string" && argScope.trim() ? argScope.trim() : warehouseScope;
           land(ctx, "memory_write marker", (session) => {
             const ids = memoryWriteIds(result);
-            return ids.length ? markerEvent({ type: "memory_write", sessionId: session, scope: warehouseScope, nodeIds: ids, harness: WAREHOUSE_HARNESS }) : null;
+            return ids.length ? markerEvent({ type: "memory_write", sessionId: session, scope, nodeIds: ids, harness: WAREHOUSE_HARNESS }) : null;
           });
         }
         if (recording && buffer.open && (params.tool === "search_memories" || params.tool === "traverse")) {

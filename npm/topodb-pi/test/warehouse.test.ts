@@ -1,12 +1,13 @@
 // test/warehouse.test.ts — pure helpers in src/warehouse.ts (spec §3, §5, §6, §8).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   HARNESS, SPOOL_HARD_CAP, warehouseDisabled, warehouseDirForDb, spoolPath, appendSpool, newUlid,
   simpleDiff, fromPiToolResult, artifactEvent, markerEvent, memoryWriteIds, nearestTopodbToml, parseWarehouseToml, resolveWarehouse,
+  DEFAULT_SPOOL_MAX_MB, spoolCapBytes, spoolBytes,
 } from "../src/warehouse.ts";
 
 test("harness label is pi", () => {
@@ -175,4 +176,30 @@ test("resolveWarehouse mirrors the Rust precedence: toml enabled=false > env swi
   assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE: "1", TOPODB_WAREHOUSE_DIR: "/env" }, off), { enabled: false, dir: "/env", source: "env" });
   const broken = { existsFile: () => true, readFile: () => { throw new Error("EACCES"); } };
   assert.deepEqual(resolveWarehouse(db, {}, broken), { enabled: true, dir: "/p/sub/memory.warehouse", source: "default" });
+});
+
+test("spoolCapBytes: default 64 MB, 0 = unlimited, invalid → default, fractional allowed", () => {
+  const MB = 1024 * 1024;
+  assert.equal(DEFAULT_SPOOL_MAX_MB, 64);
+  assert.equal(spoolCapBytes({}), 64 * MB);
+  assert.equal(spoolCapBytes({ TOPODB_WAREHOUSE_SPOOL_MAX_MB: " " }), 64 * MB);
+  assert.equal(spoolCapBytes({ TOPODB_WAREHOUSE_SPOOL_MAX_MB: "0" }), 0);
+  assert.equal(spoolCapBytes({ TOPODB_WAREHOUSE_SPOOL_MAX_MB: "8" }), 8 * MB);
+  assert.equal(spoolCapBytes({ TOPODB_WAREHOUSE_SPOOL_MAX_MB: "0.0001" }), Math.floor(0.0001 * MB));
+  assert.equal(spoolCapBytes({ TOPODB_WAREHOUSE_SPOOL_MAX_MB: "lots" }), 64 * MB);
+  assert.equal(spoolCapBytes({ TOPODB_WAREHOUSE_SPOOL_MAX_MB: "-1" }), 64 * MB);
+});
+
+test("spoolBytes totals every file under <dir>/spool, 0 when absent", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "piwh-cap-"));
+  try {
+    assert.equal(spoolBytes(dir), 0);
+    appendSpool(dir, "s", { a: 1 });
+    appendSpool(dir, "t", { b: 22 });
+    writeFileSync(path.join(dir, "spool", "old.jsonl.draining"), "x".repeat(7));
+    const line = (o: object) => Buffer.byteLength(JSON.stringify(o) + "\n");
+    assert.equal(spoolBytes(dir), line({ a: 1 }) + line({ b: 22 }) + 7);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
