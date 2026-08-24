@@ -6,6 +6,7 @@ use topodb_warehouse::{
 };
 
 const SCOPE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const SCOPE_B: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 
 fn art(id: &str, ts: i64, locator: &str, content: &str, tool: &str, kind: ArtifactType) -> Event {
     Event {
@@ -37,6 +38,19 @@ fn art(id: &str, ts: i64, locator: &str, content: &str, tool: &str, kind: Artifa
         op: None,
         marker: None,
     }
+}
+fn art_scoped(
+    id: &str,
+    ts: i64,
+    locator: &str,
+    content: &str,
+    tool: &str,
+    kind: ArtifactType,
+    scope: &str,
+) -> Event {
+    let mut e = art(id, ts, locator, content, tool, kind);
+    e.source.as_mut().unwrap().scope = scope.into();
+    e
 }
 fn marker(id: &str, ts: i64, kind: MarkerType, node_ids: Vec<String>) -> Event {
     Event {
@@ -353,4 +367,57 @@ fn pointer_only_artifacts_get_a_node_but_no_chunks_and_unknown_memory_ids_are_sk
         ),
         (1, 1, 0, 0, 1)
     );
+}
+
+#[test]
+fn cross_scope_artifacts_are_not_wired_as_evidence_but_are_counted() {
+    // Memory lives in scope A (SCOPE); the artifacts in this window landed
+    // with source.scope = B (SCOPE_B), i.e. captured from a different
+    // project. No evidence edge is representable across scopes, so derive
+    // must skip them without creating edges, while still counting the skip.
+    let (_t, db, mut wh) = setup();
+    let m1 = memory(&db, "fact one");
+    spool(
+        &wh,
+        "a.jsonl",
+        &[
+            art_scoped(
+                "a1",
+                2,
+                "/src/lib.rs",
+                "hello world\n",
+                "Read",
+                ArtifactType::FileRead,
+                SCOPE_B,
+            ),
+            art_scoped(
+                "a2",
+                3,
+                "cargo test",
+                "ok 12 passed\n",
+                "Bash",
+                ArtifactType::Command,
+                SCOPE_B,
+            ),
+            marker("m1", 5, MarkerType::MemoryWrite, vec![m1.to_string()]),
+        ],
+    );
+    wh.drain(10).unwrap();
+    let rep = derive(&db, &wh, None, 20, false).unwrap();
+    assert_eq!(rep.artifacts_created, 2);
+    assert_eq!(rep.evidence_edges, 0);
+    assert_eq!(rep.cross_scope_skipped, 2);
+
+    let scopes = topodb_json::scopes_to_scope_set(&[scope(), Scope::Shared]);
+    let ev = db
+        .edges_from(
+            &scopes,
+            m1,
+            None,
+            Some(EVIDENCE_EDGE),
+            true,
+            TimeAxis::Valid,
+        )
+        .unwrap();
+    assert!(ev.is_empty());
 }

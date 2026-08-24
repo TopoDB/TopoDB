@@ -160,7 +160,14 @@ pub fn drain(
     let mut batch: Vec<Event> = Vec::new();
     let mut consumed: Vec<std::path::PathBuf> = Vec::new();
     for p in claimed {
-        let text = std::fs::read_to_string(&p)?;
+        let text = match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            // Unreadable (EACCES/EIO): leave it for a human, keep draining the rest.
+            Err(_) => {
+                rep.deferred_files += 1;
+                continue;
+            }
+        };
         let (evs, bad) = parse_lines(&text);
         rep.skipped_lines += bad;
         rep.files += 1;
@@ -456,5 +463,33 @@ mod tests {
         let rep = wh.drain(6).unwrap();
         assert_eq!((rep.events, rep.duplicates), (0, 1));
         assert_eq!(wh.events().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_leftover_is_deferred_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let mut wh = Warehouse::open(&t.path().join("w"), cfg()).unwrap();
+        write_spool(&wh, "bad.jsonl.draining", &[art("01A", 1, "left")]);
+        write_spool(&wh, "good.jsonl", &[art("01B", 2, "fresh")]);
+        let bad = wh.layout.spool.join("bad.jsonl.draining");
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root (or on a filesystem that ignores the mode bits, e.g.
+        // some CI containers) makes the file readable anyway; in that case the
+        // hardening path under test never triggers, so skip the assertions.
+        if std::fs::read_to_string(&bad).is_ok() {
+            std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let rep = wh.drain(100).unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!((rep.files, rep.events, rep.deferred_files), (1, 1, 1));
+        assert!(!wh.layout.spool.join("good.jsonl").exists());
+        assert!(bad.is_file());
     }
 }
