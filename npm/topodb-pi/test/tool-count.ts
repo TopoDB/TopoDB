@@ -3,7 +3,7 @@
  * upgrade that adds or removes tools must go red HERE, deliberately, not
  * drift silently — bump it alongside the `@topodb/topodb-mcp` dependency.
  *
- * Tracks the PUBLISHED `@topodb/topodb-mcp` pinned in package.json (0.0.20 =
- * 32 tools, including `onboarding_pointer`). Bump this alongside the
+ * Tracks the PUBLISHED `@topodb/topodb-mcp` pinned in package.json (0.1.1 =
+ * 33 tools, including `onboarding_pointer` and `graph_snapshot`). Bump this alongside the
  * `@topodb/topodb-mcp` dependency whenever the server's tool set changes. */
-export const EXPECTED_TOOL_COUNT = 32;
+export const EXPECTED_TOOL_COUNT = 33;
