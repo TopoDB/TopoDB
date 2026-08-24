@@ -24,7 +24,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
   64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
   a `remember`/`create_memory` with an explicit `scope` now produces a
-  `memory_write` marker in that scope, so its evidence edge is found.
+  `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
 
 ### Cursor plugin
 
@@ -32,14 +32,14 @@ workspace are versioned and released independently (tags are per-package, e.g.
 - Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
   64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
   a `remember`/`create_memory` with an explicit `scope` now produces a
-  `memory_write` marker in that scope, so its evidence edge is found.
+  `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
 
 ### Codex plugin
 
 - Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
   64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
   a `remember`/`create_memory` with an explicit `scope` now produces a
-  `memory_write` marker in that scope, so its evidence edge is found.
+  `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
 
 ### `@topodb/pi` (Pi extension)
 
@@ -56,7 +56,7 @@ workspace are versioned and released independently (tags are per-package, e.g.
   The extension resolves `.topodb.toml` `[warehouse] path`/`enabled` exactly as
   the server does; `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) bounds the
   spool backlog; a `remember`/`create_memory` with an explicit `scope` now
-  produces a `memory_write` marker in that scope, so its evidence edge is found.
+  produces a `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
   Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse spec.
 
 ### `topodb-warehouse`
@@ -65,8 +65,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 - **Drain claims spool files by rename** (`<name>.jsonl` → a collision-free
   `<name>[.N].jsonl.draining`) before reading them, so a long-lived writer that keeps appending to one file
-  (the pi extension) can never have an append deleted unread; leftover
-  `.draining` files from a crashed drain are recovered first and deduped by
+  (the pi extension) cannot have an append deleted unread once its file has
+  been claimed (the residual window is a single append whose open precedes
+  the rename); leftover `.draining` files from a crashed drain are recovered first and deduped by
   event id. A failed rename (Windows sharing violation) is reported as a
   deferred file.
 

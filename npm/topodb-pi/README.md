@@ -28,8 +28,8 @@ with `evidence` links to the memories the session wrote — deterministic, no
 model calls. `topodb warehouse status --db .topodb/memory.redb` shows the tiers.
 `TOPODB_WAREHOUSE=0` turns just this off; `TOPODB_RECORD=0` turns all recording
 off. The `[warehouse]` section of the nearest `.topodb.toml` (`path`,
-`enabled`) is honoured the same way the server honours it, so one setting
-steers both. The spool backlog (total bytes under `<db>.warehouse/spool/`) is
+`enabled`) is honoured for `path` and `enabled` in a well-formed file, the
+same way the server honours it, so one setting steers both. The spool backlog (total bytes under `<db>.warehouse/spool/`) is
 capped at `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64; `0` = unlimited): over
 the cap, artifacts are dropped with one log line and markers still land, and
 capture resumes once the server has drained the spool. `ls`, custom tools,
