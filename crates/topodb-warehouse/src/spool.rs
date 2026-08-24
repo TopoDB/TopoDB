@@ -101,6 +101,11 @@ const DRAINING_EXT: &str = "draining";
 /// is durable; Windows fails the rename instead. Picking a free name makes
 /// both platforms behave the same. Every `*.draining` file is drained first
 /// on the next run; `Manifest::note_id` dedups anything already landed.
+///
+/// The `exists()` → `rename` probe is not atomic; it is safe because
+/// warehouse mutation (drain included) is single-flighted by the db's
+/// exclusive lock — every mutating path opens the db first (IMPROVEMENTS W8).
+/// A second concurrent drainer would reintroduce a real race here.
 fn claim(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let base = p.as_os_str().to_owned();
     let mut n: u32 = 0;
