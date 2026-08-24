@@ -132,15 +132,21 @@ test("memoryWriteIds finds 26-char ids in object, text-block, and string results
   assert.deepEqual(memoryWriteIds(undefined), []);
 });
 
-const fakeIo = (files: Record<string, string>) => ({
-  existsFile: (p: string) => Object.prototype.hasOwnProperty.call(files, p),
-  readFile: (p: string) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]; },
-});
+// Keys are written POSIX-style; the code under test builds candidates with
+// path.join, so compare normalized forms to stay correct on Windows too.
+const fakeIo = (files: Record<string, string>) => {
+  const norm = (p: string) => path.normalize(p);
+  const map = new Map(Object.entries(files).map(([k, v]) => [norm(k), v]));
+  return {
+    existsFile: (p: string) => map.has(norm(p)),
+    readFile: (p: string) => { if (!map.has(norm(p))) throw new Error("ENOENT"); return map.get(norm(p))!; },
+  };
+};
 
 test("nearestTopodbToml walks up from the db's directory without resolving relative paths", () => {
   const io = fakeIo({ "/r/.topodb.toml": "", "/r/a/b/.topodb.toml": "" });
-  assert.equal(nearestTopodbToml("/r/a/b/c/memory.redb", io), "/r/a/b/.topodb.toml");
-  assert.equal(nearestTopodbToml("/r/a/memory.redb", io), "/r/.topodb.toml");
+  assert.equal(nearestTopodbToml("/r/a/b/c/memory.redb", io), path.join("/r/a/b", ".topodb.toml"));
+  assert.equal(nearestTopodbToml("/r/a/memory.redb", io), path.join("/r", ".topodb.toml"));
   assert.equal(nearestTopodbToml("/elsewhere/memory.redb", io), undefined);
   // Relative db: Rust checks `<parent>/.topodb.toml` then `.topodb.toml` (cwd) and stops.
   const rel = fakeIo({ ".topodb.toml": "" });
@@ -166,7 +172,7 @@ test("resolveWarehouse mirrors the Rust precedence: toml enabled=false > env swi
   assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE_DIR: "/w " }, none), { enabled: true, dir: "/w ", source: "env" });
   assert.equal(resolveWarehouse(db, { TOPODB_WAREHOUSE: " OFF " }, none).enabled, false);
   const rel = fakeIo({ "/p/.topodb.toml": "[warehouse]\npath = \"wh\"\n" });
-  assert.deepEqual(resolveWarehouse(db, {}, rel), { enabled: true, dir: "/p/wh", source: "toml" });
+  assert.deepEqual(resolveWarehouse(db, {}, rel), { enabled: true, dir: path.join("/p", "wh"), source: "toml" });
   assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE_DIR: "/env" }, rel), { enabled: true, dir: "/env", source: "env" });
   const abs = fakeIo({ "/p/.topodb.toml": "[warehouse]\npath = \"/abs/wh\"\n" });
   assert.equal(resolveWarehouse(db, {}, abs).dir, "/abs/wh");

@@ -383,7 +383,10 @@ mod tests {
         write_spool(&wh, "s1-1.jsonl", &[art("01B", 2, "fresh")]);
         let rep = wh.drain(100).unwrap();
         assert_eq!((rep.files, rep.events, rep.deferred_files), (2, 2, 0));
-        assert!(std::fs::read_dir(&wh.layout.spool).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&wh.layout.spool)
+            .unwrap()
+            .next()
+            .is_none());
         let ids: Vec<String> = wh.events().unwrap().iter().map(|e| e.id.clone()).collect();
         assert_eq!(ids, vec!["01A".to_string(), "01B".to_string()]);
     }
@@ -415,7 +418,10 @@ mod tests {
         write_spool(&wh, "a.jsonl.draining", &[art("01A", 1, "x")]);
         let rep = wh.drain(20).unwrap();
         assert_eq!((rep.files, rep.events, rep.duplicates), (1, 0, 1));
-        assert!(std::fs::read_dir(&wh.layout.spool).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&wh.layout.spool)
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -430,13 +436,22 @@ mod tests {
         assert!(!wh.layout.spool.join("a.jsonl").exists());
         // A second fresh file claims the next free name.
         write_spool(&wh, "a.jsonl", &[art("01C", 3, "fresh2")]);
-        assert_eq!(claim(&wh.layout.spool.join("a.jsonl")).unwrap(), wh.layout.spool.join("a.jsonl.2.draining"));
+        assert_eq!(
+            claim(&wh.layout.spool.join("a.jsonl")).unwrap(),
+            wh.layout.spool.join("a.jsonl.2.draining")
+        );
         // All three are leftovers now and drain together, in (ts, id) order.
         let rep = wh.drain(5).unwrap();
         assert_eq!((rep.files, rep.events, rep.deferred_files), (3, 3, 0));
-        assert!(std::fs::read_dir(&wh.layout.spool).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&wh.layout.spool)
+            .unwrap()
+            .next()
+            .is_none());
         let ids: Vec<String> = wh.events().unwrap().iter().map(|e| e.id.clone()).collect();
-        assert_eq!(ids, vec!["01A".to_string(), "01B".to_string(), "01C".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["01A".to_string(), "01B".to_string(), "01C".to_string()]
+        );
     }
 
     #[test]
