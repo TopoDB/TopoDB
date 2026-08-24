@@ -68,18 +68,6 @@ workspace are versioned and released independently (tags are per-package, e.g.
   produces a `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
   Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse spec.
 
-### `topodb-warehouse`
-
-#### Fixed
-
-- **Drain claims spool files by rename** (`<name>.jsonl` → a collision-free
-  `<name>[.N].jsonl.draining`) before reading them, so a long-lived writer that keeps appending to one file
-  (the pi extension) cannot have an append deleted unread once its file has
-  been claimed (the residual window is a single append whose open precedes
-  the rename); leftover `.draining` files from a crashed drain are recovered first and deduped by
-  event id. A failed rename (Windows sharing violation) is reported as a
-  deferred file.
-
 ---
 
 ## `topodb` (engine)
@@ -829,6 +817,27 @@ First published release of the crate.
 
 ## `topodb-warehouse`
 
+### 0.1.1 — 2026-08-24
+
+#### Fixed
+
+- **Drain claims spool files by rename** (`<name>.jsonl` → a collision-free
+  `<name>[.N].jsonl.draining`) before reading them, so a long-lived writer that keeps appending to one file
+  (the pi extension) cannot have an append deleted unread once its file has
+  been claimed (the residual window is a single append whose open precedes
+  the rename); leftover `.draining` files from a crashed drain are recovered first and deduped by
+  event id. A failed rename (Windows sharing violation) is reported as a
+  deferred file.
+- **An unreadable leftover no longer wedges the drain** — a `.draining` file
+  that cannot be read (EACCES/EIO) is reported as a deferred file and skipped,
+  so the rest of the spool still lands.
+
+#### Added
+
+- **`DeriveReport.cross_scope_skipped`** — counts (memory, artifact) pairs whose
+  evidence edge is not representable because the memory lives in one
+  project scope and the artifact in another; previously a silent `continue`.
+
 ### 0.1.0 — 2026-08-21
 
 First published release of the crate.
@@ -845,7 +854,17 @@ First published release of the crate.
 
 ## `topodb-mcp`
 
-### Unreleased
+### 0.1.1 — 2026-08-24
+
+#### Changed
+
+- **Embeds `topodb-warehouse` 0.1.1** — the boot/hygiene drain now claims spool
+  files by rename before reading them (safe for long-lived writers such as the
+  pi extension), recovers `.draining` leftovers first, skips an unreadable
+  leftover instead of aborting, and `derive` reports `cross_scope_skipped`.
+  Tool surface unchanged (33 tools).
+
+### 0.1.0 — 2026-08-21
 
 #### Added
 
@@ -858,11 +877,6 @@ First published release of the crate.
   never fatal, and `reingest`'s `last_run` advances after attempting all, so a
   misconfigured path retries next interval rather than every tick. `topodb init`
   resolves the same sources but leaves the heavy work deferred.
-
-### 0.1.0 — 2026-08-21
-
-#### Added
-
 - **`graph_snapshot` tool** — deterministic graph export (ego view from seeds
   and/or a search query, hop-labeled, or whole-scope view) as canonical JSON,
   DOT, Mermaid, or self-contained interactive HTML (zero network requests).
@@ -1722,6 +1736,15 @@ framework (Phases 1–3), the follow-ups sweep, and distribution.
 ---
 
 ## `topodb-cli`
+
+### 0.1.1 — 2026-08-24
+
+#### Changed
+
+- **Embeds `topodb-warehouse` 0.1.1** — `topodb warehouse drain` claims spool
+  files by rename before reading them and recovers `.draining` leftovers first;
+  an unreadable leftover is reported as deferred instead of aborting;
+  `topodb warehouse derive` reports `cross_scope_skipped`.
 
 ### 0.1.0 — 2026-08-21
 
