@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { captureArtifact } from "../hooks/capture.js";
@@ -38,6 +38,15 @@ test("spoolCapBytes: default 64 MB, 0 = unlimited, invalid → default; spoolByt
     appendSpool(dir, "t", { b: 22 }, {});
     const line = (o) => Buffer.byteLength(JSON.stringify(o) + "\n");
     assert.equal(spoolBytes(dir, {}), line({ a: 1 }) + line({ b: 22 }));
+
+    appendSpool(dir, "u", { c: 333 }, {});
+    const spoolDir = path.join(warehouseDir(dir, {}), "spool");
+    const files = readdirSync(spoolDir).sort();
+    const firstSize = statSync(path.join(spoolDir, files[0])).size;
+    const trueTotal = spoolBytes(dir, {});
+    const limited = spoolBytes(dir, {}, firstSize);
+    assert.ok(limited >= firstSize);
+    assert.ok(limited <= trueTotal);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

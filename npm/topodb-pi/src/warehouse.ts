@@ -202,8 +202,10 @@ export function spoolCapBytes(env: NodeJS.ProcessEnv): number {
 /** Total bytes of every file under `<dir>/spool` (any extension — `.draining`
  * leftovers are backlog too); 0 when the directory does not exist (yet, or
  * because a drain emptied it). Directory total, not per file, so the semantics
- * match plugins/core where every hook process writes its own file. */
-export function spoolBytes(dir: string): number {
+ * match plugins/core where every hook process writes its own file. Returns
+ * early once `limit` is reached, so callers that only need an over/under
+ * answer pay O(cap), not O(backlog). */
+export function spoolBytes(dir: string, limit = Number.POSITIVE_INFINITY): number {
   const spool = path.join(dir, "spool");
   let total = 0;
   try {
@@ -213,6 +215,7 @@ export function spoolBytes(dir: string): number {
       } catch {
         /* vanished between readdir and stat (a drain) */
       }
+      if (total >= limit) return total;
     }
   } catch {
     return 0;

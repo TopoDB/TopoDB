@@ -64,7 +64,7 @@ export default function (pi: ExtensionAPI): void {
       const session = sessionOf(ctx);
       if (!session) return;
       if (opts.artifact && spoolCap > 0) {
-        if (spoolBytes(warehouseDir) >= spoolCap) {
+        if (spoolBytes(warehouseDir, spoolCap) >= spoolCap) {
           if (!capLogged) {
             capLogged = true;
             console.error(`topodb warehouse: spool cap (${spoolCap / (1024 * 1024)} MB) reached; artifacts dropped until the server drains it`);

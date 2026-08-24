@@ -41,13 +41,16 @@ export function spoolCapBytes(env) {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n * 1024 * 1024) : dflt;
 }
 /** Total bytes of every file under `<warehouse>/spool` (any extension —
- * `.draining` leftovers are backlog too); 0 when the directory is absent. */
-export function spoolBytes(dataDir, env) {
+ * `.draining` leftovers are backlog too); 0 when the directory is absent.
+ * Returns early once `limit` is reached, so callers that only need an
+ * over/under answer pay O(cap), not O(backlog). */
+export function spoolBytes(dataDir, env, limit = Infinity) {
   const spool = path.join(warehouseDir(dataDir, env), "spool");
   let total = 0;
   try {
     for (const f of readdirSync(spool)) {
       try { total += statSync(path.join(spool, f)).size; } catch { /* drained mid-walk */ }
+      if (total >= limit) return total;
     }
   } catch { return 0; }
   return total;
@@ -62,7 +65,7 @@ export function spoolOverCap(dataDir, env) {
   const cap = spoolCapBytes(env);
   if (cap <= 0) return false;
   const sentinel = path.join(warehouseDir(dataDir, env), CAPPED_SENTINEL);
-  if (spoolBytes(dataDir, env) < cap) {
+  if (spoolBytes(dataDir, env, cap) < cap) {
     try { if (existsSync(sentinel)) unlinkSync(sentinel); } catch { /* best-effort */ }
     return false;
   }

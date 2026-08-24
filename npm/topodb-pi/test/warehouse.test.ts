@@ -1,7 +1,7 @@
 // test/warehouse.test.ts — pure helpers in src/warehouse.ts (spec §3, §5, §6, §8).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -202,6 +202,23 @@ test("spoolBytes totals every file under <dir>/spool, 0 when absent", () => {
     writeFileSync(path.join(dir, "spool", "old.jsonl.draining"), "x".repeat(7));
     const line = (o: object) => Buffer.byteLength(JSON.stringify(o) + "\n");
     assert.equal(spoolBytes(dir), line({ a: 1 }) + line({ b: 22 }) + 7);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("spoolBytes stops scanning once limit is reached", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "piwh-cap-limit-"));
+  try {
+    appendSpool(dir, "s", { a: 1 });
+    appendSpool(dir, "t", { b: 22 });
+    appendSpool(dir, "u", { c: 333 });
+    const files = readdirSync(path.join(dir, "spool")).sort();
+    const firstSize = statSync(path.join(dir, "spool", files[0])).size;
+    const trueTotal = spoolBytes(dir);
+    const limited = spoolBytes(dir, firstSize);
+    assert.ok(limited >= firstSize);
+    assert.ok(limited <= trueTotal);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
