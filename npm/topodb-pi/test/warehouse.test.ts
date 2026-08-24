@@ -155,6 +155,8 @@ test("parseWarehouseToml reads only [warehouse] enabled/path and tolerates the r
   assert.deepEqual(parseWarehouseToml("[warehouse]\npath = ''\n"), { enabled: true });
   assert.deepEqual(parseWarehouseToml("[warehouse]\npath = '~/w'\nenabled = maybe\n"), { enabled: true, path: "~/w" });
   assert.deepEqual(parseWarehouseToml("[ warehouse ]\r\nenabled=true\r\n"), { enabled: true });
+  assert.deepEqual(parseWarehouseToml("[warehouse]\npath = \"a # not a comment\"\n"), { enabled: true, path: "a # not a comment" });
+  assert.deepEqual(parseWarehouseToml("[warehouse]\npath = \"wh\" # trailing comment\n"), { enabled: true, path: "wh" });
 });
 
 test("resolveWarehouse mirrors the Rust precedence: toml enabled=false > env switch; env dir > toml path > <db>.warehouse", () => {
@@ -171,7 +173,8 @@ test("resolveWarehouse mirrors the Rust precedence: toml enabled=false > env swi
   const home = fakeIo({ "/p/.topodb.toml": "[warehouse]\npath = \"~/wh\"\n" });
   const homeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
   assert.equal(resolveWarehouse(db, { [homeKey]: "/home/u" }, home).dir, path.join("/home/u", "wh"));
-  assert.equal(resolveWarehouse(db, { [homeKey]: "" }, home).dir, path.join("/p", "~/wh")); // no HOME: literal, relative to toml dir (as Rust)
+  assert.equal(resolveWarehouse(db, { [homeKey]: "" }, home).dir, path.join("/p", "wh")); // set-but-empty HOME: Rust Some("") still expands
+  assert.equal(resolveWarehouse(db, {}, home).dir, path.join("/p", "~/wh")); // unset HOME: literal, relative to toml dir (as Rust)
   const off = fakeIo({ "/p/.topodb.toml": "[warehouse]\nenabled = false\n" });
   assert.deepEqual(resolveWarehouse(db, { TOPODB_WAREHOUSE: "1", TOPODB_WAREHOUSE_DIR: "/env" }, off), { enabled: false, dir: "/env", source: "env" });
   const broken = { existsFile: () => true, readFile: () => { throw new Error("EACCES"); } };

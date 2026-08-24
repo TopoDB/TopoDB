@@ -95,11 +95,14 @@ export function parseWarehouseToml(text: string): WarehouseSection {
     const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/.exec(line);
     if (!kv) continue;
     const key = kv[1];
-    const val = kv[2].replace(/\s+#.*$/, "").trim();
+    const rawVal = kv[2].trim();
     if (key === "enabled") {
+      const val = rawVal.replace(/\s+#.*$/, "").trim();
       if (val === "true" || val === "false") out.enabled = val === "true";
     } else if (key === "path") {
-      const q = /^"(.*)"$|^'(.*)'$/.exec(val);
+      // A quoted string keeps everything inside its quotes (a `#` there is
+      // not a comment); only what follows the closing quote may be one.
+      const q = /^"([^"]*)"|^'([^']*)'/.exec(rawVal);
       const p = q ? (q[1] ?? q[2]) : undefined;
       if (p) out.path = p;
     }
@@ -136,7 +139,10 @@ export function resolveWarehouse(db: string, env: NodeJS.ProcessEnv, io: Warehou
     source = "env";
   } else if (tomlPath && section.path) {
     const home = env[process.platform === "win32" ? "USERPROFILE" : "HOME"];
-    const p = section.path.startsWith("~/") && home ? path.join(home, section.path.slice(2)) : section.path;
+    // Rust `env_home()` is `var_os(..)`: a set-but-EMPTY variable is Some("")
+    // and still expands (`"" + "wh"` → relative `wh`); only an unset one
+    // leaves the literal `~/…`.
+    const p = section.path.startsWith("~/") && home !== undefined ? path.join(home, section.path.slice(2)) : section.path;
     dir = path.isAbsolute(p) ? p : path.join(path.dirname(tomlPath), p);
     source = "toml";
   } else {
