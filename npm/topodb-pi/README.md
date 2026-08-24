@@ -27,10 +27,11 @@ into content-addressed, redacted segments and derives `Artifact`/`Chunk` nodes
 with `evidence` links to the memories the session wrote — deterministic, no
 model calls. `topodb warehouse status --db .topodb/memory.redb` shows the tiers.
 `TOPODB_WAREHOUSE=0` turns just this off; `TOPODB_RECORD=0` turns all recording
-off. The `[warehouse]` section of `.topodb.toml` is read by the server, not by
-this extension — if you set `[warehouse] path` or `enabled = false` there, also
-set `TOPODB_WAREHOUSE_DIR` / `TOPODB_WAREHOUSE=0` so the extension follows;
-otherwise it keeps spooling to a directory nothing drains. `ls`, custom tools,
+off. The `[warehouse]` section of the nearest `.topodb.toml` (`path`, `enabled`) is
+honoured the same way the server honours it, so one setting steers both. The
+spool for a session is capped at `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64;
+`0` = unlimited): over the cap, artifacts are dropped with one log line and
+markers still land, and capture resumes once the server has drained the file. `ls`, custom tools,
 MCP tools, and failed tool calls are never captured.
 
 No Rust toolchain and no separate MCP adapter required — the prebuilt

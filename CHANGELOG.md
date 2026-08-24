@@ -53,9 +53,22 @@ workspace are versioned and released independently (tags are per-package, e.g.
   in-repo parity test against `plugins/core`). The `topodb-mcp` child drains
   and derives it at boot; no new daemon plumbing. Off with
   `TOPODB_WAREHOUSE=0` (warehouse only) or `TOPODB_RECORD=0` (all recording).
-  The `[warehouse]` section of `.topodb.toml` is not read by the extension —
-  pair it with the env vars (see README). Closes the "pi recorder: wiring
-  later" item from the 2026-08-18 warehouse spec.
+  The extension resolves `.topodb.toml` `[warehouse] path`/`enabled` exactly as
+  the server does; `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) bounds a
+  session's spool; a `remember`/`create_memory` with an explicit `scope` now
+  produces a `memory_write` marker in that scope, so its evidence edge is found.
+  Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse spec.
+
+### `topodb-warehouse`
+
+#### Fixed
+
+- **Drain claims spool files by rename** (`<name>.jsonl` → `<name>.jsonl.draining`)
+  before reading them, so a long-lived writer that keeps appending to one file
+  (the pi extension) can never have an append deleted unread; leftover
+  `.draining` files from a crashed drain are recovered first and deduped by
+  event id. A failed rename (Windows sharing violation) is reported as a
+  deferred file.
 
 ---
 
