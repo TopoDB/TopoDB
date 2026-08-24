@@ -86,6 +86,24 @@ fn prepare_artifact(
     Ok(wrote_blob)
 }
 
+/// Extension a spool file gets once a drain has claimed it.
+const DRAINING_EXT: &str = "draining";
+
+/// Claims a spool file by renaming it `<name>.draining` BEFORE it is read.
+/// Writers append by path (pi keeps one `<session>-<pid>.jsonl` open for the
+/// whole session), so after the rename their next append recreates a fresh
+/// `.jsonl` instead of landing in a file we are about to delete. Leftover
+/// `.draining` files (a drain died between rename and `m.save`) are picked up
+/// first on the next run; `Manifest::note_id` dedups anything already landed.
+fn claim(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut claimed = p.as_os_str().to_owned();
+    claimed.push(".");
+    claimed.push(DRAINING_EXT);
+    let claimed = std::path::PathBuf::from(claimed);
+    std::fs::rename(p, &claimed)?;
+    Ok(claimed)
+}
+
 pub fn drain(
     layout: &Layout,
     m: &mut Manifest,
@@ -93,20 +111,43 @@ pub fn drain(
     now_ms: i64,
 ) -> std::io::Result<DrainReport> {
     let mut rep = DrainReport::default();
-    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&layout.spool)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .collect();
+    let mut leftovers: Vec<std::path::PathBuf> = Vec::new();
+    let mut names: Vec<std::path::PathBuf> = Vec::new();
+    for p in std::fs::read_dir(&layout.spool)?.filter_map(|e| e.ok().map(|e| e.path())) {
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("jsonl") => names.push(p),
+            Some(DRAINING_EXT) => leftovers.push(p),
+            _ => {}
+        }
+    }
+    leftovers.sort();
     names.sort();
-    let mut batch: Vec<Event> = Vec::new();
-    let mut consumed: Vec<std::path::PathBuf> = Vec::new();
+    // Read leftovers' content now, before any freshly-claimed file below can
+    // rename onto the exact same `.draining` path and silently overwrite one
+    // (POSIX rename replaces an existing destination).
+    let mut claimed: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(leftovers.len());
+    for p in leftovers {
+        let text = std::fs::read_to_string(&p)?;
+        claimed.push((p, text));
+    }
     for p in names {
         if cfg.spool_min_age_ms > 0 && file_age_ms(&p).is_some_and(|age| age < cfg.spool_min_age_ms)
         {
             rep.deferred_files += 1;
             continue;
         }
-        let text = std::fs::read_to_string(&p)?;
+        match claim(&p) {
+            Ok(c) => {
+                let text = std::fs::read_to_string(&c)?;
+                claimed.push((c, text));
+            }
+            // Windows sharing violation / another drainer got it first: not ours this run.
+            Err(_) => rep.deferred_files += 1,
+        }
+    }
+    let mut batch: Vec<Event> = Vec::new();
+    let mut consumed: Vec<std::path::PathBuf> = Vec::new();
+    for (p, text) in claimed {
         let (evs, bad) = parse_lines(&text);
         rep.skipped_lines += bad;
         rep.files += 1;
@@ -310,6 +351,50 @@ mod tests {
         let rep = wh.drain(1).unwrap();
         assert_eq!((rep.events, rep.deferred_files), (0, 1));
         assert!(wh.layout.spool.join("a.jsonl").is_file());
+    }
+
+    #[test]
+    fn drain_recovers_draining_leftovers_and_claims_new_files() {
+        let t = tempfile::tempdir().unwrap();
+        let mut wh = Warehouse::open(&t.path().join("w"), cfg()).unwrap();
+        // A crash leftover: claimed by a previous drain that died before m.save.
+        write_spool(&wh, "s1-1.jsonl.draining", &[art("01A", 1, "left")]);
+        write_spool(&wh, "s1-1.jsonl", &[art("01B", 2, "fresh")]);
+        let rep = wh.drain(100).unwrap();
+        assert_eq!((rep.files, rep.events, rep.deferred_files), (2, 2, 0));
+        assert!(std::fs::read_dir(&wh.layout.spool).unwrap().next().is_none());
+        let ids: Vec<String> = wh.events().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, vec!["01A".to_string(), "01B".to_string()]);
+    }
+
+    #[test]
+    fn leftovers_drain_even_when_young_files_are_deferred() {
+        let t = tempfile::tempdir().unwrap();
+        let c = WarehouseConfig {
+            spool_min_age_ms: 60_000,
+            ..WarehouseConfig::default()
+        };
+        let mut wh = Warehouse::open(&t.path().join("w"), c).unwrap();
+        write_spool(&wh, "a.jsonl.draining", &[art("01A", 1, "left")]);
+        write_spool(&wh, "a.jsonl", &[art("01B", 2, "young")]);
+        let rep = wh.drain(1).unwrap();
+        assert_eq!((rep.events, rep.deferred_files), (1, 1));
+        // The young writer file was neither claimed nor deleted; the leftover is gone.
+        assert!(wh.layout.spool.join("a.jsonl").is_file());
+        assert!(!wh.layout.spool.join("a.jsonl.draining").exists());
+    }
+
+    #[test]
+    fn a_leftover_already_landed_is_deduped_not_double_counted() {
+        let t = tempfile::tempdir().unwrap();
+        let mut wh = Warehouse::open(&t.path().join("w"), cfg()).unwrap();
+        write_spool(&wh, "a.jsonl", &[art("01A", 1, "x")]);
+        wh.drain(10).unwrap();
+        // Simulate: the same events were claimed again by a drain that died after m.save.
+        write_spool(&wh, "a.jsonl.draining", &[art("01A", 1, "x")]);
+        let rep = wh.drain(20).unwrap();
+        assert_eq!((rep.files, rep.events, rep.duplicates), (1, 0, 1));
+        assert!(std::fs::read_dir(&wh.layout.spool).unwrap().next().is_none());
     }
 
     #[test]
