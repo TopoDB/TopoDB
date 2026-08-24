@@ -12,6 +12,6 @@ async function main() {
   const dataDir = process.env.CLAUDE_PLUGIN_DATA;
   if (!dataDir || !p.session_id) return;
   recordMemoryWrite({ dataDir, env: process.env, projectDir: process.env.CLAUDE_PROJECT_DIR ?? p.cwd, sessionId: p.session_id,
-    toolResult: p.tool_response ?? p.tool_output, harness: "claude-code" });
+    toolInput: p.tool_input, toolResult: p.tool_response ?? p.tool_output, harness: "claude-code" });
 }
 main().catch(() => {}).finally(() => process.exit(0));

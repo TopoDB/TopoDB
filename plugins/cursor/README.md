@@ -27,6 +27,8 @@ All hook-driven, all failing silently to "nothing happens", never blocking:
   next to the db; the daemon's hygiene tick drains, redacts, and derives
   `Artifact`/`Chunk` nodes (`topodb warehouse status`). `TOPODB_WAREHOUSE=0`
   turns just this off (`TOPODB_RECORDING=0` turns everything off).
+  `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) caps the spool backlog; over
+  it, artifacts are dropped (markers still land) until the next drain.
 - **Episode capture** (`afterMCPExecution` + `sessionEnd`): what
   `search_memories`/`traverse`/`recent_memories` returned and which of it the
   session used, written as an `Episode` at session end. `TOPODB_RECORDING=0`

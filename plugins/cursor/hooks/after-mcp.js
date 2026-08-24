@@ -18,6 +18,6 @@ async function main() {
   const tool = bareToolName(p.tool_name);
   const result = parseResult(p.result_json ?? p.tool_output ?? p.result);
   if (RETRIEVAL_TOOLS.includes(tool)) recordRetrieval({ dataDir, sessionId, toolName: tool, toolInput: p.tool_input, toolResult: result });
-  else if (WRITE_TOOLS.includes(tool)) recordMemoryWrite({ dataDir, env: process.env, projectDir, sessionId, toolResult: result, harness: HARNESS });
+  else if (WRITE_TOOLS.includes(tool)) recordMemoryWrite({ dataDir, env: process.env, projectDir, sessionId, toolInput: p.tool_input, toolResult: result, harness: HARNESS });
 }
 runHook(main, { deadlineMs: 4000 });

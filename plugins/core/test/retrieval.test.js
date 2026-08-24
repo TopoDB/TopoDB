@@ -47,3 +47,17 @@ test("recordMemoryWrite marks captured and spools a memory_write marker with the
     assert.equal(evs[0].marker.scope, sessionScopes({ projectDir: dir }).scope);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("recordMemoryWrite carries an explicit toolInput.scope on the marker, else the project scope", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "retr-"));
+  try {
+    const toolResult = { structuredContent: { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" } };
+    recordMemoryWrite({ dataDir: dir, env: {}, projectDir: dir, sessionId: "s3", toolResult, toolInput: { content: "x", scope: " 01SCOPEAAAAAAAAAAAAAAAAAAA " } });
+    recordMemoryWrite({ dataDir: dir, env: {}, projectDir: dir, sessionId: "s3", toolResult, toolInput: { content: "y", scope: "" } });
+    recordMemoryWrite({ dataDir: dir, env: {}, projectDir: dir, sessionId: "s3", toolResult });
+    const spool = path.join(warehouseDir(dir, {}), "spool");
+    const evs = readdirSync(spool).flatMap((f) => readFileSync(path.join(spool, f), "utf8").split("\n").filter(Boolean).map(JSON.parse));
+    const project = sessionScopes({ projectDir: dir }).scope;
+    assert.deepEqual(evs.map((e) => e.marker.scope), ["01SCOPEAAAAAAAAAAAAAAAAAAA", project, project]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

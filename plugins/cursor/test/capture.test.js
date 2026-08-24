@@ -54,3 +54,13 @@ test("afterMCPExecution: another client's same-named tool is not mistaken for to
     assert.ok(!readState(dir, "conv-3"));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("afterMCPExecution: an explicit tool_input.scope on a write tool lands on the memory_write marker", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cur-mcp-"));
+  try {
+    const base = { hook_event_name: "afterMCPExecution", conversation_id: "conv-4", workspace_roots: [dir] };
+    assert.equal(run(MCP, { ...base, tool_name: "mcp__topodb__remember", tool_input: { content: "x", scope: "01SCOPEAAAAAAAAAAAAAAAAAAA" }, result_json: JSON.stringify({ structuredContent: { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" } }) }, { TOPODB_PLUGIN_DATA: dir }), "");
+    const marker = spooled(dir).find((e) => e.marker?.type === "memory_write");
+    assert.equal(marker.marker.scope, "01SCOPEAAAAAAAAAAAAAAAAAAA");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

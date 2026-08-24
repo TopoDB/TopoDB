@@ -42,3 +42,14 @@ test("session-start/end and mark-captured write markers into the spool", () => {
     assert.equal(markers(dataDir).filter((x) => x.session === "S3").length, 0);
   } finally { rmSync(dataDir, { recursive: true, force: true }); }
 });
+
+test("mark-captured carries an explicit tool_input.scope on the memory_write marker", () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-mk-"));
+  try {
+    const env = { CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: dataDir };
+    runHook("mark-captured.js", { session_id: "S", tool_name: "mcp__plugin_topodb_topodb__remember", tool_input: { content: "x", scope: "01SCOPEAAAAAAAAAAAAAAAAAAA" }, tool_response: { memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" } }, env);
+    const m = markers(dataDir);
+    assert.equal(m.length, 1);
+    assert.equal(m[0].scope, "01SCOPEAAAAAAAAAAAAAAAAAAA");
+  } finally { rmSync(dataDir, { recursive: true, force: true }); }
+});

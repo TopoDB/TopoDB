@@ -21,10 +21,18 @@ workspace are versioned and released independently (tags are per-package, e.g.
   of advertising a 0-tool degraded server.
 - When the daemon socket never binds, `launch.js` serves `topodb-mcp` on
   stdio rather than a 0-tool stub.
+- Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
+  64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
+  a `remember`/`create_memory` with an explicit `scope` now produces a
+  `memory_write` marker in that scope, so its evidence edge is found.
 
 ### Cursor plugin
 
 - Same stdio fallback when the daemon socket never binds.
+- Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
+  64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
+  a `remember`/`create_memory` with an explicit `scope` now produces a
+  `memory_write` marker in that scope, so its evidence edge is found.
 
 ### `@topodb/pi` (Pi extension)
 
