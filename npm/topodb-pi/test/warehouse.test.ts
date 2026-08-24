@@ -88,6 +88,11 @@ test("fromPiToolResult drops errors, ls, custom/MCP tools, the topodb tool, imag
   assert.equal(fromPiToolResult({ toolName: "edit", input: { path: "/p/a.rs", edits: [{ oldText: 1 }] }, content: text("ok"), isError: false }), null);
   // undefined input is tolerated (never throws)
   assert.deepEqual(fromPiToolResult({ toolName: "bash", content: text("x"), isError: false }), { toolName: "Bash", toolInput: { command: undefined }, toolResponse: "x" });
+  // Write/MultiEdit take their text from the input, so a result with no text block is still landed.
+  assert.deepEqual(fromPiToolResult({ toolName: "write", input: { path: "/p/n.rs", content: "new" }, content: [], isError: false }),
+    { toolName: "Write", toolInput: { file_path: "/p/n.rs", content: "new" }, toolResponse: undefined });
+  assert.deepEqual(fromPiToolResult({ toolName: "edit", input: { path: "/p/a.rs", edits: [{ oldText: "a", newText: "b" }] }, content: [], isError: false }),
+    { toolName: "MultiEdit", toolInput: { file_path: "/p/a.rs", edits: [{ old_string: "a", new_string: "b" }] }, toolResponse: undefined });
 });
 
 test("artifactEvent tags source.harness=pi, computes bytes, and hashes above the hard cap", () => {

@@ -198,31 +198,25 @@ export const PI_TOOL_NAMES: Record<string, string> = {
   bash: "Bash", read: "Read", edit: "MultiEdit", write: "Write", grep: "Grep", find: "Glob",
 };
 
+/** Canonical tools whose artifact text is the tool result itself. */
+const TEXT_FROM_RESULT = new Set(["Bash", "Read", "Grep", "Glob"]);
+
 export function fromPiToolResult(ev: PiToolResult): Mapped | null {
   if (ev.isError) return null;
   const toolName = PI_TOOL_NAMES[String(ev.toolName ?? "")];
   if (!toolName) return null;
   const input: Rec = isRec(ev.input) ? ev.input : {};
   const toolResponse = firstText(ev.content);
+  // Bash/Read/Grep/Glob artifacts ARE the result text; no text block (an
+  // image read) means nothing to land. Write/MultiEdit take their text from
+  // the input, so they are kept regardless.
+  if (toolResponse === undefined && TEXT_FROM_RESULT.has(toolName)) return null;
   switch (toolName) {
-    case "Bash": {
-      if (toolResponse === undefined) return null;
-      return { toolName, toolInput: { command: input.command }, toolResponse };
-    }
-    case "Read": {
-      if (toolResponse === undefined) return null;
-      return { toolName, toolInput: { file_path: input.path }, toolResponse };
-    }
-    case "Write": {
-      if (toolResponse === undefined) return null;
-      return { toolName, toolInput: { file_path: input.path, content: input.content }, toolResponse };
-    }
-    case "Grep": case "Glob": {
-      if (toolResponse === undefined) return null;
-      return { toolName, toolInput: { pattern: input.pattern }, toolResponse };
-    }
+    case "Bash": return { toolName, toolInput: { command: input.command }, toolResponse };
+    case "Read": return { toolName, toolInput: { file_path: input.path }, toolResponse };
+    case "Write": return { toolName, toolInput: { file_path: input.path, content: input.content }, toolResponse };
+    case "Grep": case "Glob": return { toolName, toolInput: { pattern: input.pattern }, toolResponse };
     case "MultiEdit": {
-      if (toolResponse === undefined) return null;
       const raw = Array.isArray(input.edits) ? (input.edits as unknown[]) : [];
       const edits = raw
         .filter((e): e is Rec => isRec(e) && typeof e.oldText === "string" && typeof e.newText === "string")
