@@ -26,6 +26,20 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 - Same stdio fallback when the daemon socket never binds.
 
+### `@topodb/pi` (Pi extension)
+
+#### Added
+
+- **Context warehouse capture** — the extension now spools successful
+  `bash`/`read`/`edit`/`write`/`grep`/`find` results and session-start /
+  session-end / memory-write markers to `<TOPODB_DB>.warehouse/spool/` in
+  the same event format as the Claude Code and Cursor plugins (pinned by an
+  in-repo parity test against `plugins/core`). The `topodb-mcp` child drains
+  and derives it at boot; no new daemon plumbing. Off with
+  `TOPODB_WAREHOUSE=0` (warehouse only) or `TOPODB_RECORD=0` (all recording).
+  Closes the "pi recorder: wiring later" item from the 2026-08-18 warehouse
+  spec.
+
 ---
 
 ## `topodb` (engine)
