@@ -21,6 +21,7 @@ test("off switches: TOPODB_RECORD=0, TOPODB_RECORDING, TOPODB_WAREHOUSE (0/off, 
   assert.equal(warehouseDisabled({ TOPODB_RECORDING: "OFF" }), true);
   assert.equal(warehouseDisabled({ TOPODB_WAREHOUSE: "off" }), true);
   assert.equal(warehouseDisabled({ TOPODB_WAREHOUSE: "1" }), false);
+  assert.equal(warehouseDisabled({ TOPODB_WAREHOUSE: " off " }), true);
 });
 
 test("warehouse dir follows the Rust <db>.warehouse rule, TOPODB_WAREHOUSE_DIR overrides", () => {

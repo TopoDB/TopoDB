@@ -15,7 +15,7 @@ export const SPOOL_HARD_CAP = 4 * 1024 * 1024;
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 const off = (v: unknown): boolean => {
-  const s = String(v ?? "").toLowerCase();
+  const s = String(v ?? "").trim().toLowerCase();
   return s === "0" || s === "off";
 };
 

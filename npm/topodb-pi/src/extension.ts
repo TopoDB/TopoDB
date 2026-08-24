@@ -64,9 +64,13 @@ export default function (pi: ExtensionAPI): void {
       console.error(`topodb warehouse: ${what} failed: ${(e as Error).message}`);
     }
   };
-  const marker = (ctx: unknown, type: string, nodeIds: string[] = []) =>
-    land(ctx, `${type} marker`, (session) => markerEvent({ type, sessionId: session, scope: warehouseScope, nodeIds, harness: WAREHOUSE_HARNESS }));
+  const marker = (ctx: unknown, type: string) =>
+    land(ctx, `${type} marker`, (session) => markerEvent({ type, sessionId: session, scope: warehouseScope, harness: WAREHOUSE_HARNESS }));
 
+  // Fires on startup/new/resume/fork AND reload. A reload keeps the session
+  // id, so it emits session_end then session_start for the same session —
+  // which is load-bearing: the derive lineage rule treats session_start as an
+  // evidence-window reset, mirroring the context reset a reload performs.
   pi.on("session_start", async (_ev, ctx) => marker(ctx, "session_start"));
   pi.on("tool_result", async (ev, ctx) => {
     land(ctx, "tool_result capture", (session) => {
@@ -126,8 +130,10 @@ export default function (pi: ExtensionAPI): void {
         }
         const result = await server.call(params.tool, params.args ?? {});
         if (params.tool === "remember" || params.tool === "create_memory") {
-          const ids = memoryWriteIds(result);
-          if (ids.length) marker(ctx, "memory_write", ids);
+          land(ctx, "memory_write marker", (session) => {
+            const ids = memoryWriteIds(result);
+            return ids.length ? markerEvent({ type: "memory_write", sessionId: session, scope: warehouseScope, nodeIds: ids, harness: WAREHOUSE_HARNESS }) : null;
+          });
         }
         if (recording && buffer.open && (params.tool === "search_memories" || params.tool === "traverse")) {
           try {
