@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,5 +71,19 @@ test("hook spools an event per tool call, honors kill switches, tags subagents",
     runHook(payload, { CLAUDE_PLUGIN_DATA: dataDir, TOPODB_WAREHOUSE_DIR: alt });
     assert.equal(readdirSync(path.join(alt, "spool")).length, 1);
     rmSync(alt, { recursive: true, force: true });
+  } finally { rmSync(dataDir, { recursive: true, force: true }); }
+});
+
+test("a .topodb.toml [warehouse] path in the plugin data dir redirects the hook's spool", () => {
+  const dataDir = mkdtempSync(path.join(tmpdir(), "topodb-wc-toml-"));
+  try {
+    writeFileSync(path.join(dataDir, ".topodb.toml"), "[warehouse]\npath = \"wh\"\n");
+    const payload = { session_id: "T", cwd: dataDir, hook_event_name: "PostToolUse", tool_name: "Read",
+      tool_input: { file_path: "/x.rs" }, tool_response: { file: { content: "hello" } } };
+    const env = { CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_PROJECT_DIR: dataDir };
+    runHook(payload, env);
+    const spool = path.join(dataDir, "wh", "spool");
+    assert.ok(existsSync(spool), "spool redirected under <dataDir>/wh");
+    assert.equal(existsSync(path.join(dataDir, "memory.warehouse")), false);
   } finally { rmSync(dataDir, { recursive: true, force: true }); }
 });

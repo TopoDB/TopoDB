@@ -72,6 +72,8 @@ All hook-driven, all failing silently to "nothing happens", never blocking:
   file reads, and MCP tool calls are captured too); the daemon's hygiene tick
   drains, redacts, and derives `Artifact`/`Chunk` nodes
   (`topodb warehouse status`). `TOPODB_WAREHOUSE=0` turns just this off.
+  `[warehouse] path`/`enabled` in the nearest `.topodb.toml` above the plugin
+  data dir are honoured too (well-formed file), as the daemon honours them.
   `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default 64) caps the spool backlog; over
   it, artifacts are dropped (markers still land) until the next drain.
 - **Episode flush** (`Stop`): what `search_memories` returned and which of it

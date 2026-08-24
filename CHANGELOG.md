@@ -25,6 +25,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
   a `remember`/`create_memory` with an explicit `scope` now produces a
   `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+- Hooks honour `[warehouse] path`/`enabled` in the nearest `.topodb.toml` above the
+  plugin data dir, with the daemon's precedence (env dir > toml path; toml
+  `enabled = false` wins), so the spool always lands where the drain looks.
 
 ### Cursor plugin
 
@@ -33,6 +36,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
   a `remember`/`create_memory` with an explicit `scope` now produces a
   `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+- Hooks honour `[warehouse] path`/`enabled` in the nearest `.topodb.toml` above the
+  plugin data dir, with the daemon's precedence (env dir > toml path; toml
+  `enabled = false` wins), so the spool always lands where the drain looks.
 
 ### Codex plugin
 
@@ -40,6 +46,9 @@ workspace are versioned and released independently (tags are per-package, e.g.
   64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
   a `remember`/`create_memory` with an explicit `scope` now produces a
   `memory_write` marker in that scope, so its evidence edge is found when the write goes to `shared` or to the session's own scope (a write into a different project's scope still has no representable edge; `derive` now reports it as `cross_scope_skipped`).
+- Hooks honour `[warehouse] path`/`enabled` in the nearest `.topodb.toml` above the
+  plugin data dir, with the daemon's precedence (env dir > toml path; toml
+  `enabled = false` wins), so the spool always lands where the drain looks.
 
 ### `@topodb/pi` (Pi extension)
 
