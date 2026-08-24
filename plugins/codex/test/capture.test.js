@@ -54,6 +54,18 @@ test("mcp__topodb__* matches: search records a retrieval, remember marks capture
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("mcp__topodb__remember: an explicit tool_input.scope lands on the memory_write marker", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cdx-cap-"));
+  try {
+    const payload = fixture("post-tool-use.mcp-remember.json");
+    payload.tool_input = { content: "x", scope: "01ARZ3NDEKTSV4RRFFQ69G5FAV" };
+    assert.equal(run({ ...payload, cwd: dir }, { TOPODB_PLUGIN_DATA: dir }), "");
+    const marker = spooled(dir).find((e) => e.marker?.type === "memory_write");
+    assert.ok(marker, "expected a memory_write marker");
+    assert.equal(marker.marker.scope, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a foreign server's same-named tool is not mistaken for topodb's", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "cdx-cap-"));
   try {

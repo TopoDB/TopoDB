@@ -34,6 +34,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
   a `remember`/`create_memory` with an explicit `scope` now produces a
   `memory_write` marker in that scope, so its evidence edge is found.
 
+### Codex plugin
+
+- Warehouse spool backlog is capped by `TOPODB_WAREHOUSE_SPOOL_MAX_MB` (default
+  64 MB; artifacts dropped over cap, markers still land, resumes after a drain);
+  a `remember`/`create_memory` with an explicit `scope` now produces a
+  `memory_write` marker in that scope, so its evidence edge is found.
+
 ### `@topodb/pi` (Pi extension)
 
 #### Added

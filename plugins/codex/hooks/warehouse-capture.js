@@ -24,7 +24,7 @@ async function main() {
     if (!isTopodbTool(toolName)) return; // qualified but not ours: no state
     recordRetrieval({ dataDir, sessionId, toolName, toolInput: p.tool_input, toolResult });
     if (WRITE_TOOLS.includes(bareToolName(toolName))) {
-      recordMemoryWrite({ dataDir, env: process.env, projectDir, sessionId, toolResult, harness: HARNESS });
+      recordMemoryWrite({ dataDir, env: process.env, projectDir, sessionId, toolInput: p.tool_input, toolResult, harness: HARNESS });
     }
     return;
   }
