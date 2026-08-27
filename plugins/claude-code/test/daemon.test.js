@@ -23,7 +23,7 @@
 // failing is worse than no test at all.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import {
@@ -127,6 +127,36 @@ function rmDir(dir) {
   // shared grace helper (30×1000ms, and it names what is still held if it ever
   // does give up). Sync variant because these teardowns run in sync `finally`s.
   rmWithGraceSync(dir);
+}
+
+/** The daemon is spawned `detached` from launch.js, so killing the shim does
+ * not kill it. Idle-exit usually reaps it; when a Windows named-pipe session
+ * does not drop, the copied `topodb-mcp.exe` stays mapped and `rmDir` EPERMs
+ * for the full grace budget. Stop the exe (and the node launcher whose
+ * command line names this tree) before unlinking. */
+function killProcessesHolding(dir) {
+  if (process.platform !== "win32") return;
+  const needle = path.resolve(dir).replace(/'/g, "''");
+  spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-Command",
+      `$n='${needle}'; Get-CimInstance Win32_Process | Where-Object { $exe=$_.ExecutablePath; $cmd=$_.CommandLine; $name=$_.Name; ($exe -and $exe.StartsWith($n,$true,[cultureinfo]::InvariantCulture) -and $name -like 'topodb-mcp*') -or ($name -eq 'node.exe' -and $cmd -and $cmd.Contains($n) -and $cmd.Contains('topodb-mcp')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    ],
+    { windowsHide: true, timeout: 15_000 },
+  );
+}
+
+async function teardownCopiedServer(sessions, ...dirs) {
+  killAll(sessions);
+  if (process.platform === "win32") {
+    for (const d of dirs) killProcessesHolding(d);
+    await sleep(500);
+  } else {
+    await sleep(3000);
+  }
+  for (const d of dirs) rmDir(d);
 }
 
 function sleep(ms) {
@@ -711,12 +741,7 @@ test("repairs an install whose platform binary is missing", pinnedPredatesDaemon
       "the repaired platform package must be the pinned server version, not whatever npm felt like",
     );
   } finally {
-    killAll(sessions);
-    // Wait out the (shortened) idle window so the daemon exits and releases the
-    // running topodb-mcp.exe that lives inside dataDir — see above.
-    await sleep(3000);
-    rmDir(dataDir);
-    rmDir(proj);
+    await teardownCopiedServer(sessions, dataDir, proj);
   }
 });
 
@@ -807,10 +832,7 @@ test("never runs a stale binary resolved from outside its own data dir", pinnedP
       "the repaired package must be the pinned server version, not the ghost's 0.0.3",
     );
   } finally {
-    killAll(sessions);
-    await sleep(3000); // let the daemon exit and release the .exe inside dataDir
-    rmDir(root);
-    rmDir(proj);
+    await teardownCopiedServer(sessions, root, proj);
   }
 });
 
