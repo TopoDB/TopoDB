@@ -2,8 +2,11 @@ use std::time::{Duration, Instant};
 use topodb::*;
 
 fn wait_for_count(db: &Db, scopes: &ScopeSet, id: NodeId, want_at_least: u64) -> AccessStats {
-    // Bumps are async (batched ~100ms). Poll with a deadline instead of sleeping blind.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Bumps are async (batched ~100ms). Poll instead of sleeping blind.
+    // 15s matches `recall.rs`'s settle deadline: a 5s cap flaked
+    // `test (windows-latest)` on unrelated PRs when the bumper thread was
+    // scheduled late under `cargo test --workspace`.
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(stats) = db.access_stats(scopes, id).unwrap() {
             if stats.access_count >= want_at_least {

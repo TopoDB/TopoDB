@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 ## Scope Discipline
 
@@ -11,6 +11,22 @@ Store one fact per memory. Use `remember()` as your atomic call — it finds or 
 ## When to Remember
 
 Record decisions, design lessons, and non-obvious facts that future you or teammates need to know. Do NOT duplicate what Git and code already record — don't memorize commit hashes or file content. Focus on context: why a choice was made, trade-offs considered, blockers resolved, or patterns the repo depends on.
+
+## When to Merge
+
+When two memories are the same fact reworded, merge them with `consolidate_memories`. You pick which copy to keep. Do not merge from similarity alone — contradictions score high too.
+
+## When to Retire
+
+When a fact is replaced, pass `supersedes` on `remember`. When a memory should never surface again, `forget` it. `lifecycle_candidates` ranks cold memories and proposes; you act.
+
+## Hygiene
+
+`memory_health` at session start reports duplicate pairs, supersessions, orphans, and stale memories. Drill into non-zero counts with the `find_*` scans. Scans never delete.
+
+## Conflicts
+
+When `remember` returns `supersession_candidates`, supersede the stale side, consolidate a duplicate, or ignore a false alarm. Uncertainty stays in the graph until something is judged.
 
 ## Recall Discipline
 
