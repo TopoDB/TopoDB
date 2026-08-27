@@ -14,6 +14,13 @@ workspace are versioned and released independently (tags are per-package, e.g.
 
 ## Unreleased
 
+### Docs
+
+- Root README describes a plugin session and the remember / ignore / merge /
+  retire / hygiene / conflict policy. The `topodb-memory` skill and
+  `CONVENTIONS.md` (onboarding v2) now carry the same merge / forget /
+  `memory_health` rules that previously lived only in tool descriptions.
+
 ### Claude Code plugin
 
 - `launch.js` uses the same data-dir resolution as the Cursor plugin, so a

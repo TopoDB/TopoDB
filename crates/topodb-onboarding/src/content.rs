@@ -7,16 +7,17 @@
 /// Coupled to `templates/CONVENTIONS.md`'s own `version:` header only by
 /// convention, not by the type system — bump BOTH together. See
 /// `template_version_matches_onboarding_version` below, which pins them.
-pub const ONBOARDING_VERSION: u32 = 1;
+pub const ONBOARDING_VERSION: u32 = 2;
 
 const CONVENTIONS_MD: &str = include_str!("../templates/CONVENTIONS.md");
 
 /// The inner pointer text (no fence markers). ~5 lines; keep it short.
 const POINTER_BODY: &str = "\
 This project uses **TopoDB** for agent memory.
-- Before writing memories, read `CONVENTIONS.md` (scope discipline, when to remember).
+- Before writing memories, read `CONVENTIONS.md` (what to store, when to merge, when to retire).
 - Search memory before asking the user to repeat context you may already have.
-- Store durable facts/decisions with `remember`; supersede when they change.";
+- Store durable facts/decisions with `remember`; supersede when they change.
+- Act on `memory_health`; scans never delete.";
 
 pub fn conventions_markdown() -> &'static str {
     CONVENTIONS_MD
@@ -87,6 +88,8 @@ mod tests {
         )));
         assert!(b.trim_end().ends_with("<!-- topodb:pointer:end -->"));
         assert!(b.contains(pointer_body().trim()));
+        assert!(pointer_body().contains("when to merge"));
+        assert!(pointer_body().contains("memory_health"));
     }
 
     /// `ensure_conventions_file` decides whether to rewrite CONVENTIONS.md by
@@ -115,6 +118,21 @@ mod tests {
         assert!(c.contains("version:"));
         assert!(c.to_lowercase().contains("scope"));
         assert!(c.to_lowercase().contains("remember"));
+        assert!(c.contains("consolidate_memories"));
+        assert!(c.contains("forget"));
+        assert!(c.contains("memory_health"));
+        assert!(c.contains("supersession_candidates"));
+    }
+
+    #[test]
+    fn root_readme_surfaces_session_and_policy() {
+        let readme = include_str!("../../../README.md");
+        assert!(readme.contains("## A session"));
+        assert!(readme.contains("## What an agent should remember"));
+        assert!(readme.contains("consolidate_memories"));
+        assert!(readme.contains("forget"));
+        assert!(readme.contains("memory_health"));
+        assert!(readme.contains("supersession_candidates"));
     }
 
     #[test]

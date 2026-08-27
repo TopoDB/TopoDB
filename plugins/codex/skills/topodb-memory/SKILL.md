@@ -82,6 +82,24 @@ History stays readable: pass `as_of` (Unix ms) to `traverse` or `get_edges` to
 see the graph as it was at that instant — superseded topology reappears,
 later edges vanish. Nodes are current-state; the time axis lives on edges.
 
+## Merge, retire, hygiene
+
+When two memories are the same fact reworded, `consolidate_memories`: you
+pick `keep` and `drop`. Never merge from similarity alone — contradictions
+score high too.
+
+When a fact is replaced, `remember` with `supersedes`. When a memory should
+never come back, `forget` it. `lifecycle_candidates` ranks cold memories;
+it proposes, you act.
+
+At session start, `memory_health` reports duplicate pairs, supersessions,
+orphans, and stale memories. Drill into non-zero counts with
+`find_duplicate_memories` / `find_orphan_memories` / `find_stale_memories`.
+Scans never delete.
+
+When `remember` returns `supersession_candidates`, supersede the stale side,
+consolidate a duplicate, or ignore a false alarm.
+
 ## Project or shared — the one choice that matters
 
 Writes land in **this project's scope** by default. That is right for most
